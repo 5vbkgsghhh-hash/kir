@@ -1,0 +1,19 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="KIR logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#1e293b"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="24" fill="url(#bg)"/>
+  <!-- left angle bracket -->
+  <path d="M40 44 L26 64 L40 84" fill="none" stroke="#475569" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- right angle bracket -->
+  <path d="M88 44 L102 64 L88 84" fill="none" stroke="#475569" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- three building columns, rising -->
+  <rect x="50" y="66" width="8" height="26" rx="2" fill="#93c5fd"/>
+  <rect x="60" y="54" width="8" height="38" rx="2" fill="#60a5fa"/>
+  <rect x="70" y="40" width="8" height="52" rx="2" fill="#3b82f6"/>
+  <!-- ground line -->
+  <line x1="46" y1="96" x2="82" y2="96" stroke="#475569" stroke-width="4" stroke-linecap="round"/>
+</svg>
