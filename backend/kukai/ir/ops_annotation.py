@@ -89,6 +89,9 @@ OPS = [
               "VIEW-BINDING LAW: target must be visible in in_view); at "
               "reproduced ±tol in view-space (geometry)"),
         writes_model=True,
+        # 03.08: «±tol» получил адрес — головка марки сверяется в осях вида
+        # с тем же 10 мм, что стояло литералом в _emit_tag.
+        tolerances={"head_mm": 10.0},
     ),
     # text — a note (± leader) in in_view at view-space `at`; width_mm
     # (optional, TextNote.Width — the ONE per-instance sheet-space size Revit
@@ -120,5 +123,11 @@ OPS = [
               "bounding-box center, and leader_to is visible in in_view "
               "(VIEW-BINDING LAW)"),
         writes_model=True,
+        # 03.08: «±tol» точки вставки — те же 5 мм, что в _emit_text.
+        # НАЗВАНО ЧЕСТНО: допуск ширины (`__wmm * 0.15 + 5.0`) сюда НЕ
+        # внесён — это относительная поправка на подгонку Revit под контент,
+        # а не обещание `post`; вносить её значило бы выдать за контракт то,
+        # чего контракт не обещает.
+        tolerances={"location_mm": 5.0},
     ),
 ]

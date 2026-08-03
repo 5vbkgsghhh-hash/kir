@@ -641,9 +641,38 @@ class LLMClient:
             #     ($1/$3, 92.6%, caps 16k) → NOT used for MiMo; AtlasCloud 404s for us.
             # allow_fallbacks stays False so a rare provider outage hard-fails to the
             # deepseek fallback tier rather than a garbage mirror (Baidu lesson).
-            _reasoning = {"effort": (reasoning_effort or getattr(self, "_reasoning_effort", None) or "high")}
+            # ПОТОЛОК РАССУЖДЕНИЯ (2026-08-03, указание оператора: 64k).
+            # OpenRouter принимает РОВНО ОДНО из двух — замерено живьём на
+            # deepseek-v4-flash-0731: `{"effort":..., "max_tokens":...}` вместе
+            # дают 400 «Only one of "reasoning.effort" and
+            # "reasoning.max_tokens" can be specified». Поэтому явный потолок
+            # ВЫТЕСНЯЕТ effort, а не дополняет его.
+            # Переменная ОТСУТСТВУЕТ или <=0 ⇒ прежняя ветка effort байт-в-байт
+            # (историческое поведение и все фолбэк-тиры не двигаются).
+            _cap_raw = os.environ.get("KUKAI_LLM_REASONING_MAX_TOKENS", "").strip()
+            try:
+                _cap = int(_cap_raw) if _cap_raw else 0
+            except ValueError:
+                _cap = 0
+            _reasoning = (
+                {"max_tokens": _cap} if _cap > 0 else
+                {"effort": (reasoning_effort or getattr(self, "_reasoning_effort", None) or "high")})
             if "deepseek" in use_model:
-                _provider = {"order": ["DeepInfra", "Fireworks", "Parasail", "GMICloud"], "allow_fallbacks": False}
+                # ПОРЯДОК ПЕРЕСОБРАН 2026-08-03 по ПОШТУЧНОМУ живому замеру на
+                # deepseek-v4-flash-0731 (полная форма: 10 инструментов, 65k
+                # max_tokens, reasoning.max_tokens=64000), `provider.only=[X]`:
+                #   DeepInfra 1.5с ($0.09/$0.18) · Novita 2.0с · Parasail 3.6с
+                #   GMICloud 3.9с · Fireworks 14.8с  (DeepSeek официальный —
+                #   «No endpoints matching» на нашей форме, брать нельзя).
+                # Fireworks стоял ВТОРЫМ и вдесятеро медленнее первого: падение
+                # DeepInfra давало пользователям ходы по 15с. Тот же урок уже был
+                # применён к цепочке в transport (_OR_PROVIDER, 2026-07-06:
+                # «Fireworks last, 429-prone»), но до ЭТОГО пина не доехал —
+                # а живой путь идёт именно здесь (client задаёт extra_body
+                # целиком, transport._pin_openrouter ставит через setdefault).
+                # allow_fallbacks=False сохранён намеренно (урок Baidu: лучше
+                # жёсткий провал в фолбэк-тир, чем мусорное зеркало).
+                _provider = {"order": ["DeepInfra", "Novita", "Parasail", "GMICloud", "Fireworks"], "allow_fallbacks": False}
                 kwargs["max_tokens"] = max(kwargs.get("max_tokens") or 0, 32768)
             else:
                 # xiaomi/mimo-v2.5 provider routing. TWO hard exclusions:

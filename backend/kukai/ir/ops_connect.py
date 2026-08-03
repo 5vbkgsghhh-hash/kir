@@ -56,6 +56,12 @@ OPS = [
             grounded=(("level", "levels", True),
                       ("system_type", "piping_system_types", False),
                       ("pipe_type", "pipe_types", False)),
+            # 03.08: обещанные ±5 мм конца и допуск диаметра.  Числа ТЕ ЖЕ,
+            # что стояли литералами в `_network_geometry_post` (`> 5` и
+            # `>0.5`); тот же допуск конца задаёт и ПОЛ ПОДРЕЗКИ под врезку
+            # отвода (`_segment_trim_bounds_mm`), чтобы у одного допуска был
+            # ровно один дом.
+            tolerances={"endpoint_mm": 5.0, "diameter_mm": 0.5},
         ),
     # route_pipe_system — ВК (water supply / drainage) network as a graph:
     # source -> route -> consumers, connectivity as an invariant. Same
@@ -94,6 +100,13 @@ OPS = [
             grounded=(("level", "levels", True),
                       ("system_type", "piping_system_types", False),
                       ("pipe_type", "pipe_types", False)),
+            # Как у create_pipe_system выше.  СВИДЕТЕЛЬ УКЛОНА (KIR-X004)
+            # сюда НЕ вносит своих чисел: `post` обещает НЕРАВЕНСТВО
+            # (|actual| >= slope_min_pct), а не ±допуск; `1e-6` там —
+            # эпсилон сравнения плавающих, а `__run < 1.0` — различитель
+            # вертикального стояка, у которого уклон не определён вовсе.
+            # Это части ПРЕДИКАТА, а не его точности (см. route_mep.py).
+            tolerances={"endpoint_mm": 5.0, "diameter_mm": 0.5},
         ),
     # route_duct_system — ОВ (ventilation) network as a graph. Mirrors
     # route_pipe_system over Duct.Create / duct BIPs (Mechanical domain);
@@ -124,5 +137,7 @@ OPS = [
             grounded=(("level", "levels", True),
                       ("system_type", "duct_system_types", False),
                       ("duct_type", "duct_types", False)),
+            # Как у route_pipe_system выше (та же оговорка про уклон).
+            tolerances={"endpoint_mm": 5.0, "diameter_mm": 0.5},
         ),
 ]

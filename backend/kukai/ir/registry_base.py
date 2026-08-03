@@ -450,8 +450,16 @@ class OpSpec:
     # Wave A2 (registry-онтология): the op's witness tolerances, keyed by
     # obligation aspect ("endpoint_mm", "height_mm", ...).  Values are the
     # EXACT numbers the emitters historically inlined (byte-parity discipline:
-    # no "improved" figures in this wave); migrated emitters read them via
-    # spec.OPS[name].tolerances[key] so each number lives in ONE place.
+    # no "improved" figures) so each number lives in ONE place.
+    #
+    # 03.08 — ЗАКОН ПРОВЕНАНСА (emit_model.py): эмиттеры больше НЕ читают
+    # этот словарь напрямую.  Число попадает в C# только объектом
+    # `emit_model.tolerance(op, key)`, и витнес, объявивший допуск, обязан
+    # содержать строку, которую этот объект сам отрендерил.  Поэтому:
+    #   * ключа, которому здесь никто не отвечает, эмиссия не переживёт;
+    #   * каждое `±<число>` из `post` обязано лежать ЗДЕСЬ (закон 3);
+    #   * мёртвая запись здесь — тоже дефект: её ловит возмущающий оракул
+    #     (tests/test_tolerance_provenance.py).
     tolerances: dict[str, float] = field(default_factory=dict)
 
 # Write families share one transaction; only query is exclusive.

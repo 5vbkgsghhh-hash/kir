@@ -89,6 +89,12 @@ class CompileOutput:
     # than malformed, handoff names the tail route so the caller falls through
     # to the recipe/wiki path instead of erroring at the user.
     handoff: Optional[dict] = None
+    # КВИТАНЦИЯ НАЗВАННОГО УМОЛЧАНИЯ: выборы, которые сделал КОМПИЛЯТОР, а не
+    # автор программы. Выбор, которого вызывающий не видит, неотличим от
+    # `.FirstOrDefault()` — а именно им плечо C# молча взяло 1 тип двери из 62
+    # (замер 02.08.2026). Эхо авторского селектора сюда не попадает: там
+    # решение принял автор, и отчитываться не о чем.
+    grounding_report: list[dict] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         d = {"ok": self.ok, "csharp": self.csharp,
@@ -97,6 +103,8 @@ class CompileOutput:
             d["plan_digest"] = self.planned.plan_digest
         if self.handoff:
             d["handoff"] = self.handoff
+        if self.grounding_report:
+            d["grounding_report"] = self.grounding_report
         return d
 
 
@@ -1120,7 +1128,9 @@ def compile_program(program: Any, revit_version: str = "2026",
                 stamp_scope=stamp_scope,
                 expected_document=expected_document,
                 expected_identities=guarded_identities)
-            return CompileOutput(ok=True, csharp=cs, planned=planned)
+            return CompileOutput(
+                ok=True, csharp=cs, planned=planned,
+                grounding_report=ground_mod.compiler_choices(grounded))
         cs = emit_for_version(normed, revit_version)
         return CompileOutput(ok=True, csharp=cs, planned=planned)
     except KirRefusal as r:

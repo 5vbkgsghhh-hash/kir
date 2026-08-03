@@ -236,8 +236,8 @@ Everything below is derived from an instrument on the date shown, not from memor
 | Fact | Value | Date / source |
 |---|---|---|
 | Writing ops in the registry | **35** (+4 query) | current `backend/kukai/ir/spec.py` |
-| Published backend snapshot | **797 code/config files** | commit `23dd666`, 2026-08-03 |
-| Python syntax check at publication | **764 files parsed** | Python 3.12, 2026-08-03 |
+| Published backend snapshot | **801 code/config files** | current `main`, 2026-08-03 |
+| Python syntax check at publication | **768 files parsed** | Python 3.12, 2026-08-03 |
 | Offline KIR smoke compile | **PASS** — level program emitted Revit 2023 C# | Python 3.12, 2026-08-03 |
 | Historical live baseline | **31 of 31 writing ops** had a witnessed run | 2026-07-28 local telemetry; telemetry is not shipped here |
 | Historical six-version compile gate | **1 056 Roslyn compilations, PASS** | 2026-07-28 local gate run |

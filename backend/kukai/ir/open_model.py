@@ -1094,6 +1094,29 @@ async def capture_open_model_profile(
 GROUND_SNAPSHOT_CS = r"""
 Func<Element, long> __Id = (Element __e) => { try { return long.Parse(__e.Id.ToString()); } catch { return -1; } };
 Func<double, double> __MM = (double __ft) => UnitUtils.ConvertFromInternalUnits(__ft, UnitTypeId.Millimeters);
+// НАЗВАННОЕ УМОЛЧАНИЕ (замер 02.08.2026, Snowdon): сколько экземпляров каждого
+// типоразмера УЖЕ РАЗМЕЩЕНО в этом документе. Без этого числа ground не может
+// назвать правило «самый употребимый», и единственным исходом на 62 кандидатах
+// остаётся отказ — при том, что плечо C# в том же документе взяло 1 тип из 62
+// молча. Один проход по экземплярам: типов в каталоге тысячи, но правило
+// опирается на ПРАКТИКУ проекта, а её знают только размещённые элементы.
+// long.Parse(...ToString()) — тот же версионно-нейтральный приём, что и __Id:
+// целочисленное свойство ElementId сменило имя и тип в 2024+, а ToString()
+// одинаков на всех шести (страж test_open_model держит это правило подстрокой,
+// поэтому старое имя нельзя даже упоминать — и это правильно).
+var __instCount = new Dictionary<long, int>();
+try
+{
+    foreach (var __fi in new FilteredElementCollector(doc).OfClass(typeof(FamilyInstance)))
+    {
+        long __tid;
+        try { __tid = long.Parse(__fi.GetTypeId().ToString()); } catch { continue; }
+        if (__tid <= 0) continue;
+        int __prev;
+        __instCount[__tid] = __instCount.TryGetValue(__tid, out __prev) ? __prev + 1 : 1;
+    }
+}
+catch { }
 var __ParamNames = new string[0];
 var __snap = new Dictionary<string, object>();
 Action<string, System.Collections.Generic.IEnumerable<Element>, int> __AddPool =
@@ -1132,6 +1155,13 @@ Action<string, System.Collections.Generic.IEnumerable<Element>, int> __AddPool =
         {
             try { __r["family_name"] = __fs.FamilyName ?? ""; } catch { }
             try { __r["type_name"] = __fs.Name ?? ""; } catch { }
+            // Ноль — ЗНАЧИМОЕ значение, а не отсутствие: правило требует
+            // счётчик на КАЖДОЙ строке пула, иначе максимум по неполным
+            // данным — утверждение, которого мы доказать не можем, и
+            // ground.py осознанно откажется его делать.
+            int __used;
+            __r["instances"] = __instCount.TryGetValue(__Id(__e), out __used)
+                ? __used : 0;
         }
         if (__ParamNames.Length > 0)
         {

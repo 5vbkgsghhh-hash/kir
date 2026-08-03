@@ -61,7 +61,7 @@ from kukai.ir.authoring import (
     # long-flagged private-helper import shrinks to render-free utilities).
     endpoint_witness, level_chain_witness, bbox_extents_witness,
 )
-from kukai.ir.emit_model import WitnessCheck
+from kukai.ir.emit_model import WitnessCheck, tolerance
 from kukai.ir.emit_utils import cs_line_comment_fragment, refuse_stmt
 from kukai.ir.diag import Diagnostic, KirRefusal, PARSE_MISSING_FIELD
 
@@ -115,7 +115,8 @@ def emit_beam(op: dict, ver: str, stamp: str,
     # свидетель. Положение балки при этом пришпилено полностью: оба конца
     # проверяются в 3D с допуском 5 мм.
     checks: list[WitnessCheck] = [
-        endpoint_witness(f"__el_{s}", oid, op["p0_mm"], op["p1_mm"], 5.0, True),
+        endpoint_witness(f"__el_{s}", oid, op["p0_mm"], op["p1_mm"],
+                         tolerance("create_beam", "endpoint_mm"), True),
         WitnessCheck(
             obligation_key="reference_level", reader_cs="",
             verdict_cs=(
@@ -167,15 +168,17 @@ def _emit_foundation_isolated(op: dict, ver: str, stamp: str,
               f"Autodesk.Revit.DB.Structure.StructuralType.Footing);\n"
               f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('NewFamilyInstance (фундамент) вернул null'), isolation)} }}\n"
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
+    ftol = tolerance("create_foundation", "location_mm")
     checks: list[WitnessCheck] = [
         WitnessCheck(
             obligation_key="footprint",
             reader_cs=f"    var __loc = __el_{s}.Location as LocationPoint;\n",
             verdict_cs=(
                 f"    if (__loc == null) __post.Add({_cs(oid + ': нет LocationPoint')});\n"
-                f"    else if (Math.Abs(MM(__loc.Point.X) - {x}) > 5.0 || Math.Abs(MM(__loc.Point.Y) - {y}) > 5.0)\n"
+                f"    else if (Math.Abs(MM(__loc.Point.X) - {x}) > {ftol} || Math.Abs(MM(__loc.Point.Y) - {y}) > {ftol})\n"
                 f"        __post.Add({_cs(oid + ': location mismatch (geometry)')});\n"),
-            message="location mismatch (geometry)", style="else_block"),
+            message="location mismatch (geometry)", tol=ftol,
+            style="else_block"),
         level_chain_witness(f"__el_{s}", oid, lv_idexpr),
         WitnessCheck(
             obligation_key="structural_type", reader_cs="",
@@ -241,8 +244,8 @@ def _emit_foundation_slab(op: dict, ver: str, stamp: str,
     checks: list[WitnessCheck] = [
         level_chain_witness(f"__el_{s}", oid, lv_idexpr),
         bbox_extents_witness(
-            f"__el_{s}", oid, min(xs), max(xs), min(ys), max(ys), 50.0,
-            key="footprint"),
+            f"__el_{s}", oid, min(xs), max(xs), min(ys), max(ys),
+            tolerance("create_foundation", "bbox_mm"), key="footprint"),
         WitnessCheck(
             obligation_key="structural_type",
             reader_cs=f"    var __sp = __el_{s}.get_Parameter(BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL);\n",

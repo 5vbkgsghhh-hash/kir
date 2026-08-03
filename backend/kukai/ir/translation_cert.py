@@ -226,6 +226,13 @@ class Obligation:
     # obligation (which all gate on their OWN param's presence).  Mutually
     # exclusive with `conditional`/`param` — one obligation gates one way.
     unless_param: str | None = None
+    # 03.08: gate on a TRUTHY value, not mere key presence.  Needed for
+    # requirements that arrive as a CONTAINER the grounder always writes:
+    # `__slope_reqs__` is `{}` on every route without slope_min_pct, so plain
+    # key-presence would demand a slope witness from every plain route.
+    # Deliberately NOT the global rule for `conditional` — `mirrored=False`
+    # IS a request, and the emitter witnesses it.
+    param_truthy: bool = False
     # Wave A2: for ops migrated to the witness model the obligation matches a
     # WitnessCheck.obligation_key — a machine KEY, never a C# substring.  When
     # ``key`` is set the markers become optional (unused on the model path);
@@ -240,6 +247,10 @@ class Obligation:
         if self.conditional and self.param is None:
             raise CertificateSchemaError(
                 f"conditional obligation {self.clause!r} needs a gating param")
+        if self.param_truthy and not self.conditional:
+            raise CertificateSchemaError(
+                f"obligation {self.clause!r}: param_truthy only refines a "
+                "conditional gate")
         if self.unless_param is not None and (self.conditional or self.param is not None):
             raise CertificateSchemaError(
                 f"obligation {self.clause!r}: unless_param is mutually "
@@ -716,13 +727,15 @@ def _refinement_specs() -> dict[str, OpRefinementSpec]:
             op="route_pipe_system",
             materializer=("Plumbing.Pipe.Create",),
             witness_source="model",
-            obligations=_network_obligations("RBS_PIPE_DIAMETER_PARAM"),
+            obligations=_network_obligations(
+                "RBS_PIPE_DIAMETER_PARAM", with_slope=True),
         ),
         OpRefinementSpec(
             op="route_duct_system",
             materializer=("Mechanical.Duct.Create",),
             witness_source="model",
-            obligations=_network_obligations("RBS_CURVE_DIAMETER_PARAM"),
+            obligations=_network_obligations(
+                "RBS_CURVE_DIAMETER_PARAM", with_slope=True),
         ),
         OpRefinementSpec(
             op="create_floor_by_contour",
@@ -1022,8 +1035,24 @@ def _hosted_obligations(noun: str) -> tuple[Obligation, ...]:
     )
 
 
-def _network_obligations(diameter_bip: str) -> tuple[Obligation, ...]:
+def _network_obligations(diameter_bip: str,
+                         with_slope: bool = False) -> tuple[Obligation, ...]:
     ob = Obligation
+    slope = (
+        # ДРЕЙФ, ЗАКРЫТЫЙ 03.08.  `route_*.post` обещает KIR-X004 («сегмент с
+        # slope_min_pct держит уклон или программа откатывается»), эмиттер
+        # ставит НАСТОЯЩЕГО свидетеля (route_mep.emit_slope_witness_cs), а
+        # обязательства в таблице не было вовсе: удаление свидетеля
+        # оставляло сертификат ДОКАЗАННЫМ.  audit_registry_coverage() это
+        # пропускал, потому что сверяет прозу по ОБЩИМ СЛОВАМ — слово
+        # «segment» есть и у диаметра, и у связности.  Ловится только
+        # мутацией (вырезать свидетеля -> `proven` обязан упасть), и именно
+        # так это теперь и проверяется — tests/test_tolerance_provenance.py.
+        ob("a segment carrying slope_min_pct holds it or the program rolls "
+           "back (geometry, KIR-X004)",
+           KIND_GEOMETRY, ("__slc",), param="__slope_reqs__",
+           conditional=True, param_truthy=True, key="slope"),
+    ) if with_slope else ()
     return (
         ob("segments materialized or typed refusal (materialize)",
            KIND_MATERIALIZE, _REFUSE, block=BLOCK_CREATE),
@@ -1054,7 +1083,7 @@ def _network_obligations(diameter_bip: str) -> tuple[Obligation, ...]:
         ob("each declared segment diameter is read back (semantic)",
            KIND_SEMANTIC, (f"BuiltInParameter.{diameter_bip}",),
            key="diameter"),
-    )
+    ) + slope
 
 
 # Some obligation constructors are referenced before their def at class-body
@@ -1074,7 +1103,7 @@ def _ensure_table() -> dict[str, OpRefinementSpec]:
 # ---------------------------------------------------------------------------
 
 
-def _op_present(op: dict, param: str) -> bool:
+def _op_present(op: dict, param: str, truthy: bool = False) -> bool:
     """Whether a gating param is genuinely present on this op instance.
 
     Presence is by key AND (for booleans) any value: place_family always
@@ -1083,7 +1112,11 @@ def _op_present(op: dict, param: str) -> bool:
     presence is the correct, emitter-aligned test.
     """
 
-    return param in op and op[param] is not None
+    if param not in op or op[param] is None:
+        return False
+    # `truthy` distinguishes «ключ есть» от «запрошено» для контейнеров —
+    # см. Obligation.param_truthy.
+    return bool(op[param]) if truthy else True
 
 
 def _not_required_because(obligation: Obligation) -> str:
@@ -1166,7 +1199,8 @@ def certify_op(
 
         required = True
         if obligation.conditional:
-            required = _op_present(op, obligation.param)
+            required = _op_present(
+                op, obligation.param, obligation.param_truthy)
         elif obligation.unless_param is not None:
             required = not _op_present(op, obligation.unless_param)
 
@@ -1323,6 +1357,15 @@ def audit_registry_coverage() -> tuple[str, ...]:
       3. Every ';'-separated clause of each op's OpSpec.post is witnessed by at
          least one obligation whose clause shares a distinguishing token —
          so a newly promised clause with no obligation is a hard mismatch.
+
+    ГРАНИЦА ЭТОГО АУДИТА, НАЗВАННАЯ ЧЕСТНО (03.08).  Инвариант 3 сверяет
+    прозу по ОБЩИМ СЛОВАМ, то есть это сопоставление подстрок в другой
+    одежде.  Пропущенный им случай измерен: клаузула уклона route_* (KIR-X004)
+    жила БЕЗ своего обязательства и проходила аудит, потому что слово
+    «segment» встречается и у диаметра, и у связности.  Сильная форма — не
+    слова, а МУТАЦИЯ: вырезать эмитируемого свидетеля и потребовать, чтобы
+    `proven` упал (tests/test_tolerance_provenance.py, закон L6).  Этот
+    аудит остаётся дешёвой первой линией, а не доказательством.
     """
 
     table = _ensure_table()

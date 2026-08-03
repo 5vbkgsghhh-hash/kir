@@ -110,6 +110,11 @@ OPS = [
                   "(reference_level_id/reference_level), а не навязывается; "
                   "StructuralType == Beam (semantic, witness)"),
             writes_model=True,
+            # 03.08: обещанные ±5 мм ЖИВУТ ЗДЕСЬ.  До этого `post` обещал
+            # число, которого реестр назвать не мог, а эмиттер штамповал
+            # tol_key="endpoint_mm" — ссылка в пустоту (дефект create_type
+            # дословно).  Число ТО ЖЕ, что стояло литералом в struct_emit.
+            tolerances={"endpoint_mm": 5.0},
             grounded=(("level", "levels", True), ("symbol", "beam_types", False)),
         ),
     OpSpec(
@@ -141,6 +146,12 @@ OPS = [
                   "structural path, reused not duplicated. "
                   "any other variety value -> typed refusal (KIR-E004), never a guess"),
             writes_model=True,
+            # 03.08: обе обещанные величины — по своей разновидности.
+            # `location_mm` — точка отдельно стоящего башмака (±5 мм),
+            # `bbox_mm` — габарит плиты (±50 мм, тот же ключ и то же число,
+            # что у create_floor: плита фундамента ЕСТЬ структурное
+            # перекрытие).  Числа те же, что стояли литералами.
+            tolerances={"location_mm": 5.0, "bbox_mm": 50.0},
             grounded=(("level", "levels", True),
                       ("symbol", "foundation_symbols", False),
                       ("type", "floor_types", False)),

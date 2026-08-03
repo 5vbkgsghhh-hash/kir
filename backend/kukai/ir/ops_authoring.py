@@ -275,6 +275,10 @@ OPS = [
                   "±tol for lengths); unknown/read-only param == typed rollback"),
             writes_model=True,
             grounded=(),
+            # 03.08: у «±tol» появился адрес.  `length_mm` — ветка value(mm),
+            # `double_abs` — эпсилон сравнения сырого double.  Оба числа ТЕ
+            # ЖЕ, что стояли литералами в _emit_setparam.
+            tolerances={"length_mm": 0.5, "double_abs": 1e-06},
         ),
     OpSpec(
             name="create_floor",
@@ -346,6 +350,9 @@ OPS = [
                   "(StairsEditScope owns its transactions — KIR-L002 otherwise)"),
             writes_model=True,
             grounded=(("base_level", "levels", True), ("top_level", "levels", True)),
+            # 03.08: обещанные ±5 мм ширины марша.  Число то же, что стояло
+            # литералом в emit_stairs_program.
+            tolerances={"width_mm": 5.0},
         ),
     OpSpec(
             name="create_column",
@@ -389,8 +396,12 @@ OPS = [
             grounded=(("level", "levels", True),
                       ("symbol", "column_symbols_{category}", False),
                       ("top_level", "levels", False)),
-            tolerances={"location_mm": 5.0, "base_offset_mm": 1.0,
-                        "top_offset_mm": 1.0},
+            # rotation_deg (03.08): `post` обещал ±0.1deg, а реестр назвать
+            # это число не мог.  В C# допуск стоит ВЫРАЖЕНИЕМ
+            # `Math.PI / 1800.0` — делитель считается из этих 0.1
+            # (Tolerance.deg_rad_divisor), поэтому байты прежние.
+            tolerances={"location_mm": 5.0, "rotation_deg": 0.1,
+                        "base_offset_mm": 1.0, "top_offset_mm": 1.0},
         ),
     OpSpec(
             name="create_window",
@@ -550,7 +561,8 @@ OPS = [
             # уровень, кривой — хост.
             grounded=(("level", "levels", False),
                       ("symbol", "family_symbols", False)),
-            tolerances={"location_mm": 5.0},
+            # rotation_deg — та же поправка, что у create_column выше.
+            tolerances={"location_mm": 5.0, "rotation_deg": 0.1},
         ),
     OpSpec(
             name="delete",

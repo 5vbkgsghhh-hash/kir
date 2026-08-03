@@ -134,8 +134,8 @@ def emit_ceiling(op: dict, ver: str, stamp: str,
               f"{refuse_stmt(oid, _cs('создание потолка вернуло null'), isolation)} }}\n"
               + ho_set
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
-    from kukai.ir import spec
-    tol = spec.OPS["create_ceiling"].tolerances
+    from kukai.ir.emit_model import tolerances
+    tol = tolerances("create_ceiling")
     xs = [pt[0] for pt in outline]
     ys = [pt[1] for pt in outline]
     checks: list[WitnessCheck] = [
@@ -153,7 +153,7 @@ def emit_ceiling(op: dict, ver: str, stamp: str,
                 f"{height_offset}) > {tol['height_offset_mm']})\n"
                 f"        __post.Add({_cs(oid + ': height offset mismatch (geometry)')});\n"),
             message="height offset mismatch (geometry)",
-            tol_key="height_offset_mm", style="guard"))
+            tol=tol["height_offset_mm"], style="guard"))
     return decl, create, checks, _readback_block(s, oid, stamp)
 
 
@@ -199,8 +199,8 @@ def _emit_railing_path(op: dict, ver: str, stamp: str,
               f"if (__el_{s} == null) {{ "
               f"{refuse_stmt(oid, _cs('создание ограждения вернуло null'), isolation)} }}\n"
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
-    from kukai.ir import spec
-    tol = spec.OPS["create_railing"].tolerances["bbox_mm"]
+    from kukai.ir.emit_model import tolerance
+    tol = tolerance("create_railing", "bbox_mm")
     xs = [pt[0] for pt in path]
     ys = [pt[1] for pt in path]
     checks: list[WitnessCheck] = [

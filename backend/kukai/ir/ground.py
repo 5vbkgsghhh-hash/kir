@@ -44,6 +44,94 @@ GROUND_BAD_SNAPSHOT = "KIR-G106"
 IN_EMIT_DEFAULT = "__doc_default__"
 _MISSING = object()
 
+#: НАЗВАННОЕ УМОЛЧАНИЕ — пулы, где «тип по умолчанию» берётся из САМОГО
+#: документа по объявленному правилу «самый употребимый».
+#:
+#: Замер 02.08.2026 (kir-bench, T1, Snowdon): плечо C# взяло `.FirstOrDefault()`
+#: и построило дверь 1 из 62 МОЛЧА — пользователь получил тип, которого не
+#: выбирал, и не узнал об этом. Наше плечо отказало KIR-G102 и оставило
+#: НУЛЕВОЙ след. Развилка между этими двумя исходами ложная: у кнопки должен
+#: быть вид по умолчанию, и он обязан быть НАЗВАН, а не случаен.
+#:
+#: Почему правило опирается на документ, а не на Revit: `ElementTypeGroup` НЕ
+#: содержит ни `DoorType`, ни `WindowType` — сверено поимённо по RevitAPI.xml
+#: 2021 и 2026 (94 члена; WallType/FloorType/RoofType/CeilingType/TextNoteType
+#: есть, дверей и окон нет ни в одной версии). Поэтому `create_wall.type`
+#: имеет документный дефолт (`IN_EMIT_DEFAULT`), а спросить у Revit «твоя
+#: дверь по умолчанию» НЕВОЗМОЖНО ПО ПОСТРОЕНИЮ. Единственное объяснимое
+#: правило — то, что сделал бы человек: «ставь такую же, как уже стоит».
+#:
+#: ГРАНИЦА ЧЛЕНСТВА СТРУКТУРНАЯ, А НЕ ВКУСОВАЯ: пул обязан быть СУЖЕН
+#: КАТЕГОРИЕЙ в самом коллекторе снапшота. «В этом проекте так принято»
+#: осмысленно только ВНУТРИ рода вещи: у двери есть сложившийся тип двери, у
+#: колонны — сложившееся сечение. Пул без сужения сравнивает несравнимое.
+#:
+#: `family_symbols` СТОЯЛ ЗДЕСЬ И БЫЛ УБРАН 03.08.2026 — это моя же ошибка,
+#: пойманная офлайн-репетицией по 63 сохранённым разборам ДО живого Revit
+#: (`scratchpad/rehearse_named_default.py`). Он единственный собирается
+#: `OfClass(FamilySymbol)` БЕЗ `OfCategory` (см. `open_model.GROUND_SNAPSHOT_CS`),
+#: и правило выбирало в нём:
+#:
+#:   R_0_200Lx50W_-50   10 190 экз., отрыв 1.73x   ← ТИП ИМПОСТА ВИТРАЖА
+#:   Standard            8 070 экз., отрыв 4.51x
+#:   170x60x5              151 экз., отрыв 2.29x
+#:   305x305x97UC            2 экз., второго нет   ← стальной профиль
+#:
+#: Импост порождается сеткой носителя и `place_family` не ставится вовсе.
+#: То есть `place_family` без `symbol` молча получал бы объект, который этой
+#: операцией не создаётся, — ХУЖЕ прежнего честного отказа, а не лучше.
+#:
+#: ПОРОГ ЗДЕСЬ НЕ СПАСАЛ, и это главный вывод: отрывы 2.29x / 3.65x / 4.51x
+#: уверенные. Беда не в силе сигнала, а в несопоставимости кандидатов, и лечится
+#: она границей пула, а не числом.
+#:
+#: Список ЗАКРЫТ и держится ДВУМЯ замками (`test_named_default.py`): перечнем
+#: имён и проверкой самого правила членства по коллектору. Расширять — осознанное
+#: решение с замером, а не побочный эффект: пул, попавший сюда без смысла,
+#: превращает отказ в тихую подмену, то есть ровно в тот дефект, ради которого
+#: правило написано.
+MOST_USED_POOLS = frozenset({
+    "door_symbols", "window_symbols",
+    "column_symbols_structural", "column_symbols_architectural",
+    "foundation_symbols", "beam_types",
+})
+
+#: Ключ в строке пула, несущий число РАЗМЕЩЁННЫХ экземпляров этого типа.
+INSTANCE_COUNT_KEY = "instances"
+
+#: Во сколько раз лидер обязан опережать следующего, чтобы его можно было
+#: НАЗВАТЬ сложившейся практикой проекта.
+#:
+#: Порог появился из замера по 5 реальным зданиям (03.08.2026, 64 разбора на
+#: диске, дедуплицировано по зданию). Без него правило подписывалось бы под
+#: утверждениями, которых не выдерживают данные:
+#:
+#:   здание          род     1-й   2-й  отрыв  доля
+#:   snowdon_plumb   двери    25    21   1.2x   17%   ← «практика» из 4 дверей
+#:   snowdon_plumb   окна     38    32   1.2x   33%
+#:   k2_ar_rd        двери   500   272   1.8x   24%
+#:   демо-v3         двери  2698  1219   2.2x   45%
+#:   sob62_r23       окна     22     7   3.1x   71%
+#:   k2_ar_rd        окна     48     1  48.0x   98%
+#:
+#: 25 против 21 — это не стандарт проекта, это жребий, и назвать его «самым
+#: употребимым» значит продать пользователю уверенность, которой нет.
+#:
+#: ЧЕСТНО О ПРОИСХОЖДЕНИИ ЧИСЛА. Наблюдения разбиваются на две группы с
+#: широким зазором посередине: {1.0, 1.0, 1.2, 1.2} и {1.8, 2.2, 3.1, 48, ∞}.
+#: Граница проведена ПО НАИБОЛЬШЕМУ ЗАЗОРУ между наблюдениями (1.2 → 1.8), а
+#: не по красивому круглому числу: «вдвое» звучало бы убедительнее, но
+#: отсекало бы 500 против 272 в реальном жилом доме, где ДГ 21-8 П —
+#: очевидный стандарт проекта. Терять результат ради круглого числа нельзя:
+#: пользователю нужен дом, а не отказ.
+#:
+#: Это всё равно `assigned`-граница в терминах bounds_audit, а не `measured`:
+#: девять точек не выводят порог, они лишь показывают, где данные рвутся.
+#: Поэтому отрыв ВСЕГДА едет в квитанции — пользователь видит силу сигнала
+#: сам и не обязан верить нашему числу. Пересматривать при первом же здании,
+#: чей отрыв попадёт в зазор 1.2–1.8.
+MOST_USED_MIN_RATIO = 1.5
+
 
 def _validate_snapshot_pool(snapshot: dict, pool_name: str,
                             diags: list[Diagnostic]) -> list[dict]:
@@ -205,6 +293,70 @@ def _narrow_by_parameter(pool: list[dict], disambiguate_by: Optional[dict]) -> l
         if actual is not _MISSING and _parameter_equals(actual, expected):
             narrowed.append(row)
     return narrowed
+
+
+def _instance_count(row: dict) -> Optional[int]:
+    """Число размещённых экземпляров, или None если строка его не несёт.
+
+    `bool` отсекается намеренно: в Python `True == 1`, и счётчик, пришедший
+    булевым, означает поломанный сборщик, а не «один экземпляр»."""
+    value = row.get(INSTANCE_COUNT_KEY)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _most_used(pool: list[dict], pool_name: str,
+               disambiguate_by: Optional[dict]) -> Optional[dict]:
+    """Названное умолчание: самый употребимый тип в ЭТОМ документе.
+
+    Возвращает None (правило неприменимо — вызывающий продолжает прежним
+    путём, вплоть до отказа) в каждом из случаев, где выбор перестал бы быть
+    объяснимым:
+
+    * пул не объявлен в `MOST_USED_POOLS`;
+    * хотя бы одна строка пула без счётчика — максимум по неполным данным
+      это утверждение, которого мы не можем доказать (старый мост, не
+      присылающий счётчиков, обязан сохранить прежнее поведение побайтово);
+    * ни одного размещённого экземпляра — правилу не на что опереться;
+    * НИЧЬЯ на максимуме — равенство значит, что в проекте нет сложившейся
+      практики, и выбор действительно произволен. Строгость тут дёшева, и мы
+      её не сдаём: отказ с кандидатами честнее монетки;
+    * СЛАБЫЙ ОТРЫВ от следующего (< ``MOST_USED_MIN_RATIO``) — «самый
+      употребимый» при 25 против 21 продаёт уверенность, которой нет.
+    """
+    if pool_name not in MOST_USED_POOLS or not pool:
+        return None
+    counts = [_instance_count(row) for row in pool]
+    if any(count is None for count in counts):
+        return None
+    top = max(counts)
+    if top <= 0:
+        return None
+    winners = [row for row, count in zip(pool, counts) if count == top]
+    if len(winners) != 1:
+        return None
+    # Отрыв считается от ЛУЧШЕГО ИЗ ОСТАЛЬНЫХ, а не от второй строки пула:
+    # порядок строк — дело коллектора, и опираться на него значило бы вернуть
+    # `.FirstOrDefault()` через заднюю дверь.
+    runner_up = max((count for count in counts if count != top), default=0)
+    if runner_up and top < runner_up * MOST_USED_MIN_RATIO:
+        return None
+    row = winners[0]
+    return {
+        "id": int(row["id"]),
+        "name": str(row.get("name")),
+        "via": ("most_used+disambiguate_by"
+                if disambiguate_by is not None else "most_used"),
+        # Правило обязано быть не только применено, но и ПРЕДЪЯВЛЕНО: без
+        # этих чисел выбор неотличим от `.FirstOrDefault()` в костюме.
+        # `runner_up` едет всегда — порог назначенный, и пользователь должен
+        # видеть силу сигнала, а не верить нашей двойке на слово.
+        "rule_detail": {"instances": top, "candidates": len(pool),
+                        "runner_up": runner_up},
+        **({"disambiguate_by": disambiguate_by}
+           if disambiguate_by is not None else {}),
+    }
 
 
 def _candidate_rows(pool: list[dict]) -> list[dict]:
@@ -378,6 +530,12 @@ def _resolve_one(sel: Any, pool_name: str, pool: list[dict], op_index: int,
                         if disambiguate_by is not None else "sole_entry"),
                 **({"disambiguate_by": disambiguate_by}
                    if disambiguate_by is not None else {})}
+    # НАЗВАННОЕ УМОЛЧАНИЕ — строго между «единственный в пуле» и отказом.
+    # Порядок неслучаен: sole_entry сильнее (один кандидат не нуждается в
+    # правиле выбора), а отказ обязан остаться там, где правило промолчало.
+    named = _most_used(pool, pool_name, disambiguate_by)
+    if named is not None:
+        return named
     code = GROUND_EMPTY_POOL if not initial_pool else GROUND_AMBIGUOUS
     # Same id-surfacing fix as the by=name AMBIGUOUS branch above, for the
     # by=default path (omitted param, several pool entries -> AMBIGUOUS never
@@ -397,6 +555,92 @@ def _resolve_one(sel: Any, pool_name: str, pool: list[dict], op_index: int,
             f"{pool_name}: несколько вариантов — default невозможен, уточните "
             f"через {{\"by\": \"element_id\", \"value\": <id из candidates>}}")))
     return None
+
+
+#: Правила, где выбор сделал КОМПИЛЯТОР, а не автор программы. Всё остальное
+#: (`name`, `element_id`, `family_type`, `ref`) — эхо сказанного, и отчитываться
+#: там не о чем. Пара «+disambiguate_by» остаётся выбором компилятора: сужение
+#: ограничивает пул, но последний шаг всё равно делает правило.
+_COMPILER_CHOICE_RULES = frozenset({
+    "most_used", "most_used+disambiguate_by",
+    "sole_entry", "sole_entry+disambiguate_by",
+    "doc_default",
+})
+
+
+def compiler_choices(grounded_ops: list[dict]) -> list[dict]:
+    """Квитанция: что выбрал компилятор там, где автор промолчал.
+
+    Отдельная функция, а не побочный продукт заземления, по той же причине,
+    по которой существует сам отчёт: выбор, который некому предъявить, — это
+    `.FirstOrDefault()` с лучшей репутацией. Порядок сохраняется программным,
+    чтобы квитанция читалась сверху вниз как сама программа.
+    """
+    report: list[dict] = []
+    for op in grounded_ops:
+        if not isinstance(op, dict):
+            continue
+        for param, sel in op.items():
+            if not isinstance(sel, dict):
+                continue
+            res = sel.get("__grounded__")
+            if not isinstance(res, dict):
+                continue
+            via = res.get("via")
+            if via not in _COMPILER_CHOICE_RULES:
+                continue
+            row = {
+                "op_id": op.get("id"),
+                "op": op.get("op"),
+                "param": param,
+                "rule": via,
+                "chosen": {"id": res.get("id"), "name": res.get("name")},
+            }
+            if isinstance(res.get("rule_detail"), dict):
+                row["rule_detail"] = res["rule_detail"]
+            report.append(row)
+    return report
+
+
+#: Как правило называется по-русски, когда его предъявляют пользователю.
+#: Пользователь не читает `via`, и «most_used» в ответе — это машинный код,
+#: выданный за объяснение.
+_RULE_NAMES_RU = {
+    "most_used": "самый употребимый в модели",
+    "most_used+disambiguate_by": "самый употребимый после сужения",
+    "sole_entry": "единственный в модели",
+    "sole_entry+disambiguate_by": "единственный после сужения",
+    "doc_default": "тип по умолчанию документа",
+}
+
+
+def describe_choices_ru(report: list[dict]) -> str:
+    """Одна строка на человеческом: что выбрал компилятор и по какому правилу.
+
+    Пустая строка, если выбирать было не из чего, — примечание, сообщающее
+    «ничего не произошло», это шум, а шум учит не читать примечания.
+    """
+    parts: list[str] = []
+    for row in report:
+        rule = _RULE_NAMES_RU.get(row.get("rule", ""), row.get("rule", ""))
+        name = (row.get("chosen") or {}).get("name")
+        detail = row.get("rule_detail") or {}
+        # «Единственный в модели» и «дефолт документа» не нуждаются в защите:
+        # выбора там не было. Предъявлять надо там, где кандидатов много —
+        # именно этот случай неотличим от `.FirstOrDefault()` без объяснения.
+        if not detail.get("candidates"):
+            continue
+        runner_up = detail.get("runner_up")
+        # Отрыв показывается всегда, когда есть с чем сравнивать: порог у нас
+        # назначенный, и пользователь должен мерить силу сигнала сам.
+        gap = (f", следующий {runner_up}" if runner_up else "")
+        parts.append(
+            f"{row.get('param')}: «{name}» "
+            f"({rule}: {detail.get('instances')} экз. "
+            f"из {detail.get('candidates')} кандидатов{gap})")
+    if not parts:
+        return ""
+    return "выбрано по умолчанию — " + "; ".join(parts)
 
 
 def _is_grounded(member: Any) -> bool:

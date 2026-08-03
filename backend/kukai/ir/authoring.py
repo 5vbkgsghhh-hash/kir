@@ -34,7 +34,8 @@ from kukai.ir import spec, docspace
 from kukai.ir.ops_authoring import WALL_LOCATION_LINE_ORDINALS
 
 from kukai.ir.contracts import ElementIdentityProof
-from kukai.ir.emit_model import BarePost, WitnessCheck, post_to_string
+from kukai.ir.emit_model import (BarePost, WitnessCheck, post_to_string,
+                                 tolerance, tolerances)
 from kukai.ir.diag import (Diagnostic, KirRefusal, PLAN_SOLO_OP, TYPE_BAD_TYPE,
                            GROUND_BAD_SELECTOR)
 from kukai.ir.ground import IN_EMIT_DEFAULT
@@ -243,7 +244,7 @@ def _level_check_expr(el_var: str, oid: str, bip: str, id_expr: str) -> str:
 def _split_witness(
     key: str, body: str, message: str, *,
     lead: str = "    ", tail: str = "\n",
-    tol_key: str | None = None,
+    tol=None,
     style: str = "else_block",
 ) -> WitnessCheck:
     reader, sep, verdict = body.partition("\n")
@@ -252,21 +253,25 @@ def _split_witness(
         reader_cs=lead + reader + sep,
         verdict_cs=verdict + tail,
         message=message,
-        tol_key=tol_key,
+        tol=tol,
         style=style,  # type: ignore[arg-type]
     )
 
 
 def endpoint_witness(
-    el_var: str, oid: str, p0, p1, tol: float, three_d: bool,
+    el_var: str, oid: str, p0, p1, tol, three_d: bool,
     *, lead: str = "    ", tail: str = "\n",
 ) -> WitnessCheck:
-    """Model form of :func:`_endpoint_check` (public: struct_emit uses it)."""
+    """Model form of :func:`_endpoint_check` (public: struct_emit uses it).
+
+    ``tol`` — отчеканенный реестром :class:`Tolerance`, а не число: провенанс
+    допуска предъявляется объектом (закон 1, emit_model.py).
+    """
 
     return _split_witness(
         "endpoints", _endpoint_check(el_var, oid, p0, p1, tol, three_d),
         "endpoints mismatch (geometry)", lead=lead, tail=tail,
-        tol_key="endpoint_mm", style="else_block")
+        tol=tol, style="else_block")
 
 
 def level_chain_witness(
@@ -282,10 +287,13 @@ def level_chain_witness(
 
 
 def bbox_extents_witness(
-    el_var: str, oid: str, xmin, xmax, ymin, ymax, tol: float,
+    el_var: str, oid: str, xmin, xmax, ymin, ymax, tol,
     *, key: str = "bbox",
 ) -> WitnessCheck:
-    """Shared floor/roof/slab bbox-extents witness (public for struct_emit)."""
+    """Shared floor/roof/slab bbox-extents witness (public for struct_emit).
+
+    ``tol`` — :class:`Tolerance` из реестра (ключ ``bbox_mm`` своего опа).
+    """
 
     return WitnessCheck(
         obligation_key=key,
@@ -296,7 +304,7 @@ def bbox_extents_witness(
             f"             Math.Abs(MM(__bb.Min.Y) - {ymin}) > {tol} || Math.Abs(MM(__bb.Max.Y) - {ymax}) > {tol})\n"
             f"        __post.Add({_cs(oid + ': bbox extents mismatch (geometry)')});\n"),
         message="bbox extents mismatch (geometry)",
-        tol_key="bbox_mm",
+        tol=tol,
         style="else_block")
 
 
@@ -482,7 +490,7 @@ def _emit_wall(op: dict, ver: str, stamp: str,
     # Wave A2: the post block is a list of WitnessCheck objects; render_post
     # reproduces the historical bytes (frame + fragment glue pinned in each
     # check).  Tolerances come from the registry (same numbers as before).
-    tol = spec.OPS["create_wall"].tolerances
+    tol = tolerances("create_wall")
     checks: list[WitnessCheck] = [
         endpoint_witness(
             f"__el_{s}", oid, op["p0_mm"], op["p1_mm"],
@@ -505,7 +513,7 @@ def _emit_wall(op: dict, ver: str, stamp: str,
                 f"            __post.Add({_cs(oid + ': arc center/radius mismatch')});\n"
                 f"    }}\n"),
             message="arc center/radius mismatch",
-            tol_key="arc_mm",
+            tol=atol,
             style="else_block"))
     checks.append(level_binding_witness(
         f"__el_{s}", oid, "WALL_BASE_CONSTRAINT", lv_idexpr))
@@ -524,7 +532,7 @@ def _emit_wall(op: dict, ver: str, stamp: str,
                 f"    if (__hp == null || Math.Abs(MM(__hp.AsDouble()) - {h}) > {tol['height_mm']})\n"
                 f"        __post.Add({_cs(oid + ': height mismatch')});\n"),
             message="height mismatch",
-            tol_key="height_mm",
+            tol=tol["height_mm"],
             style="guard"))
     if base_offset is not None:
         checks.append(WitnessCheck(
@@ -535,7 +543,7 @@ def _emit_wall(op: dict, ver: str, stamp: str,
                 f"    if (__bop == null || Math.Abs(MM(__bop.AsDouble()) - {base_offset}) > {tol['base_offset_mm']})\n"
                 f"        __post.Add({_cs(oid + ': base offset mismatch (geometry)')});\n"),
             message="base offset mismatch (geometry)",
-            tol_key="base_offset_mm",
+            tol=tol["base_offset_mm"],
             style="guard"))
     if location_line is not None:
         # An enum ordinal, so the verdict is equality, not a tolerance: there
@@ -580,7 +588,7 @@ def _emit_wall(op: dict, ver: str, stamp: str,
                     f"    if (__top == null || Math.Abs(MM(__top.AsDouble()) - {op['top_offset_mm']}) > {tol['top_offset_mm']})\n"
                     f"        __post.Add({_cs(oid + ': top offset mismatch (geometry)')});\n"),
                 message="top offset mismatch (geometry)",
-                tol_key="top_offset_mm",
+                tol=tol["top_offset_mm"],
                 style="guard"))
     readback = _readback_block(s, oid, stamp)
     return decl, create, checks, readback
@@ -612,7 +620,7 @@ def _emit_pipe(op: dict, ver: str, stamp: str,
         + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
     # Wave A2 model post (glue: level check has no own newline; the diameter
     # fragment starts with one; the LAST fragment carries the final "\n").
-    ptol = spec.OPS["create_pipe"].tolerances
+    ptol = tolerances("create_pipe")
     checks: list[WitnessCheck] = [
         endpoint_witness(f"__el_{s}", oid, op["p0_mm"], op["p1_mm"],
                          ptol["endpoint_mm"], True),
@@ -629,7 +637,7 @@ def _emit_pipe(op: dict, ver: str, stamp: str,
                 f"    if (__dp == null || Math.Abs(MM(__dp.AsDouble()) - {d}) > {ptol['diameter_mm']})\n"
                 f"        __post.Add({_cs(oid + ': diameter mismatch')});\n"),
             message="diameter mismatch",
-            tol_key="diameter_mm",
+            tol=ptol["diameter_mm"],
             style="guard"))
     readback = _readback_block(s, oid, stamp)
     return decl, create, checks, readback
@@ -656,7 +664,7 @@ def _emit_grid(op: dict, ver: str, stamp: str,
     # Wave A2 model post.  Same glue discipline as create_level: the else
     # block historically ends `    }` with NO newline; nchk starts with one;
     # the LAST fragment carries the final "\n" before the frame "}".
-    gtol = spec.OPS["create_grid"].tolerances["endpoint_mm"]
+    gtol = tolerance("create_grid", "endpoint_mm")
     checks: list[WitnessCheck] = [WitnessCheck(
         obligation_key="endpoints",
         reader_cs=f"    var __gc = __el_{s}.Curve;\n",
@@ -672,7 +680,7 @@ def _emit_grid(op: dict, ver: str, stamp: str,
             f"            __post.Add({_cs(oid + ': endpoints mismatch (geometry)')});\n"
             f"    }}" + ("" if nm else "\n")),
         message="endpoints mismatch (geometry)",
-        tol_key="endpoint_mm",
+        tol=gtol,
         style="else_block")]
     if nm:
         checks.append(WitnessCheck(
@@ -766,7 +774,7 @@ def _emit_level(op: dict, ver: str, stamp: str,
     # was `<elev check>` + nchk + "\n" — the elevation verdict carries NO
     # trailing newline when a name check follows (nchk starts with one), and
     # the LAST fragment always ends with the final "\n" before the frame "}".
-    tol = spec.OPS["create_level"].tolerances
+    tol = tolerances("create_level")
     checks: list[WitnessCheck] = [WitnessCheck(
         obligation_key="elevation",
         reader_cs="",
@@ -775,7 +783,7 @@ def _emit_level(op: dict, ver: str, stamp: str,
             f"        __post.Add({_cs(oid + ': elevation mismatch (geometry)')});"
             + ("" if nm else "\n")),
         message="elevation mismatch (geometry)",
-        tol_key="elevation_mm",
+        tol=tol["elevation_mm"],
         style="guard")]
     if nm:
         checks.append(WitnessCheck(
@@ -830,19 +838,29 @@ def _emit_setparam(op: dict, ver: str, stamp: str,
         f"__pp_{s} = __matches_{s}[0];\n"
         f"if (__pp_{s}.IsReadOnly) {{ {refuse_stmt(oid, _cs('параметр «' + pname + '» только для чтения'), isolation)} }}\n"
         f"if (!{set_expr}) {{ {refuse_stmt(oid, _cs('Set(' + pname + ') вернул false — несовместимый тип значения'), isolation)} }}")
+    # Допуски ре-чтения — из реестра.  `post` обещает «±tol for lengths», и
+    # у обещания теперь есть адрес: длина сверяется с `length_mm`, сырой
+    # double — с `double_abs`.  Формы подстановки выбраны ПО БАЙТАМ: `0.5`
+    # печатается обычным str, а `1e-6` — компактной формой `.cs` (обычный
+    # repr дал бы `1e-06` и сдвинул бы корпус эталонных эмиссий).
+    stol = tolerances("set_param")
+    vtol = None
     if val["type"] == "str":
         chk = f"(__pp_{s}.AsString() ?? \"\") != {_cs(val['v'])}"
     elif val["type"] == "mm":
-        chk = f"Math.Abs(MM(__pp_{s}.AsDouble()) - {val['v']}) > 0.5"
+        vtol = stol["length_mm"]
+        chk = f"Math.Abs(MM(__pp_{s}.AsDouble()) - {val['v']}) > {vtol}"
     elif val["type"] == "int":
         chk = f"__pp_{s}.AsInteger() != {int(val['v'])}"
     else:
-        chk = f"Math.Abs(__pp_{s}.AsDouble() - {val['v']}) > 1e-6"
+        vtol = stol["double_abs"]
+        chk = f"Math.Abs(__pp_{s}.AsDouble() - {val['v']}) > {vtol.cs}"
     post = [WitnessCheck(
         obligation_key="value_held", reader_cs="",
         verdict_cs=(
             f"    if ({chk}) __post.Add({_cs(oid + ': параметр не удержал значение (re-read)')});\n"),
-        message="параметр не удержал значение (re-read)", style="guard")]
+        message="параметр не удержал значение (re-read)",
+        tol=vtol, style="guard")]
     readback = (
         f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
         f"    var __rb = new Dictionary<string, object>();\n"
@@ -953,7 +971,7 @@ def _emit_move_elements(op: dict, ver: str, stamp: str,
     s = _safe(oid)
     targets = op["targets"]
     dx, dy, dz = op["delta_mm"]
-    htol = spec.OPS["move_elements"].tolerances["location_mm"]
+    htol = tolerance("move_elements", "location_mm")
 
     resolve_blocks = []
     for i, sel in enumerate(targets):
@@ -1027,7 +1045,7 @@ def _emit_move_elements(op: dict, ver: str, stamp: str,
                 f"        }}\n"
                 f"    }}\n"),
             message="target не сдвинулся на delta_mm (geometry)",
-            tol_key="location_mm", style="plain"),
+            tol=htol, style="plain"),
         WitnessCheck(
             obligation_key="connectors", reader_cs="",
             verdict_cs=(
@@ -1067,7 +1085,7 @@ def _emit_move_elements(op: dict, ver: str, stamp: str,
                 f"        }}\n"
                 f"    }}\n"),
             message="LocationCurve target slope changed (semantic)",
-            tol_key="location_mm", style="plain"),
+            tol=htol, style="plain"),
     ]
     readback = (
         f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
@@ -1184,7 +1202,7 @@ def _emit_floor(op: dict, ver: str, stamp: str,
               + ho_set
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
     xs = [pt[0] for pt in outline]; ys = [pt[1] for pt in outline]
-    ftol = spec.OPS["create_floor"].tolerances["bbox_mm"]
+    ftol = tolerances("create_floor")
     checks: list[WitnessCheck] = [
         level_chain_witness(f"__el_{s}", oid, lv_idexpr),
         WitnessCheck(
@@ -1196,7 +1214,8 @@ def _emit_floor(op: dict, ver: str, stamp: str,
             message="structural flag mismatch (semantic)",
             style="guard"),
         bbox_extents_witness(
-            f"__el_{s}", oid, min(xs), max(xs), min(ys), max(ys), ftol),
+            f"__el_{s}", oid, min(xs), max(xs), min(ys), max(ys),
+            ftol["bbox_mm"]),
     ]
     if height_offset is not None:
         checks.append(WitnessCheck(
@@ -1204,10 +1223,10 @@ def _emit_floor(op: dict, ver: str, stamp: str,
             reader_cs=(
                 f"    var __fhop = __el_{s}.get_Parameter(BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM);\n"),
             verdict_cs=(
-                f"    if (__fhop == null || Math.Abs(MM(__fhop.AsDouble()) - {height_offset}) > {spec.OPS['create_floor'].tolerances['height_offset_mm']})\n"
+                f"    if (__fhop == null || Math.Abs(MM(__fhop.AsDouble()) - {height_offset}) > {ftol['height_offset_mm']})\n"
                 f"        __post.Add({_cs(oid + ': height offset mismatch (geometry)')});\n"),
             message="height offset mismatch (geometry)",
-            tol_key="height_offset_mm",
+            tol=ftol["height_offset_mm"],
             style="guard"))
     return decl, create, checks, _readback_block(s, oid, stamp)
 
@@ -1302,6 +1321,8 @@ def _emit_column(op: dict, ver: str, stamp: str,
               + rotate
               + constrain
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
+    ctols = tolerances("create_column")
+    rtol = ctols["rotation_deg"]
     rotation_post = ""
     if has_rotation:
         rotation_post = (
@@ -1310,10 +1331,13 @@ def _emit_column(op: dict, ver: str, stamp: str,
             f"        double __rotDelta_{s} = Math.Atan2(\n"
             f"            Math.Sin(__loc.Rotation - __wantRot_{s}),\n"
             f"            Math.Cos(__loc.Rotation - __wantRot_{s}));\n"
-            f"        if (Math.Abs(__rotDelta_{s}) > Math.PI / 1800.0)\n"
+            # Допуск поворота эмитируется ВЫРАЖЕНИЕМ (`Math.PI / 1800.0`), а
+            # не числом радиан: делитель считается из реестрового 0.1deg в
+            # Decimal, поэтому байты те же, а число адресуемо.
+            f"        if (Math.Abs(__rotDelta_{s}) > Math.PI / {rtol.deg_rad_divisor})\n"
             f"            __post.Add({_cs(oid + ': rotation mismatch (geometry, tolerance 0.1deg)')});\n"
             f"    }}\n")
-    ctol = spec.OPS["create_column"].tolerances["location_mm"]
+    ctol = ctols["location_mm"]
     if top_xy is None:
         checks: list[WitnessCheck] = [WitnessCheck(
             obligation_key="location",
@@ -1323,7 +1347,7 @@ def _emit_column(op: dict, ver: str, stamp: str,
                 f"    else if (Math.Abs(MM(__loc.Point.X) - {x}) > {ctol} || Math.Abs(MM(__loc.Point.Y) - {y}) > {ctol})\n"
                 f"        __post.Add({_cs(oid + ': location mismatch (geometry)')});\n"),
             message="location mismatch (geometry)",
-            tol_key="location_mm",
+            tol=ctol,
             style="else_block")]
     else:
         # A slanted column has a LocationCURVE, so the point reader above would
@@ -1358,7 +1382,7 @@ def _emit_column(op: dict, ver: str, stamp: str,
                 f"            __post.Add({_cs(oid + ': колонна вышла вертикальной (geometry)')});\n"
                 f"    }}\n"),
             message="location mismatch (geometry)",
-            tol_key="location_mm",
+            tol=ctol,
             style="guard")]
     # rotation_post is an `else` continuation of the POINT location check,
     # and a slanted column replaced that check with a self-contained guard —
@@ -1374,7 +1398,7 @@ def _emit_column(op: dict, ver: str, stamp: str,
             obligation_key="rotation", reader_cs="",
             verdict_cs=rotation_post,
             message="rotation mismatch (geometry, tolerance 0.1deg)",
-            style="else_block"))
+            tol=rtol, style="else_block"))
     checks.append(WitnessCheck(
         obligation_key="structural_type", reader_cs="",
         verdict_cs=(
@@ -1382,7 +1406,7 @@ def _emit_column(op: dict, ver: str, stamp: str,
             f"        __post.Add({_cs(oid + ': StructuralType mismatch (semantic)')});\n"),
         message="StructuralType mismatch (semantic)", style="guard"))
     checks.append(level_chain_witness(f"__el_{s}", oid, lv_idexpr))
-    ctol_off = spec.OPS["create_column"].tolerances
+    ctol_off = ctols
     if base_offset is not None:
         checks.append(WitnessCheck(
             obligation_key="base_offset",
@@ -1392,7 +1416,7 @@ def _emit_column(op: dict, ver: str, stamp: str,
                 f"    if (__cbop == null || Math.Abs(MM(__cbop.AsDouble()) - {base_offset}) > {ctol_off['base_offset_mm']})\n"
                 f"        __post.Add({_cs(oid + ': base offset mismatch (geometry)')});\n"),
             message="base offset mismatch (geometry)",
-            tol_key="base_offset_mm",
+            tol=ctol_off["base_offset_mm"],
             style="guard"))
     # A slanted column's top is defined by its axis, not by the parameter —
     # we deliberately do not write it, so demanding it back would roll the
@@ -1416,7 +1440,7 @@ def _emit_column(op: dict, ver: str, stamp: str,
                     f"    if (__ctop == null || Math.Abs(MM(__ctop.AsDouble()) - {op['top_offset_mm']}) > {ctol_off['top_offset_mm']})\n"
                     f"        __post.Add({_cs(oid + ': top offset mismatch (geometry)')});\n"),
                 message="top offset mismatch (geometry)",
-                tol_key="top_offset_mm",
+                tol=ctol_off["top_offset_mm"],
                 style="guard"))
     return decl, create, checks, _readback_block(
         s, oid, stamp, location_rotation=has_rotation)
@@ -1656,7 +1680,7 @@ def _emit_hosted(op: dict, ver: str, stamp: str, kind: str,
     # Wave A2 model post.  NB the 10.0mm hosted location tolerance appears
     # both as MM-comparison and as U(10.0) (internal units) — the historical
     # bytes interleave them, preserved verbatim via the registry value.
-    htol = spec.OPS[f"create_{kind}"].tolerances["location_mm"]
+    htol = tolerance(f"create_{kind}", "location_mm")
     checks: list[WitnessCheck] = [
         WitnessCheck(
             obligation_key="host", reader_cs="",
@@ -1673,7 +1697,7 @@ def _emit_hosted(op: dict, ver: str, stamp: str, kind: str,
                 f"             Math.Abs(__loc.Point.Z - (__hl_{s}.Elevation + U({sill}))) > U({htol}))\n"
                 f"        __post.Add({_cs(oid + ': location/sill mismatch (geometry)')});\n"),
             message="location/sill mismatch (geometry)",
-            tol_key="location_mm", style="else_block"),
+            tol=htol, style="else_block"),
     ]
     if has_mirrored:
         desired = "true" if bool(op.get("mirrored", False)) else "false"
@@ -1734,7 +1758,7 @@ def _emit_room(op: dict, ver: str, stamp: str,
     if nm:
         nchk = (f"\n    if (__el_{s}.Name != {_cs(nm)}) "
                 f"__post.Add({_cs(oid + ': name mismatch')});")
-    rmtol = spec.OPS["create_room"].tolerances["location_mm"]
+    rmtol = tolerance("create_room", "location_mm")
     checks: list[WitnessCheck] = [
         WitnessCheck(
             obligation_key="level_binding", reader_cs="",
@@ -1750,7 +1774,7 @@ def _emit_room(op: dict, ver: str, stamp: str,
                 f"Math.Abs(MM(__loc.Point.Y) - {y}) > {rmtol})\n"
                 f"        __post.Add({_cs(oid + ': room placement mismatch (geometry)')});\n"),
             message="room placement mismatch (geometry)",
-            tol_key="location_mm", style="guard"),
+            tol=rmtol, style="guard"),
         WitnessCheck(
             obligation_key="area", reader_cs="",
             verdict_cs=(
@@ -1839,7 +1863,7 @@ def _emit_place_curve(op: dict, ver: str, stamp: str, isolation: str = "atomic")
         f"__el_{s} = doc.Create.NewFamilyInstance(new Reference(__pfh_{s}), __pfc_{s}, __sy_{s});\n"
         f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('NewFamilyInstance вернул null'), isolation)} }}\n"
         + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
-    ctol = spec.OPS["place_family"].tolerances["location_mm"]
+    ctol = tolerance("place_family", "location_mm")
     checks: list[WitnessCheck] = [
         WitnessCheck(
             obligation_key="location",
@@ -1859,7 +1883,7 @@ def _emit_place_curve(op: dict, ver: str, stamp: str, isolation: str = "atomic")
                 f"            __post.Add({_cs(oid + ': endpoints mismatch (geometry)')});\n"
                 f"    }}\n"),
             message="endpoints mismatch (geometry)",
-            tol_key="location_mm", style="else_block"),
+            tol=ctol, style="else_block"),
         # Свидетель проверяет ХОСТ, а не уровень: у этого класса уровня нет
         # ни в источнике (все 79 кожухов ЭОМ: LevelId = -1), ни в вызове.
         WitnessCheck(
@@ -2014,6 +2038,8 @@ def _emit_place(op: dict, ver: str, stamp: str,
               + hand
               + facing
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
+    ptols = tolerances("place_family")
+    rtol = ptols["rotation_deg"]
     rotation_post = ""
     if has_rotation:
         rotation_post = (
@@ -2022,7 +2048,9 @@ def _emit_place(op: dict, ver: str, stamp: str,
             f"        double __rotDelta_{s} = Math.Atan2(\n"
             f"            Math.Sin(__loc.Rotation - __wantRot_{s}),\n"
             f"            Math.Cos(__loc.Rotation - __wantRot_{s}));\n"
-            f"        if (Math.Abs(__rotDelta_{s}) > Math.PI / 1800.0)\n"
+            # Тот же приём, что у create_column: 0.1deg из реестра ->
+            # делитель 1800.0 через Decimal, байты выражения не движутся.
+            f"        if (Math.Abs(__rotDelta_{s}) > Math.PI / {rtol.deg_rad_divisor})\n"
             f"            __post.Add({_cs(oid + ': rotation mismatch (geometry, tolerance 0.1deg)')});\n"
             f"    }}\n")
     state_post = ""
@@ -2041,7 +2069,7 @@ def _emit_place(op: dict, ver: str, stamp: str,
         state_post += (
             f"    if (__el_{s}.FacingFlipped != {desired})\n"
             f"        __post.Add({_cs(oid + ': facing flip state mismatch (semantic)')});\n")
-    ptol = spec.OPS["place_family"].tolerances["location_mm"]
+    ptol = ptols["location_mm"]
     checks: list[WitnessCheck] = [WitnessCheck(
         obligation_key="location",
         reader_cs=f"    var __loc = __el_{s}.Location as LocationPoint;\n",
@@ -2050,7 +2078,7 @@ def _emit_place(op: dict, ver: str, stamp: str,
             f"    else if (Math.Abs(MM(__loc.Point.X) - {x}) > {ptol} || Math.Abs(MM(__loc.Point.Y) - {y}) > {ptol} || Math.Abs(MM(__loc.Point.Z) - {z}) > {ptol})\n"
             f"        __post.Add({_cs(oid + ': location mismatch (geometry)')});\n"),
         message="location mismatch (geometry)",
-        tol_key="location_mm",
+        tol=ptol,
         style="else_block")]
     if host_pt_expr:
         # Хост задан ⇒ обязан быть прочитан обратно. Без этой проверки
@@ -2066,7 +2094,7 @@ def _emit_place(op: dict, ver: str, stamp: str,
             obligation_key="rotation", reader_cs="",
             verdict_cs=rotation_post,
             message="rotation mismatch (geometry, tolerance 0.1deg)",
-            style="guard"))
+            tol=rtol, style="guard"))
     if has_mirrored:
         desired = "true" if mirrored else "false"
         checks.append(WitnessCheck(
@@ -2130,7 +2158,7 @@ def _emit_duct(op: dict, ver: str, stamp: str,
         + dia + "\n"
         + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
     # Wave A2 model post (same glue discipline as create_pipe).
-    dtol = spec.OPS["create_duct"].tolerances
+    dtol = tolerances("create_duct")
     checks: list[WitnessCheck] = [
         endpoint_witness(f"__el_{s}", oid, op["p0_mm"], op["p1_mm"],
                          dtol["endpoint_mm"], True),
@@ -2161,7 +2189,7 @@ def _emit_duct(op: dict, ver: str, stamp: str,
                 f"    else if (Math.Abs(MM(__dp.AsDouble()) - {d}) > {dtol['diameter_mm']})\n"
                 f"        __post.Add({_cs(oid + ': diameter mismatch')});\n"),
             message="diameter mismatch",
-            tol_key="diameter_mm",
+            tol=dtol["diameter_mm"],
             style="guard"))
     return decl, create, checks, _readback_block(s, oid, stamp)
 
@@ -2189,7 +2217,7 @@ def _emit_cable_tray(op: dict, ver: str, stamp: str,
     checks: list[WitnessCheck] = [
         endpoint_witness(
             f"__el_{s}", oid, op["p0_mm"], op["p1_mm"],
-            spec.OPS["create_cable_tray"].tolerances["endpoint_mm"], True),
+            tolerance("create_cable_tray", "endpoint_mm"), True),
         level_binding_witness(
             f"__el_{s}", oid, "RBS_START_LEVEL_PARAM", lv_idexpr,
             key="reference_level"),
@@ -2257,7 +2285,7 @@ def _emit_roof(op: dict, ver: str, stamp: str,
         + pitch
         + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
     xs = [pt[0] for pt in outline]; ys = [pt[1] for pt in outline]
-    rtol = spec.OPS["create_roof"].tolerances["bbox_mm"]
+    rtol = tolerance("create_roof", "bbox_mm")
     checks: list[WitnessCheck] = [
         WitnessCheck(
             obligation_key="base_level",
@@ -2371,12 +2399,12 @@ def _emit_floor_contour(op: dict, ver: str, stamp: str,
               + ho_set
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
     x0, y0, x1, y1 = C.edges_bbox(region["outer"])
-    ctol = spec.OPS["create_floor_by_contour"].tolerances["bbox_mm"]
+    ctol = tolerances("create_floor_by_contour")
     checks: list[WitnessCheck] = [
         level_chain_witness(f"__el_{s}", oid, lv_idexpr),
         bbox_extents_witness(
             f"__el_{s}", oid, round(x0, 1), round(x1, 1),
-            round(y0, 1), round(y1, 1), ctol),
+            round(y0, 1), round(y1, 1), ctol["bbox_mm"]),
     ]
     if height_offset is not None:
         checks.append(WitnessCheck(
@@ -2384,15 +2412,16 @@ def _emit_floor_contour(op: dict, ver: str, stamp: str,
             reader_cs=(
                 f"    var __fhop = __el_{s}.get_Parameter(BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM);\n"),
             verdict_cs=(
-                f"    if (__fhop == null || Math.Abs(MM(__fhop.AsDouble()) - {height_offset}) > {spec.OPS['create_floor_by_contour'].tolerances['height_offset_mm']})\n"
+                f"    if (__fhop == null || Math.Abs(MM(__fhop.AsDouble()) - {height_offset}) > {ctol['height_offset_mm']})\n"
                 f"        __post.Add({_cs(oid + ': height offset mismatch (geometry)')});\n"),
             message="height offset mismatch (geometry)",
-            tol_key="height_offset_mm",
+            tol=ctol["height_offset_mm"],
             style="guard"))
     return decl, create, checks, _readback_block(s, oid, stamp)
 
 
-def _segment_trim_bounds_mm(pa, pb, *, degree_a: int, degree_b: int
+def _segment_trim_bounds_mm(pa, pb, *, degree_a: int, degree_b: int,
+                            tol_mm: float
                             ) -> tuple[float, float]:
     """Сколько конец участка вправе отступить ВНУТРЬ под врезку отвода.
 
@@ -2414,6 +2443,10 @@ def _segment_trim_bounds_mm(pa, pb, *, degree_a: int, degree_b: int
     половина меньше 5 мм, и стыкованный конец получил бы допуск СТРОЖЕ
     свободного — связная система из коротких участков стала бы непроходимой по
     новой причине вместо старой.
+
+    ``tol_mm`` — ТОТ ЖЕ допуск конца, что и в свидетеле (``endpoint_mm`` опа
+    из реестра). Обязателен и не имеет умолчания: пол подрезки, набранный
+    здесь отдельным числом, был бы вторым домом одного допуска.
     """
     length = math.dist(pa, pb)
     if length <= 1e-6:
@@ -2422,13 +2455,20 @@ def _segment_trim_bounds_mm(pa, pb, *, degree_a: int, degree_b: int
         raise ValueError(
             f"segment has zero length between {pa!r} and {pb!r}")
     half = length / 2.0
-    return (5.0 if degree_a <= 1 else max(half, 5.0),
-            5.0 if degree_b <= 1 else max(half, 5.0))
+    return (tol_mm if degree_a <= 1 else max(half, tol_mm),
+            tol_mm if degree_b <= 1 else max(half, tol_mm))
 
 
 def _network_geometry_post(graph: dict, seg_meta: list, oid: str,
-                           diameter_bip: str) -> tuple[str, str]:
+                           diameter_bip: str,
+                           op_name: str) -> tuple[str, str, object, object]:
     """Shared live geometry/diameter witness for CONNECT emitters.
+
+    ``op_name`` — чей это свидетель: допуски конца и диаметра берутся из
+    ``spec.OPS[op_name].tolerances`` (03.08). Формат подстановки ``:g``
+    выбран не для красоты, а ради БАЙТОВ: исторический исходник набран
+    целым (``> 5``) и коротким (``>0.5``), и подстановка ``5.0`` сдвинула бы
+    весь корпус эталонных эмиссий.
 
     Endpoint orientation is chosen by full 3-D proximity to the declared
     start node. The old X/Y-only heuristic was ambiguous for every vertical
@@ -2446,6 +2486,9 @@ def _network_geometry_post(graph: dict, seg_meta: list, oid: str,
     # обязательства диаметра не существовало вовсе — аргумент `diameter_bip`
     # принимался и не использовался ни разу, а удаление проверки из эмиттера
     # оставляло сертификат «доказанным».
+    ntol = tolerances(op_name)
+    etol = ntol["endpoint_mm"]
+    dtol = ntol["diameter_mm"]
     checks = []
     dia_checks = []
     # Степень узла решает, какой у конца допуск: стыкованный конец законно
@@ -2464,7 +2507,8 @@ def _network_geometry_post(graph: dict, seg_meta: list, oid: str,
             return f"({round(value, 1)})"
 
         trim_a, trim_b = _segment_trim_bounds_mm(
-            pa, pb, degree_a=degrees.get(a, 1), degree_b=degrees.get(b, 1))
+            pa, pb, degree_a=degrees.get(a, 1), degree_b=degrees.get(b, 1),
+            tol_mm=etol.value)
         length = math.dist(pa, pb)
         ux, uy, uz = ((pb[0] - pa[0]) / length,
                       (pb[1] - pa[1]) / length,
@@ -2499,17 +2543,19 @@ def _network_geometry_post(graph: dict, seg_meta: list, oid: str,
             f"        double __r1z = MM(__e1.Z)-{lit(pb[2])};\n"
             f"        double __t1 = -(__r1x*__ux + __r1y*__uy + __r1z*__uz);\n"
             f"        double __d1 = Math.Sqrt(Math.Max(0.0, __r1x*__r1x + __r1y*__r1y + __r1z*__r1z - __t1*__t1));\n"
-            f"        if (__d0 > 5 || __t0 < -5 || __t0 > {lit(trim_a)} ||\n"
-            f"            __d1 > 5 || __t1 < -5 || __t1 > {lit(trim_b)})\n"
+            f"        if (__d0 > {etol:g} || __t0 < -{etol:g} || __t0 > {lit(trim_a)} ||\n"
+            f"            __d1 > {etol:g} || __t1 < -{etol:g} || __t1 > {lit(trim_b)})\n"
             f"          __post.Add({_cs(oid + f': segment {i} endpoints (geometry)')}); }} }}")
         if diameter is not None:
             dia_checks.append(
                 f"    {{ try {{ var __dp = {var}.get_Parameter(BuiltInParameter.{diameter_bip});\n"
-                f"        if (__dp == null || Math.Abs(MM(__dp.AsDouble())-{lit(diameter)})>0.5)\n"
+                f"        if (__dp == null || Math.Abs(MM(__dp.AsDouble())-{lit(diameter)})>{dtol:g})\n"
                 f"          __post.Add({_cs(oid + f': segment {i} diameter (semantic)')}); }}\n"
                 f"      catch {{ __post.Add({_cs(oid + f': segment {i} diameter unreadable (semantic)')}); }} }}")
 
-    return "\n".join(checks), "\n".join(dia_checks)
+    # Возвращаются и САМИ допуски: витнес обязан объявить ТОТ объект,
+    # который отрендерил число в его C# (закон 2, emit_model.py).
+    return "\n".join(checks), "\n".join(dia_checks), etol, dtol
 
 
 def _hoist_segments(seg_lines: str, seg_meta: list, seg_var: str) -> tuple[str, str]:
@@ -2565,21 +2611,21 @@ def _emit_pipe_system(op: dict, ver: str, stamp: str,
         + "".join(f"__segids_{sfx}.Add({v}.Id.ToString());\n" for v, a, b, d in seg_meta)
         + f"__sysprobe_{sfx} = {seg_meta[0][0]};")
 
-    seg_part, dia_part = _network_geometry_post(
-        graph, seg_meta, oid, "RBS_PIPE_DIAMETER_PARAM")
+    seg_part, dia_part, etol, dtol = _network_geometry_post(
+        graph, seg_meta, oid, "RBS_PIPE_DIAMETER_PARAM", op["op"])
     post = BarePost(tuple(check for check in (
         WitnessCheck(
             obligation_key="endpoints", reader_cs="",
             verdict_cs=seg_part + "\n",
             message="segment endpoints (geometry)",
-            tol_key=None, style="else_block"),
+            tol=etol, style="else_block"),
         # Диаметр — СВОЙ ключ и свой вердикт. Обязательство, разряжаемое
         # чужим ключом, неотличимо от отсутствующего.
         (WitnessCheck(
             obligation_key="diameter", reader_cs="",
             verdict_cs=dia_part + "\n",
             message="segment diameter (semantic)",
-            tol_key=None, style="else_block") if dia_part else None),
+            tol=dtol, style="else_block") if dia_part else None),
         WitnessCheck(
             obligation_key="connectivity", reader_cs="",
             verdict_cs=witness,
@@ -2653,14 +2699,14 @@ def _emit_route_pipe_system(op: dict, ver: str, stamp: str,
         + "".join(f"__segids_{sfx}.Add({v}.Id.ToString());\n" for v, a, b, d in seg_meta)
         + f"__sysprobe_{sfx} = {seg_meta[0][0]};")
 
-    seg_part, dia_part = _network_geometry_post(
-        graph, seg_meta, oid, "RBS_PIPE_DIAMETER_PARAM")
+    seg_part, dia_part, etol, dtol = _network_geometry_post(
+        graph, seg_meta, oid, "RBS_PIPE_DIAMETER_PARAM", op["op"])
     checks = [
         WitnessCheck(
             obligation_key="endpoints", reader_cs="",
             verdict_cs=seg_part + "\n",
             message="segment endpoints (geometry)",
-            tol_key=None, style="else_block"),
+            tol=etol, style="else_block"),
         WitnessCheck(
             obligation_key="connectivity", reader_cs="",
             verdict_cs=witness,
@@ -2684,7 +2730,7 @@ def _emit_route_pipe_system(op: dict, ver: str, stamp: str,
             obligation_key="diameter", reader_cs="",
             verdict_cs=dia_part + "\n",
             message="segment diameter (semantic)",
-            tol_key=None, style="else_block"))
+            tol=dtol, style="else_block"))
     post = BarePost(tuple(checks))
     readback = (
         f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
@@ -2743,14 +2789,14 @@ def _emit_route_duct_system(op: dict, ver: str, stamp: str,
         + "".join(f"__segids_{sfx}.Add({v}.Id.ToString());\n" for v, a, b, d in seg_meta)
         + f"__sysprobe_{sfx} = {seg_meta[0][0]};")
 
-    seg_part, dia_part = _network_geometry_post(
-        graph, seg_meta, oid, "RBS_CURVE_DIAMETER_PARAM")
+    seg_part, dia_part, etol, dtol = _network_geometry_post(
+        graph, seg_meta, oid, "RBS_CURVE_DIAMETER_PARAM", op["op"])
     checks = [
         WitnessCheck(
             obligation_key="endpoints", reader_cs="",
             verdict_cs=seg_part + "\n",
             message="segment endpoints (geometry)",
-            tol_key=None, style="else_block"),
+            tol=etol, style="else_block"),
         WitnessCheck(
             obligation_key="connectivity", reader_cs="",
             verdict_cs=witness,
@@ -2774,7 +2820,7 @@ def _emit_route_duct_system(op: dict, ver: str, stamp: str,
             obligation_key="diameter", reader_cs="",
             verdict_cs=dia_part + "\n",
             message="segment diameter (semantic)",
-            tol_key=None, style="else_block"))
+            tol=dtol, style="else_block"))
     post = BarePost(tuple(checks))
     readback = (
         f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
@@ -2872,7 +2918,7 @@ def _emit_create_type(op: dict, ver: str, stamp: str,
               + _stamp_type_block(f"__el_{s}", f"{stamp}:{oid}"))
     # Допуск ре-чтения — из реестра, а не литералом: WitnessCheck ниже заявляет
     # tol_key="param_mm", и это заявление должно быть правдой.
-    ptol = spec.OPS["create_type"].tolerances["param_mm"]
+    ptol = tolerance("create_type", "param_mm")
     depth_check = ""
     if depth is not None:
         depth_check = (
@@ -2894,13 +2940,13 @@ def _emit_create_type(op: dict, ver: str, stamp: str,
             f"        __post.Add({_cs(oid + ': width не удержалась (re-read)')});"
             + ("" if (depth_check or mat_check) else "\n")),
         message="width не удержалась (re-read)",
-        tol_key="param_mm", style="guard")]
+        tol=ptol, style="guard")]
     if depth_check:
         checks.append(WitnessCheck(
             obligation_key="depth", reader_cs="",
             verdict_cs=depth_check + ("" if mat_check else "\n"),
             message="depth не удержалась (re-read)",
-            tol_key="param_mm", style="guard"))
+            tol=ptol, style="guard"))
     if mat_check:
         checks.append(WitnessCheck(
             obligation_key="material", reader_cs="",
@@ -3380,6 +3426,7 @@ def _emit_tag(op: dict, ver: str, stamp: str,
         bound_expr = (
             f"    try {{ __bound_{s} = __el_{s}.TaggedLocalElementId.ToString() == __tg_{s}.Id.ToString(); }}\n"
             f"    catch {{ }}\n")
+    htol = tolerance("create_tag", "head_mm")
     post = [
         WitnessCheck(
             obligation_key="in_view", reader_cs="",
@@ -3401,11 +3448,11 @@ def _emit_tag(op: dict, ver: str, stamp: str,
                 f"        var __rel_{s} = __el_{s}.TagHeadPosition - __vw_{s}.Origin;\n"
                 f"        double __ou_{s} = MM(__rel_{s}.DotProduct(__vw_{s}.RightDirection));\n"
                 f"        double __ow_{s} = MM(__rel_{s}.DotProduct(__vw_{s}.UpDirection));\n"
-                f"        if (Math.Abs(__ou_{s} - {round(u, 2)}) > 10.0 || Math.Abs(__ow_{s} - {round(w, 2)}) > 10.0)\n"
+                f"        if (Math.Abs(__ou_{s} - {round(u, 2)}) > {htol} || Math.Abs(__ow_{s} - {round(w, 2)}) > {htol})\n"
                 f"            __post.Add({_cs(oid + ': tag head differs from at (geometry)')});\n"
                 f"    }} catch {{ __post.Add({_cs(oid + ': tag head unreadable (geometry)')}); }}\n"),
             message="tag head differs from at (geometry)",
-            style="else_block"),
+            tol=htol, style="else_block"),
     ]
     readback = (
         f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
@@ -3568,6 +3615,7 @@ def _emit_text(op: dict, ver: str, stamp: str,
             verdict_cs=width_check,
             message="width_mm сильно разошёлся с фактической шириной (geometry)",
             style="guard"))
+    attol = tolerance("create_text", "location_mm")
     checks.append(WitnessCheck(
         obligation_key="at", reader_cs="",
         verdict_cs=(
@@ -3576,11 +3624,11 @@ def _emit_text(op: dict, ver: str, stamp: str,
             f"        var __rel_{s} = __loc_{s} - __vw_{s}.Origin;\n"
             f"        double __ou_{s} = MM(__rel_{s}.DotProduct(__vw_{s}.RightDirection));\n"
             f"        double __ow_{s} = MM(__rel_{s}.DotProduct(__vw_{s}.UpDirection));\n"
-            f"        if (Math.Abs(__ou_{s} - {round(u, 2)}) > 5.0 || Math.Abs(__ow_{s} - {round(w, 2)}) > 5.0)\n"
+            f"        if (Math.Abs(__ou_{s} - {round(u, 2)}) > {attol} || Math.Abs(__ow_{s} - {round(w, 2)}) > {attol})\n"
             f"            __post.Add({_cs(oid + ': at смещена относительно заданной точки вида (geometry)')});\n"
             f"    }} catch {{ __post.Add({_cs(oid + ': text position unreadable (geometry)')}); }}\n"),
         message="at смещена относительно заданной точки вида (geometry)",
-        style="else_block"))
+        tol=attol, style="else_block"))
     if leader_check:
         checks.append(WitnessCheck(
             obligation_key="leader", reader_cs="",
@@ -4503,7 +4551,7 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
     direction = str(op["direction"])
     is_u = "true" if direction == "u" else "false"
     px, py, pz = _pt3(op["position_mm"])
-    tol = spec.OPS["create_curtain_grid_line"].tolerances["position_mm"]
+    tol = tolerance("create_curtain_grid_line", "position_mm")
     mul_tol = _MULLION_ON_LINE_EVIDENCE_MM
 
     if host["by"] == "ref":
@@ -4647,7 +4695,7 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
                 f"        __post.Add({_cs(oid + ': линия не проходит через '
                                           'запрошенную точку (geometry)')});\n"),
             message="линия не проходит через запрошенную точку (geometry)",
-            tol_key="position_mm",
+            tol=tol,
             style="guard"),
     ]
 
@@ -4881,8 +4929,9 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
     w = op.get("width_mm")
     width_cs = (f"        try {{ __run_{s}.ActualRunWidth = U({w}); }} catch {{ }}\n"
                 if w is not None else "")
+    wtol = tolerance("create_stairs", "width_mm")
     width_post = (
-        f"        try {{ if (Math.Abs(MM(__run_{s}.ActualRunWidth) - {w}) > 5.0)\n"
+        f"        try {{ if (Math.Abs(MM(__run_{s}.ActualRunWidth) - {w}) > {wtol})\n"
         f"            __post.Add({_cs(oid + ': stairs run width mismatch (geometry)')}); }}\n"
         f"        catch {{ __post.Add({_cs(oid + ': stairs run width unreadable (geometry)')}); }}\n"
         if w is not None else "")

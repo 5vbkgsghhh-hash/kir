@@ -153,8 +153,8 @@ def emit_directshape(op: dict, ver: str, stamp: str,
         f"    __lbl_{s} = __mk_{s}.Set({_cs(HONEST_MARK)});\n"
         + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
 
-    from kukai.ir import spec
-    tol = spec.OPS["create_directshape"].tolerances["bbox_mm"]
+    from kukai.ir.emit_model import tolerance
+    tol = tolerance("create_directshape", "bbox_mm")
     xmin, ymin, zmin, xmax, ymax, zmax = mesh_bbox(verts)
 
     checks: list[WitnessCheck] = [
@@ -175,7 +175,7 @@ def emit_directshape(op: dict, ver: str, stamp: str,
                 f"Math.Abs(MM(__bb_{s}.Max.Z) - {round(zmax, 2)}) > {tol})\n"
                 f"        __post.Add({_cs(oid + ': bbox extents mismatch (geometry)')});\n"),
             message="bbox extents mismatch (geometry)",
-            tol_key="bbox_mm", style="else_block"),
+            tol=tol, style="else_block"),
         # ЧИСЛО ГРАНЕЙ ЧИТАЕТСЯ С ПОСТРОЕННОГО ЭЛЕМЕНТА. Это не пересчёт
         # нашего же входа: get_Geometry возвращает то, что Revit реально
         # положил в элемент. Если он пересоберёт триангуляцию (склеит

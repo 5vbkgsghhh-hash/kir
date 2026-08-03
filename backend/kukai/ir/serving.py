@@ -504,8 +504,90 @@ _FLAT_ERROR_TO_ERRCODE = {
     "sweep_exec": ErrCode.KIR_RUNTIME_REFUSED,
     "ops_unaccounted": ErrCode.KIR_RUNTIME_REFUSED,
     "journal_write_failed": ErrCode.KIR_RUNTIME_REFUSED,
+    # ПОТЕРЯ СВЯЗИ — НЕ НАША ПОЛОМКА, и разница видна модели по флагу повтора.
+    # `internal.unhandled` объявлен (retryable=False, transient=False), то есть
+    # означает «повторять бессмысленно». Оборванный мост означает ровно
+    # обратное. Замер 03.08.2026: 4571 обрыв (close_code=1006) за 2 ч 45 мин, и
+    # на каждый из них KIR отвечал «внутренняя ошибка». См. `_transport_stage`.
+    "bridge_disconnected": ErrCode.TRANSPORT_BRIDGE_DISCONNECTED,
+    "bridge_timeout": ErrCode.TRANSPORT_BRIDGE_TIMEOUT,
     "internal": ErrCode.INTERNAL_UNHANDLED,
 }
+
+
+#: Имена классов исключений, означающих ОБРЫВ. Опознание по имени, а не по
+#: импорту, намеренно: `websockets` — сторонний пакет, и жёсткий импорт сделал
+#: бы ядро KIR незапускаемым там, где его нет (открытый срез, тестовое
+#: окружение). Имя класса при этом стабильнее его пути: `ConnectionClosed`
+#: переезжал между модулями `websockets` минимум дважды.
+_DISCONNECT_CLASS_NAMES = frozenset({
+    "ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK",
+    "WebSocketDisconnect", "ClientConnectionError", "ServerDisconnectedError",
+})
+
+#: Встроенные типы обрыва. `ConnectionError` — общий предок `ConnectionReset`/
+#: `BrokenPipe`/`ConnectionAborted`, поэтому ловится всё семейство разом.
+_DISCONNECT_TYPES: tuple[type[BaseException], ...] = (ConnectionError,)
+
+#: Молчание вместо обрыва: мост жив, но не ответил в срок.
+_TIMEOUT_TYPES: tuple[type[BaseException], ...] = (TimeoutError,)
+
+#: Глубина обхода цепочки причин. Обрыв почти никогда не приходит голым: его
+#: заворачивают в свой RuntimeError стадии конвейера. Предел нужен потому, что
+#: цепочка бывает ЦИКЛИЧЕСКОЙ (повторный `raise ... from ...` в петле
+#: восстановления), и обход без предела повесил бы обработчик отказа — то есть
+#: сломал бы ровно тот путь, который existует, чтобы ничего не ломать.
+_CAUSE_DEPTH = 8
+
+
+def _transport_stage(exc: BaseException | None) -> Optional[str]:
+    """Стадия плоского отказа, если исключение — ПОТЕРЯ СВЯЗИ, иначе None.
+
+    ЗАЧЕМ ОТДЕЛЬНО ОТ `classify_bridge_error`. Тот разбирает ПРОЗУ моста и
+    работает, когда мост ОТВЕТИЛ. Оборванный сокет прозы не приносит вовсе — он
+    приходит исключением, минует классификатор и падает в общий
+    `except Exception`, где становится «внутренней ошибкой». Поэтому здесь
+    смотрят на ТИП, а не на текст.
+
+    ГРАНИЦА УЗКАЯ, И ЭТО ПОЛОВИНА ЦЕННОСТИ ПРАВИЛА. `KeyError` или `TypeError`,
+    названные транспортом, отправили бы модель повторять программу, сломанную
+    детерминированно, — одна ложь заменилась бы другой. Всё, что не опознано
+    уверенно, остаётся `internal`.
+    """
+    seen: set[int] = set()
+    current = exc
+    for _ in range(_CAUSE_DEPTH):
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        # Порядок проверок значим: `asyncio.TimeoutError` в Python 3.11+ ЕСТЬ
+        # `TimeoutError`, а `TimeoutError` — наследник `OSError`, но НЕ
+        # `ConnectionError`, так что пересечения с обрывом нет.
+        if isinstance(current, _TIMEOUT_TYPES):
+            return "bridge_timeout"
+        if isinstance(current, _DISCONNECT_TYPES) or (
+                type(current).__name__ in _DISCONNECT_CLASS_NAMES):
+            return "bridge_disconnected"
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _failure_stage(exc: BaseException, what: str) -> tuple[str, str]:
+    """(стадия, сообщение) для общего `except` — ОДНА точка на три обработчика.
+
+    Три обработчика писали «внутренняя ошибка» независимо друг от друга, и
+    поправить их порознь значило бы завести три расходящихся правила. Здесь
+    решение принимается один раз; сообщение говорит пользователю, ЧТО делать,
+    потому что «внутренняя ошибка» не говорит ничего.
+    """
+    stage = _transport_stage(exc)
+    if stage == "bridge_disconnected":
+        return (stage, f"связь с Revit оборвалась во время {what} — "
+                       "модель не изменялась, повтори через несколько секунд")
+    if stage == "bridge_timeout":
+        return (stage, f"Revit не ответил вовремя во время {what} — "
+                       "повтори; если повторяется, перезапусти Revit")
+    return ("internal", f"внутренняя ошибка {what}")
 
 
 def _fix_hint(diag: dict) -> Optional[str]:
@@ -1308,6 +1390,17 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                       "witness": _witness,
                       "result": exec_res,
                       "outcome": _outcome.to_dict()}
+        # НАЗВАННОЕ УМОЛЧАНИЕ: выбор, сделанный компилятором за промолчавшего
+        # автора, обязан быть ПРЕДЪЯВЛЕН. Выбор, которого вызывающий не видит,
+        # неотличим от `.FirstOrDefault()` — а именно им плечо C# 02.08.2026
+        # молча взяло 1 тип двери из 62 в живом документе. Отчёт машинный,
+        # примечание человеческое; второе пусто, когда выбирать было не из чего.
+        if out.grounding_report:
+            from kukai.ir.ground import describe_choices_ru
+            out_result["grounding_report"] = out.grounding_report
+            _defaults_note = describe_choices_ru(out.grounding_report)
+            if _defaults_note:
+                out_result["defaults_note_ru"] = _defaults_note
         diagnostics = []
         if _violations:
             out_result["postconditions_violated"] = True
@@ -1578,9 +1671,9 @@ async def handle_revit_decompile(args: Any, llm_client, bridge_callback,
                     "message_ru": "прогон запущен — опрашивай action=status"}
 
         return _typed_error("args", "action должен быть start|status|cancel")
-    except Exception:  # noqa: BLE001 — absolute fail-open
+    except Exception as exc:  # noqa: BLE001 — absolute fail-open
         logger.exception("revit_decompile handler internal error")
-        return _typed_error("internal", "внутренняя ошибка декомпайла")
+        return _typed_error(*_failure_stage(exc, "декомпайла"))
 
 
 def source_catalogue_snapshot(out_dir: str) -> dict | None:
@@ -1836,9 +1929,9 @@ async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
         return {"ok": False, "refused": True, "error": "live_rebuild_unimplemented",
                 "message_ru": "живой rebuild будет включён после live-приёмки A3",
                 "dry_run_summary": summary}
-    except Exception:  # noqa: BLE001 — absolute fail-open
+    except Exception as exc:  # noqa: BLE001 — absolute fail-open
         logger.exception("revit_rebuild handler internal error")
-        return _typed_error("internal", "внутренняя ошибка rebuild")
+        return _typed_error(*_failure_stage(exc, "rebuild"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2390,9 +2483,9 @@ async def handle_revit_idempotence(
             }
         result["ok"] = successful
         return result
-    except Exception:  # noqa: BLE001 — absolute fail-open
+    except Exception as exc:  # noqa: BLE001 — absolute fail-open
         logger.exception("revit_idempotence handler internal error")
-        return _typed_error("internal", "внутренняя ошибка идемпотентности")
+        return _typed_error(*_failure_stage(exc, "идемпотентности"))
     finally:
         if lease is not None:
             try:

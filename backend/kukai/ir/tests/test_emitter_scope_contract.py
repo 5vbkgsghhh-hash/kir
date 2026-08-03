@@ -314,6 +314,52 @@ PROGRAMS = {
                                    "size_mm": [8000, 6000]}},
              "level": LVL},
         ]},
+    # ── ВЕТКИ ДОПУСКОВ, КОТОРЫЕ КОРПУС НЕ СТРОИЛ (03.08) ─────────────────
+    # Сертификат доказывает ровно то, что корпус собирает. Ветка допуска, в
+    # которую корпус не заходит, заверена только в ОТРИЦАНИИ («свидетель
+    # правильно отсутствует»), и захардкоженное число внутри неё невидимо
+    # ни сертификату, ни возмущающему оракулу. Замер 03.08: восемь ключей
+    # реестра не достигались НИ ОДНОЙ программой корпуса — шесть условных
+    # смещений/диаметров и обе числовые ветки set_param (корпус ставил
+    # только строковое значение). Здесь они закрыты; проверяет это
+    # tests/test_tolerance_provenance.py (закон «корпус — часть
+    # доказательства»).
+    "offsets_and_diameters": {
+        "ir_version": "1.0", "intent": "смещения и диаметры", "ops": [
+            {"op": "create_level", "id": "LOB", "elev_mm": 0, "name": "КИР-Н"},
+            {"op": "create_level", "id": "LOT", "elev_mm": 3300,
+             "name": "КИР-В"},
+            {"op": "create_wall", "id": "WO", "p0_mm": [0, 0],
+             "p1_mm": [5000, 0], "level": {"by": "ref", "value": "LOB"},
+             "top_level": {"by": "ref", "value": "LOT"},
+             "base_offset_mm": -150, "top_offset_mm": -250},
+            {"op": "create_column", "id": "CO", "xy": [1000, 1000],
+             "level": {"by": "ref", "value": "LOB"},
+             "top_level": {"by": "ref", "value": "LOT"},
+             "base_offset_mm": 150, "top_offset_mm": -250},
+            {"op": "create_floor", "id": "FO",
+             "outline": [[0, 0], [5000, 0], [5000, 4000], [0, 4000]],
+             "level": {"by": "ref", "value": "LOB"},
+             "height_offset_mm": -50},
+            {"op": "create_floor_by_contour", "id": "FCO",
+             "contour": {"outer": {"shape": "rect", "origin": [0, 0],
+                                   "size_mm": [5000, 4000]}},
+             "level": {"by": "ref", "value": "LOB"},
+             "height_offset_mm": 120},
+            {"op": "create_duct", "id": "DO", "p0_mm": [0, 0, 3000],
+             "p1_mm": [4000, 0, 3000],
+             "level": {"by": "ref", "value": "LOB"}, "diameter_mm": 200},
+        ]},
+    "set_param_numeric": {
+        "ir_version": "1.0", "intent": "числовые параметры", "ops": [
+            {"op": "set_param", "id": "SPM",
+             "target": {"by": "element_id", "value": 7777},
+             "param": "Смещение сверху",
+             "value": {"value": 2500, "unit": "mm"}},
+            {"op": "set_param", "id": "SPD",
+             "target": {"by": "element_id", "value": 7777},
+             "param": "Коэффициент", "value": {"value": 1.25, "unit": "raw"}},
+        ]},
     # Curve-IR (P4-B): the arc branch of create_wall declares an extra
     # __lca/__arc pair inside its post block — this fixture exercises that
     # branch so the scope contract sees it (a straight wall never touches it).

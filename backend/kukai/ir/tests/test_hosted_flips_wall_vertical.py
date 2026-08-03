@@ -594,10 +594,15 @@ class F6WallHeightVsTopConstraint(unittest.TestCase):
         the live telemetry describes -- proving the fix removes a real false
         positive, not a hypothetical one."""
         from kukai.ir.authoring import WitnessCheck, _cs, _safe
+        from kukai.ir.emit_model import tolerance
 
         s = _safe("s01")
         h = 3000.0            # the registry default -- never asked for
-        tol = 1.0
+        # Допуск предъявляется ОБЪЕКТОМ из реестра: с 03.08 витнес нельзя
+        # построить с заявленным ключом при числе, набранном рядом руками
+        # (закон 2, emit_model.py) — реконструкция старой формы обязана
+        # подчиняться тому же закону, иначе она реконструирует не то.
+        tol = tolerance("create_wall", "height_mm")
         old_check = WitnessCheck(
             obligation_key="height",
             reader_cs=(
@@ -606,7 +611,7 @@ class F6WallHeightVsTopConstraint(unittest.TestCase):
             verdict_cs=(
                 f"    if (__hp == null || Math.Abs(MM(__hp.AsDouble()) - {h}) > {tol})\n"
                 f"        __post.Add({_cs('s01: height mismatch')});\n"),
-            message="height mismatch", tol_key="height_mm", style="guard")
+            message="height mismatch", tol=tol, style="guard")
         # The control check is unconditional BY CONSTRUCTION here (mirrors
         # the pre-fix code, which appended it regardless of top_level) --
         # the live facade walls attach a real top_level whose span need not

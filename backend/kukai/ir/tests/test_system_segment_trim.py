@@ -31,6 +31,11 @@ from __future__ import annotations
 import unittest
 
 from kukai.ir.authoring import _segment_trim_bounds_mm
+from kukai.ir import spec
+
+# Допуск конца живёт В РЕЕСТРЕ (03.08): пол подрезки — то же самое число,
+# и тест берёт его оттуда же, а не набирает вторым экземпляром.
+TOL_MM = spec.OPS["create_pipe_system"].tolerances["endpoint_mm"]
 
 
 class TrimBoundsTests(unittest.TestCase):
@@ -38,20 +43,20 @@ class TrimBoundsTests(unittest.TestCase):
     def test_a_free_end_keeps_the_exact_tolerance(self) -> None:
         """Конец, который ни с чем не стыкуется, подрезать нечему."""
         trim_a, trim_b = _segment_trim_bounds_mm(
-            (0.0, 0.0, 0.0), (6000.0, 0.0, 0.0), degree_a=1, degree_b=1)
+            (0.0, 0.0, 0.0), (6000.0, 0.0, 0.0), degree_a=1, degree_b=1, tol_mm=TOL_MM)
         self.assertEqual((trim_a, trim_b), (5.0, 5.0))
 
     def test_a_junction_end_may_be_trimmed_up_to_half(self) -> None:
         """Отвод съедает начало участка — но не больше половины."""
         trim_a, trim_b = _segment_trim_bounds_mm(
-            (0.0, 0.0, 0.0), (6000.0, 0.0, 0.0), degree_a=2, degree_b=1)
+            (0.0, 0.0, 0.0), (6000.0, 0.0, 0.0), degree_a=2, degree_b=1, tol_mm=TOL_MM)
         self.assertEqual(trim_a, 3000.0)
         self.assertEqual(trim_b, 5.0)
 
     def test_both_ends_may_be_junctions(self) -> None:
         """Средний участок ветки подрезается с обеих сторон."""
         trim_a, trim_b = _segment_trim_bounds_mm(
-            (0.0, 0.0, 0.0), (0.0, 4000.0, 0.0), degree_a=3, degree_b=2)
+            (0.0, 0.0, 0.0), (0.0, 4000.0, 0.0), degree_a=3, degree_b=2, tol_mm=TOL_MM)
         self.assertEqual((trim_a, trim_b), (2000.0, 2000.0))
 
     def test_a_short_segment_never_gets_a_looser_bound_than_the_tolerance(self) -> None:
@@ -61,14 +66,14 @@ class TrimBoundsTests(unittest.TestCase):
         система из коротких участков стала бы непроходимой по другой причине.
         """
         trim_a, _ = _segment_trim_bounds_mm(
-            (0.0, 0.0, 0.0), (6.0, 0.0, 0.0), degree_a=2, degree_b=1)
+            (0.0, 0.0, 0.0), (6.0, 0.0, 0.0), degree_a=2, degree_b=1, tol_mm=TOL_MM)
         self.assertEqual(trim_a, 5.0)
 
     def test_a_degenerate_segment_is_refused_not_tolerated(self) -> None:
         """Нулевая длина — не «всё сошлось», а отсутствие участка."""
         with self.assertRaises(ValueError):
             _segment_trim_bounds_mm(
-                (10.0, 10.0, 10.0), (10.0, 10.0, 10.0), degree_a=1, degree_b=1)
+                (10.0, 10.0, 10.0), (10.0, 10.0, 10.0), degree_a=1, degree_b=1, tol_mm=TOL_MM)
 
 
 class EmissionDistinguishesEndsTests(unittest.TestCase):
