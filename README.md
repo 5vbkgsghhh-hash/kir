@@ -23,7 +23,7 @@
   <a href="#why">Why</a> ·
   <a href="#the-idea-in-one-picture">The idea</a> ·
   <a href="#show-me-code">Code</a> ·
-  <a href="#measured-not-promised">Measured facts</a> ·
+  <a href="#measured-not-promised">Measured results</a> ·
   <a href="#the-five-laws">Five laws</a> ·
   <a href="docs/ARCHITECTURE.md">Architecture</a> ·
   <a href="examples/README.md">Examples</a> ·
@@ -229,7 +229,7 @@ That stamp is why a retry is idempotent: op ids are written into the model insid
 transaction, so re-running a program skips what is already stamped, and resume-from-op-K is simply
 "skip what carries a stamp".
 
-## Measured, not promised
+## Measured results
 
 Everything below is derived from an instrument on the date shown, not from memory.
 

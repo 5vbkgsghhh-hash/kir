@@ -23,7 +23,7 @@
   <a href="#why">Зачем</a> ·
   <a href="#the-idea-in-one-picture">Идея одной картинкой</a> ·
   <a href="#show-me-code">Код</a> ·
-  <a href="#measured-not-promised">Измеренные факты</a> ·
+  <a href="#measured-not-promised">Фактические результаты</a> ·
   <a href="#the-five-laws">Пять законов</a> ·
   <a href="docs/ARCHITECTURE.ru.md">Архитектура</a> ·
   <a href="examples/README.ru.md">Примеры</a> ·
@@ -236,7 +236,7 @@ sequenceDiagram
 опа K» — это просто «пропустить всё, что несёт штамп».
 
 <a id="measured-not-promised"></a>
-## Измерено, а не обещано
+## Фактические результаты
 
 Всё ниже получено инструментом на указанную дату, а не по памяти.
 
