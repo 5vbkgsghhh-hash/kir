@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.12.0" />
+  </ItemGroup>
+
+  <!--
+    The service loads Revit references from NuGet's global-packages folder at
+    runtime.  Declare the complete shipped matrix here so `dotnet restore`
+    provisions a fresh CI runner / production host without relying on some
+    unrelated Bridge build having warmed the cache first.
+
+    PackageDownload is deliberate: it acquires every exact version while
+    adding none of these assemblies to CompileService's own net8 compile
+    closure.  Keep this list in lockstep with RoslynCompiler.AllShippedVersions;
+    startup and /ready remain fail-closed if any DLL is absent.
+  -->
+  <ItemGroup>
+    <PackageDownload
+      Include="Revit_All_Main_Versions_API_x64"
+      Version="[2021.0.0];[2022.0.0];[2023.0.0];[2024.0.0];[2025.0.0];[2026.0.0]" />
+    <PackageDownload
+      Include="Microsoft.NETFramework.ReferenceAssemblies.net48"
+      Version="[1.0.3]" />
+  </ItemGroup>
+
+</Project>

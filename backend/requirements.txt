@@ -1,0 +1,48 @@
+# KUKAI Backend — pinned dependencies (Python 3.12+)
+# Generated from working environment 2026-03-24
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+litellm>=1.40.0
+httpx>=0.27.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+asyncpg>=0.29.0
+aiosqlite>=0.20.0  # retained for IFC engine + SQLite→PG migration script
+python-multipart>=0.0.9
+defusedxml>=0.7.1
+cryptography>=42.0
+openpyxl>=3.1.0
+pdfplumber>=0.10.0
+python-docx>=1.0.0
+pytesseract>=0.3.10
+Pillow>=10.0
+numpy>=1.26.0
+openai>=1.0.0
+
+# IFC module deps REMOVED 2026-06-10 — module archived to kukai/_archive/ifc/.
+# Dropped: ifcopenshell, structlog, prometheus-client, psutil, gigachat, and
+# sentence-transformers (the latter pulled ~2 GB of torch+CUDA for BGE-M3, which
+# was only ever used by the archived IFC path — real RAG uses OpenAI 3-large).
+
+# Config / YAML
+pyyaml>=6.0.1          # YAML config parsing
+
+# Scheduler v2 + building-correctness checker (kukai/modeling/)
+networkx>=3.0,<4.0     # AON graph (scheduler) + room/egress connectivity graph (checker)
+shapely>=2.0           # polygon/clearance geometry for habitability rules (kukai/modeling/checker)
+
+# Transport state store (multi-worker / Redis-ready seam — IRON 8).
+# ONLY needed when KUKAI_STATE_BACKEND=redis; the default in-process backend
+# imports nothing from here. fakeredis is test-only (contract suite).
+redis>=5.0            # async client (redis.asyncio); used only by the redis backend
+fakeredis>=2.20       # test-only: drives the StateStore contract suite without a server
+
+# Russian morphology for the lemma-normalized lexicon (KUKAI_LEMMA_LEXICON,
+# IQ-moment #7, kukai/nlp/lemma.py). Pure-Python + precompiled offline DAWG
+# dictionaries — no torch, no network. Imported lazily; if absent, lemma()
+# falls back to the legacy suffix stripper (prod never breaks on this dep).
+# These versions are embedded in knowledge/routing_index.json normalizer
+# metadata. Drift is a startup/CI error, so pin them exactly.
+pymorphy3==2.0.6
+pymorphy3-dicts-ru==2.4.417150.4580142

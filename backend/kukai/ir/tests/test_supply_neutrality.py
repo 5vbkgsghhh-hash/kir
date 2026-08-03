@@ -1,0 +1,166 @@
+"""§18.5 — закон нейтральности поставки. Опровергающие тесты (§18.7 п.2).
+
+Написаны ДО починки и на момент написания падали все: в исполняемом коде
+компилятора стояли литеральный id устройства владельца (`serving.ADMIN_DEVICE`),
+абсолютный путь установки для телеметрии отказов (`coverage_feed._DEFAULT`) и
+абсолютный `/root/...` для вывода декомпайла (`extract.DEFAULT_OUTPUT_ROOT`).
+
+Что именно утверждается:
+  * список допущенных устройств принадлежит УСТАНОВКЕ (env KUKAI_ADMIN_DEVICES),
+    а не автору кода; env задан и пуст ⇒ живой путь выключен;
+  * отказ гейта НАЗЫВАЕТ переменную, которую надо настроить (иначе сторонний
+    разработчик не может открыть обратный путь никогда);
+  * отсутствие пути = функция выключена, а не запись в чужую ФС;
+  * дефолтный корень вывода не указывает в чужую установку.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from kukai.ir import coverage_feed, serving
+from kukai.ir.decompile import extract
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+class _EnvGuard(unittest.TestCase):
+    """Снимает/возвращает env-переменные, которые тест трогает."""
+
+    _VARS: tuple[str, ...] = ()
+
+    def setUp(self) -> None:
+        self._saved = {name: os.environ.get(name) for name in self._VARS}
+
+    def tearDown(self) -> None:
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+class AdminDeviceAllowList(_EnvGuard):
+    _VARS = ("KUKAI_ADMIN_DEVICES", "KUKAI_KIR_TOOL", "KUKAI_KIR_DECOMPILE")
+
+    def test_env_list_is_parsed_and_trimmed(self) -> None:
+        os.environ["KUKAI_ADMIN_DEVICES"] = " dev-a , dev-b ,,"
+        self.assertEqual(serving.admin_devices(), ("dev-a", "dev-b"))
+        self.assertTrue(serving.is_admin_device("dev-a"))
+        self.assertTrue(serving.is_admin_device("dev-b"))
+        self.assertFalse(serving.is_admin_device("dev-c"))
+        self.assertFalse(serving.is_admin_device(None))
+
+    def test_env_present_but_empty_disables_the_live_path(self) -> None:
+        os.environ["KUKAI_ADMIN_DEVICES"] = "   "
+        os.environ["KUKAI_KIR_TOOL"] = "stage2"
+        os.environ["KUKAI_KIR_DECOMPILE"] = "stage2"
+        self.assertEqual(serving.admin_devices(), ())
+        with mock.patch.object(serving, "_turn_device_id",
+                               return_value="any-device"):
+            self.assertFalse(serving.revit_ir_enabled())
+            self.assertFalse(serving.revit_decompile_enabled())
+
+    def test_unset_env_keeps_this_installation_working(self) -> None:
+        # Миграционный фолбэк: прод-.env трогать нельзя, поэтому «переменная не
+        # задана» обязана сохранить ровно прежнее поведение этой установки.
+        os.environ.pop("KUKAI_ADMIN_DEVICES", None)
+        self.assertEqual(
+            serving.admin_devices(), (serving._MIGRATION_ADMIN_DEVICE,))
+        os.environ["KUKAI_KIR_TOOL"] = "stage2"
+        with mock.patch.object(serving, "_turn_device_id",
+                               return_value=serving._MIGRATION_ADMIN_DEVICE):
+            self.assertTrue(serving.revit_ir_enabled())
+
+    def test_gate_refusal_names_the_env_variable(self) -> None:
+        os.environ["KUKAI_ADMIN_DEVICES"] = ""
+        os.environ["KUKAI_KIR_DECOMPILE"] = "stage2"
+
+        async def _never_bridge(method, params):  # pragma: no cover
+            raise AssertionError("gate refusal must not touch the bridge")
+
+        for handler in (serving.handle_revit_decompile,
+                        serving.handle_revit_rebuild,
+                        serving.handle_revit_idempotence):
+            result = _run(handler(
+                {"action": "status", "doc_stamp": "docA"}, None, _never_bridge))
+            self.assertFalse(result.get("ok", True), msg=result)
+            self.assertEqual(result.get("error"), "gate", msg=result)
+            self.assertIn("KUKAI_ADMIN_DEVICES", result.get("message_ru", ""),
+                          msg=result)
+
+    def test_only_the_migration_default_carries_a_device_literal(self) -> None:
+        # §18.5, принуждение: hex-32 литерал в исполняемом коде — ровно один,
+        # и он помечен как миграционный дефолт. Появление второго означает, что
+        # чьё-то устройство снова зашили в компилятор.
+        source = Path(serving.__file__).read_text(encoding="utf-8")
+        hits = re.findall(r"[\"'][0-9a-f]{32}[\"']", source)
+        self.assertEqual(len(hits), 1, msg=hits)
+        self.assertIn("_MIGRATION_ADMIN_DEVICE", source)
+
+
+class RejectionFeedPath(_EnvGuard):
+    _VARS = ("KIR_REJECTIONS_PATH",)
+
+    @staticmethod
+    def _one_diagnostic():
+        from kukai.ir.diag import Diagnostic
+        return Diagnostic(
+            code="KIR-G001", message_ru="неизвестный вид", op_index=0,
+            field_name="kind", got="ost_nonsense")
+
+    def test_no_env_and_no_local_install_writes_nothing(self) -> None:
+        # Замысел прежний: без env и без СВОЕЙ установки фид молчит, а не
+        # создаёт чужой каталог. Носитель условия сменился — раньше это был
+        # isdir() абсолютного пути в самом модуле, теперь один авторитет
+        # install_paths, поэтому «нет своей установки» выражается им.
+        os.environ.pop("KIR_REJECTIONS_PATH", None)
+        import tempfile
+        from kukai.ir import install_paths
+        with tempfile.TemporaryDirectory() as bare:
+            # каталог без backend/kukai ⇒ install_root() == None
+            with mock.patch.object(install_paths, "_INSTALL_ROOT",
+                                   Path(bare)):
+                self.assertIsNone(coverage_feed._feed_path())
+                with mock.patch.object(coverage_feed.os, "makedirs") as makedirs:
+                    coverage_feed.record_rejections(
+                        [self._one_diagnostic()], [{"op": "create_wall"}])
+                makedirs.assert_not_called()
+
+    def test_env_path_is_written(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nested", "kir_rejections.jsonl")
+            os.environ["KIR_REJECTIONS_PATH"] = path
+            coverage_feed.record_rejections(
+                [self._one_diagnostic()], [{"op": "create_wall"}])
+            self.assertTrue(os.path.isfile(path))
+
+    def test_module_default_is_not_a_foreign_absolute_path(self) -> None:
+        self.assertIsNone(coverage_feed._DEFAULT)
+
+
+class DecompileOutputRoot(_EnvGuard):
+    _VARS = ("KUKAI_DECOMPILE_OUT",)
+
+    def test_env_wins(self) -> None:
+        os.environ["KUKAI_DECOMPILE_OUT"] = "/somewhere/else"
+        self.assertEqual(
+            extract.default_output_root(), Path("/somewhere/else"))
+
+    def test_default_does_not_point_into_a_foreign_installation(self) -> None:
+        os.environ.pop("KUKAI_DECOMPILE_OUT", None)
+        root = str(extract.default_output_root())
+        self.assertFalse(root.startswith("/root"), msg=root)
+        self.assertFalse(root.startswith("/opt"), msg=root)
+        self.assertEqual(str(extract.DEFAULT_OUTPUT_ROOT), root)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

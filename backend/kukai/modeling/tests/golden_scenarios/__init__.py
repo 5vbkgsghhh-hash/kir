@@ -1,0 +1,1 @@
+"""Golden scenario YAML files."""
