@@ -24,7 +24,7 @@
   <a href="#the-idea-in-one-picture">The idea</a> ·
   <a href="#show-me-code">Code</a> ·
   <a href="#measured-not-promised">Measured results</a> ·
-  <a href="#the-five-laws">Five laws</a> ·
+  <a href="#the-five-laws">Invariants</a> ·
   <a href="docs/ARCHITECTURE.md">Architecture</a> ·
   <a href="examples/README.md">Examples</a> ·
   <a href="#repository-state">Repository state</a>
@@ -244,16 +244,16 @@ Everything below is derived from an instrument on the date shown, not from memor
 | Historical reverse-direction coverage | **48 categories; 92.83% on the 90 758-element R2026 model** | 2026-07-27/28 local runs |
 | Historical production compile errors structurally inexpressible in KIR | **≈60%** of 85 374 over seven weeks | local report; completeness caveats apply |
 
-## The five laws
+## Checked invariants
 
-The invariant is easy to write and hard to keep: **zero silently-wrong outcomes**. On 2026-07-28 an
-audit found that our own spec stated it in prose — and the implementation had drifted exactly where
-the prose did not compile. So honesty became arithmetic: five conservation laws, each with an
-enforcement mechanism. Breaking one is a build or run failure, not a note to a reviewer.
+The reverse pipeline enforces five checked invariants: full document coverage, a reason recorded for
+every element it cannot express, witnesses that match the data actually read, contamination marking
+for partial reads, and neutral identifiers. Each invariant is backed by a test or verification run;
+a violation stops the build or run.
 
 ```mermaid
 flowchart LR
-    subgraph LAWS["§18 — five conservation laws"]
+    subgraph LAWS["§18 — five invariants"]
         direction TB
         L1["1 · CENSUS<br/>lifted + atoms + not_read<br/>= the whole document"]
         L2["2 · RECEIPT<br/>every cut emits<br/>element_id + typed_reason"]
