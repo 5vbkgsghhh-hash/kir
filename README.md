@@ -14,9 +14,9 @@
 <p align="center">
   <img alt="License Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Revit 2021-2026" src="https://img.shields.io/badge/Revit-2021%E2%80%932026-005386">
-  <img alt="Compile gate 1056 checks" src="https://img.shields.io/badge/compile%20gate-1056%20checks%20PASS-brightgreen">
-  <img alt="Live-proven 31 of 31 writing ops" src="https://img.shields.io/badge/live--proven-31%2F31%20writing%20ops-success">
-  <img alt="Open source August 9 2026" src="https://img.shields.io/badge/open--source-Aug%209%2C%202026-orange">
+  <img alt="Historical compile gate 1056 checks" src="https://img.shields.io/badge/historical%20compile%20gate-1056%20checks-brightgreen">
+  <img alt="35 writing ops registered" src="https://img.shields.io/badge/registry-35%20writing%20ops-success">
+  <img alt="KIR backend source published" src="https://img.shields.io/badge/source-backend%20published-orange">
 </p>
 
 <p align="center">
@@ -27,7 +27,7 @@
   <a href="#the-five-laws">Five laws</a> ·
   <a href="docs/ARCHITECTURE.md">Architecture</a> ·
   <a href="examples/README.md">Examples</a> ·
-  <a href="#constellation">Constellation</a>
+  <a href="#repository-state">Repository state</a>
 </p>
 
 ---
@@ -116,6 +116,21 @@ edit what already exists".
 
 A stage-by-stage account of both pipelines — the registry as one source of truth, isolation modes,
 the census, fold, rebuild verification — lives in [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md).
+
+## Repository layout
+
+The current repository contains the runnable source snapshot, not only the public open-core slice:
+
+- `backend/kukai/ir/` — the forward compiler, typed diagnostics, serving, witness/acceptance
+  machinery and the reverse/decompile pipeline;
+- `backend/kukai/modeling/bridge/` — bridge clients and adapters used to talk to a Revit session;
+- `backend/compile-service/` — the .NET 8 Roslyn service used for versioned C# compilation;
+- `backend/kukai/ir/tests/` and `backend/tests/` — unit, contract and bridge tests;
+- `examples/` — small SDK programs that can be compiled offline before connecting Revit.
+
+Runtime data, credentials, virtual environments, build outputs and logs are intentionally not part
+of the repository. A live run still requires a separately installed Revit bridge and the matching
+Revit API reference packages.
 
 ## Show me code
 
@@ -220,15 +235,14 @@ Everything below is derived from an instrument on the date shown, not from memor
 
 | Fact | Value | Date / source |
 |---|---|---|
-| Writing ops in the registry | **31** (+4 query) | 2026-07-28, `spec.OPS` |
-| Writing ops with at least one successful live run + witness | **31 of 31** | union of `data/telemetry/kir_witness.jsonl` (rows with `ok` + `family=write` + `duration_ms>0`; includes the 2026-07-28 runs P8/P10v2/P11 and the night P9) and the 2026-07-27 live-matrix artifact (adds `create_floor`, `create_room`) |
-| Last op to close | `move_elements` — 2026-07-28 night, Revit 2026: a *connected* cable-tray pair moved +500 mm Z, witness 3/3, connection verified alive by an independent read | same |
-| Six-version compile gate | **1 056 Roslyn compilations, PASS** (101 atomic + 69 per-op × 6 versions) | 2026-07-28 |
-| Test suite | **1 692 passed / 2 767 subtests** | 2026-07-28, full suite in a clean window |
-| Categories the reverse direction reads | **48** | 2026-07-28 |
-| Coverage — R2023 model, 1 383 elements | **93.28%** (raw 77.30%) | 2026-07-27 |
-| Coverage — R2026 model, 90 758 elements | **92.83%** (raw 56.94%) | 2026-07-27 |
-| Production compile errors structurally inexpressible in KIR | **≈60%** of 85 374 over seven weeks | with the source report's caveats on log completeness |
+| Writing ops in the registry | **35** (+4 query) | current `backend/kukai/ir/spec.py` |
+| Published backend snapshot | **797 code/config files** | commit `23dd666`, 2026-08-03 |
+| Python syntax check at publication | **764 files parsed** | Python 3.12, 2026-08-03 |
+| Offline KIR smoke compile | **PASS** — level program emitted Revit 2023 C# | Python 3.12, 2026-08-03 |
+| Historical live baseline | **31 of 31 writing ops** had a witnessed run | 2026-07-28 local telemetry; telemetry is not shipped here |
+| Historical six-version compile gate | **1 056 Roslyn compilations, PASS** | 2026-07-28 local gate run |
+| Historical reverse-direction coverage | **48 categories; 92.83% on the 90 758-element R2026 model** | 2026-07-27/28 local runs |
+| Historical production compile errors structurally inexpressible in KIR | **≈60%** of 85 374 over seven weeks | local report; completeness caveats apply |
 
 ## The five laws
 
@@ -278,35 +292,24 @@ Full account: [**Five Conservation Laws of Honesty for an AI Agent in CAD**](doc
 - [**One Day Inside an AI-led Compiler Team**](docs/articles/2026-07-one-day-chronicle.md) — a
   first-person account of one working day on this project.
 
-## Constellation
+<a id="repository-state"></a>
+## Current repository state
 
-Two of the articles above now live in their own repositories, developed and versioned
-independently rather than as sections of this one:
+The KIR backend source is published in `main` now. To prepare a clean local environment:
 
-- [**revit-api-traps**](https://github.com/BigDick2014/revit-api-traps) — a living catalog of
-  measured Autodesk Revit API traps. Each entry: documented | observed | our bug.
-- [**five-laws-of-honesty**](https://github.com/BigDick2014/five-laws-of-honesty) — the five
-  conservation laws, standalone.
+```bash
+cd backend
+python3.12 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+PYTHONPATH=. python -c "from kukai.ir import spec; print(len(spec.OPS))"
+dotnet restore compile-service/CompileService.csproj
+dotnet run --project compile-service
+```
 
-The numbers manifest for the whole constellation stays here:
-[`docs/articles/publication_manifest.json`](docs/articles/publication_manifest.json).
-
-## Roadmap to August 9
-
-The date is a commitment, not a result already achieved. What ships is the compiler core: the
-registry, the schema and grammar generators, the staged pipeline, the per-version emitters, the
-witness machinery, the decompile spine, and the specs that govern them.
-
-| Milestone | State |
-|---|---|
-| Specs canonised inside the repository (`SPEC_V1.md`, `KIR_DECOMPILE_SPEC.md`) | done 2026-07-28 |
-| Delivery neutrality — device allow-list, no absolute paths, no locale-only keys | done 2026-07-28 |
-| Every module signed `live` / `incubating` / `deleted` in `WIRING.md` | done 2026-07-28 |
-| Translation certificate wired into the compile gate | planned |
-| `open_model` preflight — one live RollBack run, then default-on | planned |
-| Mission bench, full run on a held-out corpus | planned |
-| Incremental-rebuild spine wired (merkle first — it is the keystone) | planned, after the bench |
-| Code lands in this repository | **August 9, 2026** |
+The last two commands provision and start the Roslyn compile service. Live execution additionally
+needs a Revit 2021–2026 installation, its API reference assemblies and a separately running bridge.
+The source snapshot is deliberately free of machine-specific paths, credentials and runtime data.
 
 ---
 
