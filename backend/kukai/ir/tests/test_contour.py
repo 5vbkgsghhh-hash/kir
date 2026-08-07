@@ -170,12 +170,16 @@ class GridAnchors(unittest.TestCase):
         # grid 1 x grid А = (0,0); +offset 200 -> first corner at (200, 200)
         self.assertIn("P(200.0, 200.0, 0)", out.csharp)
 
+    # KIR-G105 ВЫВЕДЕН ИЗ УПОТРЕБЛЕНИЯ 04.08.2026 (RELATE): один код на три
+    # разных ремонта не мог назвать следующий ход ни в одном из них. Здесь
+    # проверяется, что CONTOUR получил расщеплённые коды, а не что он их
+    # получил «где-то» — каждый случай назван отдельно.
     def test_unknown_grid_refused_with_candidates(self):
         out = compile_program(_prog({"outer": {
             "shape": "rect", "origin": {"at_grid": ["9", "А"]},
             "size_mm": [3000, 3000]}}), snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
-        d = [x for x in out.diagnostics if x.code == "KIR-G105"][0]
+        d = [x for x in out.diagnostics if x.code == "KIR-G108"][0]
         self.assertIn("1", d.candidates)
 
     def test_parallel_grids_refused(self):
@@ -184,7 +188,7 @@ class GridAnchors(unittest.TestCase):
             "size_mm": [3000, 3000]}}), snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
         codes = [d.code for d in out.diagnostics]
-        self.assertIn("KIR-G105", codes)
+        self.assertIn("KIR-G110", codes)
 
     def test_literal_only_region_grounds_without_grids(self):
         """No at_grid + level by element_id -> no snapshot needed at all."""

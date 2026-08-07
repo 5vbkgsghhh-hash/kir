@@ -9,6 +9,30 @@ Func<string, string, Dictionary<string, object>> __Refuse = (string __oid, strin
     __e["error"] = "stale_or_failed"; __e["op_id"] = __oid; __e["message"] = __msg;
     return __e;
 };
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element и у исключений — это полное имя типа CLR:
+// из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ, WorksetId,
+// ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и ни один из
+// них сюда не передаётся. Исключение дописывает ": сообщение" и стек,
+// поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __ClassName = (__cnObj) =>
+{
+    if (__cnObj == null) return "";
+    string __cn = __cnObj.ToString();
+    if (__cn == null) return "";
+    int __cnCut = __cn.IndexOf((char)10);
+    if (__cnCut >= 0) __cn = __cn.Substring(0, __cnCut);
+    __cnCut = __cn.IndexOf(':');
+    if (__cnCut >= 0) __cn = __cn.Substring(0, __cnCut);
+    __cn = __cn.Trim();
+    __cnCut = __cn.LastIndexOf('.');
+    return __cnCut >= 0 && __cnCut + 1 < __cn.Length
+        ? __cn.Substring(__cnCut + 1) : __cn;
+};
 var __results = new Dictionary<string, object>();
 var __post = new List<string>();
 Wall __el_W1 = null;
@@ -32,7 +56,7 @@ using (Transaction __t = new Transaction(doc, "KIR: стена 6м + труба 
         if (__wt_W1 == null) { __t.RollBack(); return __Refuse("W1", "тип стены не найден (модель изменилась после grounding)"); }
         Element __lv_raw_W1 = doc.GetElement(new ElementId(42));
         Level __lv_W1 = __lv_raw_W1 as Level;
-        if (__lv_W1 == null) { __t.RollBack(); return __Refuse("W1", (__lv_raw_W1 == null ? "уровень не найден (модель изменилась после grounding)" : "id уровня резолвится не в Level, а в " + __lv_raw_W1.GetType().Name + " — причина (дрейф модели или неверный id) не определена рантаймом")); }
+        if (__lv_W1 == null) { __t.RollBack(); return __Refuse("W1", (__lv_raw_W1 == null ? "уровень не найден (модель изменилась после grounding)" : "id уровня резолвится не в Level, а в " + __ClassName(__lv_raw_W1) + " — причина (дрейф модели или неверный id) не определена рантаймом")); }
         __el_W1 = Wall.Create(doc, Line.CreateBound(P(0, 0, 0), P(6000, 0, 0)), __wt_W1.Id, __lv_W1.Id, U(3000.0), 0.0, false, false);
         if (__el_W1 == null) { __t.RollBack(); return __Refuse("W1", "Wall.Create вернул null"); }
         try { Parameter __cm = __el_W1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:aab4b046:W1"); } catch { }
@@ -40,7 +64,7 @@ using (Transaction __t = new Transaction(doc, "KIR: стена 6м + труба 
         // create_pipe P1
         Element __lv_raw_P1 = doc.GetElement(new ElementId(42));
         Level __lv_P1 = __lv_raw_P1 as Level;
-        if (__lv_P1 == null) { __t.RollBack(); return __Refuse("P1", (__lv_raw_P1 == null ? "уровень не найден (модель изменилась после grounding)" : "id уровня резолвится не в Level, а в " + __lv_raw_P1.GetType().Name + " — причина (дрейф модели или неверный id) не определена рантаймом")); }
+        if (__lv_P1 == null) { __t.RollBack(); return __Refuse("P1", (__lv_raw_P1 == null ? "уровень не найден (модель изменилась после grounding)" : "id уровня резолвится не в Level, а в " + __ClassName(__lv_raw_P1) + " — причина (дрейф модели или неверный id) не определена рантаймом")); }
         __el_P1 = Autodesk.Revit.DB.Plumbing.Pipe.Create(doc, new ElementId(300), new ElementId(200), __lv_P1.Id, P(0, 0, 2700), P(3000, 0, 2700));
         if (__el_P1 == null) { __t.RollBack(); return __Refuse("P1", "Pipe.Create вернул null"); }
         try { Parameter __dp_P1 = __el_P1.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM); if (__dp_P1 != null && !__dp_P1.IsReadOnly) __dp_P1.Set(U(50.0)); } catch { }

@@ -122,7 +122,15 @@ public sealed class RoslynCompiler
     private static readonly CSharpCompilationOptions CompilationOptions = new(
         OutputKind.DynamicallyLinkedLibrary,
         optimizationLevel: OptimizationLevel.Release,
-        allowUnsafe: false
+        allowUnsafe: false,
+        platform: Platform.AnyCpu,
+        nullableContextOptions: NullableContextOptions.Disable
+    );
+
+    private static readonly CSharpParseOptions ParseOptions = new(
+        languageVersion: LanguageVersion.CSharp10,
+        documentationMode: DocumentationMode.None,
+        kind: SourceCodeKind.Regular
     );
 
     public RoslynCompiler(ILogger<RoslynCompiler> logger)
@@ -153,7 +161,7 @@ public sealed class RoslynCompiler
 
     /// <summary>
     /// Compiles the given C# code against the specified Revit version.
-    /// Returns only diagnostics — no assembly is emitted.
+    /// Runs the same full Emit gate as the Bridge and returns diagnostics.
     /// </summary>
     public CompileResult Compile(string code, string revitVersion)
     {
@@ -175,7 +183,7 @@ public sealed class RoslynCompiler
         allRefs.AddRange(systemRefs);
         allRefs.AddRange(revitApiRefs);
 
-        var syntaxTree = CSharpSyntaxTree.ParseText(code);
+        var syntaxTree = CSharpSyntaxTree.ParseText(code, ParseOptions);
 
         var compilation = CSharpCompilation.Create(
             assemblyName: $"CompileCheck_{Guid.NewGuid():N}",
@@ -183,7 +191,9 @@ public sealed class RoslynCompiler
             references: allRefs,
             options: CompilationOptions);
 
-        var diagnostics = compilation.GetDiagnostics();
+        using var assemblyStream = new MemoryStream();
+        var emitResult = compilation.Emit(assemblyStream);
+        var diagnostics = emitResult.Diagnostics;
 
         var errors = diagnostics
             .Where(d => d.Severity == DiagnosticSeverity.Error)

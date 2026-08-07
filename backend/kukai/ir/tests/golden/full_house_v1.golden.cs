@@ -204,7 +204,8 @@ using (Transaction __t = new Transaction(doc, "KIR: полный дом v1"))
                 __post.Add("R1: room placement mismatch (geometry)");
             if (__el_R1.Area <= 1e-6)
                 __post.Add("R1: room is not enclosed (semantic)");
-            if (__el_R1.Name != "Зал") __post.Add("R1: name mismatch");
+            Parameter __rnm_R1 = __el_R1.get_Parameter(BuiltInParameter.ROOM_NAME);
+            if (__rnm_R1 == null || __rnm_R1.AsString() != "Зал") __post.Add("R1: name mismatch");
         }
         // post T1
         {
@@ -350,7 +351,9 @@ using (Transaction __t = new Transaction(doc, "KIR: полный дом v1"))
 {
     var __rb = new Dictionary<string, object>();
     __rb["id"] = __el_R1.Id.ToString();
-    __rb["name"] = __el_R1.Name;
+    try { Parameter __rnb_R1 = __el_R1.get_Parameter(BuiltInParameter.ROOM_NAME);
+        __rb["name"] = __rnb_R1 != null ? __rnb_R1.AsString() : __el_R1.Name; } catch { }
+    try { __rb["name_and_number"] = __el_R1.Name; } catch { }
     try { __rb["area_m2"] = Math.Round(UnitUtils.ConvertFromInternalUnits(__el_R1.Area, UnitTypeId.SquareMeters), 2); } catch { }
     __results["R1"] = __rb;
 }

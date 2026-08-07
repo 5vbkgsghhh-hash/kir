@@ -13,13 +13,14 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator, Mapping
 
 from kukai.ir.revit_read_helpers import ELEMENT_LEVEL_HELPERS_CS
 
-from .census import NO_CATEGORY_KEY
+from .census_contract import NO_CATEGORY_KEY
 from .geometry_store import GEOMETRY_HELPER_CS, parse_geometry
 from .schema import (
     EXTRACT_BATCH,
@@ -509,6 +510,61 @@ _CATEGORY_SPECS = (
     CategorySpec("OST_TelephoneDevices",
                  ".OfCategory(BuiltInCategory.OST_TelephoneDevices)",
                  discipline="electrical"),
+
+    # ── ПРОЁМЫ КАК ОТДЕЛЬНЫЕ ЭЛЕМЕНТЫ (wave/opening, 03.08.2026) ──────────
+    #
+    # ЕДИНСТВЕННАЯ МОЛЧАЛИВАЯ ПОТЕРЯ, найденная обходом восьми зданий. Проём
+    # делается ДВУМЯ механизмами: внутренней петлёй эскиза носителя (это мы
+    # умеем — 60 create_floor с непустым holes в трёх зданиях) и ОТДЕЛЬНЫМ
+    # элементом Opening. Второго не существовало для чтения вовсе, и это
+    # хуже, чем «не поднимается»: элемент не извлекается ⇒ атома не даёт ⇒
+    # его нет ни в одном ранжире причин, а НОСИТЕЛЬ при этом поднимается
+    # обычным create_floor/create_wall и пересобирается СПЛОШНЫМ. Приёмка L2
+    # такое не ловит по построению (acceptance.py прямым текстом: геометрию
+    # не смотрит вообще), то есть тихо неверный результат снаружи неотличим
+    # от успеха.
+    #
+    # ЧТО ЗАМЕРЕНО (перепись восьми зданий): OST_FloorOpening 10,
+    # OST_ShaftOpening 9, OST_SWallRectOpening 9, OST_RoofOpening 7 —
+    # 35 элементов в 3 зданиях из 6. Входят ровно эти четыре и ни одной
+    # строкой больше: OST_CeilingOpening, OST_ArcWallRectOpening,
+    # OST_ColumnOpening и OST_StructuralFramingOpening КОМПИЛИРУЮТСЯ (см.
+    # ниже), но ни один замер не говорит, что за ними стоит, — тот же порог,
+    # по которому 28.07 в таблицу не пустили OST_CurtainGrids.
+    #
+    # ИМЕНА ПРОВЕРЕНЫ КОМПИЛЯЦИЕЙ 6/6 (:52412, 2021-2026), а не по памяти:
+    # членов BuiltInCategory в RevitAPI.xml нет вовсе. Тем же прогоном взят
+    # ОТРИЦАТЕЛЬНЫЙ контроль — выдуманное OST_TotallyMadeUpOpening не
+    # компилируется ни на одной версии, то есть оракул различает.
+    #
+    # ТРИ ИЗ ЧЕТЫРЁХ ИМЕЮТ ОП (`create_opening`, ops_opening.py) и дают
+    # `source_contract_gap`: операция есть, а L0 1.0 не несёт ни
+    # Opening.Host, ни границы проёма. ЧЕТВЁРТАЯ — OST_ShaftOpening —
+    # входит БЕЗ опа и даёт `no_lifter`, и это правда: шахту не строит
+    # никакая операция реестра (причина в ops_opening.VARIETIES_NOT_TAKEN —
+    # её связь с парой уровней нечем подтвердить с построенного элемента).
+    # Прецедент ровно этой формы уже записан выше по файлу: «ЧЕТЫРЕ СТРОКИ
+    # ВХОДЯТ БЕЗ ОПА, И ЭТО НАЗВАНО ВСЛУХ ... Это ХУЖЕ поднятой операции и
+    # ЛУЧШЕ невидимости».
+    #
+    # ДОПИСАНО В КОНЕЦ, как и всё выше: порядок кортежа — часть замороженного
+    # формата возобновления (цикл идёт по EXTRACT_CATEGORIES[len(processed):],
+    # то есть категория адресуется ИНДЕКСОМ). Рост таблицы 73 -> 77 обязан
+    # получить свою ступень диалекта — она заведена в schema.py
+    # (kir-decompile-l0-dialect/7), иначе свежий слепок не откроется своим же
+    # читателем.
+    CategorySpec("OST_SWallRectOpening",
+                 ".OfCategory(BuiltInCategory.OST_SWallRectOpening)",
+                 discipline="architectural"),
+    CategorySpec("OST_FloorOpening",
+                 ".OfCategory(BuiltInCategory.OST_FloorOpening)",
+                 discipline="architectural"),
+    CategorySpec("OST_RoofOpening",
+                 ".OfCategory(BuiltInCategory.OST_RoofOpening)",
+                 discipline="architectural"),
+    CategorySpec("OST_ShaftOpening",
+                 ".OfCategory(BuiltInCategory.OST_ShaftOpening)",
+                 discipline="architectural"),
 )
 EXTRACT_CATEGORIES = tuple(spec.name for spec in _CATEGORY_SPECS)
 _SPEC_BY_NAME = {spec.name: spec for spec in _CATEGORY_SPECS}
@@ -1017,9 +1073,38 @@ __result["project_info"] = __project;
 Func<string, string> __Discipline = (__name) =>
 {
     string __upper = (__name ?? "").ToUpperInvariant();
-    var __tokens = new HashSet<string>(
-        Regex.Split(__upper, @"[^\p{L}\p{Nd}]+")
-             .Where(__token => !String.IsNullOrWhiteSpace(__token)));
+    // БЕЗ Regex, и это не вкусовщина. Замер 04.08 на живом устройстве:
+    // голое `Regex` -> CS0103, полное имя -> CS1069 «type has been forwarded
+    // to assembly 'System'».
+    //
+    // ПРИЧИНА ОДНА, А НЕ ДВЕ (первая редакция этого комментария была неверна
+    // и списывала CS0103 на usings): обёртку излучаемого кода строит СЕРВЕР
+    // (`bridge_protocol._WRAPPER_HEADER`), клиент своего списка не имеет
+    // вовсе — `CodeCompiler` сам себя описывает как «receives pre-wrapped
+    // code from server», и все шесть копий обёртки одинаковы и все включают
+    // `System.Text.RegularExpressions`. Значит оба отказа — про ОТСУТСТВУЮЩУЮ
+    // ССЫЛКУ: на .NET Framework 4.8 `Regex` живёт в `System.dll`, которой нет
+    // в замыкании РАЗВЁРНУТОГО у пользователя плагина (в HEAD она есть —
+    // расхождение между деревом и установленным бинарником, а не внутри
+    // дерева). Там же `Stopwatch` и `Stack<T>` — итого 24 места, все найдены
+    // одним проходом переписи после того, как три из них нашлись живьём.
+    //
+    // Разбор по индексам требует только String/Char: `Char.IsLetterOrDigit`
+    // покрывает те же категории Unicode, что `[^\p{L}\p{Nd}]+` в обратную.
+    // Сторож класса — `tests/bridge_reference_closure.py`, профиль `deployed`.
+    var __tokens = new HashSet<string>();
+    int __tokStart = -1;
+    for (int __tokI = 0; __tokI <= __upper.Length; __tokI++)
+    {
+        bool __tokIn = __tokI < __upper.Length
+            && Char.IsLetterOrDigit(__upper[__tokI]);
+        if (__tokIn) { if (__tokStart < 0) __tokStart = __tokI; }
+        else if (__tokStart >= 0)
+        {
+            __tokens.Add(__upper.Substring(__tokStart, __tokI - __tokStart));
+            __tokStart = -1;
+        }
+    }
     if (__tokens.Contains("ОВ") || __tokens.Contains("HVAC") ||
         __tokens.Contains("MECH")) return "mechanical";
     if (__tokens.Contains("ВК") || __tokens.Contains("PLUMB"))
@@ -1441,6 +1526,65 @@ class ExtractionResult:
     completed_categories: tuple[str, ...]
     partial_categories: tuple[str, ...]
     resumed: bool
+    #: Разбивка ВРЕМЕНИ по категориям, ключ — имя категории (см.
+    #: :func:`_timing_totals` о том, что здесь разделяется, а что нет).
+    #: Пустой словарь у резюма завершённого потока: там ничего не читали.
+    timing: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+
+
+#: ГРАНИЦА ЗАМЕРА, ОБЪЯВЛЕННАЯ СЛОВАМИ.
+#:
+#: ``bridge_ms`` — один неделимый отсюда отрезок. Внутри него лежат, по
+#: порядку: отправка в вебсокет, ожидание UI-потока Revit, компиляция тела C#
+#: Roslyn'ом, работа коллектора Revit API, сериализация ответа в JSON на
+#: стороне плагина, обратный транспорт и ``json.loads`` в нашем процессе.
+#: РАЗДЕЛИТЬ ИХ ИЗ ПИТОНА НЕЛЬЗЯ: плагин не возвращает собственного времени
+#: (Stopwatch есть только в ContextCollector и IFCExporter — это другие пути,
+#: не путь декомпайла). Кто захочет разделить — обязан добавить отсчёт В
+#: ПЛАГИН, и это отдельная волна.
+#:
+#: Что ЗАМЕРЯЕТСЯ раздельно и честно:
+#:   ``probe_ms``  — дешёвый вызов пробы (count + max id) той же категории.
+#:                   У него та же постоянная цена вызова (транспорт + Roslyn +
+#:                   попадание в UI-поток), но почти нет сбора и сериализации.
+#:                   Поэтому ``probe_ms/вызов`` — ВЕРХНЯЯ ОЦЕНКА постоянной
+#:                   цены одного обращения к мосту, а ``bridge_ms/pages``
+#:                   минус она — нижняя оценка полезной работы Revit.
+#:                   Верхняя, а не точная: проба тоже гоняет коллектор.
+#:   ``parse_ms``  — НАШ разбор страницы в типы (``_parse_page``).
+#:   ``write_ms``  — НАША запись строк в L0.jsonl вместе с ``fsync``.
+#:   ``bytes``     — сколько L0 прибавил на этой категории (прокси размера
+#:                   ответа: ответ мы уже разобрали, повторно сериализовать
+#:                   его ради размера дороже, чем сам замер).
+_TIMING_KEYS = ("probe_ms", "bridge_ms", "parse_ms", "write_ms")
+
+
+def _new_timing_slot() -> dict[str, float]:
+    return {"probe_ms": 0.0, "bridge_ms": 0.0, "parse_ms": 0.0,
+            "write_ms": 0.0, "pages": 0.0, "bytes": 0.0, "elements": 0.0}
+
+
+def _timing_totals(
+    timing: Mapping[str, Mapping[str, float]],
+) -> dict[str, float]:
+    """Свернуть покатегорийную разбивку в итог прогона.
+
+    ``bridge_ms`` НЕ делится дальше — см. ``_TIMING_KEYS`` выше.  ``our_ms``
+    (parse+write) и ``bridge_ms`` — это ровно та граница, которая решает
+    вопрос «наши оптимизации вообще имеют смысл»: если ``bridge_ms``
+    подавляет, лечится только чтением МЕНЬШЕГО, а не более быстрым питоном.
+    """
+
+    out: dict[str, float] = {key: 0.0 for key in _TIMING_KEYS}
+    out.update({"pages": 0.0, "bytes": 0.0, "elements": 0.0})
+    for slot in timing.values():
+        for key in out:
+            out[key] += float(slot.get(key) or 0.0)
+    out["our_ms"] = out["parse_ms"] + out["write_ms"]
+    out["bridge_ms_share"] = (
+        round(out["bridge_ms"] / (out["bridge_ms"] + out["our_ms"]), 4)
+        if (out["bridge_ms"] + out["our_ms"]) > 0 else 0.0)
+    return {key: round(value, 3) for key, value in out.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -2490,9 +2634,15 @@ async def extract_document(
                 category for category in EXTRACT_CATEGORIES
                 if state["category_states"][category] ==
                 CategoryState.COMPLETE.value)
+            # Готовый поток заново не читают — отдаём разбивку ТОГО чтения,
+            # которое его наполнило, а не пустую (иначе резюм завершённого
+            # слепка выглядел бы как бесплатный).
+            _done_timing = state.get("timing")
             return ExtractionResult(
                 output, checkpoint, int(state["element_count"]),
-                complete, (), resumed=True)
+                complete, (), resumed=True,
+                timing=(dict(_done_timing)
+                        if isinstance(_done_timing, Mapping) else {}))
 
     if state["header_written"]:
         metadata = _read_header(output)
@@ -2525,6 +2675,15 @@ async def extract_document(
     processed = list(state["processed_categories"])
     category_states = dict(state["category_states"])
     element_count = int(state["element_count"])
+    # Разбивка ПЕРЕЖИВАЕТ резюм: чекпойнты, снятые до этой волны, ключа не
+    # несут, и его отсутствие значит «не мерили», а не «ноль миллисекунд».
+    # Категории, дочитанные вторым заходом, дописываются к первым — сумма
+    # тогда описывает РАБОТУ, а не один календарный отрезок.
+    _prior_timing = state.get("timing")
+    timing: dict[str, dict[str, float]] = (
+        {str(key): {str(k): float(v) for k, v in dict(value).items()}
+         for key, value in _prior_timing.items()}
+        if isinstance(_prior_timing, Mapping) else {})
     # Запас ожидания окна ОДИН на прогон (см. _WindowWaitBudget): мёртвое
     # окно обязано стоить пять минут ровно один раз, а не пять минут на
     # каждую из полусотни категорий. Конвейер передаёт СВОЙ запас, чтобы
@@ -2544,17 +2703,26 @@ async def extract_document(
             # `parameter -> [шесть исходов]`. Агрегат страниц, а не элементов,
             # поэтому его размер не зависит от размера модели.
             receipt_slots: dict[str, list[int]] = {}
+            # ПРИБОР. Часы заводятся ДО пробы и живут ровно одну категорию:
+            # разбивка обязана пережить падение, поэтому она уезжает в
+            # чекпойнт вместе со смещением, а не копится в памяти до конца
+            # сорокаминутного чтения.
+            slot_t = _new_timing_slot()
+            _bytes_at_start = handle.tell()
             try:
+                _t0 = time.monotonic()
                 probe_payload = await _execute_awaiting_window(
                     executor,
                     build_category_probe_cs(category, link_title=link_title),
                     timeout_ms=timeout_ms, retries=retries,
                     budget=window_budget, what=f"проба {category}")
+                slot_t["probe_ms"] += (time.monotonic() - _t0) * 1000.0
                 expected_count, scopes = _parse_probe(probe_payload)
                 for scope in scopes:
                     scope_count = 0
                     cursor: int | None = None
                     while True:
+                        _t0 = time.monotonic()
                         page_payload = await _execute_awaiting_window(
                             executor,
                             build_category_batch_cs(
@@ -2565,9 +2733,14 @@ async def extract_document(
                             budget=window_budget,
                             what=(f"страница {category}"
                                   f" scope={scope.key!r} after={cursor}"))
+                        _t1 = time.monotonic()
+                        slot_t["bridge_ms"] += (_t1 - _t0) * 1000.0
+                        slot_t["pages"] += 1.0
                         elements, has_more, next_cursor, receipts = _parse_page(
                             page_payload, category=category, scope=scope,
                             after_element_id=cursor)
+                        _t2 = time.monotonic()
+                        slot_t["parse_ms"] += (_t2 - _t1) * 1000.0
                         for receipt in receipts:
                             slots = receipt_slots.setdefault(
                                 receipt.parameter, [0] * len(SECTION_RECEIPT_OUTCOMES))
@@ -2581,6 +2754,8 @@ async def extract_document(
                             })
                             scope_count += 1
                             extracted_count += 1
+                        slot_t["write_ms"] += (
+                            time.monotonic() - _t2) * 1000.0
                         if not has_more:
                             break
                         cursor = next_cursor
@@ -2615,9 +2790,15 @@ async def extract_document(
             except L0SchemaError as exc:
                 raise ExtractionProtocolError(
                     f"{category}: {exc}") from exc
+            _t3 = time.monotonic()
             _write_record(handle, {
                 "record": "category_status", "status": status.to_dict()})
             committed_offset = _sync_file(handle)
+            slot_t["write_ms"] += (time.monotonic() - _t3) * 1000.0
+            slot_t["bytes"] = float(committed_offset - _bytes_at_start)
+            slot_t["elements"] = float(extracted_count)
+            timing[category] = {
+                key: round(value, 3) for key, value in slot_t.items()}
             processed.append(category)
             category_states[category] = category_state.value
             element_count += extracted_count
@@ -2626,6 +2807,10 @@ async def extract_document(
                 "processed_categories": list(processed),
                 "category_states": dict(category_states),
                 "element_count": element_count,
+                # Разбивка едет в чекпойнт, а не в L0: L0 — детерминированный
+                # артефакт (I4), и настенное время в нём сделало бы два
+                # одинаковых чтения побайтово разными.
+                "timing": dict(timing),
             })
             _atomic_write_json(checkpoint, state)
             if on_progress is not None:
@@ -2674,7 +2859,8 @@ async def extract_document(
         category for category in EXTRACT_CATEGORIES
         if category_states[category] == CategoryState.PARTIAL.value)
     return ExtractionResult(
-        output, checkpoint, element_count, complete, partial, resumed)
+        output, checkpoint, element_count, complete, partial, resumed,
+        timing=timing)
 
 
 @dataclass(frozen=True, slots=True)

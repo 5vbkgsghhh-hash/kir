@@ -408,6 +408,30 @@ ANNOTATION_EXTRACT_HELPER_CS = r"""
 // Точка вида считается ТОЙ ЖЕ формулой, что и свидетель марки:
 //   rel = P - view.Origin;  u = rel·view.RightDirection;  v = rel·view.UpDirection
 // Провод несёт СЫРЫЕ футы; пересчёт в мм принадлежит офлайн-разборщику.
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element/Curve/Surface и у исключений — это полное имя
+// типа CLR: из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ,
+// WorksetId, ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и
+// ни один из них сюда не передаётся. Исключение дописывает ": сообщение" и
+// стек, поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __anClassName = (__ancnObj) =>
+{
+    if (__ancnObj == null) return "";
+    string __ancn = __ancnObj.ToString();
+    if (__ancn == null) return "";
+    int __ancnCut = __ancn.IndexOf((char)10);
+    if (__ancnCut >= 0) __ancn = __ancn.Substring(0, __ancnCut);
+    __ancnCut = __ancn.IndexOf(':');
+    if (__ancnCut >= 0) __ancn = __ancn.Substring(0, __ancnCut);
+    __ancn = __ancn.Trim();
+    __ancnCut = __ancn.LastIndexOf('.');
+    return __ancnCut >= 0 && __ancnCut + 1 < __ancn.Length
+        ? __ancn.Substring(__ancnCut + 1) : __ancn;
+};
 Func<ElementId, string> __anValidIdString = (__id) =>
     (__id == null || __id == ElementId.InvalidElementId)
         ? null : __id.ToString();
@@ -418,7 +442,7 @@ Func<double, bool> __anFinite = (__value) =>
 
 _ANNOTATION_EXTRACT_BODY_CS = r"""
 long __anCallBudgetMs = __AN_CALL_BUDGET_MS__L;
-var __anCallWatch = System.Diagnostics.Stopwatch.StartNew();
+long __anCallWatchT0 = DateTime.UtcNow.Ticks;
 
 var __anFailures = new List<object>();
 Action<string, string, string> __anFail =
@@ -437,7 +461,7 @@ bool __anBudgetOut = false;
 foreach (string __anRaw in __anIds)
 {
     if (__anBudgetOut
-        || __anCallWatch.ElapsedMilliseconds >= __anCallBudgetMs)
+        || ((DateTime.UtcNow.Ticks - __anCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __anCallBudgetMs)
     {
         __anBudgetOut = true;
         __anFail(__anRaw, "call_budget_exhausted", "call_budget_exhausted");
@@ -474,7 +498,7 @@ foreach (string __anRaw in __anIds)
         if (__anText == null)
         {
             __anFail(__anRaw,
-                     "not a TextElement: " + __anEl.GetType().Name,
+                     "not a TextElement: " + __anClassName(__anEl),
                      "element_kind_mismatch");
             continue;
         }
@@ -560,7 +584,7 @@ foreach (string __anRaw in __anIds)
     {
         __anFail(__anRaw,
                  "annotation read failed at " + __anStep + ": "
-                     + __anEx.GetType().Name,
+                     + __anClassName(__anEx),
                  "read_failed");
     }
 }

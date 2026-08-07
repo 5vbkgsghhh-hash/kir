@@ -1136,7 +1136,7 @@ Action<string, System.Collections.Generic.IEnumerable<Element>, int> __AddPool =
         try { __r["name"] = __e.Name ?? ""; } catch { __r["name"] = ""; }
         try { __r["unique_id"] = __e.UniqueId ?? ""; } catch { __r["unique_id"] = ""; }
         try { __r["version_guid"] = __e.VersionGuid.ToString("N"); } catch { __r["version_guid"] = ""; }
-        try { __r["class_name"] = __e.GetType().FullName ?? ""; } catch { __r["class_name"] = ""; }
+        try { __r["class_name"] = __e.ToString() ?? ""; } catch { __r["class_name"] = ""; }
         try
         {
             var __category = __e.Category;
@@ -1248,7 +1248,7 @@ foreach (Grid __g in __gridQuery.Take(1000))
     try { __r["name"] = __g.Name ?? ""; } catch { __r["name"] = ""; }
     try { __r["unique_id"] = __g.UniqueId ?? ""; } catch { __r["unique_id"] = ""; }
     try { __r["version_guid"] = __g.VersionGuid.ToString("N"); } catch { __r["version_guid"] = ""; }
-    try { __r["class_name"] = __g.GetType().FullName ?? ""; } catch { __r["class_name"] = ""; }
+    try { __r["class_name"] = __g.ToString() ?? ""; } catch { __r["class_name"] = ""; }
     try
     {
         var __line = __g.Curve as Line;

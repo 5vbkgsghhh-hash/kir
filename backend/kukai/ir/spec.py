@@ -13,6 +13,9 @@ REGISTRY_MODULES.md for how a wave adds an op.
 """
 from __future__ import annotations
 
+from types import MappingProxyType
+from typing import Mapping
+
 # Re-export the shared base so `spec.KINDS`, `spec.OpSpec`, `spec.DEFAULTS`,
 # `spec.WRITE_FAMILIES`, ... all keep resolving exactly as before.
 from kukai.ir.registry_base import *  # noqa: F401,F403
@@ -25,30 +28,61 @@ from kukai.ir.registry_base import (  # explicit, for this module + linters
 from kukai.ir import (  # noqa: E402
     ops_authoring, ops_contour, ops_connect, ops_mep,
     ops_doc, ops_struct, ops_annotation, ops_families, ops_arch,
-    ops_shape,
+    ops_shape, ops_room, ops_opening,
 )
 
 _REGISTRY_MODULES = (
     ops_authoring, ops_contour, ops_connect, ops_mep,
     ops_doc, ops_struct, ops_annotation, ops_families, ops_arch,
-    ops_shape,
+    ops_shape, ops_room, ops_opening,
 )
 
 # Aggregate — duplicate op names across modules are a hard error (each op lives
 # in exactly one ops_*.py; this is what makes concurrent-wave edits safe).
-OPS: dict[str, OpSpec] = {}
-for _mod in _REGISTRY_MODULES:
-    for _op in _mod.OPS:
-        if _op.name in OPS:
-            raise AssertionError(
-                f"duplicate op name {_op.name!r} across registry modules "
-                f"(module {_mod.__name__}); each op must live in exactly one ops_*.py")
-        OPS[_op.name] = _op
+def _build_ops() -> Mapping[str, OpSpec]:
+    built: dict[str, OpSpec] = {}
+    for module in _REGISTRY_MODULES:
+        for op in module.OPS:
+            if op.name in built:
+                raise AssertionError(
+                    f"duplicate op name {op.name!r} across registry modules "
+                    f"(module {module.__name__}); each op must live in "
+                    "exactly one ops_*.py")
+            built[op.name] = op
+    return MappingProxyType(built)
+
+
+OPS: Mapping[str, OpSpec] = _build_ops()
+
+
+#: Ops that OWN THEIR TRANSACTION SCOPE and therefore must be the sole op of
+#: their program (KIR-L002 / `diag.PLAN_SOLO_OP`).
+#:
+#: `create_stairs` drives `StairsEditScope`, which opens and commits its own
+#: transactions; it cannot nest inside the shared program transaction, so a
+#: neighbour in the same program is unbuildable BY REVIT, not by our taste.
+#:
+#: ONE TRUTH, FOUR READERS. Until 2026-08-04 this fact was spelled three times
+#: in three places — a hardcoded `op["op"] == "create_stairs"` in the emitter
+#: (`authoring.emit_program`), a private `_SOLO_OPS` in
+#: `decompile/materialize.py`, and prose in `tool_doc`/`course`. The plan stage
+#: knew it NOWHERE, so the refusal only existed AFTER grounding: the sandbox
+#: assembled the program, `plan_program` accepted it, and the model met the wall
+#: only on a live device (measured 04.08 — `plan_program` accepted
+#: `[create_stairs, create_wall]` without a word). A fact stated in N places
+#: drifts in N-1 of them; stated here it is read by plan, emit and materialize
+#: alike.
+SOLO_OPS: frozenset[str] = frozenset({"create_stairs"})
 
 
 def _lint_registry() -> None:
     """Registry invariants, enforced at import on the AGGREGATE (RISK R10,
     bare-action ban 13.2, §16 placeholder ban)."""
+    for name in SOLO_OPS:
+        if name not in OPS:
+            raise AssertionError(
+                f"SOLO_OPS names {name!r}, which is not a registered op — "
+                f"a solo rule about a nonexistent op is a rule nobody enforces")
     for op in OPS.values():
         if not isinstance(op.effect, EffectKind):
             raise AssertionError(f"{op.name}: effect must be typed")

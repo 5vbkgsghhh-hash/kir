@@ -289,6 +289,30 @@ def _csharp_string(value: str) -> str:
 
 MEP_SYSTEM_HELPER_CS = r"""
 // KIR DECOMPILE — read-only MEP system helpers. Никаких транзакций.
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element/Curve/Surface и у исключений — это полное имя
+// типа CLR: из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ,
+// WorksetId, ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и
+// ни один из них сюда не передаётся. Исключение дописывает ": сообщение" и
+// стек, поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __msClassName = (__mscnObj) =>
+{
+    if (__mscnObj == null) return "";
+    string __mscn = __mscnObj.ToString();
+    if (__mscn == null) return "";
+    int __mscnCut = __mscn.IndexOf((char)10);
+    if (__mscnCut >= 0) __mscn = __mscn.Substring(0, __mscnCut);
+    __mscnCut = __mscn.IndexOf(':');
+    if (__mscnCut >= 0) __mscn = __mscn.Substring(0, __mscnCut);
+    __mscn = __mscn.Trim();
+    __mscnCut = __mscn.LastIndexOf('.');
+    return __mscnCut >= 0 && __mscnCut + 1 < __mscn.Length
+        ? __mscn.Substring(__mscnCut + 1) : __mscn;
+};
 Func<ElementId, string> __msValidIdString = (__id) =>
     (__id == null || __id == ElementId.InvalidElementId)
         ? null : __id.ToString();
@@ -297,7 +321,7 @@ Func<ElementId, string> __msValidIdString = (__id) =>
 
 _MEP_SYSTEM_BODY_CS = r"""
 long __msCallBudgetMs = __MS_CALL_BUDGET_MS__L;
-var __msCallWatch = System.Diagnostics.Stopwatch.StartNew();
+long __msCallWatchT0 = DateTime.UtcNow.Ticks;
 
 var __msFailures = new List<object>();
 Action<string, string, string> __msFail =
@@ -316,7 +340,7 @@ bool __msBudgetOut = false;
 foreach (string __msRaw in __msIds)
 {
     if (__msBudgetOut
-        || __msCallWatch.ElapsedMilliseconds >= __msCallBudgetMs)
+        || ((DateTime.UtcNow.Ticks - __msCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __msCallBudgetMs)
     {
         __msBudgetOut = true;
         __msFail(__msRaw, "call_budget_exhausted", "call_budget_exhausted");
@@ -350,7 +374,7 @@ foreach (string __msRaw in __msIds)
         Autodesk.Revit.DB.MEPCurve __msCurve = __msEl as Autodesk.Revit.DB.MEPCurve;
         if (__msCurve == null)
         {
-            __msFail(__msRaw, "not an MEPCurve: " + __msEl.GetType().Name,
+            __msFail(__msRaw, "not an MEPCurve: " + __msClassName(__msEl),
                      "element_kind_mismatch");
             continue;
         }
@@ -392,7 +416,7 @@ foreach (string __msRaw in __msIds)
     {
         __msFail(__msRaw,
                  "MEP system read failed at " + __msStep + ": "
-                     + __msEx.GetType().Name,
+                     + __msClassName(__msEx),
                  "read_failed");
     }
 }

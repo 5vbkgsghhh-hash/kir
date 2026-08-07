@@ -1,0 +1,9 @@
+{
+  "schema_version": "target-profile-manifest-archive/1",
+  "archives": [
+    {
+      "manifest_digest": "4fe7a0b9b39a96eaf2f81a111533866a649306cd5f9c1678f1d480c8e6ef838f",
+      "resource": "target_profiles.archive.4fe7a0b9b39a96eaf2f81a111533866a649306cd5f9c1678f1d480c8e6ef838f.v1.json"
+    }
+  ]
+}

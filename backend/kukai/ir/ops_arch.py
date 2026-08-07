@@ -83,10 +83,10 @@ from kukai.ir.registry_base import *  # noqa: F401,F403 (OpSpec/ParamSpec/...)
 #: члена, потому что замер даёт ровно два: .Left/.Right/.Landing/.Run/.None/
 #: .Center не компилируются ни на одной из шести версий, хотя «левое/правое»
 #: — первое, что приходит в голову и что написал бы человек по памяти.
-RAILING_PLACEMENT_MEMBERS = {
+RAILING_PLACEMENT_MEMBERS = freeze_registry_mapping({
     "treads": "Treads",
     "stringer": "Stringer",
-}
+})
 
 OPS = [
     OpSpec(

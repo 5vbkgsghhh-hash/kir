@@ -525,6 +525,30 @@ TAG_EXTRACT_HELPER_CS = r"""
 // Точка головы считается ТОЙ ЖЕ формулой, что и прямой эмиттер:
 //   rel = P - view.Origin;  u = rel·view.RightDirection;  v = rel·view.UpDirection
 // Провод несёт СЫРЫЕ футы; пересчёт в мм принадлежит офлайн-разборщику.
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element/Curve/Surface и у исключений — это полное имя
+// типа CLR: из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ,
+// WorksetId, ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и
+// ни один из них сюда не передаётся. Исключение дописывает ": сообщение" и
+// стек, поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __tgClassName = (__tgcnObj) =>
+{
+    if (__tgcnObj == null) return "";
+    string __tgcn = __tgcnObj.ToString();
+    if (__tgcn == null) return "";
+    int __tgcnCut = __tgcn.IndexOf((char)10);
+    if (__tgcnCut >= 0) __tgcn = __tgcn.Substring(0, __tgcnCut);
+    __tgcnCut = __tgcn.IndexOf(':');
+    if (__tgcnCut >= 0) __tgcn = __tgcn.Substring(0, __tgcnCut);
+    __tgcn = __tgcn.Trim();
+    __tgcnCut = __tgcn.LastIndexOf('.');
+    return __tgcnCut >= 0 && __tgcnCut + 1 < __tgcn.Length
+        ? __tgcn.Substring(__tgcnCut + 1) : __tgcn;
+};
 Func<ElementId, string> __tgValidIdString = (__id) =>
     (__id == null || __id == ElementId.InvalidElementId)
         ? null : __id.ToString();
@@ -587,7 +611,7 @@ _TAG_TARGET_SPATIAL_CS = r"""
             {
                 __tgFail(__tgRaw,
                          "unknown SpatialElementTag subclass: "
-                             + __tgSpa.GetType().Name,
+                             + __tgClassName(__tgSpa),
                          "element_kind_mismatch");
                 continue;
             }
@@ -668,7 +692,7 @@ __TAG_TARGET_SPATIAL__
 
 _TAG_EXTRACT_BODY_CS = r"""
 long __tgCallBudgetMs = __TG_CALL_BUDGET_MS__L;
-var __tgCallWatch = System.Diagnostics.Stopwatch.StartNew();
+long __tgCallWatchT0 = DateTime.UtcNow.Ticks;
 
 var __tgFailures = new List<object>();
 Action<string, string, string> __tgFail =
@@ -687,7 +711,7 @@ bool __tgBudgetOut = false;
 foreach (string __tgRaw in __tgIds)
 {
     if (__tgBudgetOut
-        || __tgCallWatch.ElapsedMilliseconds >= __tgCallBudgetMs)
+        || ((DateTime.UtcNow.Ticks - __tgCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __tgCallBudgetMs)
     {
         __tgBudgetOut = true;
         __tgFail(__tgRaw, "call_budget_exhausted", "call_budget_exhausted");
@@ -730,7 +754,7 @@ foreach (string __tgRaw in __tgIds)
         if (__tgInd == null && __tgSpa == null)
         {
             __tgFail(__tgRaw,
-                     "not a tag element: " + __tgEl.GetType().Name,
+                     "not a tag element: " + __tgClassName(__tgEl),
                      "element_kind_mismatch");
             continue;
         }
@@ -840,7 +864,7 @@ __TAG_TARGET_BLOCK__
     {
         __tgFail(__tgRaw,
                  "tag read failed at " + __tgStep + ": "
-                     + __tgEx.GetType().Name,
+                     + __tgClassName(__tgEx),
                  "read_failed");
     }
 }

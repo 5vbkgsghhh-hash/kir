@@ -618,11 +618,18 @@ class CurveCSharpEmitterTests(unittest.TestCase):
     def test_cooperative_element_and_call_budget_harness_is_emitted(
             self) -> None:
         for token in (
-            "System.Diagnostics.Stopwatch.StartNew()",
+            # Budgets are timed with mscorlib only. Stopwatch lives in
+            # System.dll, which is absent from the reference closure on part of
+            # the fleet — measured live 2026-08-04, CS1069 "forwarded to
+            # assembly 'System'". Full qualification does not help: CS1069 is a
+            # REFERENCE fault, not a using fault. See
+            # tests/bridge_reference_closure.py.
+            "DateTime.UtcNow.Ticks",
+            "TimeSpan.TicksPerMillisecond",
             "long __cvElementBudgetMs = 2000L;",
             "long __cvCallBudgetMs = 20000L;",
-            "__cvElementWatch.ElapsedMilliseconds",
-            "__cvCallWatch.ElapsedMilliseconds",
+            "__cvElementWatchT0",
+            "__cvCallWatchT0",
             '"time_budget_exceeded"',
             '"call_budget_exhausted"',
             '__row["elapsed_ms"] = __cvBudgetElapsed',

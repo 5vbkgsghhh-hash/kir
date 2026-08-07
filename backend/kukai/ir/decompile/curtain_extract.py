@@ -1754,9 +1754,33 @@ Func<XYZ, bool> __cwFiniteXYZ = (__point) =>
 Func<XYZ, object> __cwPoint = (__point) => (object)new double[] {
     __cwMM(__point.X), __cwMM(__point.Y), __cwMM(__point.Z)
 };
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element/Curve/Surface и у исключений — это полное имя
+// типа CLR: из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ,
+// WorksetId, ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и
+// ни один из них сюда не передаётся. Исключение дописывает ": сообщение" и
+// стек, поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __cwClassName = (__cwcnObj) =>
+{
+    if (__cwcnObj == null) return "";
+    string __cwcn = __cwcnObj.ToString();
+    if (__cwcn == null) return "";
+    int __cwcnCut = __cwcn.IndexOf((char)10);
+    if (__cwcnCut >= 0) __cwcn = __cwcn.Substring(0, __cwcnCut);
+    __cwcnCut = __cwcn.IndexOf(':');
+    if (__cwcnCut >= 0) __cwcn = __cwcn.Substring(0, __cwcnCut);
+    __cwcn = __cwcn.Trim();
+    __cwcnCut = __cwcn.LastIndexOf('.');
+    return __cwcnCut >= 0 && __cwcnCut + 1 < __cwcn.Length
+        ? __cwcn.Substring(__cwcnCut + 1) : __cwcn;
+};
 Func<Exception, string> __cwError = (__error) =>
 {
-    string __message = __error.GetType().Name + ": " + (__error.Message ?? "");
+    string __message = __cwClassName(__error) + ": " + (__error.Message ?? "");
     return __message.Length <= 300 ? __message : __message.Substring(0, 300);
 };
 // A straight bound Line becomes ("line", p0, p1); anything else is the honest
@@ -1794,7 +1818,7 @@ _CURTAIN_EXTRACT_BODY_CS = r"""
 var __cwRequestedIds = new string[] { __CW_WALL_IDS__ };
 long __cwElementBudgetMs = __CW_ELEMENT_BUDGET_MS__L;
 long __cwCallBudgetMs = __CW_CALL_BUDGET_MS__L;
-var __cwCallWatch = System.Diagnostics.Stopwatch.StartNew();
+long __cwCallWatchT0 = DateTime.UtcNow.Ticks;
 
 // Носителей витражной сетки в Revit ТРИ РОДА, а не один: стена, витражная
 // система, кровля. Пока коллектор смотрел только на стены, панели остальных
@@ -1809,13 +1833,13 @@ var __cwHostCats = new BuiltInCategory[] {
 };
 foreach (BuiltInCategory __cwCat in __cwHostCats)
 {
-    if (__cwCallWatch.ElapsedMilliseconds >= __cwCallBudgetMs) break;
+    if (((DateTime.UtcNow.Ticks - __cwCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __cwCallBudgetMs) break;
     if (__cwFound.Count == __cwRequestedSet.Count) break;
     foreach (Element __element in new FilteredElementCollector(__src)
              .OfCategory(__cwCat)
              .WhereElementIsNotElementType())
     {
-        if (__cwCallWatch.ElapsedMilliseconds >= __cwCallBudgetMs) break;
+        if (((DateTime.UtcNow.Ticks - __cwCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __cwCallBudgetMs) break;
         string __id = __element.Id.ToString();
         if (__cwRequestedSet.Contains(__id) && !__cwFound.ContainsKey(__id))
         {
@@ -1925,17 +1949,17 @@ foreach (string __requestedId in __cwRequestedIds)
     string __cwBudgetReason = null;
     long __cwBudgetElapsed = 0L;
 
-    if (__cwCallWatch.ElapsedMilliseconds >= __cwCallBudgetMs)
+    if (((DateTime.UtcNow.Ticks - __cwCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __cwCallBudgetMs)
     {
         __cwBudgetReason = "call_budget_exhausted";
-        __cwBudgetElapsed = __cwCallWatch.ElapsedMilliseconds;
+        __cwBudgetElapsed = ((DateTime.UtcNow.Ticks - __cwCallWatchT0) / TimeSpan.TicksPerMillisecond);
     }
     else
     {
-        var __cwElementWatch = System.Diagnostics.Stopwatch.StartNew();
+        long __cwElementWatchT0 = DateTime.UtcNow.Ticks;
         Func<bool> __cwBudgetExceeded = () =>
-            __cwElementWatch.ElapsedMilliseconds >= __cwElementBudgetMs ||
-            __cwCallWatch.ElapsedMilliseconds >= __cwCallBudgetMs;
+            ((DateTime.UtcNow.Ticks - __cwElementWatchT0) / TimeSpan.TicksPerMillisecond) >= __cwElementBudgetMs ||
+            ((DateTime.UtcNow.Ticks - __cwCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __cwCallBudgetMs;
 
         Element __element = null;
         __cwFound.TryGetValue(__requestedId, out __element);
@@ -2507,15 +2531,15 @@ foreach (string __requestedId in __cwRequestedIds)
             }
         }
 
-        if (__cwElementWatch.ElapsedMilliseconds >= __cwElementBudgetMs)
+        if (((DateTime.UtcNow.Ticks - __cwElementWatchT0) / TimeSpan.TicksPerMillisecond) >= __cwElementBudgetMs)
         {
             __cwBudgetReason = "time_budget_exceeded";
-            __cwBudgetElapsed = __cwElementWatch.ElapsedMilliseconds;
+            __cwBudgetElapsed = ((DateTime.UtcNow.Ticks - __cwElementWatchT0) / TimeSpan.TicksPerMillisecond);
         }
-        else if (__cwCallWatch.ElapsedMilliseconds >= __cwCallBudgetMs)
+        else if (((DateTime.UtcNow.Ticks - __cwCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __cwCallBudgetMs)
         {
             __cwBudgetReason = "call_budget_exhausted";
-            __cwBudgetElapsed = __cwCallWatch.ElapsedMilliseconds;
+            __cwBudgetElapsed = ((DateTime.UtcNow.Ticks - __cwCallWatchT0) / TimeSpan.TicksPerMillisecond);
         }
     }
 

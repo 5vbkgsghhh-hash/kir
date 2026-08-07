@@ -28,6 +28,7 @@ from typing import Any, Mapping
 
 from kukai.ir.acceptance_evidence import (
     ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
+    LEGACY_ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
     AcceptanceEvidence,
     AcceptanceRegistration,
 )
@@ -309,8 +310,10 @@ class AcceptanceJournal:
                     "terminal evidence digest exists without evidence")
             return
         evidence_row = _mapping(evidence, "terminal evidence")
-        if evidence_row.get("schema_version") != (
-                ACCEPTANCE_EVIDENCE_SCHEMA_VERSION):
+        if evidence_row.get("schema_version") not in (
+            LEGACY_ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
+            ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
+        ):
             raise AcceptanceJournalError(
                 "terminal evidence schema is unsupported")
         if evidence_row.get("registration_digest") != registration_digest:

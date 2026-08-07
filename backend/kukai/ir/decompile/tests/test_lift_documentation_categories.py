@@ -270,11 +270,20 @@ class AnnotationsRefuseByTheirOwnName(unittest.TestCase):
         Линии, высотные отметки, уклоны и типовые аннотации вошли в чтение
         сознательно и без опа (так и записано в ee32fb82). Переклеить на них
         новый код значило бы гнаться за красивой причиной вместо верной.
+
+        03.08 СПИСОК СТАЛ КОРОЧЕ НА ОДНУ СТРОКУ, и это НЕ ослабление теста, а
+        его смысл в действии. ``OST_RoomSeparationLines`` ушёл отсюда потому,
+        что у категории ПОЯВИЛСЯ оп (``create_room_separator``, wave/room), и
+        держать её здесь значило бы требовать заведомо ЛОЖНОЙ причины: «опа
+        нет» посылало бы следующего писать операцию, которая написана. Ровно
+        тот же переезд, что 30.07 проделали марки и текстовое примечание, и
+        ровно по той же причине. Её собственные границы теперь проверяются
+        адресно — ``test_lift_room_separator.py``.
         """
 
         opless = (
             "OST_Lines", "OST_SpotElevations", "OST_SpotSlopes",
-            "OST_GenericAnnotation", "OST_RoomSeparationLines",
+            "OST_GenericAnnotation",
         )
         elements = tuple(
             _annotation(str(3000 + i), category)

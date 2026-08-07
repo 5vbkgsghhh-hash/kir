@@ -51,6 +51,28 @@ X_UNCLASSIFIED = "KIR-X999"          # typed envelope for the rest; raw kept in 
 # and make a repair retry look safe even though the model already changed.
 W_POSTCONDITIONS_COMMITTED = "KIR-W004"
 
+# ─── B: sandBox — исполнение АВТОРСКОГО СКРИПТА (kukai/ir/sandbox.py) ────────
+#
+# ПОЧЕМУ НОВАЯ БУКВА, А НЕ P/T/L. Стадия предшествует разбору программы: на
+# ней программы ЕЩЁ НЕТ, есть питон, который её пишет. Отказ адресован другому
+# ремонту — модель чинит СВОЙ скрипт, а не операцию IR, — и указывает на
+# строку исходника, а не на op_index. Смешать это с P (разбор JSON) значило бы
+# послать ремонт не туда, ровно как смешение двух бюджетов в KIR-L001.
+# Занятые буквы на 03.08.2026 (замер грепом по репозиторию): A C D E G L M P S
+# T W X. Свободна B, и она читается: sandBox.
+SANDBOX_SYNTAX = "KIR-B001"             # исходник не разобран Python
+SANDBOX_TIMEOUT = "KIR-B002"            # не завершился: процессорное время/стена
+SANDBOX_MEMORY = "KIR-B003"             # превышен предел памяти (RLIMIT_AS)
+SANDBOX_FORBIDDEN_IMPORT = "KIR-B004"   # импорт вне белого списка
+SANDBOX_FORBIDDEN_BUILTIN = "KIR-B005"  # open/eval/exec/id/... — с причиной
+SANDBOX_RUNTIME = "KIR-B006"            # любое другое исключение скрипта
+SANDBOX_NO_OPS = "KIR-B007"             # отработал, но программы не выдал
+SANDBOX_BAD_RESULT = "KIR-B008"         # выдал не-IR / не JSON-представимое
+SANDBOX_OUTPUT_LIMIT = "KIR-B009"       # транспортный потолок (НЕ бюджет автора)
+SANDBOX_NONDETERMINISM = "KIR-B010"     # адрес объекта в выходе / разные прогонки
+SANDBOX_CRASH = "KIR-B011"              # процесс умер, не сказав ничего
+SANDBOX_UNAVAILABLE = "KIR-B012"        # НАШ дефект: изоляция/язык недоступны
+
 
 @dataclass
 class Diagnostic:
@@ -66,6 +88,10 @@ class Diagnostic:
     # fix is provably safe to auto-apply; otherwise "maybe-incorrect".
     suggested_replacement: Optional[Any] = None
     applicability: Optional[str] = None
+    # Present only for an unexpected internal failure.  It is safe to expose
+    # on the wire and correlates the refusal with the full server-side
+    # traceback without leaking exception text or source payloads.
+    incident_id: Optional[str] = None
 
     def as_dict(self) -> dict:
         return {k: v for k, v in asdict(self).items() if v not in (None, [])}
@@ -76,5 +102,20 @@ class KirRefusal(Exception):
     compile_program() catches it and returns a refused CompileOutput."""
 
     def __init__(self, diags: list[Diagnostic]):
-        super().__init__(f"{len(diags)} diagnostic(s)")
+        # ТЕКСТ ИСКЛЮЧЕНИЯ НЕСЁТ ПРИЧИНУ, а не её количество.
+        #
+        # Замер 03.08: отказ САМОГО ЯЗЫКА (`dsl.py` поднимает `DslRefusal` —
+        # наследника этого класса — на дубле id, на неадресуемой ручке, на
+        # исчерпанном bulk-бюджете) уходит из песочницы через `str(exc)`, и
+        # модель получала «DslRefusal: 1 diagnostic(s)»: место есть, причины
+        # нет. Пересекать границу процесса умеет только текст, поэтому текст
+        # обязан быть содержательным. Коды и сообщения ведущих диагностик
+        # стоят здесь ровно затем; полный список остаётся в `.diagnostics` и
+        # никуда не девается для тех, кто ловит исключение целиком.
+        head = "; ".join(
+            f"{d.code}: {d.message_ru}" if getattr(d, "message_ru", "")
+            else str(getattr(d, "code", "")) for d in diags[:3])
+        if len(diags) > 3:
+            head += f" (и ещё {len(diags) - 3})"
+        super().__init__(head or f"{len(diags)} diagnostic(s)")
         self.diagnostics = diags

@@ -32,13 +32,122 @@ def _top_level_definitions(path: Path) -> set[str]:
     }
 
 
+def _module_name(path: Path) -> str:
+    rel = path.relative_to(BACKEND_ROOT).with_suffix("")
+    parts = list(rel.parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _resolve_import_base(module: str, level: int, imported: str | None) -> str:
+    if not level:
+        return imported or ""
+    package = module.rpartition(".")[0].split(".")
+    keep = len(package) - (level - 1)
+    base = package[:max(keep, 0)]
+    if imported:
+        base.extend(imported.split("."))
+    return ".".join(base)
+
+
+def _compiler_import_graph() -> dict[str, set[str]]:
+    paths = [
+        path for path in IR_ROOT.rglob("*.py")
+        if "tests" not in path.parts
+    ]
+    by_module = {_module_name(path): path for path in paths}
+    # Package facades intentionally re-export their children.  Counting those
+    # convenience edges collapses the whole package into one artificial SCC;
+    # the layer gate measures implementation modules instead.
+    facades = {"kukai.ir", "kukai.ir.decompile", "kukai.ir.course"}
+    nodes = set(by_module) - facades
+    graph = {name: set() for name in nodes}
+    for name in sorted(nodes):
+        for node in ast.walk(_tree(by_module[name])):
+            candidates: set[str] = set()
+            if isinstance(node, ast.Import):
+                candidates.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                base = _resolve_import_base(name, node.level, node.module)
+                candidates.add(base)
+                candidates.update(
+                    f"{base}.{alias.name}" for alias in node.names
+                    if alias.name != "*"
+                )
+            graph[name].update(candidate for candidate in candidates
+                               if candidate in nodes)
+    return graph
+
+
+def _strong_components(
+    graph: dict[str, set[str]],
+) -> set[frozenset[str]]:
+    """Tarjan SCCs with more than one implementation module."""
+    next_index = 0
+    indexes: dict[str, int] = {}
+    lows: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    components: set[frozenset[str]] = set()
+
+    def visit(node: str) -> None:
+        nonlocal next_index
+        indexes[node] = lows[node] = next_index
+        next_index += 1
+        stack.append(node)
+        on_stack.add(node)
+        for target in sorted(graph[node]):
+            if target not in indexes:
+                visit(target)
+                lows[node] = min(lows[node], lows[target])
+            elif target in on_stack:
+                lows[node] = min(lows[node], indexes[target])
+        if lows[node] != indexes[node]:
+            return
+        component: set[str] = set()
+        while stack:
+            target = stack.pop()
+            on_stack.remove(target)
+            component.add(target)
+            if target == node:
+                break
+        if len(component) > 1:
+            components.add(frozenset(component))
+
+    for node in sorted(graph):
+        if node not in indexes:
+            visit(node)
+    return components
+
+
 class AuthorityBoundaryTests(unittest.TestCase):
+    def test_compiler_cycles_cannot_grow(self) -> None:
+        """The KIR implementation-module graph must remain acyclic."""
+        self.assertEqual(_strong_components(_compiler_import_graph()), set())
+
     def test_foundational_modules_do_not_import_orchestrators(self) -> None:
         forbidden_by_module = {
             "authoring_validation.py": {
                 "kukai.ir.authoring",
                 "kukai.ir.serving",
                 "kir_idempotence",
+            },
+            "hosted_geometry.py": {
+                "kukai.ir.authoring",
+                "kukai.ir.compiler",
+                "kukai.ir.ground",
+                "kukai.ir.serving",
+            },
+            "authoring_emit_support.py": {
+                "kukai.ir.arch_emit",
+                "kukai.ir.authoring",
+                "kukai.ir.compiler",
+                "kukai.ir.opening_emit",
+                "kukai.ir.room_emit",
+                "kukai.ir.serving",
+                "kukai.ir.shape_emit",
+                "kukai.ir.struct_emit",
             },
             "idempotence_contract.py": {
                 "kukai.ir.serving",
@@ -131,6 +240,16 @@ class AuthorityBoundaryTests(unittest.TestCase):
 
         authoring_defs = _top_level_definitions(IR_ROOT / "authoring.py")
         self.assertNotIn("validate", authoring_defs)
+        self.assertFalse({
+            "_cs",
+            "_eid",
+            "_level_expr",
+            "_readback_block",
+            "_stamp_block",
+            "_symbol_res",
+            "endpoint_witness",
+            "level_chain_witness",
+        } & authoring_defs)
 
         idempotence_defs = _top_level_definitions(
             BACKEND_ROOT / "kir_idempotence.py")
@@ -140,6 +259,28 @@ class AuthorityBoundaryTests(unittest.TestCase):
             "IdempotenceReport",
             "KindComparison",
         } & idempotence_defs)
+
+    def test_authoring_reexports_the_shared_emission_authority(self) -> None:
+        from kukai.ir import authoring
+        from kukai.ir import authoring_emit_support as support
+
+        names = (
+            "EMIT_ID_RANGE",
+            "EMIT_UNSUPPORTED",
+            "IN_EMIT_DEFAULT",
+            "_cs",
+            "_eid",
+            "_level_expr",
+            "_readback_block",
+            "_stamp_block",
+            "_symbol_res",
+            "bbox_extents_witness",
+            "endpoint_witness",
+            "level_chain_witness",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIs(getattr(authoring, name), getattr(support, name))
 
     def test_historical_import_contracts_are_reexported(self) -> None:
         import kir_idempotence as legacy_idempotence

@@ -17,7 +17,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
+
+
+def _freeze_registry_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            key: _freeze_registry_value(item)
+            for key, item in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_registry_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_registry_value(item) for item in value)
+    return value
+
+
+def freeze_registry_mapping(values: Mapping[Any, Any]) -> Mapping[Any, Any]:
+    """Return a defensive, recursively immutable registry mapping."""
+    return _freeze_registry_value(dict(values))
+
 
 IR_VERSION = "1.0"
 REVIT_VERSIONS = ("2021", "2022", "2023", "2024", "2025", "2026")
@@ -29,7 +49,9 @@ REVIT_VERSIONS = ("2021", "2022", "2023", "2024", "2025", "2026")
 OBJECT_KINDS_ADDED = ("geometry", "document")
 # consult stays in the action vocabulary but routes to the wiki knowledge path;
 # by definition it has no IR ops. The cube renders these cells "route-only".
-ROUTE_ONLY_ACTIONS = {"consult": "wiki-knowledge-path"}
+ROUTE_ONLY_ACTIONS = freeze_registry_mapping({
+    "consult": "wiki-knowledge-path",
+})
 # SPEC §16 verdict: the release-builder's kind-less placeholder «action×-» dies.
 # The cube validator's hard error was right; orphan cards map to
 # geometry/document/view via the migration table, never released with "-".
@@ -37,9 +59,9 @@ BANNED_OBJECT_KIND_PLACEHOLDERS = ("-", "")
 
 # Single defaults table (ir_defaults discipline: one source for compiler,
 # schema and future reference-interpreter — divergence reopens the fork).
-DEFAULTS = {
+DEFAULTS = freeze_registry_mapping({
     "wall": {"height_mm": 3000.0},
-}
+})
 
 
 # ── Kind table: the closed enum that killed the pdfCount=0 bug class ────────
@@ -80,7 +102,8 @@ class KindSpec:
                 f"{self.discipline!r}; expected one of {sorted(DISCIPLINES)}")
 
 
-KINDS: dict[str, KindSpec] = {k.name: k for k in (
+KINDS: Mapping[str, KindSpec] = freeze_registry_mapping({
+    kind.name: kind for kind in (
     # The canonical regression case (2026-07-16 incident): PDF underlays are
     # raster ImageInstance elements, NOT ImportInstance — encoded here once.
     KindSpec("pdf_underlay",
@@ -255,7 +278,7 @@ KINDS: dict[str, KindSpec] = {k.name: k for k in (
     KindSpec("part",
              ".OfCategory(BuiltInCategory.OST_Parts).WhereElementIsNotElementType()",
              discipline="shared"),
-)}
+)})
 
 # Escape value (SPEC 12.8): schema admits it so decoding can't derail; the
 # compiler answers with GROUND_UNSUPPORTED_KIND -> recipe-path handoff.
@@ -266,14 +289,14 @@ KIND_ESCAPE = "other"
 # C# predicate. Kept deliberately small for v1.
 # value_type + optional kind restriction (a filter reading a wall-only BIP on
 # doors would be a silent-wrong answer — restricted filters refuse instead).
-FILTERS: dict[str, dict] = {
+FILTERS: Mapping[str, Mapping[str, Any]] = freeze_registry_mapping({
     "level_name": {"type": str},     # Element.LevelId -> Level with this exact name (trimmed)
     "name_contains": {"type": str},  # Element.Name contains (OrdinalIgnoreCase)
     # 2026-07-16 live prod case («выдели несущие стены»: model invented
     # STATIC_WALL_BASE_IMAGE / Wall.Structural, ~5 min of repair): the truth
     # is WALL_STRUCTURAL_SIGNIFICANT, encoded here once.
     "structural": {"type": bool, "kinds": ("wall",)},
-}
+})
 
 LIST_FIELDS = ("id", "name", "category", "type_name", "level_name")
 LIST_LIMIT_DEFAULT = 100
@@ -310,6 +333,10 @@ class ParamSpec:
     ref_kinds: tuple[ReferenceKind, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "choices", tuple(self.choices))
+        object.__setattr__(self, "ref_kinds", tuple(self.ref_kinds))
+        object.__setattr__(self, "default", _freeze_param_default(
+            self.default, field_name=f"{self.name}.default"))
         if self.ref_kinds:
             if self.kind not in ("sel", "target_w", "refs_w"):
                 raise ValueError(
@@ -327,6 +354,27 @@ class ParamSpec:
             producer in self.ref_kinds
             or ReferenceKind.ELEMENT in self.ref_kinds
         )
+
+
+def _freeze_param_default(value: Any, *, field_name: str) -> Any:
+    """Copy a JSON-shaped default into an immutable value graph.
+
+    Registry defaults are process-wide compiler semantics. Lists become
+    tuples (SDK/schema adapters already lower tuples to JSON arrays); mappings
+    and sets are rejected until they have an explicit immutable wire model.
+    """
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_param_default(
+            item, field_name=f"{field_name}[{index}]")
+                     for index, item in enumerate(value))
+    if isinstance(value, (dict, set, frozenset, bytearray)):
+        raise TypeError(
+            f"{field_name}: mutable/ambiguous registry default "
+            f"{type(value).__name__} is forbidden")
+    raise TypeError(
+        f"{field_name}: unsupported registry default {type(value).__name__}")
 
 
 class EffectKind(str, Enum):
@@ -460,7 +508,27 @@ class OpSpec:
     #   * каждое `±<число>` из `post` обязано лежать ЗДЕСЬ (закон 3);
     #   * мёртвая запись здесь — тоже дефект: её ловит возмущающий оракул
     #     (tests/test_tolerance_provenance.py).
-    tolerances: dict[str, float] = field(default_factory=dict)
+    tolerances: Mapping[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        params = tuple(self.params)
+        if any(not isinstance(param, ParamSpec) for param in params):
+            raise TypeError(f"{self.name}: params must contain ParamSpec")
+        capability = tuple(tuple(cell) for cell in self.capability)
+        grounded = tuple(tuple(binding) for binding in self.grounded)
+        copied_tolerances = dict(self.tolerances)
+        for key, value in copied_tolerances.items():
+            if not isinstance(key, str) or not key:
+                raise TypeError(f"{self.name}: tolerance keys must be strings")
+            if (not isinstance(value, (int, float))
+                    or isinstance(value, bool)):
+                raise TypeError(
+                    f"{self.name}.{key}: tolerance must be numeric")
+        object.__setattr__(self, "params", params)
+        object.__setattr__(self, "capability", capability)
+        object.__setattr__(self, "grounded", grounded)
+        object.__setattr__(
+            self, "tolerances", MappingProxyType(copied_tolerances))
 
 # Write families share one transaction; only query is exclusive.
 WRITE_FAMILIES = ("authoring", "modify")

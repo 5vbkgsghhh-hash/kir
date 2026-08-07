@@ -770,6 +770,30 @@ GROUP_EXTRACT_HELPER_CS = r"""
 // KIR DECOMPILE Wave A1b — read-only model-group instance helpers.
 // Origin crosses the wire in RAW internal feet, rotation in RAW radians;
 // the offline parser owns unit conversion. No Transaction opens.
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element/Curve/Surface и у исключений — это полное имя
+// типа CLR: из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ,
+// WorksetId, ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и
+// ни один из них сюда не передаётся. Исключение дописывает ": сообщение" и
+// стек, поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __grClassName = (__grcnObj) =>
+{
+    if (__grcnObj == null) return "";
+    string __grcn = __grcnObj.ToString();
+    if (__grcn == null) return "";
+    int __grcnCut = __grcn.IndexOf((char)10);
+    if (__grcnCut >= 0) __grcn = __grcn.Substring(0, __grcnCut);
+    __grcnCut = __grcn.IndexOf(':');
+    if (__grcnCut >= 0) __grcn = __grcn.Substring(0, __grcnCut);
+    __grcn = __grcn.Trim();
+    __grcnCut = __grcn.LastIndexOf('.');
+    return __grcnCut >= 0 && __grcnCut + 1 < __grcn.Length
+        ? __grcn.Substring(__grcnCut + 1) : __grcn;
+};
 Func<XYZ, bool> __grFiniteXYZ = (__point) =>
     __point != null
     && !Double.IsNaN(__point.X) && !Double.IsInfinity(__point.X)
@@ -797,7 +821,7 @@ Func<ElementId, long> __grIdOrder = (__id) =>
 
 _GROUP_EXTRACT_BODY_CS = r"""
 long __grCallBudgetMs = __GR_CALL_BUDGET_MS__L;
-var __grCallWatch = System.Diagnostics.Stopwatch.StartNew();
+long __grCallWatchT0 = DateTime.UtcNow.Ticks;
 
 // §18.2, закон квитанции: группа, которую съел бюджет или не дал прочитать
 // API, обязана назваться. Стадия полномодельная — сверить её ответ со
@@ -841,11 +865,11 @@ foreach (Autodesk.Revit.DB.Group __group in __grAll)
     string __groupId = "<unresolved group>";
     try { __groupId = __group.Id.ToString(); } catch { }
     if (__grBudgetOut
-        || __grCallWatch.ElapsedMilliseconds >= __grCallBudgetMs)
+        || ((DateTime.UtcNow.Ticks - __grCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __grCallBudgetMs)
     {
         __grBudgetOut = true;
         __grFail(__groupId, "call_budget_exhausted", "call_budget_exhausted",
-                 (object)__grCallWatch.ElapsedMilliseconds);
+                 (object)((DateTime.UtcNow.Ticks - __grCallWatchT0) / TimeSpan.TicksPerMillisecond));
         continue;
     }
     // ИМЯ ЧТЕНИЯ, КОТОРОЕ СЕЙЧАС ИДЁТ. Тип исключения без имени вызова —
@@ -887,15 +911,30 @@ foreach (Autodesk.Revit.DB.Group __group in __grAll)
         // attached-detail-group TYPES available to this group's type. Cheap
         // read-only ISet<ElementId> count (Revit 2019.1+ on GroupType); a
         // throw falls back to 0, which the parser accepts (>= 0).
+        // ВЫЗОВ УБРАН, И ЭТО НЕ ЛЕНЬ. `GetAvailableAttachedDetailGroupTypeIds`
+        // возвращает `ISet<ElementId>`, а `ISet<>` на net48 объявлен в
+        // `System.dll`, которой нет в замыкании ссылок РАЗВЁРНУТОГО плагина.
+        // Живой замер 04.08: `CS0012: The type 'ISet<>' is defined in an
+        // assembly that is not referenced` плюс `CS0030: Cannot convert type
+        // 'method' to 'long'` — вторая ошибка следствие первой: без интерфейса
+        // `.Count` вырождается в метод-группу LINQ.
+        //
+        // ОБОЙТИ КАСТОМ НЕЛЬЗЯ: любое использование выражения требует, чтобы
+        // компилятор загрузил его тип, — приведение к `object` или
+        // `IEnumerable` этого не снимает. Значит выбор был между «не читать
+        // это поле» и «не читать группы вообще»; поле необязательное (парсер
+        // принимает >= 0, что и было заявлено прежним комментарием), а группы
+        // обязательны.
+        //
+        // НОВЫЙ РОД МИНЫ, и его стоит знать: она не в том, что МЫ ПИШЕМ, а в
+        // том, что мы ВЫЗЫВАЕМ. Тип возврата чужого метода тянет за собой
+        // несуществующую сборку, и сторож `bridge_reference_closure`, который
+        // судит имена в нашем тексте, такое не видит по построению.
+        //
+        // ВЕРНУТЬ, когда у клиента появится `System.dll` в замыкании: снять
+        // этот блок и восстановить прежние четыре строки.
         long __attachedCount = 0L;
-        __grStep = "GroupType.GetAvailableAttachedDetailGroupTypeIds";
-        try
-        {
-            var __attached =
-                __groupType.GetAvailableAttachedDetailGroupTypeIds();
-            if (__attached != null) __attachedCount = (long)__attached.Count;
-        }
-        catch (Exception) { __attachedCount = 0L; }
+        __grStep = "GroupType.GetAvailableAttachedDetailGroupTypeIds:skipped";
 
         var __row = new Dictionary<string, object>();
         __row["element_id"] = __groupId;
@@ -985,7 +1024,7 @@ foreach (Autodesk.Revit.DB.Group __group in __grAll)
             // нет), и она называет то, что раньше было бы молчанием.
             __grFail(__groupId,
                      "group origin unread, row kept: "
-                     + __originError.GetType().Name + ": "
+                     + __grClassName(__originError) + ": "
                      + __originError.Message,
                      "read_failed", null);
         }
@@ -998,7 +1037,7 @@ foreach (Autodesk.Revit.DB.Group __group in __grAll)
         // в котором 2846 групп выглядели одним событием.
         __grFail(__groupId,
                  "group read failed at " + __grStep + ": "
-                 + __groupError.GetType().Name + ": " + __groupError.Message,
+                 + __grClassName(__groupError) + ": " + __groupError.Message,
                  "read_failed", null);
     }
 }

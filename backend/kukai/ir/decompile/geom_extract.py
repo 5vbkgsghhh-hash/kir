@@ -1522,9 +1522,33 @@ Func<XYZ, object> __gxPoint = (__point) => (object)new double[] {
 Func<XYZ, object> __gxVector = (__vector) => (object)new double[] {
     __vector.X, __vector.Y, __vector.Z
 };
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element/Curve/Surface и у исключений — это полное имя
+// типа CLR: из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ,
+// WorksetId, ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и
+// ни один из них сюда не передаётся. Исключение дописывает ": сообщение" и
+// стек, поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __gxClassName = (__gxcnObj) =>
+{
+    if (__gxcnObj == null) return "";
+    string __gxcn = __gxcnObj.ToString();
+    if (__gxcn == null) return "";
+    int __gxcnCut = __gxcn.IndexOf((char)10);
+    if (__gxcnCut >= 0) __gxcn = __gxcn.Substring(0, __gxcnCut);
+    __gxcnCut = __gxcn.IndexOf(':');
+    if (__gxcnCut >= 0) __gxcn = __gxcn.Substring(0, __gxcnCut);
+    __gxcn = __gxcn.Trim();
+    __gxcnCut = __gxcn.LastIndexOf('.');
+    return __gxcnCut >= 0 && __gxcnCut + 1 < __gxcn.Length
+        ? __gxcn.Substring(__gxcnCut + 1) : __gxcn;
+};
 Func<Exception, string> __gxError = (__error) =>
 {
-    string __message = __error.GetType().Name + ": " + (__error.Message ?? "");
+    string __message = __gxClassName(__error) + ": " + (__error.Message ?? "");
     return __message.Length <= 300 ? __message : __message.Substring(0, 300);
 };
 Func<XYZ, XYZ, XYZ, XYZ, Dictionary<string, object>> __gxFrame =
@@ -1730,7 +1754,7 @@ __gxCurve = (__curve) =>
         };
     }
     throw new InvalidOperationException(
-        "unsupported curve: " + __curve.GetType().Name);
+        "unsupported curve: " + __gxClassName(__curve));
 };
 
 Func<Surface, Dictionary<string, object>> __gxNurbsSurface = (__surface) =>
@@ -1843,7 +1867,7 @@ Func<Face, Dictionary<string, object>> __gxSurface = (__face) =>
         if (__face is HermiteFace || __ruled != null)
             return __gxNurbsSurface(__surface);
         throw new InvalidOperationException(
-            "unsupported surface: " + __surface.GetType().Name);
+            "unsupported surface: " + __gxClassName(__surface));
     }
     finally
     {
@@ -2053,12 +2077,12 @@ var __gxRequestedSet = new HashSet<string>(__gxRequestedIds);
 long __gxElementBudgetMs = __GX_ELEMENT_BUDGET_MS__L;
 long __gxCallBudgetMs = __GX_CALL_BUDGET_MS__L;
 ViewDetailLevel __gxDetailLevel = ViewDetailLevel.__GX_DETAIL_ENUM__;
-var __gxCallWatch = System.Diagnostics.Stopwatch.StartNew();
+long __gxCallWatchT0 = DateTime.UtcNow.Ticks;
 var __gxFound = new Dictionary<string, Element>();
 foreach (Element __element in new FilteredElementCollector(__src)
          .WhereElementIsNotElementType())
 {
-    if (__gxCallWatch.ElapsedMilliseconds >= __gxCallBudgetMs) break;
+    if (((DateTime.UtcNow.Ticks - __gxCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __gxCallBudgetMs) break;
     string __id = __element.Id.ToString();
     if (__gxRequestedSet.Contains(__id) && !__gxFound.ContainsKey(__id))
     {
@@ -2080,18 +2104,18 @@ foreach (string __requestedId in __gxRequestedIds)
         __row["detail_level"] = "__GX_DETAIL_NAME__";
     string __gxBudgetReason = null;
     long __gxBudgetElapsed = 0L;
-    System.Diagnostics.Stopwatch __gxElementWatch = null;
-    if (__gxCallWatch.ElapsedMilliseconds >= __gxCallBudgetMs)
+    long __gxElementWatchT0 = 0L;
+    if (((DateTime.UtcNow.Ticks - __gxCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __gxCallBudgetMs)
     {
         __gxBudgetReason = "call_budget_exhausted";
-        __gxBudgetElapsed = __gxCallWatch.ElapsedMilliseconds;
+        __gxBudgetElapsed = ((DateTime.UtcNow.Ticks - __gxCallWatchT0) / TimeSpan.TicksPerMillisecond);
     }
     else
     {
-        __gxElementWatch = System.Diagnostics.Stopwatch.StartNew();
+        __gxElementWatchT0 = DateTime.UtcNow.Ticks;
         Func<bool> __gxBudgetExceeded = () =>
-            __gxElementWatch.ElapsedMilliseconds >= __gxElementBudgetMs ||
-            __gxCallWatch.ElapsedMilliseconds >= __gxCallBudgetMs;
+            ((DateTime.UtcNow.Ticks - __gxElementWatchT0) / TimeSpan.TicksPerMillisecond) >= __gxElementBudgetMs ||
+            ((DateTime.UtcNow.Ticks - __gxCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __gxCallBudgetMs;
         Element __element = null;
         if (!__gxFound.TryGetValue(__requestedId, out __element) ||
             __element == null)
@@ -2143,15 +2167,15 @@ foreach (string __requestedId in __gxRequestedIds)
         // Prefer the element reason for the active over-budget element; the
         // next and every remaining row will carry call_budget_exhausted when
         // the call deadline was crossed at the same time.
-        if (__gxElementWatch.ElapsedMilliseconds >= __gxElementBudgetMs)
+        if (((DateTime.UtcNow.Ticks - __gxElementWatchT0) / TimeSpan.TicksPerMillisecond) >= __gxElementBudgetMs)
         {
             __gxBudgetReason = "time_budget_exceeded";
-            __gxBudgetElapsed = __gxElementWatch.ElapsedMilliseconds;
+            __gxBudgetElapsed = ((DateTime.UtcNow.Ticks - __gxElementWatchT0) / TimeSpan.TicksPerMillisecond);
         }
-        else if (__gxCallWatch.ElapsedMilliseconds >= __gxCallBudgetMs)
+        else if (((DateTime.UtcNow.Ticks - __gxCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __gxCallBudgetMs)
         {
             __gxBudgetReason = "call_budget_exhausted";
-            __gxBudgetElapsed = __gxCallWatch.ElapsedMilliseconds;
+            __gxBudgetElapsed = ((DateTime.UtcNow.Ticks - __gxCallWatchT0) / TimeSpan.TicksPerMillisecond);
         }
     }
     if (__gxBudgetReason != null)

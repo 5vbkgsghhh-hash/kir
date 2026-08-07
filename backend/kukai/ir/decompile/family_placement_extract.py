@@ -1051,6 +1051,30 @@ FAMILY_PLACEMENT_EXTRACT_HELPER_CS = r"""
 // KIR DECOMPILE Wave A1b — read-only FamilyInstance placement helpers.
 // Position crosses the wire in RAW internal feet, rotation in RAW radians;
 // the offline parser owns unit conversion. No Transaction opens.
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element/Curve/Surface и у исключений — это полное имя
+// типа CLR: из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ,
+// WorksetId, ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и
+// ни один из них сюда не передаётся. Исключение дописывает ": сообщение" и
+// стек, поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __fpClassName = (__fpcnObj) =>
+{
+    if (__fpcnObj == null) return "";
+    string __fpcn = __fpcnObj.ToString();
+    if (__fpcn == null) return "";
+    int __fpcnCut = __fpcn.IndexOf((char)10);
+    if (__fpcnCut >= 0) __fpcn = __fpcn.Substring(0, __fpcnCut);
+    __fpcnCut = __fpcn.IndexOf(':');
+    if (__fpcnCut >= 0) __fpcn = __fpcn.Substring(0, __fpcnCut);
+    __fpcn = __fpcn.Trim();
+    __fpcnCut = __fpcn.LastIndexOf('.');
+    return __fpcnCut >= 0 && __fpcnCut + 1 < __fpcn.Length
+        ? __fpcn.Substring(__fpcnCut + 1) : __fpcn;
+};
 Func<XYZ, bool> __fpFiniteXYZ = (__point) =>
     __point != null
     && !Double.IsNaN(__point.X) && !Double.IsInfinity(__point.X)
@@ -1147,7 +1171,7 @@ _FAMILY_PLACEMENT_BODY_CS = r"""
 var __fpRequestedIds = new string[] { __FP_ELEMENT_IDS__ };
 long __fpElementBudgetMs = __FP_ELEMENT_BUDGET_MS__L;
 long __fpCallBudgetMs = __FP_CALL_BUDGET_MS__L;
-var __fpCallWatch = System.Diagnostics.Stopwatch.StartNew();
+long __fpCallWatchT0 = DateTime.UtcNow.Ticks;
 
 // §18.2, закон квитанции: КАЖДЫЙ запрошенный id уходит либо строкой в
 // placements, либо записью {element_id, reason, typed_reason} в failures.
@@ -1175,7 +1199,7 @@ var __fpFound = new Dictionary<string, Element>();
 foreach (Element __element in new FilteredElementCollector(__src)
          .WhereElementIsNotElementType())
 {
-    if (__fpCallWatch.ElapsedMilliseconds >= __fpCallBudgetMs) break;
+    if (((DateTime.UtcNow.Ticks - __fpCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __fpCallBudgetMs) break;
     string __id = __element.Id.ToString();
     if (__fpRequestedSet.Contains(__id) && !__fpFound.ContainsKey(__id))
     {
@@ -1202,7 +1226,7 @@ Func<string, Element, Dictionary<string, object>> __fpReadRow =
         if (__instance == null)
         {
             __outcome["reason"] =
-                "not a FamilyInstance: " + __element.GetType().Name;
+                "not a FamilyInstance: " + __fpClassName(__element);
             __outcome["typed"] = "element_kind_mismatch";
             return __outcome;
         }
@@ -1273,7 +1297,7 @@ Func<string, Element, Dictionary<string, object>> __fpReadRow =
         else
         {
             __row["host_id"] = __host.Id.ToString();
-            __row["host_class"] = __host.GetType().Name;
+            __row["host_class"] = __fpClassName(__host);
         }
 
         __row["hand_orientation"] = __hand;
@@ -1382,7 +1406,7 @@ Func<string, Element, Dictionary<string, object>> __fpReadRow =
         // fail-closed by absence from PLACEMENTS, never from the ANSWER.
         __outcome["row"] = null;
         __outcome["reason"] =
-            "placement read failed: " + __readError.GetType().Name;
+            "placement read failed: " + __fpClassName(__readError);
         __outcome["typed"] = "read_failed";
         return __outcome;
     }
@@ -1393,14 +1417,14 @@ bool __fpBudgetOut = false;
 foreach (string __requestedId in __fpRequestedIds)
 {
     if (__fpBudgetOut
-        || __fpCallWatch.ElapsedMilliseconds >= __fpCallBudgetMs)
+        || ((DateTime.UtcNow.Ticks - __fpCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __fpCallBudgetMs)
     {
         // Хвост пачки после исчерпания бюджета — не «ничего не нашли», а
         // «не смотрели»: каждый оставшийся id получает свою квитанцию.
         __fpBudgetOut = true;
         __fpFail(__requestedId, "call_budget_exhausted",
                  "call_budget_exhausted",
-                 (object)__fpCallWatch.ElapsedMilliseconds);
+                 (object)((DateTime.UtcNow.Ticks - __fpCallWatchT0) / TimeSpan.TicksPerMillisecond));
         continue;
     }
 
@@ -1413,9 +1437,9 @@ foreach (string __requestedId in __fpRequestedIds)
         continue;
     }
 
-    var __fpElementWatch = System.Diagnostics.Stopwatch.StartNew();
+    long __fpElementWatchT0 = DateTime.UtcNow.Ticks;
     var __fpOutcome = __fpReadRow(__requestedId, __element);
-    long __fpElementElapsed = __fpElementWatch.ElapsedMilliseconds;
+    long __fpElementElapsed = ((DateTime.UtcNow.Ticks - __fpElementWatchT0) / TimeSpan.TicksPerMillisecond);
     if (__fpElementElapsed >= __fpElementBudgetMs)
     {
         // Cooperative element budget: a read that overran is NOT trusted --

@@ -7,17 +7,11 @@ name-tuple append for the beam 3D-dims check) exactly mirroring wave/mep's
 precedent (see its authoring.py diff: route_mep.py holds the logic,
 authoring.py gets the registration).
 
-Reused from authoring.py UNCHANGED (imported, not copied): _gid, _eid, _cs,
+Reused from authoring_emit_support.py (the shared lower layer): _gid, _eid, _cs,
 _safe, _level_expr, _pt3, _endpoint_check, _level_chain_check, _stamp_block,
 _readback_block, _symbol_res, EMIT_UNSUPPORTED, IN_EMIT_DEFAULT. These are
-all leading-underscore (module-private) names — a real, more fragile
-cross-module coupling than wave/mep's connect.py reuse (connect.py
-deliberately exposes graph_validate/emit_segments_cs/emit_fittings_cs/
-emit_connectivity_witness_cs as PUBLIC names for exactly this kind of
-tiling). Flagged: if a future Fable pass wants a cleaner seam, promoting
-these to public names in authoring.py (drop the underscore, no behavior
-change) is the fix — not attempted here to keep this wave's authoring.py
-diff minimal.
+historical leading-underscore names retained for byte-compatible migration.
+Their implementation has one owner below both dispatch and domain emitters.
 
 create_foundation(variety="slab") is deliberately NOT implemented by
 calling authoring._emit_floor() directly, even though that function's
@@ -53,7 +47,7 @@ fallback).
 """
 from __future__ import annotations
 
-from kukai.ir.authoring import (
+from kukai.ir.authoring_emit_support import (
     _gid, _eid, _cs, _safe, _level_expr, _pt3,
     _stamp_block, _readback_block, _symbol_res,
     _loop_pts, EMIT_UNSUPPORTED, IN_EMIT_DEFAULT,

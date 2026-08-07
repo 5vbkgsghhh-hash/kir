@@ -201,6 +201,23 @@ _CONTRACTS = {
     "create_curtain_grid_line": _direct(
         "create_curtain_grid_line", "_grid_line_node",
         sources=("side:curtain_grid_line",)),
+    # wave/room (2026-08-03). Инверсия ПОСЕГМЕНТНАЯ и потому точная: в L0
+    # каждый OST_RoomSeparationLines — один ModelCurve со своими p0/p1 и
+    # своим level_id, и лифт даёт ему ломаную ровно из двух точек (закон
+    # «один L0-элемент → РОВНО ОДИН L1-узел» не позволил бы сшить соседние
+    # линии в одну ломаную, да и сшивать их нечем: общей личности у них нет).
+    # Гарантия BOUNDED, а не FORM_EXACT: дуговой разделитель не выражается
+    # вовсе (у `path` дугового параметра нет — 14 из 2 313 на K2), а
+    # разделитель, чья плоскость смещена от своего уровня, тоже остаётся
+    # атомом, потому что смещения нет у самой операции (4 из 2 313).
+    "create_room_separator": _direct(
+        "create_room_separator", "_lift_room_separator",
+        sources=("L0:OST_RoomSeparationLines",),
+        guarantee=ReverseGuarantee.BOUNDED,
+        limitation=("an arc separator has no expressible parameter and a "
+                    "chord would silently straighten it; a separator whose "
+                    "plane is offset from its own level has no offset "
+                    "parameter either — both stay typed atoms")),
 
     # The op exists, but current frozen capture lacks a mandatory source fact.
     "create_dimension": ReverseContract(
@@ -208,11 +225,41 @@ _CONTRACTS = {
         "L0 has no owner-view basis and Dimension.References",
         sources=("L0:OST_Dimensions",),
         limitation="must extend annotation capture before a lifter is legal"),
-    "create_railing": ReverseContract(
-        "create_railing", ReverseMode.CAPTURE_GAP, ReverseGuarantee.NONE,
-        "L0 has neither a railing path nor hosted placement position",
-        sources=("L0:OST_Railings", "L0:OST_StairsRailing"),
-        limitation="host id alone cannot determine Treads versus Stringer"),
+    # wave/opening (03.08.2026). Операция ЕСТЬ, обратного хода НЕТ, и это
+    # заявлено здесь, а не подразумевается: замороженная строка L0 1.0 не
+    # несёт НИ ОДНОГО обязательного входа проёма — ни Opening.Host (носитель),
+    # ни Opening.BoundaryRect/BoundaryCurves (границу). Объявить DIRECT
+    # значило бы обещать подъём, которого нет, а этот манифест существует
+    # ровно затем, чтобы такие обещания не протухали молча.
+    "create_opening": ReverseContract(
+        "create_opening", ReverseMode.CAPTURE_GAP, ReverseGuarantee.NONE,
+        "L0 carries neither Opening.Host nor the opening boundary "
+        "(BoundaryRect / BoundaryCurves)",
+        sources=("L0:OST_SWallRectOpening", "L0:OST_FloorOpening",
+                 "L0:OST_RoofOpening"),
+        limitation=("capture must start reading Opening.Host and the "
+                    "boundary before a lifter is legal; the shaft variety is "
+                    "additionally outside the forward op itself")),
+    # 03.08.2026: ПЕРЕВЕДЁН ИЗ capture_gap В direct, и повод — замер, а не
+    # желание. Захват ограждений (``sketch_extract.RailingPathRecord``:
+    # Railing.GetPath, HasHost/HostId, STAIRS_RAILING_BASE_LEVEL_PARAM) поехал
+    # ещё 29.07 и снимает данные в проде; k2_ar_rd_v9 несёт 31 строку захвата,
+    # из них 28 свободных ограждений с путём и базовым уровнем. То есть
+    # прежняя формулировка «L0 has neither a railing path nor hosted placement
+    # position» перестала быть правдой в первой своей половине — а манифест
+    # существует ровно затем, чтобы такие утверждения не протухали молча.
+    #
+    # ВТОРАЯ ПОЛОВИНА ОСТАЛАСЬ ПРАВДОЙ ЦЕЛИКОМ, поэтому гарантия BOUNDED, а не
+    # FORM_EXACT: ЛЕСТНИЧНОЕ ограждение не инвертируется вовсе — позиции
+    # (Treads/Stringer) в API нет геттера ни на одной из шести версий.
+    "create_railing": _direct(
+        "create_railing", "_lift_railing",
+        sources=("L0:OST_Railings", "L0:OST_StairsRailing", "side:sketch"),
+        guarantee=ReverseGuarantee.BOUNDED,
+        limitation=("only variety=path is inverted; a hosted railing stays an "
+                    "atom because RailingPlacementPosition has no getter on "
+                    "any shipped version, and re-emitting it as a free path "
+                    "railing would silently drop its host")),
 
     # Current-state reverse representations that are intentionally not the
     # same high-level op.

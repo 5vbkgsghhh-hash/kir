@@ -7,8 +7,76 @@ decoding can always terminate; the compiler answers it with a typed handoff.
 """
 from __future__ import annotations
 
-from kukai.ir import spec
+from kukai.ir import relate, spec
 from kukai.ir.emit_utils import ELEMENT_ID_MAX
+
+#: RELATE, СХЕМА: адрес выписывается ВСЮДУ ДОСЛОВНО, а `$defs`/`$ref` делает
+#: пост-проход `schema_dedup.hoist`.
+#:
+#: Спека §10 предлагала обратное — «`$defs` для адреса + `$ref` в 22 местах»
+#: руками. Код против, и по двум причинам сразу:
+#:   1) `schema_dedup.hoist` ОТКАЗЫВАЕТ схеме, у которой уже есть `$defs`
+#:      («повторный хойст запрещён») — рукописный `$defs` не сэкономил бы, а
+#:      сломал бы единственный работающий механизм дедупликации;
+#:   2) сам `schema_dedup` объясняет почему: рукописный `$defs` — это второй
+#:      источник правды о форме, и он отстаёт от генератора при первой правке.
+#: Замер обоих путей — в отчёте волны; выигрыш хойста на адресе тот же, что
+#: спека ждала от рукописного `$ref`.
+
+
+def _grid_name_schema() -> dict:
+    return {"type": "string", "minLength": 1,
+            "maxLength": relate.MAX_GRID_NAME_LEN}
+
+
+def _grid_line_schema() -> dict:
+    """Узел <линия>: имя оси строкой ЛИБО объект с необязательным отступом.
+
+    ПАРНОСТЬ `offset_mm`+`toward` схемой НЕ выражена намеренно. «Одно из двух»
+    JSON Schema не выражает без `oneOf`, а `oneOf` здесь удвоил бы поддерево
+    ради закона, который всё равно проверяет компилятор — тот же довод, по
+    которому в этом доме существует `KIR-P007` (place_family: точка ЛИБО
+    кривая) вместо схемной конструкции. Схема остаётся fail-closed по ПОЛЯМ
+    (`additionalProperties: false`), а «offset без toward» — отказ KIR-T001,
+    называющий следующий ход.
+    """
+    return {"oneOf": [
+        _grid_name_schema(),
+        {"type": "object", "properties": {
+            "grid": _grid_name_schema(),
+            "offset_mm": {"type": "number",
+                          "minimum": -relate.MAX_OFFSET_MM,
+                          "maximum": relate.MAX_OFFSET_MM},
+            "toward": _grid_name_schema()},
+         "required": ["grid"], "additionalProperties": False},
+    ]}
+
+
+#: КОРОТКАЯ строка, и это решение по замеру, а не лаконичность ради неё.
+#:
+#: Описание в схеме платится СТОЛЬКО РАЗ, сколько точечных параметров в
+#: реестре (25 на 04.08). Полная формулировка идиомы (~130 токенов) стоила бы
+#: +3 250 токенов схемы; здесь она одна на пакет — в `tool_doc.TRAPS`, где за
+#: неё платят ОДИН раз. Замер обеих вёрсток — в отчёте волны.
+_ADDRESS_DOC = "точка от ОСЕЙ модели: {\"at_grid\": [\"Б\", \"3\"]}"
+
+
+def _address_schema(dims: int) -> dict:
+    """Адрес от осей для параметра размерности ``dims``.
+
+    Форма ЗАКРЫТА и совпадает с реестром `relate.ADDRESS_FORMS` — схема
+    описывает ровно то, что примет компилятор, и ни поля больше.
+    """
+    at_grid = {"type": "array", "minItems": 2, "maxItems": 2,
+               "items": _grid_line_schema()}
+    if dims == 2:
+        return {"type": "object", "description": _ADDRESS_DOC,
+                "properties": {"at_grid": at_grid},
+                "required": ["at_grid"], "additionalProperties": False}
+    return {"type": "object",
+            "description": _ADDRESS_DOC + " + z_mm (у сетки осей нет Z)",
+            "properties": {"at_grid": at_grid, "z_mm": {"type": "number"}},
+            "required": ["at_grid", "z_mm"], "additionalProperties": False}
 
 
 def _kind_enum() -> list:
@@ -141,8 +209,16 @@ def _op_schema(op: spec.OpSpec) -> dict:
             ]}
         elif p.kind in ("pt_xy", "pt_xyz"):
             lo = 3 if p.kind == "pt_xyz" else 2
-            props[p.name] = {"type": "array", "minItems": lo, "maxItems": lo,
-                             "items": {"type": "number"}}
+            literal = {"type": "array", "minItems": lo, "maxItems": lo,
+                       "items": {"type": "number"}}
+            # RELATE: адрес от осей — ВТОРАЯ форма того же значения, и она
+            # выписывается дословно, как всё остальное в этом генераторе.
+            # Сжатие — работа `schema_dedup.hoist` (см. заметку у
+            # `_ADDRESS_DEF` выше): здесь один источник правды о форме.
+            if p.name in relate.addressable_params(op.name):
+                props[p.name] = {"oneOf": [literal, _address_schema(lo)]}
+            else:
+                props[p.name] = literal
         elif p.kind == "mm":
             s = {"type": "number"}
             if p.min_val is not None:
@@ -283,12 +359,18 @@ def _op_schema(op: spec.OpSpec) -> dict:
             anchor = {"oneOf": [
                 {"type": "array", "minItems": 2, "maxItems": 2,
                  "items": {"type": "number"}},
+                _address_schema(2),
+                # ЛЕГАСИ-ФОРМА, живая только здесь: мировая пара [dx,dy].
+                # Она и есть Д1 спеки (мировая рамка отступа), и в новых
+                # точечных параметрах её нет. Остаётся ради голденов
+                # `region`; узловой отступ работает и тут.
                 {"type": "object", "properties": {
                     "at_grid": {"type": "array", "minItems": 2, "maxItems": 2,
-                                "items": {"type": "string"}},
+                                "items": _grid_line_schema()},
                     "offset_mm": {"type": "array", "minItems": 2, "maxItems": 2,
                                   "items": {"type": "number"}}},
-                 "required": ["at_grid"], "additionalProperties": False}]}
+                 "required": ["at_grid", "offset_mm"],
+                 "additionalProperties": False}]}
             shape = {"oneOf": [
                 {"type": "object", "properties": {
                     "shape": {"const": "rect"}, "origin": anchor,

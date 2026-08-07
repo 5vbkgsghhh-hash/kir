@@ -23,7 +23,11 @@ from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
 
 class RegistryResultSemantics(unittest.TestCase):
     def test_every_op_has_a_closed_effect_and_result_contract(self):
-        self.assertEqual(len(spec.OPS), 39)
+        # 39 -> 41: wave/room (create_room_separator) и wave/opening в один
+        # вечер 03.08. Число — СТОРОЖ, а не факт: оп, добавленный молча, обязан
+        # уронить эту строку и заставить автора пройти весь список контрактов
+        # ниже.
+        self.assertEqual(len(spec.OPS), 41)
         for name, op in spec.OPS.items():
             with self.subTest(op=name):
                 self.assertIsInstance(op.effect, EffectKind)

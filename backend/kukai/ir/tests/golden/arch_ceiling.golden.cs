@@ -9,6 +9,30 @@ Func<string, string, Dictionary<string, object>> __Refuse = (string __oid, strin
     __e["error"] = "stale_or_failed"; __e["op_id"] = __oid; __e["message"] = __msg;
     return __e;
 };
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element и у исключений — это полное имя типа CLR:
+// из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ, WorksetId,
+// ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и ни один из
+// них сюда не передаётся. Исключение дописывает ": сообщение" и стек,
+// поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __ClassName = (__cnObj) =>
+{
+    if (__cnObj == null) return "";
+    string __cn = __cnObj.ToString();
+    if (__cn == null) return "";
+    int __cnCut = __cn.IndexOf((char)10);
+    if (__cnCut >= 0) __cn = __cn.Substring(0, __cnCut);
+    __cnCut = __cn.IndexOf(':');
+    if (__cnCut >= 0) __cn = __cn.Substring(0, __cnCut);
+    __cn = __cn.Trim();
+    __cnCut = __cn.LastIndexOf('.');
+    return __cnCut >= 0 && __cnCut + 1 < __cn.Length
+        ? __cn.Substring(__cnCut + 1) : __cn;
+};
 var __results = new Dictionary<string, object>();
 var __post = new List<string>();
 Ceiling __el_C1 = null;
@@ -30,7 +54,7 @@ using (Transaction __t = new Transaction(doc, "KIR: подвесной пото�
         if (__ty_C1 == null) { __t.RollBack(); return __Refuse("C1", "потолок: тип не найден (модель изменилась после grounding)"); }
         Element __lv_raw_C1 = doc.GetElement(new ElementId(42));
         Level __lv_C1 = __lv_raw_C1 as Level;
-        if (__lv_C1 == null) { __t.RollBack(); return __Refuse("C1", (__lv_raw_C1 == null ? "уровень не найден (модель изменилась после grounding)" : "id уровня резолвится не в Level, а в " + __lv_raw_C1.GetType().Name + " — причина (дрейф модели или неверный id) не определена рантаймом")); }
+        if (__lv_C1 == null) { __t.RollBack(); return __Refuse("C1", (__lv_raw_C1 == null ? "уровень не найден (модель изменилась после grounding)" : "id уровня резолвится не в Level, а в " + __ClassName(__lv_raw_C1) + " — причина (дрейф модели или неверный id) не определена рантаймом")); }
         var __loops_C1 = new List<CurveLoop>();
         CurveLoop __ol_C1 = new CurveLoop();
         __ol_C1.Append(Line.CreateBound(P(0, 0, 0), P(6000, 0, 0)));

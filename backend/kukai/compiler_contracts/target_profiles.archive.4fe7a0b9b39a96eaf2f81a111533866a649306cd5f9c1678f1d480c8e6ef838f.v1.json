@@ -1,0 +1,87 @@
+{
+  "schema_version": "target-profile-manifest/1",
+  "compiler_policy": {
+    "roslyn_package_version": "4.9.2",
+    "language_version": "10.0",
+    "optimization": "release",
+    "platform": "AnyCPU",
+    "allow_unsafe": false,
+    "nullable": "disabled"
+  },
+  "reference_policy": {
+    "system_prefixes": [
+      "System.Runtime",
+      "System.Private.CoreLib",
+      "System.Core",
+      "System.Collections",
+      "System.Linq",
+      "System.Text.RegularExpressions",
+      "System.Text.Encoding",
+      "System.Memory",
+      "System.Buffers",
+      "System.Numerics",
+      "System.ObjectModel",
+      "System.ComponentModel",
+      "System.Console",
+      "netstandard",
+      "mscorlib"
+    ],
+    "system_exact_names": [
+      "System"
+    ],
+    "revit_assemblies": [
+      "RevitAPI",
+      "RevitAPIUI"
+    ]
+  },
+  "profiles": [
+    {
+      "profile_id": "revit-2021-net48-cs10-r1",
+      "revit_year": "2021",
+      "release_policy": "frozen",
+      "target_framework": "net48",
+      "revit_api_package_version": "2021.0.0",
+      "revit_api_reference_path": "lib/net48"
+    },
+    {
+      "profile_id": "revit-2022-net48-cs10-r1",
+      "revit_year": "2022",
+      "release_policy": "frozen",
+      "target_framework": "net48",
+      "revit_api_package_version": "2022.0.0",
+      "revit_api_reference_path": "lib/net48"
+    },
+    {
+      "profile_id": "revit-2023-net48-cs10-r1",
+      "revit_year": "2023",
+      "release_policy": "official",
+      "target_framework": "net48",
+      "revit_api_package_version": "2023.0.0",
+      "revit_api_reference_path": "lib/net48"
+    },
+    {
+      "profile_id": "revit-2024-net48-cs10-r1",
+      "revit_year": "2024",
+      "release_policy": "official",
+      "target_framework": "net48",
+      "revit_api_package_version": "2024.0.0",
+      "revit_api_reference_path": "lib/net48"
+    },
+    {
+      "profile_id": "revit-2025-net8-cs10-r1",
+      "revit_year": "2025",
+      "release_policy": "official",
+      "target_framework": "net8.0",
+      "revit_api_package_version": "2025.0.0",
+      "revit_api_reference_path": "lib/net8.0"
+    },
+    {
+      "profile_id": "revit-2026-net8-cs10-r1",
+      "revit_year": "2026",
+      "release_policy": "official",
+      "target_framework": "net8.0",
+      "revit_api_package_version": "2026.0.0",
+      "revit_api_reference_path": "lib/net8.0"
+    }
+  ]
+}

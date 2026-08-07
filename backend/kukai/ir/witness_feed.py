@@ -257,6 +257,7 @@ def record_witness(*, program: Any, family: str, revit_version: str,
                    result_payload: Optional[dict] = None,
                    outcome: Optional[dict] = None,
                    acceptance_evidence: Optional[Mapping[str, Any]] = None,
+                   author_digest: Optional[str] = None,
                    ) -> None:
     """Записать одно ЖИВОЕ исполнение. Никогда не raises (fail-open)."""
     path = _feed_path()
@@ -286,6 +287,14 @@ def record_witness(*, program: Any, family: str, revit_version: str,
             record["plan_schema"] = PLAN_SCHEMA
             record["plan_digest"] = planned.plan_digest
             record["source_op_count"] = planned.source_op_count
+        # ПОДПИСЬ ИСХОДНИКА, ПОРОДИВШЕГО ПРОГРАММУ. Едет рядом с `plan_digest`
+        # и ровно по тем же правилам: `plan_digest` отвечает «что было
+        # скомпилировано», `author_digest` — «чем это написано». Поля нет
+        # вовсе, когда программу написали операциями: пустая строка в корпусе
+        # читалась бы как «скрипт был и не подписался».
+        if isinstance(author_digest, str) and author_digest:
+            record["author_digest"] = author_digest[:128]
+            record["authored_in"] = "python"
         if len(raw_ops) > _MAX_OPS_PER_RECORD:
             record["ops_truncated"] = len(raw_ops) - _MAX_OPS_PER_RECORD
         if witness is not None:

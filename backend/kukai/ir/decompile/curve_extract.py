@@ -730,9 +730,33 @@ Func<XYZ, object> __cvPoint = (__point) => (object)new double[] {
 Func<XYZ, object> __cvVector = (__vector) => (object)new double[] {
     __vector.X, __vector.Y, __vector.Z
 };
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element/Curve/Surface и у исключений — это полное имя
+// типа CLR: из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ,
+// WorksetId, ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и
+// ни один из них сюда не передаётся. Исключение дописывает ": сообщение" и
+// стек, поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __cvClassName = (__cvcnObj) =>
+{
+    if (__cvcnObj == null) return "";
+    string __cvcn = __cvcnObj.ToString();
+    if (__cvcn == null) return "";
+    int __cvcnCut = __cvcn.IndexOf((char)10);
+    if (__cvcnCut >= 0) __cvcn = __cvcn.Substring(0, __cvcnCut);
+    __cvcnCut = __cvcn.IndexOf(':');
+    if (__cvcnCut >= 0) __cvcn = __cvcn.Substring(0, __cvcnCut);
+    __cvcn = __cvcn.Trim();
+    __cvcnCut = __cvcn.LastIndexOf('.');
+    return __cvcnCut >= 0 && __cvcnCut + 1 < __cvcn.Length
+        ? __cvcn.Substring(__cvcnCut + 1) : __cvcn;
+};
 Func<Exception, string> __cvError = (__error) =>
 {
-    string __message = __error.GetType().Name + ": " + (__error.Message ?? "");
+    string __message = __cvClassName(__error) + ": " + (__error.Message ?? "");
     return __message.Length <= 300 ? __message : __message.Substring(0, 300);
 };
 // Classify one LocationCurve into ("line"|"arc"|"spline_unsupported") with the
@@ -804,7 +828,7 @@ _CURVE_EXTRACT_BODY_CS = r"""
 var __cvRequestedIds = new string[] { __CV_ELEMENT_IDS__ };
 long __cvElementBudgetMs = __CV_ELEMENT_BUDGET_MS__L;
 long __cvCallBudgetMs = __CV_CALL_BUDGET_MS__L;
-var __cvCallWatch = System.Diagnostics.Stopwatch.StartNew();
+long __cvCallWatchT0 = DateTime.UtcNow.Ticks;
 
 // One bounded collector pass resolves the requested elements by their
 // version-safe ElementId.ToString() representation.
@@ -813,7 +837,7 @@ var __cvFound = new Dictionary<string, Element>();
 foreach (Element __element in new FilteredElementCollector(__src)
          .WhereElementIsNotElementType())
 {
-    if (__cvCallWatch.ElapsedMilliseconds >= __cvCallBudgetMs) break;
+    if (((DateTime.UtcNow.Ticks - __cvCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __cvCallBudgetMs) break;
     string __id = __element.Id.ToString();
     if (__cvRequestedSet.Contains(__id) && !__cvFound.ContainsKey(__id))
     {
@@ -841,14 +865,14 @@ foreach (string __requestedId in __cvRequestedIds)
     string __cvBudgetReason = null;
     long __cvBudgetElapsed = 0L;
 
-    if (__cvCallWatch.ElapsedMilliseconds >= __cvCallBudgetMs)
+    if (((DateTime.UtcNow.Ticks - __cvCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __cvCallBudgetMs)
     {
         __cvBudgetReason = "call_budget_exhausted";
-        __cvBudgetElapsed = __cvCallWatch.ElapsedMilliseconds;
+        __cvBudgetElapsed = ((DateTime.UtcNow.Ticks - __cvCallWatchT0) / TimeSpan.TicksPerMillisecond);
     }
     else
     {
-        var __cvElementWatch = System.Diagnostics.Stopwatch.StartNew();
+        long __cvElementWatchT0 = DateTime.UtcNow.Ticks;
         Element __element = null;
         if (__cvFound.TryGetValue(__requestedId, out __element)
             && __element != null)
@@ -924,15 +948,15 @@ foreach (string __requestedId in __cvRequestedIds)
             }
         }
 
-        if (__cvElementWatch.ElapsedMilliseconds >= __cvElementBudgetMs)
+        if (((DateTime.UtcNow.Ticks - __cvElementWatchT0) / TimeSpan.TicksPerMillisecond) >= __cvElementBudgetMs)
         {
             __cvBudgetReason = "time_budget_exceeded";
-            __cvBudgetElapsed = __cvElementWatch.ElapsedMilliseconds;
+            __cvBudgetElapsed = ((DateTime.UtcNow.Ticks - __cvElementWatchT0) / TimeSpan.TicksPerMillisecond);
         }
-        else if (__cvCallWatch.ElapsedMilliseconds >= __cvCallBudgetMs)
+        else if (((DateTime.UtcNow.Ticks - __cvCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __cvCallBudgetMs)
         {
             __cvBudgetReason = "call_budget_exhausted";
-            __cvBudgetElapsed = __cvCallWatch.ElapsedMilliseconds;
+            __cvBudgetElapsed = ((DateTime.UtcNow.Ticks - __cvCallWatchT0) / TimeSpan.TicksPerMillisecond);
         }
     }
 

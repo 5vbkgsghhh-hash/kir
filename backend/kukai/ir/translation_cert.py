@@ -597,6 +597,81 @@ def _refinement_specs() -> dict[str, OpRefinementSpec]:
                    KIND_GEOMETRY, ("NumTriangles",), key="triangles"),
             ),
         ),
+        # wave/room (2026-08-03): разделитель помещений.
+        OpRefinementSpec(
+            op="create_room_separator",
+            materializer=("NewRoomBoundaryLines",),
+            witness_source="model",
+            obligations=(
+                ob("room separator segments exist (materialized or typed "
+                   "refusal)", KIND_MATERIALIZE, _REFUSE, block=BLOCK_CREATE),
+                # СКОЛЬКО. Ломаная из n точек обязана дать n-1 кривую: одна
+                # линия вместо четырёх — это не «почти построили», это другая
+                # граница, и снаружи она выглядит успехом.
+                #
+                # KIND_IDENTITY, А НЕ KIND_MATERIALIZE, И ЭТО НЕ ВКУС:
+                # materialize-обязательства сертификат гасит СТОРОНОЙ СОЗДАНИЯ
+                # (наличие материализатора + __Refuse) и на свидетеля не
+                # смотрит вовсе — то есть под этим родом вырезание живого
+                # свидетеля оставляло бы PROVEN. Поймал мутационный оракул L6
+                # (test_tolerance_provenance), а не рассуждение.
+                ob("созданных сегментов ровно на один меньше, чем точек path "
+                   "(identity)",
+                   KIND_IDENTITY, (".Count !=",), key="segment_count"),
+                # ЧТО ИМЕННО. Сердце операции: обычная модельная линия на том
+                # же месте не ограничивает ничего и снаружи неотличима от
+                # разделителя — ровно та подмена, из-за которой волна потолков
+                # отказалась строить перекрытие вместо потолка.
+                ob("каждый созданный сегмент лежит в категории "
+                   "OST_RoomSeparationLines, а не в обычных модельных линиях "
+                   "(topology)",
+                   KIND_TOPOLOGY, ("OST_RoomSeparationLines",),
+                   key="category"),
+                # ГДЕ. Element.LevelId — то же первое звено, которым уровень
+                # читает сторона извлечения: один вопрос, один судья.
+                ob("level binding == resolved level у каждого сегмента "
+                   "(topology)", KIND_TOPOLOGY, (".LevelId",),
+                   key="level_binding"),
+                ob("концы каждого сегмента == соседняя пара точек path "
+                   "(geometry)", KIND_GEOMETRY, (".GetEndPoint(",),
+                   key="endpoints"),
+            ),
+        ),
+        # wave/opening (2026-08-03): проём как ОТДЕЛЬНЫЙ элемент.
+        OpRefinementSpec(
+            op="create_opening",
+            # Один материализатор на обе ветви: перегрузки NewOpening
+            # различаются аргументами, а не именем.
+            materializer=("doc.Create.NewOpening",),
+            witness_source="model",
+            obligations=(
+                ob("opening exists (materialized or typed refusal)",
+                   KIND_MATERIALIZE, _REFUSE, block=BLOCK_CREATE),
+                # ПРИНАДЛЕЖНОСТЬ — общее обязательство обеих ветвей: и у
+                # прямоугольного проёма в стене, и у профильного в
+                # перекрытии носитель читается одним и тем же
+                # `Opening.Host`. Ключ поэтому один, безусловный.
+                ob("opening belongs to the host element the program asked "
+                   "for (Opening.Host, topology)",
+                   KIND_TOPOLOGY, (".Host",), key="host"),
+                # ГАБАРИТ — ключи РАЗНЫЕ, потому что читаются разные члены
+                # API и ветви взаимоисключающие. Общий ключ здесь был бы
+                # дефектом: необязательное обязательство разряжается ровно
+                # ОТСУТСТВИЕМ своего свидетеля (certify_op), и один ключ на
+                # две условные ветви объявил бы витнес соседней ветви
+                # «лишним».
+                ob("wall_rect variety: IsRectBoundary and the BoundaryRect "
+                   "corners hold the requested Z band and width along the "
+                   "wall, the absolute shift staying unpinned (geometry)",
+                   KIND_GEOMETRY, ("BoundaryRect",),
+                   param="p0_mm", conditional=True, key="rect_extent"),
+                ob("host_face variety: the BoundaryCurves extents == outline "
+                   "extents for a vertical cut and contain them "
+                   "for a perpendicular one (geometry)",
+                   KIND_GEOMETRY, ("BoundaryCurves",),
+                   param="outline", conditional=True, key="bbox"),
+            ),
+        ),
         OpRefinementSpec(
             op="create_roof",
             materializer=("NewFootPrintRoof",),

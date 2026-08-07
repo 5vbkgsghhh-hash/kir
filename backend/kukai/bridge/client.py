@@ -188,3 +188,4 @@ class BridgeClient:
             self._connected = False
             self._last_ping = None
             return False
+

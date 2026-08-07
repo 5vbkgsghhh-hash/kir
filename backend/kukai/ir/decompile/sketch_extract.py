@@ -1370,6 +1370,30 @@ def extract_sketch_profiles(payload: Any) -> ProfileExtraction:
 # This is a method body for the same ``wrap_user_code`` path used in serving.
 # It performs no transaction and never calls get_BoundingBox/get_Geometry.
 SKETCH_EXTRACT_CS = r"""
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element/Curve/Surface и у исключений — это полное имя
+// типа CLR: из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ,
+// WorksetId, ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и
+// ни один из них сюда не передаётся. Исключение дописывает ": сообщение" и
+// стек, поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __skClassName = (__skcnObj) =>
+{
+    if (__skcnObj == null) return "";
+    string __skcn = __skcnObj.ToString();
+    if (__skcn == null) return "";
+    int __skcnCut = __skcn.IndexOf((char)10);
+    if (__skcnCut >= 0) __skcn = __skcn.Substring(0, __skcnCut);
+    __skcnCut = __skcn.IndexOf(':');
+    if (__skcnCut >= 0) __skcn = __skcn.Substring(0, __skcnCut);
+    __skcn = __skcn.Trim();
+    __skcnCut = __skcn.LastIndexOf('.');
+    return __skcnCut >= 0 && __skcnCut + 1 < __skcn.Length
+        ? __skcn.Substring(__skcnCut + 1) : __skcn;
+};
 Func<double, double> __MM = (__value) =>
     UnitUtils.ConvertFromInternalUnits(__value, UnitTypeId.Millimeters);
 double __JoinTolerance = UnitUtils.ConvertToInternalUnits(
@@ -1478,7 +1502,7 @@ Func<IList<Curve>, bool, Dictionary<string, object>> __ReadChain =
             else
             {
                 __result["reason"] = "unsupported exact curve kind: "
-                    + __curve.GetType().Name;
+                    + __skClassName(__curve);
                 return __result;
             }
             if (__index == 0) __first = __start;
@@ -1517,7 +1541,7 @@ Func<IList<Curve>, bool, Dictionary<string, object>> __ReadChain =
     }
     catch (Exception __error)
     {
-        __result["reason"] = "curve read failed: " + __error.GetType().Name;
+        __result["reason"] = "curve read failed: " + __skClassName(__error);
         return __result;
     }
 };
@@ -1586,7 +1610,7 @@ Func<Element, Dictionary<string, object>> __DependentSketchLoops = (__element) =
     catch (Exception __error)
     {
         __result["reason"] = "Sketch.Profile failed: "
-            + __error.GetType().Name;
+            + __skClassName(__error);
         return __result;
     }
 };
@@ -1659,7 +1683,7 @@ Func<FootPrintRoof, Dictionary<string, object>> __FootPrintRoofLoops = (__roof) 
     catch (Exception __error)
     {
         __result["reason"] = "FootPrintRoof.GetProfiles failed: "
-            + __error.GetType().Name;
+            + __skClassName(__error);
         return __result;
     }
 };
@@ -1688,7 +1712,7 @@ Func<ExtrusionRoof, Dictionary<string, object>> __ExtrusionRoofLoops = (__roof) 
     catch (Exception __error)
     {
         __result["reason"] = "ExtrusionRoof.GetProfile failed: "
-            + __error.GetType().Name;
+            + __skClassName(__error);
         return __result;
     }
 };
@@ -1798,7 +1822,7 @@ Func<Autodesk.Revit.DB.Architecture.Railing, string, Dictionary<string, object>>
         // Autodesk документирует это на всех шести версиях:
         // InapplicableDataException «The railing has incorrect internal data».
         __pathRow["reason"] = "Railing.GetPath failed: "
-            + __error.GetType().Name;
+            + __skClassName(__error);
     }
     __railBlock["path"] = __pathRow;
 
@@ -1826,7 +1850,7 @@ Func<Autodesk.Revit.DB.Architecture.Railing, string, Dictionary<string, object>>
     catch (Exception __error)
     {
         __hostRow["reason"] = "Railing host read failed: "
-            + __error.GetType().Name;
+            + __skClassName(__error);
     }
     __railBlock["host"] = __hostRow;
 
@@ -1861,7 +1885,7 @@ Func<Autodesk.Revit.DB.Architecture.Railing, string, Dictionary<string, object>>
     catch (Exception __error)
     {
         __baseRow["reason"] = "railing base level read failed: "
-            + __error.GetType().Name;
+            + __skClassName(__error);
     }
     __railBlock["base_level"] = __baseRow;
 
@@ -1882,7 +1906,7 @@ Func<Autodesk.Revit.DB.Architecture.Railing, string, Dictionary<string, object>>
 var __skRequestedIds = new string[] { __SK_ELEMENT_IDS__ };
 long __skElementBudgetMs = __SK_ELEMENT_BUDGET_MS__L;
 long __skCallBudgetMs = __SK_CALL_BUDGET_MS__L;
-var __skCallWatch = System.Diagnostics.Stopwatch.StartNew();
+long __skCallWatchT0 = DateTime.UtcNow.Ticks;
 var __skRequestedSet = new HashSet<string>(__skRequestedIds);
 bool __skAll = (__skRequestedIds.Length == 0);
 var __skSeen = new HashSet<string>();
@@ -1905,12 +1929,12 @@ Func<string, bool> __skAccept = (__elementId) =>
     if (!__skAll && !__skRequestedSet.Contains(__elementId)) return false;
     __skSeen.Add(__elementId);
     if (__skBudgetOut
-        || __skCallWatch.ElapsedMilliseconds >= __skCallBudgetMs)
+        || ((DateTime.UtcNow.Ticks - __skCallWatchT0) / TimeSpan.TicksPerMillisecond) >= __skCallBudgetMs)
     {
         __skBudgetOut = true;
         __skFail(__elementId, "call_budget_exhausted",
                  "call_budget_exhausted",
-                 (object)__skCallWatch.ElapsedMilliseconds);
+                 (object)((DateTime.UtcNow.Ticks - __skCallWatchT0) / TimeSpan.TicksPerMillisecond));
         return false;
     }
     return true;
@@ -1924,9 +1948,9 @@ foreach (Floor __floor in new FilteredElementCollector(__src)
 {
     string __floorId = __floor.Id.ToString();
     if (!__skAccept(__floorId)) continue;
-    var __floorWatch = System.Diagnostics.Stopwatch.StartNew();
+    long __floorWatchT0 = DateTime.UtcNow.Ticks;
     var __floorRow = __ProfileRow(__floor, "OST_Floors");
-    long __floorElapsed = __floorWatch.ElapsedMilliseconds;
+    long __floorElapsed = ((DateTime.UtcNow.Ticks - __floorWatchT0) / TimeSpan.TicksPerMillisecond);
     if (__floorElapsed >= __skElementBudgetMs)
     {
         // Перерасход не выдаётся за прочитанное: строка выбрасывается, а
@@ -1945,9 +1969,9 @@ foreach (RoofBase __roof in new FilteredElementCollector(__src)
 {
     string __roofId = __roof.Id.ToString();
     if (!__skAccept(__roofId)) continue;
-    var __roofWatch = System.Diagnostics.Stopwatch.StartNew();
+    long __roofWatchT0 = DateTime.UtcNow.Ticks;
     var __roofRow = __ProfileRow(__roof, "OST_Roofs");
-    long __roofElapsed = __roofWatch.ElapsedMilliseconds;
+    long __roofElapsed = ((DateTime.UtcNow.Ticks - __roofWatchT0) / TimeSpan.TicksPerMillisecond);
     if (__roofElapsed >= __skElementBudgetMs)
     {
         __skFail(__roofId, "time_budget_exceeded", "time_budget_exceeded",
@@ -1966,7 +1990,7 @@ foreach (Autodesk.Revit.DB.Architecture.Stairs __stairs
 {
     string __stairsId = __stairs.Id.ToString();
     if (!__skAccept(__stairsId)) continue;
-    var __stairsWatch = System.Diagnostics.Stopwatch.StartNew();
+    long __stairsWatchT0 = DateTime.UtcNow.Ticks;
     var __row = new Dictionary<string, object>();
     __row["element_id"] = __stairsId;
     __row["category"] = "OST_Stairs";
@@ -2022,7 +2046,7 @@ foreach (Autodesk.Revit.DB.Architecture.Stairs __stairs
             catch (Exception __error)
             {
                 __runRow["reason"] = "StairsRun.GetStairsPath failed: "
-                    + __error.GetType().Name;
+                    + __skClassName(__error);
             }
             __runRows.Add(__runRow);
         }
@@ -2030,10 +2054,10 @@ foreach (Autodesk.Revit.DB.Architecture.Stairs __stairs
     catch (Exception __error)
     {
         __row["reason"] = "Stairs.GetStairsRuns failed: "
-            + __error.GetType().Name;
+            + __skClassName(__error);
     }
     __row["stairs_run_paths"] = __runRows;
-    long __stairsElapsed = __stairsWatch.ElapsedMilliseconds;
+    long __stairsElapsed = ((DateTime.UtcNow.Ticks - __stairsWatchT0) / TimeSpan.TicksPerMillisecond);
     if (__stairsElapsed >= __skElementBudgetMs)
     {
         __skFail(__stairsId, "time_budget_exceeded", "time_budget_exceeded",
@@ -2055,9 +2079,9 @@ foreach (Ceiling __ceiling in new FilteredElementCollector(__src)
 {
     string __ceilingId = __ceiling.Id.ToString();
     if (!__skAccept(__ceilingId)) continue;
-    var __ceilingWatch = System.Diagnostics.Stopwatch.StartNew();
+    long __ceilingWatchT0 = DateTime.UtcNow.Ticks;
     var __ceilingRow = __ProfileRow(__ceiling, "OST_Ceilings");
-    long __ceilingElapsed = __ceilingWatch.ElapsedMilliseconds;
+    long __ceilingElapsed = ((DateTime.UtcNow.Ticks - __ceilingWatchT0) / TimeSpan.TicksPerMillisecond);
     if (__ceilingElapsed >= __skElementBudgetMs)
     {
         __skFail(__ceilingId, "time_budget_exceeded", "time_budget_exceeded",
@@ -2080,9 +2104,9 @@ foreach (Autodesk.Revit.DB.Architecture.Railing __railing
 {
     string __railingId = __railing.Id.ToString();
     if (!__skAccept(__railingId)) continue;
-    var __railingWatch = System.Diagnostics.Stopwatch.StartNew();
+    long __railingWatchT0 = DateTime.UtcNow.Ticks;
     var __railingRow = __RailingRow(__railing, "OST_StairsRailing");
-    long __railingElapsed = __railingWatch.ElapsedMilliseconds;
+    long __railingElapsed = ((DateTime.UtcNow.Ticks - __railingWatchT0) / TimeSpan.TicksPerMillisecond);
     if (__railingElapsed >= __skElementBudgetMs)
     {
         __skFail(__railingId, "time_budget_exceeded", "time_budget_exceeded",
@@ -2101,9 +2125,9 @@ foreach (Autodesk.Revit.DB.Architecture.Railing __balcony
 {
     string __balconyId = __balcony.Id.ToString();
     if (!__skAccept(__balconyId)) continue;
-    var __balconyWatch = System.Diagnostics.Stopwatch.StartNew();
+    long __balconyWatchT0 = DateTime.UtcNow.Ticks;
     var __balconyRow = __RailingRow(__balcony, "OST_Railings");
-    long __balconyElapsed = __balconyWatch.ElapsedMilliseconds;
+    long __balconyElapsed = ((DateTime.UtcNow.Ticks - __balconyWatchT0) / TimeSpan.TicksPerMillisecond);
     if (__balconyElapsed >= __skElementBudgetMs)
     {
         __skFail(__balconyId, "time_budget_exceeded", "time_budget_exceeded",

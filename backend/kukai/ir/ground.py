@@ -29,7 +29,7 @@ import difflib
 import math
 from typing import Any, Optional
 
-from kukai.ir import spec
+from kukai.ir import relate, spec
 from kukai.ir.diag import Diagnostic, KirRefusal, GROUND_BAD_SELECTOR
 from kukai.ir.emit_utils import ELEMENT_ID_MAX
 
@@ -580,6 +580,19 @@ def compiler_choices(grounded_ops: list[dict]) -> list[dict]:
     for op in grounded_ops:
         if not isinstance(op, dict):
             continue
+        # RELATE: адрес — это НЕ умолчание (автор сказал «А/3» вслух), но
+        # ВЫВОД компилятора из сказанного, и предъявлять его надо по той же
+        # причине. Отдельное правило `at_grid`, а не подмешивание в
+        # `_COMPILER_CHOICE_RULES`: смешать «я выбрал за тебя» и «я вывел из
+        # твоих слов» значило бы соврать про происхождение обоих.
+        for row in op.get("__grid_address__") or ():
+            report.append({
+                "op_id": op.get("id"), "op": op.get("op"),
+                "param": row.get("param"), "rule": "at_grid",
+                "chosen": {"point_mm": row.get("point_mm")},
+                "rule_detail": {"lines": row.get("lines"),
+                                "angle_deg": row.get("angle_deg")},
+            })
         for param, sel in op.items():
             if not isinstance(sel, dict):
                 continue
@@ -621,7 +634,19 @@ def describe_choices_ru(report: list[dict]) -> str:
     «ничего не произошло», это шум, а шум учит не читать примечания.
     """
     parts: list[str] = []
+    addresses: list[str] = []
     for row in report:
+        if row.get("rule") == "at_grid":
+            # Квитанция адреса печатается ВСЕГДА: она отвечает на вопрос
+            # «что компилятор вывел из «А/3»», а не «чем он заполнил
+            # молчание». Без неё выбор оси неотличим от угадывания.
+            detail = row.get("rule_detail") or {}
+            addresses.extend(relate.describe_receipt_ru([{
+                "op_id": row.get("op_id"), "param": row.get("param"),
+                "point_mm": (row.get("chosen") or {}).get("point_mm"),
+                "lines": detail.get("lines") or (),
+            }]))
+            continue
         rule = _RULE_NAMES_RU.get(row.get("rule", ""), row.get("rule", ""))
         name = (row.get("chosen") or {}).get("name")
         detail = row.get("rule_detail") or {}
@@ -638,9 +663,12 @@ def describe_choices_ru(report: list[dict]) -> str:
             f"{row.get('param')}: «{name}» "
             f"({rule}: {detail.get('instances')} экз. "
             f"из {detail.get('candidates')} кандидатов{gap})")
-    if not parts:
-        return ""
-    return "выбрано по умолчанию — " + "; ".join(parts)
+    lines: list[str] = []
+    if addresses:
+        lines.append("адрес от осей — " + "; ".join(addresses))
+    if parts:
+        lines.append("выбрано по умолчанию — " + "; ".join(parts))
+    return "\n".join(lines)
 
 
 def _is_grounded(member: Any) -> bool:
@@ -735,8 +763,17 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
             if isinstance(sel, dict) and sel.get("by") in (
                     "name", "default", "family_type"):
                 return True
-        # at_grid anchors read the grids pool (CONTOUR sublanguage)
-        if op["op"] == "create_floor_by_contour" and "at_grid" in repr(op.get("contour")):
+        # Адрес от осей читает пул `grids`.
+        #
+        # До 04.08 здесь стоял ОДИН оп и СТРОКОВЫЙ поиск:
+        # `op["op"] == "create_floor_by_contour" and "at_grid" in repr(...)`.
+        # Теперь адрес живёт в любом точечном параметре, и спрашивать про пул
+        # надо по РЕАЛЬНЫМ значениям реальных параметров, а не по `repr`:
+        # подстрока «at_grid» в имени типа больше не может ни включить чтение
+        # пула, ни (что хуже) остаться незамеченной там, где адрес есть.
+        if "at_grid" in repr(op.get("contour")):
+            return True
+        if relate.program_uses_address(op):
             return True
         return False
     needs_snapshot = any(_needs_pool(op, spec.OPS[op["op"]]) for op in normed_ops)
@@ -759,9 +796,33 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
         return snapshot.get(pool_name + "__truncated") is True
 
     out = []
+    address_receipt: list[dict] = []
     for i, op in enumerate(normed_ops):
         ospec = spec.OPS[op["op"]]
         g = dict(op)
+        # RELATE: адрес от осей -> литеральная точка, ЗДЕСЬ и до всего
+        # остального. Пересечение двух прямых есть чистая функция от
+        # снапшота: отказ до транзакции дешевле отказа внутри неё, а в
+        # эмиттер, как и у CONTOUR, уходят только числа.
+        op_receipt: list[dict] = []
+        for param, dims in relate.addressable_params(ospec.name).items():
+            value = op.get(param)
+            if not relate.is_address(value):
+                continue
+            point = relate.resolve_address(
+                value, snapshot_pool("grids"), op["id"], param, diags,
+                dims=dims, truncated=pool_truncated("grids"),
+                receipt=op_receipt)
+            if point is not None:
+                g[param] = point
+        if op_receipt:
+            # КВИТАНЦИЯ. Автор написал «А/3» — он обязан увидеть, ЧТО из
+            # этого вывел компилятор (id и имя каждой оси, отступ, сторона,
+            # итоговая точка). Выбор, который некому предъявить, неотличим
+            # от `.FirstOrDefault()` в костюме — тот же закон, что у
+            # НАЗВАННОГО УМОЛЧАНИЯ.
+            g["__grid_address__"] = op_receipt
+            address_receipt.extend(op_receipt)
         diameter_spec = next((p for p in ospec.params if p.name == "diameter_mm"), None)
         diameter_bounds = ((diameter_spec.min_val, diameter_spec.max_val)
                            if diameter_spec is not None else None)
@@ -892,6 +953,79 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
             if res:
                 g[param] = {"__grounded__": res}
         out.append(g)
+    if address_receipt:
+        _recheck_geometry_after_addresses(out, diags)
     if diags:
         raise KirRefusal(diags)
     return out
+
+
+def resolution_report(
+    grounded_ops: list[dict],
+) -> tuple["GroundingResolution", ...]:
+    """Return every explicit selector resolution, not only default choices.
+
+    ``compiler_choices`` intentionally powers a concise user-facing note and
+    therefore omits ordinary by-name/by-id resolutions.  Evidence cannot make
+    that trade-off: every model-dependent address must be bound to the ground
+    digest even when no choice was surprising enough to narrate.
+    """
+    from kukai.ir.midend import GroundingResolution
+
+    report: list[GroundingResolution] = []
+    for op in grounded_ops:
+        op_id = op.get("id")
+        if not isinstance(op_id, str) or not op_id:
+            continue
+        report.extend(GroundingResolution.collect(op_id=op_id, payload=op))
+    return tuple(report)
+
+
+def ground_program(
+    planned: "PlannedProgram",
+    snapshot: Any,
+) -> "GroundedProgram":
+    """Typed, immutable adapter around the legacy list-based grounder."""
+    from kukai.ir.midend import GroundedProgram, PlannedProgram
+
+    if not isinstance(planned, PlannedProgram):
+        raise TypeError("ground_program requires PlannedProgram")
+    grounded_ops = ground(planned.to_ops(), snapshot)
+    return GroundedProgram.from_ops(
+        planned,
+        grounded_ops,
+        resolution_report(grounded_ops),
+    )
+
+
+def _recheck_geometry_after_addresses(grounded: list[dict],
+                                      diags: list[Diagnostic]) -> None:
+    """Законы, которым нужны ЧИСЛА, — второй площадкой вызова, не копией.
+
+    Два закона плана читают координаты концов: «длина ~0» и «дверь за краем
+    стены». Пока концы были литералами, оба доказывались до снапшота. Адрес от
+    осей даёт числа только здесь — и закон обязан ДОЕХАТЬ сюда, а не замолчать
+    на этой части диапазона (прибор на часть диапазона опаснее отсутствующего).
+
+    Обе функции ИМПОРТИРУЮТСЯ, а не переписываются: `authoring_validation.
+    reject_zero_length` и `hosted_geometry.hosted_offset_check` остаются
+    единственными владельцами своих правил.
+    """
+    from kukai.ir.authoring_validation import reject_zero_length
+    from kukai.ir.hosted_geometry import hosted_offset_check
+
+    addressed = {op["id"] for op in grounded if "__grid_address__" in op}
+    by_id = {op["id"]: op for op in grounded}
+    for index, op in enumerate(grounded):
+        if op["id"] in addressed and "p0_mm" in op and "p1_mm" in op:
+            reject_zero_length(op["p0_mm"], op["p1_mm"], op["op"], index,
+                               op["id"], diags)
+        if op["op"] not in ("create_window", "create_door"):
+            continue
+        host = op.get("host") or {}
+        wall = by_id.get(host.get("value"))
+        if (wall is None or wall.get("op") != "create_wall"
+                or wall["id"] not in addressed
+                or "p0_mm" not in wall or "p1_mm" not in wall):
+            continue
+        hosted_offset_check(op, wall, str(host.get("value")), index, diags)

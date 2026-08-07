@@ -15,11 +15,14 @@ SPEC 12.9), kind escape value -> typed Diagnostic list, never an exception.
 """
 from __future__ import annotations
 
+import logging
 import re
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
-from kukai.ir import spec
+from kukai.ir import relate, spec
+from kukai.ir.compile_output import CompileOutput
 from kukai.ir.contracts import ElementIdentityProof
 from kukai.ir.diag import (
     Diagnostic, KirRefusal,
@@ -27,9 +30,12 @@ from kukai.ir.diag import (
     PARSE_MISSING_FIELD, PARSE_DUP_ID, PARSE_EXCLUSIVE_FIELDS,
     GROUND_UNSUPPORTED_KIND, GROUND_BAD_SELECTOR,
     GROUND_MODEL_BINDING, TYPE_BAD_TYPE, TYPE_BAD_ENUM, TYPE_BOUNDS, PLAN_LIMIT,
+    PLAN_SOLO_OP,
 )
 from kukai.ir.emit_utils import (ELEMENT_ID_MAX, cs_identifier_fragment,
                                  cs_line_comment_fragment, cs_string_literal)
+from kukai.ir.hosted_geometry import hosted_offset_check
+from kukai.ir.lowering import lower_program
 from kukai.ir.midend import (
     FieldOrigin,
     OperationFamily,
@@ -39,6 +45,8 @@ from kukai.ir.midend import (
     PlannedProgram,
     ProgramFamily,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_OPS_PER_PROGRAM = 20    # user-authored (pre-macro-expansion) op budget
 MAX_BULK_OPS = 300          # internal bulk (decompile/rebuild) pre-macro budget
@@ -74,38 +82,6 @@ def pre_macro_budget(*, bulk: bool) -> tuple[str, int]:
     назвать один бюджет, а померить другой."""
     return ((BUDGET_INTERNAL_BULK, MAX_BULK_OPS) if bulk
             else (BUDGET_AUTHORED, MAX_OPS_PER_PROGRAM))
-
-
-@dataclass
-class CompileOutput:
-    ok: bool
-    csharp: Optional[str] = None                 # emitted Execute-body (doc in scope)
-    diagnostics: list[Diagnostic] = field(default_factory=list)
-    per_version: dict[str, str] = field(default_factory=dict)
-    # Immutable typed mid-end accepted by this compilation.  C# is merely one
-    # lowering of this exact plan; acceptance/evidence bind to plan_digest.
-    planned: Optional[PlannedProgram] = None
-    # Any-Query invariant (SPEC §14): when the refusal is out-of-coverage rather
-    # than malformed, handoff names the tail route so the caller falls through
-    # to the recipe/wiki path instead of erroring at the user.
-    handoff: Optional[dict] = None
-    # КВИТАНЦИЯ НАЗВАННОГО УМОЛЧАНИЯ: выборы, которые сделал КОМПИЛЯТОР, а не
-    # автор программы. Выбор, которого вызывающий не видит, неотличим от
-    # `.FirstOrDefault()` — а именно им плечо C# молча взяло 1 тип двери из 62
-    # (замер 02.08.2026). Эхо авторского селектора сюда не попадает: там
-    # решение принял автор, и отчитываться не о чем.
-    grounding_report: list[dict] = field(default_factory=list)
-
-    def as_dict(self) -> dict:
-        d = {"ok": self.ok, "csharp": self.csharp,
-             "diagnostics": [x.as_dict() for x in self.diagnostics]}
-        if self.planned is not None:
-            d["plan_digest"] = self.planned.plan_digest
-        if self.handoff:
-            d["handoff"] = self.handoff
-        if self.grounding_report:
-            d["grounding_report"] = self.grounding_report
-        return d
 
 
 # ── C# helpers emitted once per program (7.3-safe, read-only) ────────────────
@@ -564,6 +540,29 @@ def _parse_and_check_internal(
         diags.append(Diagnostic(code="KIR-L002", field_name="ops",
                                 got=sorted(families),
                                 message_ru="смешение query и write-опов в одной программе не поддерживается в v1"))
+    # plan: op owning its own transaction scope is SOLE (KIR-L002, spec.SOLO_OPS).
+    #
+    # ЗДЕСЬ, А НЕ ТОЛЬКО В ЭМИТТЕРЕ, и это разница между «правило есть» и
+    # «правило достижимо». Отказ жил ровно в одном месте — `emit_program`, то
+    # есть ПОСЛЕ заземления. Значит песочница собирала программу, план её
+    # принимал, и о стене модель узнавала только на живом устройстве, где
+    # круглый рейс стоит дороже всего. Замер 04.08: `plan_program` принимал
+    # `[create_stairs, create_wall]` молча. Живого Revit для этого правила не
+    # нужно — оно о ФОРМЕ ПРОГРАММЫ, и потому обязано быть видно офлайн.
+    # Отказ в эмиттере ОСТАЁТСЯ дословно: это последний рубеж, а не дубль.
+    solo = sorted({n["op"] for n in normed} & spec.SOLO_OPS)
+    if solo and len(normed) > 1:
+        neighbours = sorted({n["op"] for n in normed} - spec.SOLO_OPS)
+        diags.append(Diagnostic(
+            code=PLAN_SOLO_OP, field_name="ops",
+            expected="1", got=len(normed),
+            candidates=neighbours,
+            message_ru=(
+                f"{solo[0]} — единственный оп своей программы (владеет "
+                f"собственными транзакциями); соседей здесь {len(normed) - 1}. "
+                f"Здание — это ПАЧКА программ: тело отдельно, лестницы "
+                f"отдельно. Уровень, созданный программой тела, доступен "
+                f"лестничной по ИМЕНИ: base_level=\"Этаж 1\"")))
     # DAG: every ref-bearing registry param resolves to an EARLIER typed
     # reference producer.  Producer identity is declared by ResultSpec; op
     # spelling (historically startswith("create_")) has no semantics.
@@ -677,29 +676,12 @@ def _parse_and_check_internal(
             host = n.get("host") or {}
             wall = byid.get(host.get("value"))
             if wall is not None and wall.get("op") == "create_wall" \
-                    and "p0_mm" in wall and "p1_mm" in wall:
-                import math as _math
-                arc = wall.get("arc")
-                if isinstance(arc, dict):
-                    ln = abs(float(arc["radius_mm"]) * (
-                        float(arc["end_angle_rad"])
-                        - float(arc["start_angle_rad"])))
-                else:
-                    ln = _math.hypot(
-                        wall["p1_mm"][0] - wall["p0_mm"][0],
-                        wall["p1_mm"][1] - wall["p0_mm"][1])
-                off = n.get("offset_mm", 0)
-                if off > ln:
-                    diags.append(Diagnostic(
-                        code="KIR-T002", op_index=idx, op_id=n["id"],
-                        field_name="offset_mm", expected=f"0..{ln:.0f}", got=off,
-                        message_ru=f"offset {off}мм за пределами стены «{host.get('value')}» ({ln:.0f}мм)"))
-                else:
-                    host_shape = {
-                        "p0_mm": wall["p0_mm"], "p1_mm": wall["p1_mm"]}
-                    if isinstance(arc, dict):
-                        host_shape["arc"] = arc
-                    n["__host_wall__"] = host_shape
+                    and "p0_mm" in wall and "p1_mm" in wall \
+                    and not relate.is_address(wall["p0_mm"]) \
+                    and not relate.is_address(wall["p1_mm"]):
+                # Адресованный хост проверяется ТЕМ ЖЕ судьёй в `ground`,
+                # когда его концы станут числами — см. hosted_offset_check.
+                hosted_offset_check(n, wall, str(host.get("value")), idx, diags)
     # policy-gate on the plan (SPEC 12.2): destructive ops need explicit opt-in
     if any(n["op"] == "delete" for n in normed) and program.get("allow_destructive") is not True:
         diags.append(Diagnostic(
@@ -1000,6 +982,16 @@ def _emit_op(op: dict, revit_version: str) -> str:
                 f"            try {{ var __cat = __fs.Category; int __catId; if (__cat != null && Int32.TryParse(__cat.Id.ToString(), out __catId)) __row[\"category\"] = Enum.GetName(typeof(BuiltInCategory), __catId) ?? __catId.ToString(); }} catch {{ }}\n"
                 f"            try {{ __row[\"family_name\"] = __fs.FamilyName ?? \"\"; }} catch {{ }}\n"
                 f"            try {{ __row[\"type_name\"] = __fs.Name ?? \"\"; }} catch {{ }}\n"
+                # ЧЕМ ЭТОТ ТИПОРАЗМЕР ВООБЩЕ РАЗМЕЩАЮТ. Без этого поля пул
+                # `family_symbols` не отвечает на единственный вопрос,
+                # который к нему приходит от `place_family`: держит ли
+                # символ точку. Замер живьём 04.08 («Проект1», 320 штук):
+                # 279 ViewBased, 20 OneLevelBased, 16 OneLevelBasedHosted,
+                # 4 TwoLevelsBased. Ни имя, ни категория этого не говорят —
+                # `MullionType` id 407 назывался «50 x 150 мм» и при
+                # размещении точкой уехал в (0,0,0), а системная панель
+                # вернула LocationPoint == null.
+                f"            try {{ __row[\"placement\"] = __fs.Family != null ? __fs.Family.FamilyPlacementType.ToString() : \"\"; }} catch {{ }}\n"
                 f"        }}\n")
         return (f"// {name} {cs_line_comment_fragment(oid)}\n"
                 f"var {var} = new FilteredElementCollector(doc){collector_cs}"
@@ -1067,6 +1059,8 @@ def compile_program(program: Any, revit_version: str = "2026",
     MAX_OPS_PER_PROGRAM budget; the post-expansion ceiling is unchanged.
     Internal callers do not set it by hand either — they go through
     `compile_rebuild_chunk`, the single rebuild policy point below."""
+    stage = "plan"
+    planned: PlannedProgram | None = None
     try:
         # Accepting PlannedProgram makes the typed boundary composable: serving
         # can classify before the snapshot read, then lower this SAME object
@@ -1075,14 +1069,20 @@ def compile_program(program: Any, revit_version: str = "2026",
         # Grounders/emitters still operate on dicts; this is a detached lowering
         # view, never the plan object whose digest acceptance/evidence records.
         normed = planned.to_ops()
+        stage = "target_profile"
         if revit_version not in spec.REVIT_VERSIONS:
             raise KirRefusal([Diagnostic(code="KIR-E001", field_name="revit_version",
                                          expected=list(spec.REVIT_VERSIONS),
                                          got=revit_version,
                                          message_ru="неизвестная версия Revit")])
+        from kukai.compiler_contract import load_target_profile_manifest
+        target_profile = load_target_profile_manifest().profile_for_year(
+            revit_version)
         if normed and spec.OPS[normed[0]["op"]].family in spec.WRITE_FAMILIES:
             from kukai.ir import authoring, ground as ground_mod
-            grounded = ground_mod.ground(normed, snapshot)
+            stage = "ground"
+            grounded_program = ground_mod.ground_program(planned, snapshot)
+            grounded = grounded_program.to_ops()
             guarded_identities = expected_identities
             if open_model_profile is not None:
                 from kukai.ir.open_model import (
@@ -1095,6 +1095,7 @@ def compile_program(program: Any, revit_version: str = "2026",
                         message_ru=(
                             "профиль открытой модели имеет неверный тип"),
                     )])
+                stage = "open_model_preflight"
                 binding_report = preflight_programs(
                     {"ops": grounded},
                     open_model_profile,
@@ -1120,17 +1121,29 @@ def compile_program(program: Any, revit_version: str = "2026",
                     if expected_identities is None
                     else tuple(expected_identities) + derived
                 )
-            cs = authoring.emit_program(
-                grounded, revit_version,
-                planned.intent,
+            stage = "lower"
+            lowered_program = lower_program(
+                grounded_program,
+                target_profile,
                 isolation=isolation,
                 disallow_wall_joins=disallow_wall_joins,
                 stamp_scope=stamp_scope,
                 expected_document=expected_document,
-                expected_identities=guarded_identities)
+                expected_identities=guarded_identities,
+                open_model_profile_digest=(
+                    open_model_profile.digest
+                    if open_model_profile is not None else None
+                ),
+            )
+            stage = "emit_authoring"
+            emitted_artifact = authoring.emit_artifact(lowered_program)
             return CompileOutput(
-                ok=True, csharp=cs, planned=planned,
+                ok=True, csharp=emitted_artifact.source, planned=planned,
+                grounded=grounded_program,
+                lowered=lowered_program,
+                emitted=emitted_artifact,
                 grounding_report=ground_mod.compiler_choices(grounded))
+        stage = "emit_query"
         cs = emit_for_version(normed, revit_version)
         return CompileOutput(ok=True, csharp=cs, planned=planned)
     except KirRefusal as r:
@@ -1148,9 +1161,23 @@ def compile_program(program: Any, revit_version: str = "2026",
                            "kinds": kinds}
         return out
     except Exception as e:  # noqa: BLE001 — compiler must never panic (RISK R1/R4 discipline)
+        incident_id = uuid.uuid4().hex
+        logger.exception(
+            "KIR compiler panic incident_id=%s stage=%s query_id=%s "
+            "revit_version=%s plan_digest=%s input_type=%s",
+            incident_id,
+            stage,
+            query_id or "-",
+            revit_version,
+            planned.plan_digest if planned is not None else "-",
+            type(program).__name__,
+        )
         return CompileOutput(ok=False, diagnostics=[Diagnostic(
-            code="KIR-P000", message_ru=f"внутренняя ошибка компилятора: {type(e).__name__}",
-            got=str(e)[:200])])
+            code="KIR-P000",
+            message_ru=("внутренняя ошибка компилятора; сообщите "
+                        f"incident_id={incident_id}"),
+            incident_id=incident_id,
+        )])
 
 
 def compile_rebuild_chunk(program: Any, revit_version: str = "2026",

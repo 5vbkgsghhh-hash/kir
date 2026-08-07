@@ -107,19 +107,19 @@ from kukai.ir.registry_base import *  # noqa: F401,F403 (OpSpec/ParamSpec/...)
 #: и в родном Revit означают «объём без BIM-роли». Категории, у которых в KIR
 #: есть настоящая операция (стены, перекрытия, кровли, колонны, каркас),
 #: отсутствуют намеренно — см. пункт 2 шапки. Все члены замерены 6/6.
-DIRECTSHAPE_CATEGORIES = {
+DIRECTSHAPE_CATEGORIES = freeze_registry_mapping({
     "generic_model": "OST_GenericModel",
     "mass": "OST_Mass",
     "site": "OST_Site",
     "entourage": "OST_Entourage",
     "specialty_equipment": "OST_SpecialityEquipment",
     "furniture": "OST_Furniture",
-}
+})
 
 #: Категории, которые компилируются, но запрещены здесь, и операция, которая
 #: делает то же самое ЧЕСТНО. Читается отказом, поэтому пользователь узнаёт не
 #: «нельзя», а «вот чем это делается».
-IMPERSONATION_ROUTES = {
+IMPERSONATION_ROUTES = freeze_registry_mapping({
     "walls": "create_wall",
     "floors": "create_floor / create_floor_by_contour",
     "roofs": "create_roof",
@@ -128,7 +128,7 @@ IMPERSONATION_ROUTES = {
     "structural_framing": "create_beam",
     "ceilings": "create_ceiling",
     "stairs": "create_stairs",
-}
+})
 
 OPS = [
     OpSpec(

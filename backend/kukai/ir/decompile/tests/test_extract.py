@@ -193,7 +193,15 @@ class GeneratedCSharpTests(unittest.TestCase):
         for token in (
             "Level", "Grid", "GetBoundarySegments", "ProjectInformation",
             "RevitLinkInstance", "GetLinkDocument", "get_BoundingBox(null)",
-            "UnitTypeId.SquareMeters", "Regex.Split",
+            "UnitTypeId.SquareMeters",
+            # ПОЛНОЕ ИМЯ, а не голое `Regex.Split` — замерено 04.08 на живом
+            # устройстве оператора: `CS0103: The name 'Regex' does not exist`.
+            # `System.Text.RegularExpressions` НЕ входит в список usings
+            # клиента намеренно: его `Group` конфликтует с
+            # `Autodesk.Revit.DB.Group` (см. NOTES_A1B). Серверная обёртка его
+            # включает — поэтому расхождение и не всплывало до живого прогона.
+            # Так же квалифицируют `Regex` правила аудита.
+            "Char.IsLetterOrDigit",
         ):
             self.assertIn(token, body)
         self.assertIn(f".Take({EXTRACT_BATCH + 1})", body)

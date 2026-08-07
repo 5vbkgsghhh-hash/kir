@@ -1,0 +1,12 @@
+{
+  "case_id": "tower-reshape-54-v0",
+  "final_build_digest": "sha256:789a91fb9168a03fc12c9ca6b2aab9b790b0dfecbca0a700ced07be3d197a59d",
+  "final_entity_count": 360,
+  "final_instance_count": 61,
+  "final_source_digest": "sha256:caa3ec3ed9d0fb8a58363557c39edad2730f543d41918695b2d9dc1bdbbdabf3",
+  "initial_build_digest": "sha256:6b6374105fd5fd80e0103381b73dc266c9de9019ebdb8d2d7a8555582f7bb796",
+  "initial_source_digest": "sha256:48cd30ce5226ca702990acfb3de6c0971dc0bec6d02bcfe806fa378aff891d4f",
+  "phase_a_build_digest": "sha256:1e74bcd2520425d8cdb3d208c882df43c2845e986a199e46ddb7145272e67c0d",
+  "phase_a_source_digest": "sha256:b548378b2049893ab6b867ffa3cd9296d2ade95349210bb28e4ef8d8c313c8a4",
+  "schema": "kir-ai-authoring-benchmark-fixture-receipt/0"
+}

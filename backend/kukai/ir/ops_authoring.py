@@ -10,18 +10,18 @@ from kukai.ir.registry_base import *  # noqa: F401,F403 (OpSpec/ParamSpec/DEFAUL
 #: ordinals, which is what ``WALL_KEY_REF_PARAM`` stores.  ONE table, shared by
 #: the emitter (word -> ordinal) and the lift (ordinal -> word), so the two
 #: directions cannot drift apart.  Order is Revit's, and the tests pin it.
-WALL_LOCATION_LINE_ORDINALS = {
+WALL_LOCATION_LINE_ORDINALS = freeze_registry_mapping({
     "wall_centerline": 0,
     "core_centerline": 1,
     "finish_face_exterior": 2,
     "finish_face_interior": 3,
     "core_exterior": 4,
     "core_interior": 5,
-}
+})
 
-WALL_LOCATION_LINE_NAMES = {
+WALL_LOCATION_LINE_NAMES = freeze_registry_mapping({
     ordinal: name for name, ordinal in WALL_LOCATION_LINE_ORDINALS.items()
-}
+})
 
 OPS = [
     OpSpec(
@@ -53,7 +53,7 @@ OPS = [
             params=(
                 ParamSpec("kind", "kind_enum", required=True),
                 ParamSpec("where", "filters"),
-                ParamSpec("fields", "fields", default=list(LIST_FIELDS)),
+                ParamSpec("fields", "fields", default=LIST_FIELDS),
                 ParamSpec("limit", "int", default=LIST_LIMIT_DEFAULT, min_val=1, max_val=LIST_LIMIT_MAX),
             ),
             capability=(("list", "category"), ("list", "element"), ("list", "link"),

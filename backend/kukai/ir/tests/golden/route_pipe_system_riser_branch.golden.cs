@@ -9,6 +9,30 @@ Func<string, string, Dictionary<string, object>> __Refuse = (string __oid, strin
     __e["error"] = "stale_or_failed"; __e["op_id"] = __oid; __e["message"] = __msg;
     return __e;
 };
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element и у исключений — это полное имя типа CLR:
+// из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ, WorksetId,
+// ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и ни один из
+// них сюда не передаётся. Исключение дописывает ": сообщение" и стек,
+// поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __ClassName = (__cnObj) =>
+{
+    if (__cnObj == null) return "";
+    string __cn = __cnObj.ToString();
+    if (__cn == null) return "";
+    int __cnCut = __cn.IndexOf((char)10);
+    if (__cnCut >= 0) __cn = __cn.Substring(0, __cnCut);
+    __cnCut = __cn.IndexOf(':');
+    if (__cnCut >= 0) __cn = __cn.Substring(0, __cnCut);
+    __cn = __cn.Trim();
+    __cnCut = __cn.LastIndexOf('.');
+    return __cnCut >= 0 && __cnCut + 1 < __cn.Length
+        ? __cn.Substring(__cnCut + 1) : __cn;
+};
 var __results = new Dictionary<string, object>();
 var __post = new List<string>();
 Element __sysprobe_SYS1 = null;
@@ -31,7 +55,7 @@ using (Transaction __t = new Transaction(doc, "KIR: стояк ВК с отво�
         // route_pipe_system SYS1 — graph: 3 nodes, 2 segments
         Element __lv_raw_SYS1 = doc.GetElement(new ElementId(42));
         Level __lv_SYS1 = __lv_raw_SYS1 as Level;
-        if (__lv_SYS1 == null) { __t.RollBack(); return __Refuse("SYS1", (__lv_raw_SYS1 == null ? "уровень не найден (модель изменилась после grounding)" : "id уровня резолвится не в Level, а в " + __lv_raw_SYS1.GetType().Name + " — причина (дрейф модели или неверный id) не определена рантаймом")); }
+        if (__lv_SYS1 == null) { __t.RollBack(); return __Refuse("SYS1", (__lv_raw_SYS1 == null ? "уровень не найден (модель изменилась после grounding)" : "id уровня резолвится не в Level, а в " + __ClassName(__lv_raw_SYS1) + " — причина (дрейф модели или неверный id) не определена рантаймом")); }
         __seg_SYS1_0 = Autodesk.Revit.DB.Plumbing.Pipe.Create(doc, new ElementId(300), new ElementId(200), __lv_SYS1.Id, P(0.0, 0.0, 15000.0), P(0.0, 0.0, 0.0));
         if (__seg_SYS1_0 == null) { __t.RollBack(); return __Refuse("seg-0", "создание сегмента вернуло null"); }
         try { var __d0 = __seg_SYS1_0.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM); if (__d0 != null && !__d0.IsReadOnly) __d0.Set(U(100.0)); } catch { }
@@ -120,10 +144,11 @@ using (Transaction __t = new Transaction(doc, "KIR: стояк ВК с отво�
             var __ids = new HashSet<string>();
             foreach (var __e in __segs) __ids.Add(__e.Id.ToString());
             var __seen = new HashSet<string>();
-            var __stack = new Stack<Element>();
-            __stack.Push(__segs[0]); __seen.Add(__segs[0].Id.ToString());
+            var __stack = new List<Element>();
+            __stack.Add(__segs[0]); __seen.Add(__segs[0].Id.ToString());
             while (__stack.Count > 0) {
-                var __cur = __stack.Pop();
+                var __cur = __stack[__stack.Count - 1];
+                __stack.RemoveAt(__stack.Count - 1);
                 ConnectorManager __cm = null;
                 try { if (__cur is MEPCurve) __cm = ((MEPCurve)__cur).ConnectorManager;
                        else if (__cur is FamilyInstance) __cm = ((FamilyInstance)__cur).MEPModel.ConnectorManager; } catch { }
@@ -134,8 +159,8 @@ using (Transaction __t = new Transaction(doc, "KIR: стояк ВК с отво�
                         if (__owner == null) continue;
                         var __k = __owner.Id.ToString();
                         if (!__seen.Contains(__k)) { __seen.Add(__k);
-                            if (__ids.Contains(__k)) __stack.Push(__owner);
-                            else __stack.Push(__owner); }
+                            if (__ids.Contains(__k)) __stack.Add(__owner);
+                            else __stack.Add(__owner); }
                     }
                 }
             }

@@ -24,8 +24,6 @@ Grid.Create) are stable 2021-2026; the live divergence is ElementId literals —
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import re
 from typing import Any, Mapping, Sequence
@@ -38,18 +36,18 @@ from kukai.ir.emit_model import (BarePost, WitnessCheck, post_to_string,
                                  tolerance, tolerances)
 from kukai.ir.diag import (Diagnostic, KirRefusal, PLAN_SOLO_OP, TYPE_BAD_TYPE,
                            GROUND_BAD_SELECTOR)
-from kukai.ir.ground import IN_EMIT_DEFAULT
 from kukai.ir.emit_utils import (
-    ELEMENT_ID_MAX,
-    cs_element_id_literal,
-    cs_identifier_fragment,
     cs_line_comment_fragment,
-    cs_string_literal,
     program_refusal_tokens,
     refuse_stmt,
 )
+from kukai.ir.emitted_artifact import EmittedArtifact
+from kukai.ir.lowering import (
+    LoweredProgram,
+    program_hash,
+    program_stamp as _program_stamp,
+)
 
-EMIT_ID_RANGE = "KIR-E002"     # grounded id unrepresentable on this Revit version
 # Внутренний контракт эмиссии, не пользовательский ввод: op-локальный гард,
 # написанный мимо emit_utils.refuse_stmt(), уносит семантику ЦЕЛОЙ программы
 # внутрь SubTransaction.  Своя буква намеренно вне занятого разбором
@@ -80,84 +78,37 @@ from kukai.ir.authoring_validation import (
     _validate_arc,
     validate,
 )
+from kukai.ir.authoring_emit_support import (
+    EMIT_ID_RANGE,
+    EMIT_UNSUPPORTED,
+    IN_EMIT_DEFAULT,
+    _cs,
+    _eid,
+    _endpoint_check,
+    _gid,
+    _level_chain_check,
+    _level_check_expr,
+    _level_expr,
+    _loop_pts,
+    _pt3,
+    _readback_block,
+    _safe,
+    _split_witness,
+    _stamp_block,
+    _stamp_readback,
+    _symbol_res,
+    bbox_extents_witness,
+    endpoint_witness,
+    level_binding_witness,
+    level_chain_witness,
+)
 
 
 # ── emit ─────────────────────────────────────────────────────────────────────
 
-def _cs(s: str) -> str:
-    return cs_string_literal(s)
-
-
 def _indent(block: str, pad: str) -> str:
     return "\n".join(pad + ln if ln.strip() else ln
                      for ln in block.splitlines())
-
-
-def _safe(s: str) -> str:
-    return cs_identifier_fragment(s)
-
-
-def _eid(val: int, ver: str, op_id: str) -> str:
-    """ElementId literal, version-aware (the gate-caught divergence)."""
-    try:
-        return cs_element_id_literal(val, ver)
-    except ValueError:
-        if not (isinstance(val, int) and not isinstance(val, bool)
-                and 1 <= val <= ELEMENT_ID_MAX):
-            message = (
-                f"id {val} вне положительного 64-битного пространства "
-                "ElementId")
-        else:
-            message = (
-                f"id {val} вне 32-битного пространства ElementId Revit {ver}")
-        raise KirRefusal([Diagnostic(
-            code=EMIT_ID_RANGE, op_id=op_id, got=val,
-            message_ru=message)])
-
-
-def _gid(op: dict, param: str) -> dict:
-    return op[param]["__grounded__"]
-
-
-def _level_expr(op: dict, s: str, ver: str, oid: str,
-                isolation: str = "atomic") -> tuple[str, str]:
-    """(resolution C#, level id C#-expr for topology checks). Ref -> the
-    created level variable; pinned -> GetElement + stale guard.
-
-    The guard distinguishes WHY ``as Level`` failed.  Measured live 27.07
-    twice (``create_beam`` x16, two runs ~74 min apart, one editor, one local
-    file, journalctl kukai-backend): X003 claimed "уровень не найден (модель
-    изменилась после grounding)" 130-460ms after ``ground_snapshot`` had just
-    returned the SAME level catalogue — too little time for a human edit.
-    ``doc.GetElement(id) as Level`` returns null for two different reasons
-    that used to share one fixed message: the id no longer resolves at all
-    (consistent with genuine drift) and the id resolves to something that
-    was never a Level.  The second case does NOT by itself prove a grounding
-    bug: ``ground.py``'s ``by: element_id`` path is a documented, deliberate
-    pass-through (existence/kind re-checked only here, at runtime — see
-    ``ground.py`` module docstring) — a wrong id can equally come from the
-    calling side.  So the message states the observed FACT (wrong runtime
-    type) and stops there; it must not invent a cause the guard cannot see,
-    same discipline as the lie ``test_hangs_and_lies.py`` already found and
-    fixed for "NewFamilyInstance вернул null" / "NewElbowFitting: failed to
-    insert elbow" — one layer deeper: baked into this guard's own static C#
-    string rather than a raw Revit message, so the earlier fix (which only
-    reads ``serving._translate_runtime``'s input) never saw it.
-    """
-    lv = _gid(op, "level")
-    if lv.get("via") == "ref":
-        rv = "__el_" + _safe(lv["ref"])
-        return (f"Level __lv_{s} = {rv};", f"{rv}.Id.ToString()")
-    raw = f"__lv_raw_{s}"
-    vanished = _cs("уровень не найден (модель изменилась после grounding)")
-    wrong_type = _cs("id уровня резолвится не в Level, а в ")
-    tail = _cs(" — причина (дрейф модели или неверный id) не определена рантаймом")
-    msg_expr = (f"({raw} == null ? {vanished} : "
-                f"{wrong_type} + {raw}.GetType().Name + {tail})")
-    res = (f"Element {raw} = doc.GetElement({_eid(lv['id'], ver, oid)});\n"
-           f"Level __lv_{s} = {raw} as Level;\n"
-           f"if (__lv_{s} == null) {{ {refuse_stmt(oid, msg_expr, isolation)} }}")
-    return res, _cs(str(lv["id"]))
 
 
 _AUTH_PREAMBLE = r"""
@@ -177,147 +128,56 @@ var __post = new List<string>();
 """.strip("\n")
 
 
-def _stamp_block(el_var: str, stamp: str) -> str:
-    if not stamp.startswith("kir:a5:"):
-        # Public/chat emission remains byte-compatible.  Only an A5 run treats
-        # this value as an authoritative ownership receipt used for orphan
-        # reconciliation and cleanup.
-        return (f'try {{ Parameter __cm = {el_var}.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); '
-                f'if (__cm != null && !__cm.IsReadOnly) __cm.Set({_cs(stamp)}); }} catch {{ }}')
-    return (
-        f'try {{ Parameter __cm = {el_var}.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); '
-        f'if (__cm == null) throw new InvalidOperationException("A5 stamp parameter missing"); '
-        f'if (__cm.IsReadOnly) throw new InvalidOperationException("A5 stamp parameter is read-only"); '
-        f'if (!__cm.Set({_cs(stamp)}) || __cm.AsString() != {_cs(stamp)}) '
-        f'throw new InvalidOperationException("A5 stamp readback mismatch"); }} '
-        f'catch (Exception __stampEx) {{ throw new InvalidOperationException('
-        f'"A5 stamp write failed: " + __stampEx.Message, __stampEx); }}')
+#: Помощник имени класса. НЕ в преамбуле: программа, которая его не зовёт, не
+#: обязана его нести. Замер 04.08.2026 — при безусловной эмиссии объявление
+#: попадало в 812 из 1292 эмиссий, а звали его 144; остальные 668 несли
+#: мёртвый C# и, что хуже, сдвигали замороженные байты
+#: (`test_emit_model_byte_parity`) у программ, которых правка не касалась.
+#: Храповик обязан щёлкать на изменение эмиссии, а не на рост преамбулы.
+_CLASS_NAME_HELPER_CS = """\
+// Имя класса БЕЗ обращения к среде выполнения за типом: та форма записи
+// целиком отвергается валидатором безопасности моста версий до 06.07.2026,
+// который всё ещё стоит на части флота, — тело браковалось бы на машине
+// пользователя ДО компиляции, и сервер об этом не узнавал бы.
+// Object.ToString() у Element и у исключений — это полное имя типа CLR:
+// из Autodesk.Revit.DB его перекрывают только ElementId, UV, XYZ, WorksetId,
+// ScheduleFieldId и PolymeshFacet (замер по индексу ловушек), и ни один из
+// них сюда не передаётся. Исключение дописывает ": сообщение" и стек,
+// поэтому срез идёт по первому переводу строки и первому двоеточию.
+// Результат побайтно равен прежнему .Name.
+Func<object, string> __ClassName = (__cnObj) =>
+{
+    if (__cnObj == null) return "";
+    string __cn = __cnObj.ToString();
+    if (__cn == null) return "";
+    int __cnCut = __cn.IndexOf((char)10);
+    if (__cnCut >= 0) __cn = __cn.Substring(0, __cnCut);
+    __cnCut = __cn.IndexOf(':');
+    if (__cnCut >= 0) __cn = __cn.Substring(0, __cnCut);
+    __cn = __cn.Trim();
+    __cnCut = __cn.LastIndexOf('.');
+    return __cnCut >= 0 && __cnCut + 1 < __cn.Length
+        ? __cn.Substring(__cnCut + 1) : __cn;
+};
+"""
 
 
-def _stamp_readback(el_var: str, rb_var: str = "__rb", type_level: bool = False) -> str:
-    """Read the stamp from Revit; never echo the value we merely attempted."""
-    bip = ("ALL_MODEL_TYPE_COMMENTS" if type_level
-           else "ALL_MODEL_INSTANCE_COMMENTS")
-    return (f"    try {{ var __stampParam = {el_var}.get_Parameter(BuiltInParameter.{bip}); "
-            f"if (__stampParam != null) {rb_var}[\"stamp\"] = __stampParam.AsString(); }} catch {{ }}\n")
+def _with_class_name_helper(program: str) -> str:
+    """Вставить объявление ``__ClassName`` ТОЛЬКО если программа его зовёт.
 
-
-def _pt3(pt: list) -> tuple:
-    return (pt[0], pt[1], pt[2] if len(pt) > 2 else 0)
-
-
-def _endpoint_check(el_var: str, oid: str, p0, p1, tol: float, three_d: bool) -> str:
-    x0, y0, z0 = _pt3(p0)
-    x1, y1, z1 = _pt3(p1)
-    orient_z = (f' + Math.Pow(MM(__a.Z) - {z0}, 2)' if three_d else '')
-    orient_z_b = (f' + Math.Pow(MM(__b.Z) - {z0}, 2)' if three_d else '')
-    zc = (f' || Math.Abs(MM(__e0.Z) - {z0}) > {tol} || Math.Abs(MM(__e1.Z) - {z1}) > {tol}'
-          if three_d else "")
-    return (
-        f"var __lc = {el_var}.Location as LocationCurve;\n"
-        f"    if (__lc == null) __post.Add({_cs(oid + ': нет LocationCurve')});\n"
-        f"    else\n    {{\n"
-        f"        var __a = __lc.Curve.GetEndPoint(0); var __b = __lc.Curve.GetEndPoint(1);\n"
-        f"        double __da = Math.Pow(MM(__a.X) - {x0}, 2) + Math.Pow(MM(__a.Y) - {y0}, 2){orient_z};\n"
-        f"        double __db = Math.Pow(MM(__b.X) - {x0}, 2) + Math.Pow(MM(__b.Y) - {y0}, 2){orient_z_b};\n"
-        f"        var __e0 = __da <= __db ? __a : __b; var __e1 = __da <= __db ? __b : __a;\n"
-        f"        if (Math.Abs(MM(__e0.X) - {x0}) > {tol} || Math.Abs(MM(__e0.Y) - {y0}) > {tol} ||\n"
-        f"            Math.Abs(MM(__e1.X) - {x1}) > {tol} || Math.Abs(MM(__e1.Y) - {y1}) > {tol}{zc})\n"
-        f"            __post.Add({_cs(oid + ': endpoints mismatch (geometry)')});\n"
-        f"    }}")
-
-
-def _level_check_expr(el_var: str, oid: str, bip: str, id_expr: str) -> str:
-    """id_expr is a C# string expression (literal or <var>.Id.ToString())."""
-    return (
-        f"var __bp = {el_var}.get_Parameter(BuiltInParameter.{bip});\n"
-        f"    if (__bp == null || __bp.AsElementId() == null || __bp.AsElementId().ToString() != {id_expr})\n"
-        f"        __post.Add({_cs(oid + ': level binding mismatch (topology)')});")
-
-
-# ── Wave A2: witness-model wrappers over the string helpers ─────────────────
-# Each wrapper partitions the legacy fragment at its first newline (reader
-# statement vs guard+verdict) and pins the surrounding glue (lead indent /
-# trailing newline) INSIDE the check, so render_post's concatenation is
-# byte-identical to the historical hand-built post block.
-
-def _split_witness(
-    key: str, body: str, message: str, *,
-    lead: str = "    ", tail: str = "\n",
-    tol=None,
-    style: str = "else_block",
-) -> WitnessCheck:
-    reader, sep, verdict = body.partition("\n")
-    return WitnessCheck(
-        obligation_key=key,
-        reader_cs=lead + reader + sep,
-        verdict_cs=verdict + tail,
-        message=message,
-        tol=tol,
-        style=style,  # type: ignore[arg-type]
-    )
-
-
-def endpoint_witness(
-    el_var: str, oid: str, p0, p1, tol, three_d: bool,
-    *, lead: str = "    ", tail: str = "\n",
-) -> WitnessCheck:
-    """Model form of :func:`_endpoint_check` (public: struct_emit uses it).
-
-    ``tol`` — отчеканенный реестром :class:`Tolerance`, а не число: провенанс
-    допуска предъявляется объектом (закон 1, emit_model.py).
+    Объявление кладётся в преамбулу (перед ``__results``), то есть строго до
+    любого кода операций, — та же видимость, что у ``__Refuse``. Проверено
+    живым компилятором на 2021 и 2026 в обоих режимах изоляции.
     """
+    if "__ClassName(" not in program:
+        return program
+    anchor = "var __results = new Dictionary<string, object>();"
+    if anchor not in program:
+        raise AssertionError(
+            "программа зовёт __ClassName, но в ней нет якоря преамбулы — "
+            "объявление было бы потеряно, и это CS0103 на машине пользователя")
+    return program.replace(anchor, _CLASS_NAME_HELPER_CS + anchor, 1)
 
-    return _split_witness(
-        "endpoints", _endpoint_check(el_var, oid, p0, p1, tol, three_d),
-        "endpoints mismatch (geometry)", lead=lead, tail=tail,
-        tol=tol, style="else_block")
-
-
-def level_chain_witness(
-    el_var: str, oid: str, id_expr: str,
-    *, key: str = "level_binding", lead: str = "    ", tail: str = "\n",
-) -> WitnessCheck:
-    """Model form of :func:`_level_chain_check` (public: struct_emit uses it)."""
-
-    return _split_witness(
-        key, _level_chain_check(el_var, oid, id_expr),
-        "level binding mismatch (topology)", lead=lead, tail=tail,
-        style="guard")
-
-
-def bbox_extents_witness(
-    el_var: str, oid: str, xmin, xmax, ymin, ymax, tol,
-    *, key: str = "bbox",
-) -> WitnessCheck:
-    """Shared floor/roof/slab bbox-extents witness (public for struct_emit).
-
-    ``tol`` — :class:`Tolerance` из реестра (ключ ``bbox_mm`` своего опа).
-    """
-
-    return WitnessCheck(
-        obligation_key=key,
-        reader_cs=f"    var __bb = {el_var}.get_BoundingBox(null);\n",
-        verdict_cs=(
-            f"    if (__bb == null) __post.Add({_cs(oid + ': нет BoundingBox')});\n"
-            f"    else if (Math.Abs(MM(__bb.Min.X) - {xmin}) > {tol} || Math.Abs(MM(__bb.Max.X) - {xmax}) > {tol} ||\n"
-            f"             Math.Abs(MM(__bb.Min.Y) - {ymin}) > {tol} || Math.Abs(MM(__bb.Max.Y) - {ymax}) > {tol})\n"
-            f"        __post.Add({_cs(oid + ': bbox extents mismatch (geometry)')});\n"),
-        message="bbox extents mismatch (geometry)",
-        tol=tol,
-        style="else_block")
-
-
-def level_binding_witness(
-    el_var: str, oid: str, bip: str, id_expr: str,
-    *, key: str = "base_constraint", lead: str = "    ", tail: str = "\n",
-) -> WitnessCheck:
-    """Model form of :func:`_level_check_expr` (public: struct_emit uses it)."""
-
-    return _split_witness(
-        key, _level_check_expr(el_var, oid, bip, id_expr),
-        "level binding mismatch (topology)", lead=lead, tail=tail,
-        style="guard")
 
 
 def _arc_curve_cs(arc: dict) -> str:
@@ -709,50 +569,6 @@ def _emit_grid(op: dict, ver: str, stamp: str,
     return decl, create, checks, readback
 
 
-def _readback_block(
-    s: str,
-    oid: str,
-    stamp: str,
-    *,
-    location_rotation: bool = False,
-    family_state: bool = False,
-) -> str:
-    rotation = (
-        f"    try {{ var __lp2 = __el_{s}.Location as LocationPoint;\n"
-        f"        if (__lp2 != null) __rb[\"rotation_deg\"] = "
-        f"Math.Round(__lp2.Rotation * 180.0 / Math.PI, 6); }} catch {{ }}\n"
-        if location_rotation else ""
-    )
-    state = (
-        f"    try {{ var __fi2 = __el_{s} as FamilyInstance;\n"
-        f"        if (__fi2 != null) {{\n"
-        f"            __rb[\"mirrored\"] = __fi2.Mirrored;\n"
-        f"            __rb[\"hand_flipped\"] = __fi2.HandFlipped;\n"
-        f"            __rb[\"facing_flipped\"] = __fi2.FacingFlipped;\n"
-        f"        }} }} catch {{ }}\n"
-        if family_state else ""
-    )
-    return (
-        f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
-        f"    var __rb = new Dictionary<string, object>();\n"
-        f"    __rb[\"id\"] = __el_{s}.Id.ToString();\n"
-        + _stamp_readback(f"__el_{s}") +
-        f"    try {{ var __lc2 = __el_{s}.Location as LocationCurve;\n"
-        f"        if (__lc2 != null) {{\n"
-        f"            var __s2 = __lc2.Curve.GetEndPoint(0); var __e2 = __lc2.Curve.GetEndPoint(1);\n"
-        f"            __rb[\"start_mm\"] = new double[] {{ Math.Round(MM(__s2.X), 1), Math.Round(MM(__s2.Y), 1), Math.Round(MM(__s2.Z), 1) }};\n"
-        f"            __rb[\"end_mm\"] = new double[] {{ Math.Round(MM(__e2.X), 1), Math.Round(MM(__e2.Y), 1), Math.Round(MM(__e2.Z), 1) }};\n"
-        f"        }} }} catch {{ }}\n"
-        f"    try {{ var __tid = __el_{s}.GetTypeId();\n"
-        f"        if (__tid != null && __tid != ElementId.InvalidElementId) {{\n"
-        f"            var __te = doc.GetElement(__tid);\n"
-        f"            if (__te != null && __te.Name != null) __rb[\"type_name\"] = __te.Name;\n"
-        f"        }} }} catch {{ }}\n"
-        + rotation +
-        state +
-        f"    __results[{_cs(oid)}] = __rb;\n}}")
-
-
 def _emit_level(op: dict, ver: str, stamp: str,
                 isolation: str = "atomic") -> tuple[str, str, str, str]:
     oid = op["id"]
@@ -1096,53 +912,6 @@ def _emit_move_elements(op: dict, ver: str, stamp: str,
         f"    __rb[\"count\"] = __mtIds_{s}.Count;\n"
         f"    __results[{_cs(oid)}] = __rb;\n}}")
     return decl, create, post, readback
-
-
-EMIT_UNSUPPORTED = "KIR-E003"     # feature unsupported on this Revit version
-
-
-def _level_chain_check(el_var: str, oid: str, id_expr: str) -> str:
-    """Topology: level binding via the version-safe BIP chain (witness pattern).
-
-    ЗВЕНО ПРИНИМАЕТСЯ, ТОЛЬКО ЕСЛИ ДЕРЖИТ НАСТОЯЩИЙ ElementId. Раньше условием
-    перехода был `HasValue`, а он у параметра-ссылки истинен и когда значение
-    равно InvalidElementId: замерено 27.07 на балке —
-    `FAMILY_LEVEL_PARAM: HasValue=True, AsElementId=-1`. Цепочка обрывалась на
-    пустом звене, сравнивала «-1» с ожидаемым id и обвиняла правильно
-    построенный элемент. «Параметр заполнен» и «параметр существует» — разные
-    вещи, и различать их обязана сама цепочка."""
-    def link(bip: str, first: bool = False) -> str:
-        head = (f"Parameter __lp = {el_var}.get_Parameter(BuiltInParameter.{bip});\n"
-                if first else
-                f"    if (__lp == null || !__lp.HasValue "
-                f"|| __lp.AsElementId() == null "
-                f"|| __lp.AsElementId() == ElementId.InvalidElementId) "
-                f"__lp = {el_var}.get_Parameter(BuiltInParameter.{bip});\n")
-        return head
-    return (
-        link("FAMILY_BASE_LEVEL_PARAM", first=True)
-        + link("FAMILY_LEVEL_PARAM")
-        + link("SCHEDULE_LEVEL_PARAM")
-        + link("LEVEL_PARAM")
-        + f"    if (__lp == null || __lp.AsElementId() == null || __lp.AsElementId().ToString() != {id_expr})\n"
-        f"        __post.Add({_cs(oid + ': level binding mismatch (topology)')});")
-
-
-def _symbol_res(op: dict, s: str, oid: str, ver: str,
-                isolation: str = "atomic") -> str:
-    g = _gid(op, "symbol")
-    return (f"FamilySymbol __sy_{s} = doc.GetElement({_eid(g['id'], ver, oid)}) as FamilySymbol;\n"
-            f"if (__sy_{s} == null) {{ {refuse_stmt(oid, _cs('типоразмер не найден (модель изменилась после grounding)'), isolation)} }}\n"
-            f"if (!__sy_{s}.IsActive) {{ __sy_{s}.Activate(); doc.Regenerate(); }}")
-
-
-def _loop_pts(pts: list, name: str, z: str = "0") -> list:
-    out = [f"CurveLoop {name} = new CurveLoop();"]
-    n = len(pts)
-    for k in range(n):
-        a, b = pts[k], pts[(k + 1) % n]
-        out.append(f"{name}.Append(Line.CreateBound(P({a[0]}, {a[1]}, {z}), P({b[0]}, {b[1]}, {z})));")
-    return out
 
 
 def _emit_floor(op: dict, ver: str, stamp: str,
@@ -1754,10 +1523,18 @@ def _emit_room(op: dict, ver: str, stamp: str,
               f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('NewRoom вернул null'), isolation)} }}"
               + rename + "\n"
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
-    nchk = ""
-    if nm:
-        nchk = (f"\n    if (__el_{s}.Name != {_cs(nm)}) "
-                f"__post.Add({_cs(oid + ': name mismatch')});")
+    # ИМЯ ПОМЕЩЕНИЯ ЧИТАЕТСЯ ПАРАМЕТРОМ, А НЕ `Room.Name`.
+    #
+    # Замер живьём 04.08 («Проект1», Revit 2026, транзакция откачена):
+    #     rm.Name = "KIR_GAP_ROOM_1";
+    #     rm.Name                     -> "KIR_GAP_ROOM_1 1"   (имя + НОМЕР)
+    #     ROOM_NAME.AsString()        -> "KIR_GAP_ROOM_1"
+    # Сеттер `Room.Name` кладёт ТОЛЬКО имя, а геттер склеивает его с номером
+    # помещения. Постусловие, сверявшее геттер с запрошенным именем, поэтому
+    # не выполнялось НИКОГДА: живая матрица 04.08 откатила ИСПРАВНОЕ
+    # помещение с `KIR-X004: RM: name mismatch`. Ложный красный — свидетель
+    # мерил не то, чем оп писал. Читаем тот же параметр, в который пишет
+    # сеттер; отсутствие параметра — тоже нарушение (fail-closed).
     rmtol = tolerance("create_room", "location_mm")
     checks: list[WitnessCheck] = [
         WitnessCheck(
@@ -1786,7 +1563,9 @@ def _emit_room(op: dict, ver: str, stamp: str,
     if nm:
         checks.append(WitnessCheck(
             obligation_key="name", reader_cs="",
-            verdict_cs=(f"\n    if (__el_{s}.Name != {_cs(nm)}) "
+            verdict_cs=(f"\n    Parameter __rnm_{s} = "
+                        f"__el_{s}.get_Parameter(BuiltInParameter.ROOM_NAME);\n"
+                        f"    if (__rnm_{s} == null || __rnm_{s}.AsString() != {_cs(nm)}) "
                         f"__post.Add({_cs(oid + ': name mismatch')});\n"),
             message="name mismatch", style="guard"))
     post = checks
@@ -1794,7 +1573,13 @@ def _emit_room(op: dict, ver: str, stamp: str,
         f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
         f"    var __rb = new Dictionary<string, object>();\n"
         f"    __rb[\"id\"] = __el_{s}.Id.ToString();\n"
-        f"    __rb[\"name\"] = __el_{s}.Name;\n"
+        # `name` — ИМЯ (то, что ставил оп). `name_and_number` — склейка,
+        # которую отдаёт `Room.Name`: она полезна человеку, но сверять по
+        # ней нельзя, и разные ключи не дают их спутать.
+        f"    try {{ Parameter __rnb_{s} = "
+        f"__el_{s}.get_Parameter(BuiltInParameter.ROOM_NAME);\n"
+        f"        __rb[\"name\"] = __rnb_{s} != null ? __rnb_{s}.AsString() : __el_{s}.Name; }} catch {{ }}\n"
+        f"    try {{ __rb[\"name_and_number\"] = __el_{s}.Name; }} catch {{ }}\n"
         f"    try {{ __rb[\"area_m2\"] = Math.Round(UnitUtils.ConvertFromInternalUnits(__el_{s}.Area, UnitTypeId.SquareMeters), 2); }} catch {{ }}\n"
         f"    __results[{_cs(oid)}] = __rb;\n}}")
     return decl, create, post, readback
@@ -3690,6 +3475,27 @@ def _emit_directshape_mesh(op: dict, ver: str, stamp: str,
     return shape_emit.emit_directshape(op, ver, stamp, isolation)
 
 
+# wave/room (2026-08-03): разделитель помещений. Логика в room_emit.py (своя
+# зона волны), здесь — только регистрация. Импорт отложенный по той же
+# причине, что у волн выше: room_emit импортирует помощники ИЗ этого модуля.
+
+def _emit_room_separator(op: dict, ver: str, stamp: str,
+                         isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import room_emit
+    return room_emit.emit_room_separator(op, ver, stamp, isolation)
+
+
+# wave/opening (2026-08-03): проём КАК ОТДЕЛЬНЫЙ ЭЛЕМЕНТ (Autodesk.Revit.DB.
+# Opening) — единственная молчаливая потеря, найденная замером восьми зданий.
+# Логика в opening_emit.py (своя зона волны), здесь — только регистрация.
+# Импорт отложенный по той же причине, что у волн выше.
+
+def _emit_opening(op: dict, ver: str, stamp: str,
+                  isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import opening_emit
+    return opening_emit.emit_opening(op, ver, stamp, isolation)
+
+
 def _emit_group(op: dict, ver: str, stamp: str,
                 isolation: str = "atomic") -> tuple[str, str, str, str]:
     """Emit a native Revit group of a repeated component (feat/native-groups).
@@ -4119,6 +3925,12 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
             f"if (__ct_{s} == null) {{ {refuse_stmt(oid, _cs('тип панели не найден (модель изменилась после grounding)'), isolation)} }}")
     elif by == "name":
         want = sel["value"]
+        not_found_message = (
+            "тип панели «" + want + "» не найден среди "
+            "типоразмеров семейств и типов стен")
+        ambiguous_message = (
+            "тип панели «" + want + "» неоднозначен — "
+            "несколько типов с этим именем; укажите element_id")
         type_res = (
             f"var __cts_{s} = new List<ElementType>();\n"
             f"foreach (Element __cte_{s} in new FilteredElementCollector(doc)"
@@ -4129,11 +3941,8 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
             f".OfClass(typeof(WallType)))\n"
             f"    if (__ctw_{s}.Name == {_cs(want)}) "
             f"__cts_{s}.Add((ElementType)__ctw_{s});\n"
-            f"if (__cts_{s}.Count == 0) {{ {refuse_stmt(oid, _cs('тип панели «' + want + '» не найден среди '
-                              'типоразмеров семейств и типов стен'), isolation)} }}\n"
-            f"if (__cts_{s}.Count > 1) {{ {refuse_stmt(oid, _cs('тип панели «' + want + '» неоднозначен — '
-                              'несколько типов с этим именем; укажите '
-                              'element_id'), isolation)} }}\n"
+            f"if (__cts_{s}.Count == 0) {{ {refuse_stmt(oid, _cs(not_found_message), isolation)} }}\n"
+            f"if (__cts_{s}.Count > 1) {{ {refuse_stmt(oid, _cs(ambiguous_message), isolation)} }}\n"
             f"__ct_{s} = __cts_{s}[0];")
     else:
         raise KirRefusal([Diagnostic(
@@ -4187,6 +3996,24 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"    }}\n"
         f"    catch {{ return false; }}\n"
         f"}};")
+
+    unlock_refusal_message = (
+        '"замок ячейки не снимается для " + '
+        f'__ClassName(__cp_{s}) + " (панель " + '
+        f'__cp_{s}.Id.ToString() + "): " + '
+        f'__ClassName(__cux_{s}) + ": " + '
+        f'(String.IsNullOrEmpty(__cux_{s}.Message) ? '
+        '"(пустое сообщение Revit)" : '
+        f'__cux_{s}.Message)')
+    type_chase_refusal_message = (
+        '"догон типа ячейки не прошёл: " + '
+        f'__ClassName(__ctx_{s}) + ": " + '
+        f'(String.IsNullOrEmpty(__ctx_{s}.Message) ? '
+        '"(пустое сообщение Revit)" : '
+        f'__ctx_{s}.Message) + " | занявший " + '
+        f'__cn_{s}.Id.ToString() + " (" + '
+        f'__ClassName(__cn_{s}) + "), просили тип " '
+        f'+ __ct_{s}.Id.ToString()')
 
     create = (
         f"// set_curtain_panel {cs_line_comment_fragment(oid)}\n"
@@ -4255,13 +4082,7 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"    try {{ __cp_{s}.Pinned = false; }}\n"
         f"    catch (Exception __cux_{s})\n"
         f"    {{\n"
-        f"        {refuse_stmt(oid, '"замок ячейки не снимается для " + '
-                              f'__cp_{s}.GetType().Name + " (панель " + '
-                              f'__cp_{s}.Id.ToString() + "): " + '
-                              f'__cux_{s}.GetType().Name + ": " + '
-                              f'(String.IsNullOrEmpty(__cux_{s}.Message) ? '
-                              '"(пустое сообщение Revit)" : '
-                              f'__cux_{s}.Message)', isolation)}\n"
+        f"        {refuse_stmt(oid, unlock_refusal_message, isolation)}\n"
         f"    }}\n"
         f"}}\n"
         # УЛИКА, А НЕ ПУСТАЯ СТРОКА. Revit бросает из ChangePanelType с
@@ -4276,12 +4097,12 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"try {{ __cn_{s} = __cg_{s}.ChangePanelType(__cp_{s}, __ct_{s}); }}\n"
         f"catch (Exception __cex_{s})\n"
         f"{{\n"
-        f"    string __cdg_{s} = __cex_{s}.GetType().Name + \": \" + "
+        f"    string __cdg_{s} = __ClassName(__cex_{s}) + \": \" + "
         f"(String.IsNullOrEmpty(__cex_{s}.Message) ? \"(пустое сообщение "
         f"Revit)\" : __cex_{s}.Message);\n"
         f"    if (__cex_{s}.InnerException != null)\n"
         f"        __cdg_{s} += \" | внутреннее \" + "
-        f"__cex_{s}.InnerException.GetType().Name + \": \" + "
+        f"__ClassName(__cex_{s}.InnerException) + \": \" + "
         f"(__cex_{s}.InnerException.Message ?? \"\");\n"
         f"    bool __cul_{s} = false;\n"
         f"    try {{ foreach (ElementId __cui_{s} in "
@@ -4292,10 +4113,10 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"(__clk_{s} ? \"да\" : \"нет\") + \", pinned=\" + "
         f"(__cpn_{s} ? \"да\" : \"нет\");\n"
         f"    __cdg_{s} += \" | ячейка ({u},{v}) панель \" + "
-        f"__cp_{s}.Id.ToString() + \" (\" + __cp_{s}.GetType().Name + "
+        f"__cp_{s}.Id.ToString() + \" (\" + __ClassName(__cp_{s}) + "
         f"\"), разблокирована=\" + (__cul_{s} ? \"да\" : \"нет\")"
         f" + \", новый тип \" + __ct_{s}.Id.ToString() + \" (\" + "
-        f"__ct_{s}.GetType().Name + \"), носитель \" + "
+        f"__ClassName(__ct_{s}) + \"), носитель \" + "
         f"__ch_{s}.Id.ToString();\n"
         f"    {refuse_stmt(oid, f'\"ChangePanelType: \" + __cdg_{s}', isolation)}\n"
         f"}}\n"
@@ -4339,14 +4160,7 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"        }}\n"
         f"        catch (Exception __ctx_{s})\n"
         f"        {{\n"
-        f"            {refuse_stmt(oid, '"догон типа ячейки не прошёл: " + '
-                                  f'__ctx_{s}.GetType().Name + ": " + '
-                                  f'(String.IsNullOrEmpty(__ctx_{s}.Message) ? '
-                                  '"(пустое сообщение Revit)" : '
-                                  f'__ctx_{s}.Message) + " | занявший " + '
-                                  f'__cn_{s}.Id.ToString() + " (" + '
-                                  f'__cn_{s}.GetType().Name + "), просили тип " '
-                                  f'+ __ct_{s}.Id.ToString()', isolation)}\n"
+        f"            {refuse_stmt(oid, type_chase_refusal_message, isolation)}\n"
         f"        }}\n"
         f"    }}\n"
         f"}}")
@@ -4370,6 +4184,16 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"{{\n"
         + _indent(_stamp_block(f"__cn_{s}", stamp), "    ") + "\n"
         f"}}")
+
+    cell_unreadable_message = _cs(
+        oid + ": ячейка (%d,%d) не читается "
+        "после сборки (semantic)" % (u, v))
+    panel_type_mismatch_message = _cs(
+        oid + ": тип панели в ячейке не "
+        "равен запрошенному (semantic)")
+    cell_host_mismatch_message = _cs(
+        oid + ": ячейка принадлежит "
+        "другому носителю (topology)")
 
     post = [
         WitnessCheck(
@@ -4407,15 +4231,13 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
                 f"    if (__co_{s} == null) __co_{s} = __cq_{s};\n"),
             verdict_cs=(
                 f"    if (__co_{s} == null)\n"
-                f"        __post.Add({_cs(oid + ': ячейка (%d,%d) не читается '
-                                          'после сборки (semantic)' % (u, v))});\n"
+                f"        __post.Add({cell_unreadable_message});\n"
                 f"    else\n"
                 f"    {{\n"
                 f"        ElementId __cet_{s} = __ccEffType{s}(__co_{s});\n"
                 f"        if (__cet_{s} == null || __cet_{s}.ToString() != "
                 f"__ct_{s}.Id.ToString())\n"
-                f"            __post.Add({_cs(oid + ': тип панели в ячейке не '
-                                              'равен запрошенному (semantic)')});\n"
+                f"            __post.Add({panel_type_mismatch_message});\n"
                 f"    }}\n"),
             message="тип панели в ячейке не равен запрошенному (semantic)",
             style="else_block"),
@@ -4435,8 +4257,7 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
                 f"            if (__cfi_{s}.Host == null\n"
                 f"                || __cfi_{s}.Host.Id.ToString() != "
                 f"__ch_{s}.Id.ToString())\n"
-                f"                __post.Add({_cs(oid + ': ячейка принадлежит '
-                                                  'другому носителю (topology)')});\n"
+                f"                __post.Add({cell_host_mismatch_message});\n"
                 f"        }}\n"
                 f"        else\n"
                 f"        {{\n"
@@ -4447,8 +4268,7 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
                 # занявшего лежит на оси носителя.
                 f"            bool __chm_{s} = __ccAxis{s}(__co_{s});\n"
                 f"            if (!__chm_{s})\n"
-                f"                __post.Add({_cs(oid + ': ячейка принадлежит '
-                                                  'другому носителю (topology)')});\n"
+                f"                __post.Add({cell_host_mismatch_message});\n"
                 f"        }}\n"
                 f"    }}\n"),
             message="ячейка принадлежит другому носителю (topology)",
@@ -4488,7 +4308,7 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"        __rb[\"created\"] = "
         f"(__co_{s}.Id.ToString() != __cpi_{s});\n"
         f"        __rb[\"type_chased\"] = __cch_{s};\n"
-        f"        __rb[\"panel_class\"] = __co_{s}.GetType().Name;\n"
+        f"        __rb[\"panel_class\"] = __ClassName(__co_{s});\n"
         f"        bool __rbl_{s} = false;\n"
         f"        try {{ foreach (ElementId __rbi_{s} in "
         f"__cg_{s}.GetUnlockedPanelIds())\n"
@@ -4553,6 +4373,19 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
     px, py, pz = _pt3(op["position_mm"])
     tol = tolerance("create_curtain_grid_line", "position_mm")
     mul_tol = _MULLION_ON_LINE_EVIDENCE_MM
+    stamp_refusal_message = (
+        '"линия разрезки не принимает штамп прогона (" + '
+        f'__gsx_{s_}.Message + ") — созданный, но непомеченный '
+        'элемент сломал бы сверку пересборки"')
+    grid_membership_message = _cs(
+        oid + ": созданная линия не состоит "
+        "в сетке носителя (topology)")
+    direction_mismatch_message = _cs(
+        oid + ": направление линии не равно "
+        "запрошенному (semantic)")
+    position_mismatch_message = _cs(
+        oid + ": линия не проходит через "
+        "запрошенную точку (geometry)")
 
     if host["by"] == "ref":
         host_res = f"__gh_{s_} = (Element)__el_{_safe(host['value'])};"
@@ -4627,15 +4460,15 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
         f"try {{ __gl_{s_} = __gg_{s_}.AddGridLine({is_u}, __gp_{s_}, false); }}\n"
         f"catch (Exception __gex_{s_})\n"
         f"{{\n"
-        f"    string __gdg_{s_} = __gex_{s_}.GetType().Name + \": \" + "
+        f"    string __gdg_{s_} = __ClassName(__gex_{s_}) + \": \" + "
         f"(String.IsNullOrEmpty(__gex_{s_}.Message) ? \"(пустое сообщение "
         f"Revit)\" : __gex_{s_}.Message);\n"
         f"    if (__gex_{s_}.InnerException != null)\n"
         f"        __gdg_{s_} += \" | внутреннее \" + "
-        f"__gex_{s_}.InnerException.GetType().Name + \": \" + "
+        f"__ClassName(__gex_{s_}.InnerException) + \": \" + "
         f"(__gex_{s_}.InnerException.Message ?? \"\");\n"
         f"    __gdg_{s_} += \" | носитель \" + __gh_{s_}.Id.ToString() + "
-        f"\" (\" + __gh_{s_}.GetType().Name + \"), направление "
+        f"\" (\" + __ClassName(__gh_{s_}) + \"), направление "
         f"{direction}, точка ({px}, {py}, {pz}) мм\";\n"
         f"    {refuse_stmt(oid, f'\"AddGridLine: \" + __gdg_{s_}', isolation)}\n"
         f"}}\n"
@@ -4656,9 +4489,7 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
         f"}}\n"
         f"catch (Exception __gsx_{s_})\n"
         f"{{\n"
-        f"    {refuse_stmt(oid, '"линия разрезки не принимает штамп прогона (" + '
-                          f'__gsx_{s_}.Message + ") — созданный, но непомеченный '
-                          'элемент сломал бы сверку пересборки"', isolation)}\n"
+        f"    {refuse_stmt(oid, stamp_refusal_message, isolation)}\n"
         f"}}")
 
     post = [
@@ -4672,8 +4503,7 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
                 f"    __gdel_{s_} = __gDist{s_}(__gr_{s_}, __gp_{s_});\n"),
             verdict_cs=(
                 f"    if (!__gmem_{s_})\n"
-                f"        __post.Add({_cs(oid + ': созданная линия не состоит '
-                                          'в сетке носителя (topology)')});\n"),
+                f"        __post.Add({grid_membership_message});\n"),
             message="созданная линия не состоит в сетке носителя (topology)",
             style="else_block"),
         WitnessCheck(
@@ -4681,8 +4511,7 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
             reader_cs="",
             verdict_cs=(
                 f"    if (__gisu_{s_} != {is_u})\n"
-                f"        __post.Add({_cs(oid + ': направление линии не равно '
-                                          'запрошенному (semantic)')});\n"),
+                f"        __post.Add({direction_mismatch_message});\n"),
             message="направление линии не равно запрошенному (semantic)",
             style="guard"),
         WitnessCheck(
@@ -4692,8 +4521,7 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
                 # -1 — «не измерено»: нечитаемая кривая обязана быть
                 # отказом, а не молчаливым успехом.
                 f"    if (__gdel_{s_} < 0.0 || __gdel_{s_} > {tol})\n"
-                f"        __post.Add({_cs(oid + ': линия не проходит через '
-                                          'запрошенную точку (geometry)')});\n"),
+                f"        __post.Add({position_mismatch_message});\n"),
             message="линия не проходит через запрошенную точку (geometry)",
             tol=tol,
             style="guard"),
@@ -4773,26 +4601,9 @@ _EMITTERS = {"create_wall": _emit_wall, "create_pipe": _emit_pipe,
              "create_ceiling": _emit_ceiling_arch,
              "create_railing": _emit_railing_arch,
              "create_directshape": _emit_directshape_mesh,
+             "create_room_separator": _emit_room_separator,
+             "create_opening": _emit_opening,
              "move_elements": _emit_move_elements, "change_type": _emit_change_type}
-
-
-def program_hash(grounded_ops: list[dict]) -> str:
-    blob = json.dumps(grounded_ops, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:8]
-
-
-def _program_stamp(grounded_ops: list[dict], stamp_scope: str = "") -> str:
-    """Return the legacy stamp or one exact A5 run-owned stamp.
-
-    The empty default preserves every existing golden byte-for-byte.  A scoped
-    stamp is an internal compiler input, never part of user-authored KIR.
-    """
-
-    if stamp_scope:
-        if not re.fullmatch(r"a5:[0-9a-f]{12}:[0-9a-f]{16}", stamp_scope):
-            raise ValueError("invalid internal A5 stamp scope")
-        return f"kir:{stamp_scope}:{program_hash(grounded_ops)}"
-    return f"kir:{program_hash(grounded_ops)}"
 
 
 def _document_binding_guard(
@@ -4914,7 +4725,8 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
                         *, stamp_scope: str = "",
                         expected_document: Mapping[str, str] | None = None,
                         expected_identities: Sequence[
-                            ElementIdentityProof] | None = None) -> str:
+                            ElementIdentityProof] | None = None,
+                        _program_stamp_value: str | None = None) -> str:
     """Dedicated whole-program template for create_stairs: StairsEditScope owns
     its transactions (cannot nest inside the shared program txn — the reason
     for the KIR-L002 sole-op rule). The IFailuresPreprocessor implementation
@@ -4923,7 +4735,11 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
     proven by the 6/6 gate like every other template)."""
     oid = op["id"]
     s = _safe(oid)
-    stamp = _program_stamp([op], stamp_scope)
+    derived_stamp = _program_stamp([op], stamp_scope)
+    if (_program_stamp_value is not None
+            and _program_stamp_value != derived_stamp):
+        raise ValueError("program stamp disagrees with stairs payload")
+    stamp = _program_stamp_value or derived_stamp
     x0, y0 = op["p0_mm"][0], op["p0_mm"][1]
     x1, y1 = op["p1_mm"][0], op["p1_mm"][1]
     w = op.get("width_mm")
@@ -4955,7 +4771,7 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
     )
     base = _lvl_pin(op, "base_level", f"__base_{s}", ver, oid)
     top = _lvl_pin(op, "top_level", f"__top_{s}", ver, oid)
-    return (
+    return _with_class_name_helper(
         f"{_AUTH_PREAMBLE}\n"
         f"// create_stairs {cs_line_comment_fragment(oid)} — sole-op program, StairsEditScope owns transactions\n"
         + pre_doc_guard +
@@ -5205,13 +5021,19 @@ def _wrap_create_per_op(op: dict, s: str, create: str,
         f"}}")
 
 
-def emit_program(grounded_ops: list[dict], revit_version: str, intent: str = "",
-                 *, isolation: str = "atomic", postconditions: str = "strict",
-                 disallow_wall_joins: bool = False,
-                 stamp_scope: str = "",
-                 expected_document: Mapping[str, str] | None = None,
-                 expected_identities: Sequence[
-                     ElementIdentityProof] | None = None) -> str:
+def _emit_program_core(
+    grounded_ops: list[dict],
+    revit_version: str,
+    intent: str = "",
+    *,
+    isolation: str = "atomic",
+    postconditions: str = "strict",
+    disallow_wall_joins: bool = False,
+    stamp_scope: str = "",
+    expected_document: Mapping[str, str] | None = None,
+    expected_identities: Sequence[ElementIdentityProof] | None = None,
+    _program_stamp_value: str | None = None,
+) -> str:
     """Emit one authoring program.
 
     ``isolation``:
@@ -5238,7 +5060,11 @@ def emit_program(grounded_ops: list[dict], revit_version: str, intent: str = "",
     if postconditions not in ("strict", "report"):
         raise ValueError(
             f"postconditions must be 'strict' or 'report', got {postconditions!r}")
-    if any(op["op"] == "create_stairs" for op in grounded_ops):
+    # ПОСЛЕДНИЙ РУБЕЖ. То же правило стоит теперь и на плане
+    # (`compiler.plan_program`, `spec.SOLO_OPS`), чтобы быть достижимым БЕЗ
+    # живого Revit; здесь оно остаётся дословно — эмиттер обязан отказывать
+    # сам, а не полагаться на то, что до него дошли через план.
+    if any(op["op"] in spec.SOLO_OPS for op in grounded_ops):
         if len(grounded_ops) != 1:
             raise KirRefusal([Diagnostic(
                 code=PLAN_SOLO_OP,
@@ -5248,12 +5074,17 @@ def emit_program(grounded_ops: list[dict], revit_version: str, intent: str = "",
         return emit_stairs_program(
             grounded_ops[0], revit_version, intent, stamp_scope=stamp_scope,
             expected_document=expected_document,
-            expected_identities=expected_identities)
+            expected_identities=expected_identities,
+            _program_stamp_value=_program_stamp_value)
     per_op = isolation == "per_op"
     # A partial commit cannot honour a whole-program rollback, so per_op forces
     # report-mode postconditions (drift surfaced, elements kept).
     report_posts = per_op or postconditions == "report"
-    stamp = _program_stamp(grounded_ops, stamp_scope)
+    derived_stamp = _program_stamp(grounded_ops, stamp_scope)
+    if (_program_stamp_value is not None
+            and _program_stamp_value != derived_stamp):
+        raise ValueError("program stamp disagrees with grounded payload")
+    stamp = _program_stamp_value or derived_stamp
     txn_name = ("KIR: " + (intent or "authoring"))[:80]
     op_ids = {op["id"] for op in grounded_ops}
     decls, creates, posts, readbacks = [], [], [], []
@@ -5341,7 +5172,7 @@ def emit_program(grounded_ops: list[dict], revit_version: str, intent: str = "",
         _indent(identity_guard_raw, "        ") + "\n"
         if identity_guard_raw else ""
     )
-    return (
+    return _with_class_name_helper(
         f"{_AUTH_PREAMBLE}\n"
         + op_refuse_decl
         + "\n".join(decls) + "\n"
@@ -5408,3 +5239,61 @@ def emit_program(grounded_ops: list[dict], revit_version: str, intent: str = "",
         + op_refuse_class +
         f"private static class __KirPad\n"
         f"{{")
+
+
+def emit_program(grounded_ops: list[dict], revit_version: str, intent: str = "",
+                 *, isolation: str = "atomic", postconditions: str = "strict",
+                 disallow_wall_joins: bool = False,
+                 stamp_scope: str = "",
+                 expected_document: Mapping[str, str] | None = None,
+                 expected_identities: Sequence[
+                     ElementIdentityProof] | None = None) -> str:
+    """Compatibility facade for callers that still hold mutable op dicts.
+
+    The compiler production path uses :func:`emit_lowered_program`; this raw
+    entry remains for SDK/tests and converges on the same private byte owner.
+    """
+
+    return _emit_program_core(
+        grounded_ops,
+        revit_version,
+        intent,
+        isolation=isolation,
+        postconditions=postconditions,
+        disallow_wall_joins=disallow_wall_joins,
+        stamp_scope=stamp_scope,
+        expected_document=expected_document,
+        expected_identities=expected_identities,
+    )
+
+
+def emit_lowered_program(lowered: LoweredProgram) -> str:
+    """Emit the exact policy and target bound by ``LoweredProgram``."""
+
+    if not isinstance(lowered, LoweredProgram):
+        raise TypeError("emit_lowered_program requires a LoweredProgram")
+    policy = lowered.policy
+    return _emit_program_core(
+        lowered.grounded.to_ops(),
+        lowered.target_profile.revit_year,
+        lowered.grounded.planned.intent,
+        isolation=policy.isolation.value,
+        postconditions=policy.postconditions.value,
+        disallow_wall_joins=policy.disallow_wall_joins,
+        stamp_scope=policy.stamp_scope,
+        expected_document=(
+            policy.expected_document.compiler_guard()
+            if policy.expected_document is not None else None
+        ),
+        expected_identities=policy.expected_identities,
+        _program_stamp_value=lowered.program_stamp,
+    )
+
+
+def emit_artifact(lowered: LoweredProgram) -> EmittedArtifact:
+    """Return the content-addressed result of typed authoring emission."""
+
+    return EmittedArtifact(
+        lowered=lowered,
+        source=emit_lowered_program(lowered),
+    )

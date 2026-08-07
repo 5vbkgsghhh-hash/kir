@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from kukai.ir import docspace, spec
+from kukai.ir import docspace, relate, spec
 from kukai.ir.diag import (
     Diagnostic,
     PARSE_MISSING_FIELD,
@@ -17,6 +17,7 @@ from kukai.ir.diag import (
     TYPE_BOUNDS,
 )
 from kukai.ir.emit_utils import ELEMENT_ID_MAX, is_finite_number
+from kukai.ir.numeric_contracts import MODEL_COORD_LIMIT_MM
 
 
 def _num(x) -> bool:
@@ -27,7 +28,10 @@ def _num(x) -> bool:
 # extent is ~16 km from origin; a coordinate beyond that is a unit/garbage
 # error that previously sailed to a late Revit runtime refusal.  Refused
 # statically here instead — same enforcement point as every numeric bound.
-_COORD_LIMIT_MM = 16_000_000.0
+# Backward-compatible name used by authoring and the bounds inventory. The
+# value itself is owned by numeric_contracts so RELATE need not import this
+# validator and form a dependency cycle.
+_COORD_LIMIT_MM = MODEL_COORD_LIMIT_MM
 
 #: Потолок длины `create_text.content`.
 #:
@@ -55,6 +59,27 @@ def _pt_ok(v, dims=(2, 3)) -> bool:
 def _dist(a, b) -> float:
     dz = (a[2] if len(a) > 2 else 0) - (b[2] if len(b) > 2 else 0)
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + dz ** 2)
+
+
+#: Минимальная длина отрезка (мм). Ниже — Revit сам откажет ShortCurveTolerance,
+#: и отказ придёт из транзакции вместо компиляции.
+_MIN_SEGMENT_MM = 1.0
+
+
+def reject_zero_length(p0, p1, op_name: str, i, oid, diags: list) -> bool:
+    """«длина ~0 (p0==p1)» — ОДНА реализация на две стадии.
+
+    Литеральные концы проверяются здесь, на validate. Концы, приехавшие
+    адресом от осей, известны только после ground — и тот же закон вызывается
+    оттуда (`ground.ground`), а не переписывается заново. Правило, написанное
+    дважды, расходится в одном из двух мест; вызванное дважды — нет.
+    """
+    if _dist(p0, p1) >= _MIN_SEGMENT_MM:
+        return True
+    diags.append(Diagnostic(
+        code=TYPE_BOUNDS, op_index=i, op_id=oid, field_name="p1_mm",
+        message_ru=f"{op_name}: длина ~0 (p0==p1)"))
+    return False
 
 
 # Endpoint agreement tolerance between the arc dict and p0_mm/p1_mm (mm). The
@@ -203,9 +228,20 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
     _pt_required = {
         pp.name: pp.required for pp in ospec.params
         if pp.name in ("p0_mm", "p1_mm")}
+    # RELATE (04.08): адресуемость параметра — вопрос к РЕЕСТРУ, а не к списку
+    # здесь. `relate.addressable_params` выводит её из рода pt_xy/pt_xyz с
+    # одним НАЗВАННЫМ исключением (`move_elements.delta_mm` — смещение, а не
+    # положение). Свой список стал бы четвёртым судьёй и разошёлся бы на
+    # первом же новом опе.
+    _addressable = relate.addressable_params(name)
     for key in (("p0_mm", "p1_mm") if has_pts else ()):
         v = op.get(key)
         if v is None and not _pt_required.get(key, True):
+            continue
+        if relate.is_address(v) and key in _addressable:
+            if relate.validate_address(v, oid, key, diags,
+                                       dims=_addressable[key]):
+                norm[key] = v
             continue
         if not _pt_ok(v, dims=dims):
             diags.append(Diagnostic(
@@ -214,13 +250,22 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                 message_ru=f"{key} — точка в мм"))
         else:
             norm[key] = v
-    if "p0_mm" in norm and "p1_mm" in norm and _dist(norm["p0_mm"], norm["p1_mm"]) < 1.0:
-        diags.append(Diagnostic(
-            code=TYPE_BOUNDS, op_index=i, op_id=oid, field_name="p1_mm",
-            message_ru=f"{name}: длина ~0 (p0==p1)"))
+    # Закон «длина ~0» — чистая функция от ЧИСЕЛ, и когда числа приезжают из
+    # снапшота, он обязан переехать за ту же черту, а не потеряться. Второй
+    # вызов той же функции стоит в `ground` (одна реализация, две площадки);
+    # прибор, который молчит на части диапазона, опаснее отсутствующего.
+    if ("p0_mm" in norm and "p1_mm" in norm
+            and not relate.is_address(norm["p0_mm"])
+            and not relate.is_address(norm["p1_mm"])):
+        reject_zero_length(norm["p0_mm"], norm["p1_mm"], name, i, oid, diags)
     for p in ospec.params:
         if p.kind in ("pt_xy", "pt_xyz") and p.name not in ("p0_mm", "p1_mm"):
             v = op.get(p.name)
+            if relate.is_address(v) and p.name in _addressable:
+                if relate.validate_address(v, oid, p.name, diags,
+                                           dims=_addressable[p.name]):
+                    norm[p.name] = v
+                continue
             # wave/struct (2026-07-17): OPTIONAL pt_xy/pt_xyz — needed for
             # create_foundation's kind-discriminated xy (isolated-only;
             # absent for kind=slab). Every PRE-EXISTING pt_xy/pt_xyz param
@@ -307,7 +352,20 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
         elif p.kind == "sel":
             sel = op.get(p.name)
             if sel is None:
-                continue                      # ground handles required/defaults
+                # Requiredness is a property of the authored program, not of
+                # the model snapshot.  Program-envelope defaults have already
+                # been applied before this validator runs, so an absent value
+                # here cannot become valid during grounding.  Deferring the
+                # refusal used to let PlannedProgram represent an impossible
+                # program and made the same input fail at a different stage
+                # depending on whether a caller happened to invoke ground().
+                if p.required:
+                    diags.append(Diagnostic(
+                        code=PARSE_MISSING_FIELD, op_index=i, op_id=oid,
+                        field_name=p.name,
+                        expected="обязательный селектор",
+                        message_ru=f"{p.name} обязателен"))
+                continue
             if not _sel_shape_ok(sel):
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
@@ -395,10 +453,16 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
             # возможный вид ссылки: у поднятого из модели ограждения хозяин —
             # лестница с настоящим element_id, а опа-строки, которая её
             # создала, в программе нет и быть не может.
+            # create_opening: тот же случай, что у ячейки витража, линии
+            # разрезки и ограждения — и БОЛЕЕ ТОГО, основной. Проём режут в
+            # том, что УЖЕ СТОИТ («сделай проём в этой плите»), а носитель,
+            # построенный этой же программой, — частный случай. Требовать ref
+            # значило бы запретить главный сценарий операции.
             if p.name == "host" \
                     and name not in ("set_curtain_panel",
                                      "create_curtain_grid_line",
-                                     "create_railing") \
+                                     "create_railing",
+                                     "create_opening") \
                     and name not in ("create_door", "create_window") \
                     and isinstance(sel, dict) and sel.get("by") != "ref":
                 diags.append(Diagnostic(
@@ -822,6 +886,23 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
                     got=v, message_ru=f"{p.name} — объект дуги (canonical Arc)"))
+                continue
+            # RELATE + дуга — НЕ смешиваются, и это решение, а не пропуск.
+            # Дуга задаётся центром, радиусом и углами; её концы обязаны
+            # СОВПАСТЬ с p0_mm/p1_mm, и это сверяется прямо ниже. Если концы
+            # приезжают из снапшота, сверять на validate нечего, а перенести
+            # сверку в ground значило бы, что дуга при промахе по осям едет
+            # мимо своих же концов. `arc` спекой прямо вынесен за v1 (§9.4).
+            if any(relate.is_address(norm.get(k)) for k in ("p0_mm", "p1_mm")):
+                diags.append(Diagnostic(
+                    code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
+                    got=sorted(k for k in ("p0_mm", "p1_mm")
+                               if relate.is_address(norm.get(k))),
+                    message_ru=(
+                        f"{name}: дуга и адрес от осей вместе не выражаются — "
+                        "концы дуги заданы её центром/радиусом/углами и обязаны "
+                        "совпасть с p0_mm/p1_mm. Задайте концы дуговой стены "
+                        "литералами [x, y]")))
                 continue
             arc_norm = _validate_arc(v, i, oid, norm.get("p0_mm"),
                                      norm.get("p1_mm"), diags)

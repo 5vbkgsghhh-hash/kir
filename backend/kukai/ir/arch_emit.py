@@ -6,13 +6,11 @@ connect.py, contour.py и любой другой ops_*.py. authoring.py пол�
 аддитивно импорт и две строки в _EMITTERS — тот же минимальный шов, которым
 подключилась волна каркаса.
 
-Переиспользовано из authoring.py БЕЗ ИЗМЕНЕНИЙ (импортом, не копией): _gid,
+Переиспользовано из authoring_emit_support.py БЕЗ ИЗМЕНЕНИЙ: _gid,
 _eid, _cs, _safe, _level_expr, _stamp_block, _readback_block, _loop_pts,
 EMIT_UNSUPPORTED, плюс ПУБЛИЧНЫЕ модели свидетелей level_chain_witness и
-bbox_extents_witness. Тот же список, что у struct_emit.py, с той же оговоркой
-в его шапке: часть имён — приватные (с подчёркиванием), и если будущий проход
-захочет чистый шов, лечится это повышением их до публичных в authoring.py, а
-не копированием тел сюда.
+bbox_extents_witness. Подчёркнутые имена сохранены для byte-compatible
+миграции; единственный владелец реализаций — нижележащий support-модуль.
 
 ГЛАВНОЕ ОБ ЭТОМ ФАЙЛЕ. Обе операции написаны по ЗАМЕРУ компайл-сервиса на
 шести версиях (2021-2026), а не по памяти об API. Замер и его следствия
@@ -29,7 +27,7 @@ bbox_extents_witness. Тот же список, что у struct_emit.py, с т�
 """
 from __future__ import annotations
 
-from kukai.ir.authoring import (
+from kukai.ir.authoring_emit_support import (
     _gid, _eid, _cs, _safe, _level_expr, _stamp_block, _stamp_readback,
     _readback_block, _loop_pts, EMIT_UNSUPPORTED,
     level_chain_witness, bbox_extents_witness,

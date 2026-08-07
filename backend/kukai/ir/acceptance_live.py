@@ -288,12 +288,25 @@ foreach (Element __kirAcceptanceElement in new FilteredElementCollector(doc)
         ? __kirAcceptanceByLevel[__kirAcceptanceLevel] + 1L : 1L;
     __kirAcceptanceTotal++;
 }}
+// ПОРЯДОК ЗДЕСЬ — ЧАСТЬ КОНТРАКТА, И ОН ПОРЯДКОВЫЙ, А НЕ КУЛЬТУРНЫЙ.
+// `ScopeCensusObservation` принимает строки только в питоновском
+// `sorted()`, то есть по кодовым точкам. `OrderBy` без компаратора берёт
+// `Comparer<string>.Default` — сравнение ПО КУЛЬТУРЕ машины.
+//
+// Замер живьём 04.08 (устройство оператора, CurrentCulture=ru-RU, имена
+// уровней «Проект1»): культурный и порядковый порядок не совпали НИ В ОДНОЙ
+// позиции — «Основание B.O.» шло первым, а порядковый ждёт там
+// «KIR_GAP_CEIL»; у категорий разошлись `OST_Rooms` и
+// `OST_RoomSeparationLines`. Приёмка падала fail-closed: `KIR-A002` до
+// записи («scope census rows must be unique and sorted») и
+// `post_read_invalid` после неё — на программе, которая построилась верно.
 var __kirAcceptanceRows = new List<object>();
 foreach (var __kirAcceptanceCategoryPair in
-         __kirAcceptanceCounts.OrderBy(__x => __x.Key))
+         __kirAcceptanceCounts.OrderBy(__x => __x.Key, StringComparer.Ordinal))
 {{
     foreach (var __kirAcceptanceLevelPair in
-             __kirAcceptanceCategoryPair.Value.OrderBy(__x => __x.Key))
+             __kirAcceptanceCategoryPair.Value.OrderBy(
+                 __x => __x.Key, StringComparer.Ordinal))
     {{
         __kirAcceptanceRows.Add(new Dictionary<string, object> {{
             {{"category", __kirAcceptanceCategoryPair.Key}},
@@ -308,7 +321,8 @@ var {result_var} = new Dictionary<string, object> {{
     {{"phase", "{accepted_phase}"}},
     {{"expectation_digest", "{exp_digest}"}},
     {{"document_digest", "{document.digest}"}},
-    {{"categories", __kirAcceptanceWanted.OrderBy(__x => __x).ToList()}},
+    {{"categories", __kirAcceptanceWanted.OrderBy(
+        __x => __x, StringComparer.Ordinal).ToList()}},
     {{"rows", __kirAcceptanceRows}},
     {{"total", __kirAcceptanceTotal}}
 }};

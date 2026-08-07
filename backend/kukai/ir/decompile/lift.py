@@ -74,6 +74,7 @@ from kukai.ir.decompile.schema import (
 from kukai.ir.decompile.sketch_extract import (
     CurveKind,
     ProfileIndexRecord,
+    RailingPathRecord,
     SketchPayloadError,
     StairsRunPathRecord,
 )
@@ -176,6 +177,11 @@ _CANDIDATES: dict[str, _Candidate] = {
     # знает и знать не должен — он ищет строку.
     "DirectShape": _Candidate(
         "direct_shape", "create_directshape", "_lift_directshape"),
+    # wave/room (2026-08-03). Категория читается с 29.07 как КОНТЕКСТ
+    # помещений, но опа под неё не было, и все 2 313 элементов K2 уходили в
+    # `no_lifter` — «операции не существует». Теперь она есть.
+    "OST_RoomSeparationLines": _Candidate(
+        "room_separator", "create_room_separator", "_lift_room_separator"),
 }
 
 # ДЕСЯТЬ РОДОВ МАРОК — ОДИН оп и ОДИН лифтер (волна марок, 30.07). Список не
@@ -262,8 +268,32 @@ _validate_candidate_contracts()
 # слепки, снятые до стадии, обязаны дать прежний ответ дословно, иначе
 # история покрытия перестанет быть историей. Ровно так же 30.07 переехало
 # ``OST_TextNotes``.
+# wave/opening (03.08.2026): ПРОЁМ КАК ОТДЕЛЬНЫЙ ЭЛЕМЕНТ — та самая
+# единственная МОЛЧАЛИВАЯ потеря, которую нашёл обход восьми зданий. Тонкость
+# не в том, что проём не поднимается, а в том, что до этой волны он не давал
+# НИ ОДНОГО следа: категории нет ни в одной таблице, элемент не извлекается,
+# атома не получается, а НОСИТЕЛЬ при этом поднимается обычным create_floor и
+# пересобирается СПЛОШНЫМ. Приёмка L2 такое не ловит по построению (она прямо
+# говорит, что геометрию не смотрит вообще), то есть тихо неверный результат
+# снаружи неотличим от успеха.
+#
+# Три рода, которые ВЫРАЖАЕТ `create_opening`, стоят здесь, а не в
+# `_CANDIDATES`, и это точная причина, а не осторожность: операция ЕСТЬ, но
+# замороженная строка L0 1.0 не несёт ни `Opening.Host`, ни границы проёма
+# (`BoundaryRect`/`BoundaryCurves`) — то есть не хватает не опа, а ЧТЕНИЯ.
+# `source_contract_gap` посылает ремонт в стадию извлечения,
+# `no_lifter` послал бы писать операцию, которая написана. Ровно то различие,
+# ради которого этот код и заведён.
+#
+# `OST_ShaftOpening` здесь НАМЕРЕННО НЕТ: у шахты операции действительно нет
+# (см. `ops_opening.VARIETIES_NOT_TAKEN["shaft"]` — связь с парой уровней
+# нечем подтвердить с построенного элемента), и `no_lifter` про неё — правда.
+# Класть её сюда значило бы обещать операцию, которой нет, — зеркальная ложь.
 _OPS_WITHOUT_L0_INPUTS: Mapping[str, str] = MappingProxyType({
     "OST_Dimensions": "create_dimension",
+    "OST_SWallRectOpening": "create_opening",
+    "OST_FloorOpening": "create_opening",
+    "OST_RoofOpening": "create_opening",
 })
 
 #: Обязательный вход опа → тот член Revit API, который пришлось бы НАЧАТЬ
@@ -304,6 +334,19 @@ _L0_HAS_NO_SOURCE_FOR: Mapping[str, str] = MappingProxyType({
     "at": "точка в координатах вида (нужен базис вида, не только XYZ)",
     "line_at": "точка в координатах вида (нужен базис вида, не только XYZ)",
     "content": "TextElement.Text",
+    # wave/opening (03.08.2026). Род проёма — ЕДИНСТВЕННЫЙ обязательный вход
+    # `create_opening`, и он не «одно поле», а решение, которое принимается по
+    # ТРЁМ членам сразу: `Opening.Host` (стена -> wall_rect, перекрытие/
+    # кровля/потолок -> host_face, пусто -> шахта), `IsRectBoundary` и сама
+    # граница. Ни одного из них замороженная строка L0 1.0 не читает, поэтому
+    # отказ называет их поимённо — он спецификация следующей волны чтения, а
+    # не жалоба. Имена сверены по индексу ловушек: Host/IsRectBoundary/
+    # BoundaryRect/BoundaryCurves живут 6/6, а `Opening.SketchId` — 2022-2026,
+    # то есть эскиз проёма на 2021 прочесть нечем вовсе, и это шов, о который
+    # следующий обязан не споткнуться.
+    "variety": ("Opening.Host + Opening.IsRectBoundary + "
+                "Opening.BoundaryRect/BoundaryCurves (все 6/6; "
+                "Opening.SketchId только 2022-2026)"),
 })
 
 
@@ -354,6 +397,12 @@ class _Context:
     # Пустой словарь = квитанций нет (старый разбор или стадия без срезов) —
     # ровно прежнее поведение.
     family_placement_failures: Mapping[str, Any] = field(default_factory=dict)
+    #: Захват ограждений стадией ``sketch`` (путь, хозяин, базовый уровень) —
+    #: тот же боковой индекс, что несёт профили и пути маршей. Пустое
+    #: отображение = стадии в этом слепке НЕ БЫЛО, и ограждение обязано дать
+    #: ПРЕЖНИЙ отказ дословно: «слепок, снятый до стадии, обязан дать прежний
+    #: ответ». Поле с умолчанием, а не обязательное, ровно поэтому.
+    railing_path_index: Mapping[str, Any] = field(default_factory=dict)
     # Ячейки витражей, ключом по id ЭЛЕМЕНТА ЯЧЕЙКИ: (id носителя, строка
     # носителя, строка панели). Пустой словарь = стадия не отдала индекс (или
     # отдала схемой /1 без адресов) — панели тогда идут прежним путём и
@@ -712,29 +761,40 @@ def _matching_level(
 
 def _side_indexes(
     profile_index: Mapping[str, Any] | None,
-) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-    """Split the two exact Sketch side indexes without changing frozen L0.
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Split the three exact Sketch side indexes without changing frozen L0.
 
     ``ProfileExtraction.profile_index`` is accepted directly for closed
     floor/roof profiles.  Stairs paths live in the extractor's sibling
     ``stairs_run_path_index``; callers may therefore pass either that index
     directly or the persisted ``ProfileExtraction.to_dict()`` envelope.
+
+    ``railing_path_index`` — третий сосед, и он НЕОБЯЗАТЕЛЬНЫЙ по построению:
+    ``ProfileExtraction.to_dict`` кладёт ключ только когда ограждения
+    действительно захвачены. Слепок, снятый до волны захвата 29.07, ключа не
+    имеет — и обязан дать ПРЕЖНИЙ отказ ограждения дословно, а не новый.
+    Именно поэтому здесь возвращается пустое отображение, а не ``profile_index``
+    целиком: в прямой (не-конвертной) форме диалекты записей различить нечем,
+    и подсунуть лифту ограждения чужие строки значило бы выдумать путь.
     """
 
     if not isinstance(profile_index, Mapping):
-        return {}, {}
+        return {}, {}, {}
     nested_profiles = profile_index.get("profile_index")
     nested_stairs = profile_index.get("stairs_run_path_index")
+    nested_railings = profile_index.get("railing_path_index")
     if ("profile_index" in profile_index
-            or "stairs_run_path_index" in profile_index):
+            or "stairs_run_path_index" in profile_index
+            or "railing_path_index" in profile_index):
         return (
             nested_profiles if isinstance(nested_profiles, Mapping) else {},
             nested_stairs if isinstance(nested_stairs, Mapping) else {},
+            nested_railings if isinstance(nested_railings, Mapping) else {},
         )
     # A direct closed-profile index and a direct stairs-run-path index share
     # the same element-id outer key shape.  Each lifter strictly parses only
     # its own record dialect, so exposing the mapping to both is fail-closed.
-    return profile_index, profile_index
+    return profile_index, profile_index, {}
 
 
 def _curtain_side_index(
@@ -1834,41 +1894,153 @@ def _lift_railing(
     context: _Context,
     _nodes_by_source: Mapping[str, L1Node],
 ) -> L1OpNode:
-    """Ограждение обратным ходом (wave/arch, 2026-07-29).
+    """Ограждение обратным ходом (wave/arch 29.07 + подключение чтения 03.08).
 
-    ЧЕСТНО О СОСТОЯНИИ: на сегодняшнем слепке этот лифт НЕ ПОДНИМАЕТ НИ
-    ОДНОГО ограждения, и это не дефект лифта, а точный диагноз. Замер K2
-    (13A-RD-AR-K2_v33, 55 293 элемента): все 203 OST_StairsRailing лежат в
-    L0 как ``bbox_only`` (31) или ``point`` (172), с пустым ``params`` и
-    ``host_id: null``, и ни одно не встречается ни в одном боковом индексе —
-    ни в эскизах, ни в кривых. Ни пути, ни хозяина, ни позиции в источнике
-    просто НЕТ.
+    ИСТОРИЯ ЭТОЙ ФУНКЦИИ — половина её смысла, поэтому она здесь целиком.
 
-    Зачем тогда лифт написан. До него эти 203 элемента получали причину
-    «операции не существует» (REGISTRY_OP_GAP) — правду, которая больше не
-    правда, и которая указывает чинить не то. Теперь они получают причину,
-    называющую НЕДОСТАЮЩИЙ ФАКТ поимённо. Ранжир причин — то, по чему
-    решают, что строить дальше (см. коммит 9c63cc4e), и подменять в нём
-    «нечего читать» на «нечем строить» дороже любого процента покрытия.
+    29.07 лифт написали, и он честно отказывал ВСЕГДА: замер K2 показал, что
+    все 203 OST_StairsRailing лежат в L0 как ``bbox_only``/``point`` с пустым
+    ``params`` и ``host_id: null`` — ни пути, ни хозяина, ни позиции. Отказ
+    был не дефектом лифта, а точным диагнозом стороне ИЗВЛЕЧЕНИЯ.
 
-    Позиция (Treads/Stringer) выведению не поддаётся в принципе: это не
-    геометрия, а параметр размещения, и угадать его по габариту нельзя.
-    Поэтому даже полный путь без позиции даёт отказ, а не ограждение
-    «по проступям, наверное».
+    Той же волной сторона извлечения диагноз ПРИНЯЛА:
+    ``sketch_extract.RailingPathRecord`` снимает ``Railing.GetPath()``,
+    ``HasHost``/``HostId`` и ``STAIRS_RAILING_BASE_LEVEL_PARAM``, а
+    ``pipeline._STAGE_CATEGORIES['sketch']`` кормит стадию обеими категориями
+    ограждений. Захват поехал в прод и снимает данные с 29.07.
+
+    А ЛИФТ ЕГО НЕ ЧИТАЛ. ``_Context`` знал ``stairs_run_path_index`` и не знал
+    ``railing_path_index``; функция ниже отказывала по ``element.host_id``, то
+    есть по строке L0, при том что в ``sketch.index.json`` того же разбора
+    лежали готовые пути. Замер 03.08 по k2_ar_rd_v9: 31 строка захвата,
+    28 — свободные ограждения с путём, базовым уровнем и плоскостью РОВНО на
+    отметке уровня; все 31 — прямые (``curve_kinds`` = line). Это ровно тот
+    класс дефекта, ради которого заведена причина ``source_contract_gap``:
+    оп есть, чтение есть, а провода между ними нет.
+
+    ЧТО ОСТАЁТСЯ ОТКАЗОМ И ПОЧЕМУ (границы не переехали):
+
+    * ЛЕСТНИЧНОЕ ограждение (``has_host``) — позиция установки
+      (``RailingPlacementPosition``) НЕЧИТАЕМА: во всём член-составе
+      ``Autodesk.Revit.DB.Architecture.Railing`` на всех шести версиях
+      геттера нет, она существует только как аргумент ``Create`` и как три
+      поля перечисления. Переложить такое ограждение в ``variety=path``
+      значило бы МОЛЧА ПОТЕРЯТЬ ХОЗЯИНА: на вид то же место, а лестница
+      больше не владеет своим ограждением.
+    * ДУГА в пути — у ``create_railing`` нет дугового параметра, а хорда
+      это другое ограждение.
+    * ПЛОСКОСТЬ ПУТИ ВЫШЕ/НИЖЕ УРОВНЯ — ``Railing.Create(doc, CurveLoop,
+      typeId, baseLevelId)`` кладёт путь на уровень, смещения у операции нет.
+
+    * СЛЕПОК БЕЗ СТАДИИ — прежний отказ ДОСЛОВНО (см. первую ветку ниже).
     """
-    if element.host_id:
-        # Хозяин известен — но одного хозяина мало: перегрузка
-        # Railing.Create(doc, hostId, typeId, position) требует ПОЗИЦИЮ, а
-        # она в L0 не снимается ничем. Ставить Treads по умолчанию значило бы
-        # поставить ограждение не туда молча.
+    raw = context.railing_path_index.get(element.element_id)
+    if raw is None:
+        # СЛЕПОК СНЯТ ДО СТАДИИ ЗАХВАТА — прежний ответ ДОСЛОВНО. Обе строки
+        # ниже не трогать: разбор, снятый до 29.07, обязан дать тот же отказ
+        # с той же причиной, а не новый.
+        if element.host_id:
+            # Хозяин известен — но одного хозяина мало: перегрузка
+            # Railing.Create(doc, hostId, typeId, position) требует ПОЗИЦИЮ, а
+            # она в L0 не снимается ничем. Ставить Treads по умолчанию значило
+            # бы поставить ограждение не туда молча.
+            _refuse(
+                AtomReason.MISSING_PARAMETER,
+                "frozen L0 carries no RailingPlacementPosition for a hosted "
+                "railing (host is known, placement side is not)")
+        _refuse(
+            AtomReason.MISSING_GEOMETRY,
+            "frozen L0 has no railing path and no host id "
+            "(ограждение в слепке — только габарит)")
+    try:
+        record = RailingPathRecord.from_dict(
+            element.element_id, raw,
+            f"railing_path_index[{element.element_id!r}]")
+    except SketchPayloadError as exc:
+        _refuse(
+            AtomReason.MISSING_GEOMETRY,
+            f"railing side-index row is invalid: {exc}")
+    if record.has_host is True or record.host_id or element.host_id:
+        # Позиция установки НЕЧИТАЕМА: полный член-состав
+        # Autodesk.Revit.DB.Architecture.Railing на всех шести версиях не
+        # содержит геттера RailingPlacementPosition — она встречается только
+        # как аргумент двух перегрузок Create и как три поля перечисления.
+        # Перекладывать лестничное ограждение в variety=path значило бы
+        # ПОТЕРЯТЬ хозяина молча: ограждение перестало бы принадлежать
+        # лестнице, оставшись на вид на месте.
         _refuse(
             AtomReason.MISSING_PARAMETER,
-            "frozen L0 carries no RailingPlacementPosition for a hosted "
-            "railing (host is known, placement side is not)")
-    _refuse(
-        AtomReason.MISSING_GEOMETRY,
-        "frozen L0 has no railing path and no host id "
-        "(ограждение в слепке — только габарит)")
+            "hosted railing has no readable RailingPlacementPosition "
+            "(Railing exposes no getter on any shipped version)")
+    if record.has_host is None:
+        # `None` — «ПРОЧИТАТЬ НЕ УДАЛОСЬ», и запись заведена трёхзначной
+        # именно затем, чтобы это не схлопнулось в «хозяина нет». Свободное
+        # ограждение из неизвестности — это молчаливая потеря хозяина ровно
+        # той же ценой, что и ветка выше; поэтому здесь отказ, а не `not`.
+        _refuse(
+            AtomReason.MISSING_METADATA,
+            "railing host state was not read (unknown is not 'no host')")
+    if not record.path_available or record.path is None:
+        _refuse(
+            AtomReason.MISSING_GEOMETRY,
+            "railing side index read no path for this railing")
+    path = record.path
+    if any(kind is not CurveKind.LINE for kind in path.curve_kinds):
+        _refuse(
+            AtomReason.CURVE_KIND_UNSUPPORTED,
+            "create_railing path has no arc parameter and a chord would be "
+            "a different railing")
+    if not (2 <= len(path.points_mm) <= 64):
+        _refuse(
+            AtomReason.UNSUPPORTED_SIGNATURE,
+            "create_railing path holds 2..64 points "
+            f"(this railing has {len(path.points_mm)})")
+    # Вырожденное звено отказывает ВПЕРЁД (authoring_validation, порог 1 мм:
+    # Revit такую кривую не строит). Поймать здесь — значит отдать честный
+    # атом вместо программы, которую компилятор всё равно отвергнет.
+    if any(math.dist(path.points_mm[i], path.points_mm[i + 1]) < 1.0
+           for i in range(len(path.points_mm) - 1)):
+        _refuse(
+            AtomReason.INVALID_VALUE,
+            "railing path has a segment shorter than 1 mm "
+            "(Revit does not build such a curve)")
+    if not record.base_level_id:
+        _refuse(
+            AtomReason.MISSING_REFERENCE,
+            "create_railing(variety=path) has no base level and none can be "
+            "derived — STAIRS_RAILING_BASE_LEVEL_PARAM was not read")
+    level = context.levels_by_id.get(record.base_level_id)
+    if level is None or not level.name:
+        _refuse(
+            AtomReason.MISSING_METADATA,
+            "railing base level metadata is absent")
+    # ОТМЕТКА ПЛОСКОСТИ ПУТИ. Railing.Create(doc, CurveLoop, typeId,
+    # baseLevelId) кладёт путь НА УРОВЕНЬ; смещения от уровня у операции нет
+    # ни одного параметра. Ограждение, чья плоскость от уровня отстоит,
+    # приехало бы обратно на другой отметке — молча и незаметно (у башни в 59
+    # этажей контур был бы правильный). Замер K2: у всех 28 свободных
+    # ограждений разбора plane_z ровно равна отметке уровня, то есть отказ
+    # ниже честный, а не запретительный.
+    if record.plane_z_mm is None:
+        _refuse(
+            AtomReason.MISSING_GEOMETRY,
+            "railing path plane elevation was not read")
+    # Сетка ОДНА — та же CANON_MM, на которой канон округляет каждое поле
+    # ``*_mm``. Заводить свой порог значило бы завести второго судью о том,
+    # что считать «той же отметкой».
+    if abs(record.plane_z_mm - level.elevation_mm) > CANON_MM:
+        _refuse(
+            AtomReason.UNSUPPORTED_SIGNATURE,
+            "railing path plane is offset from its base level and "
+            "create_railing has no offset parameter "
+            f"({record.plane_z_mm - level.elevation_mm:+.1f} mm)")
+    params: dict[str, Any] = {
+        "variety": "path",
+        "path": [[float(x), float(y)] for x, y in path.points_mm],
+        "level": _level_ref(level.id, level.name),
+        "type": _catalog_ref(element),
+    }
+    return _op_node(element, "create_railing", params)
 
 
 def _lift_roof(
@@ -3350,8 +3522,71 @@ def _lift_directshape(
     })
 
 
+def _lift_room_separator(
+    element: L0Element,
+    context: _Context,
+    _nodes_by_source: Mapping[str, L1Node],
+) -> L1OpNode:
+    """Разделитель помещений обратным ходом (wave/room, 03.08).
+
+    ДО ЭТОЙ ВОЛНЫ КАТЕГОРИИ ЗДЕСЬ НЕ БЫЛО ВОВСЕ, и это была правда: операции
+    не существовало, все 2 313 элементов K2 честно получали ``no_lifter``
+    («category is outside the exact Part 5 lifter table»). Читалась категория
+    с 29.07 — как КОНТЕКСТ помещений (extract.py: «границу помещения задаёт
+    линия, а не стена»), — но сказать прочитанное было нечем.
+
+    ОДИН ЭЛЕМЕНТ — ОДИН ОТРЕЗОК, И ЭТО НЕ УПРОЩЕНИЕ. В L0 каждый
+    OST_RoomSeparationLines несёт собственные ``p0_mm``/``p1_mm`` и
+    собственный ``level_id``; ломаная из четырёх звеньев лежит в модели
+    четырьмя ЭЛЕМЕНТАМИ с четырьмя ElementId. Сшивать соседние линии в одну
+    ломаную нельзя ни по закону («один L0-элемент → РОВНО ОДИН L1-узел»), ни
+    по данным: общей личности, которая доказывала бы их родство, у них нет —
+    только совпадение координат, а это догадка. Поэтому лифт даёт ломаную
+    ровно из двух точек, и пересборка вернёт столько же элементов, сколько
+    было.
+
+    ЧТО ОСТАЁТСЯ ОТКАЗОМ И ПОЧЕМУ (замер k2_ar_rd_v9, 2 313 элементов):
+
+    * ДУГА — 14 элементов (``curve_kind: arc``). У ``path`` дугового
+      параметра нет, а хорда — это другая граница: помещение поехало бы
+      площадью, и verify этого не увидел бы (сравниваются концы).
+    * ПЛОСКОСТЬ НЕ НА УРОВНЕ — 4 элемента (смещение -30 мм). Смещения нет ни
+      у операции, ни у API: SketchPlane.Create(doc, levelId) строит плоскость
+      САМОГО уровня. Вернуть такой разделитель «примерно туда» молча —
+      ровно та тихая потеря, которую §18.1 запрещает.
+    * УРОВНЯ НЕТ В СПРАВОЧНИКЕ — уровень обязателен, вывести его неоткуда.
+    """
+    p0, p1 = _curve(element, dimensions=3)
+    _refuse_non_line_curve(element, context, "create_room_separator")
+    level = (context.levels_by_id.get(element.level_id)
+             if element.level_id else None)
+    if level is None or not level.name:
+        _refuse(
+            AtomReason.MISSING_REFERENCE,
+            "room separator has no named level and create_room_separator "
+            "takes its sketch plane from the level itself")
+    # ОТМЕТКА. Сетка ОДНА — та же CANON_MM, на которой канон округляет каждое
+    # поле ``*_mm``; свой порог здесь означал бы второго судью о том, что
+    # считать «той же отметкой» (тот же довод и тот же приём, что у
+    # _lift_railing с его plane_z).  Проверяются ОБА конца: это заодно
+    # доказывает, что отрезок лежит В ПЛОСКОСТИ уровня, а не пересекает её.
+    if (abs(p0[2] - level.elevation_mm) > CANON_MM
+            or abs(p1[2] - level.elevation_mm) > CANON_MM):
+        _refuse(
+            AtomReason.UNSUPPORTED_SIGNATURE,
+            "room separator plane is offset from its own level and "
+            "create_room_separator has no offset parameter "
+            f"({p0[2] - level.elevation_mm:+.1f} mm)")
+    params: dict[str, Any] = {
+        "path": [[p0[0], p0[1]], [p1[0], p1[1]]],
+        "level": _level_ref(level.id, level.name),
+    }
+    return _op_node(element, "create_room_separator", params)
+
+
 _LIFTERS = {
     "_lift_directshape": _lift_directshape,
+    "_lift_room_separator": _lift_room_separator,
     "_lift_wall": _lift_wall,
     "_lift_floor": _lift_floor,
     "_lift_roof": _lift_roof,
@@ -3696,7 +3931,7 @@ def _context(
     tag_index: Any = None,
     mep_system_index: Any = None,
 ) -> _Context:
-    profiles, stairs_paths = _side_indexes(profile_index)
+    profiles, stairs_paths, railing_paths = _side_indexes(profile_index)
     placements = parse_family_placement_index(family_placement_index)
     (curtain_cells, curtain_bodies, curtain_mullions,
      curtain_grid_lines) = _curtain_side_index(curtain_index)
@@ -3714,6 +3949,7 @@ def _context(
         wall_curve_index=_wall_curve_side_index(wall_curve_index),
         family_placement_failures=parse_family_placement_failures(
             family_placement_index),
+        railing_path_index=railing_paths,
         curtain_cells=curtain_cells,
         curtain_cell_bodies=curtain_bodies,
         curtain_mullions=curtain_mullions,
@@ -3918,7 +4154,7 @@ def lift_element(
                     wall_curve_index, curtain_index)):
             if source.element_id == element.element_id:
                 return node
-    profiles, stairs_paths = _side_indexes(profile_index)
+    profiles, stairs_paths, railing_paths = _side_indexes(profile_index)
     (curtain_cells, curtain_bodies, curtain_mullions,
      curtain_grid_lines) = _curtain_side_index(curtain_index)
     empty_context = _Context(
@@ -3933,6 +4169,7 @@ def lift_element(
             family_placement_index),
         family_placement_requested=family_placement_index is not None,
         wall_curve_index=_wall_curve_side_index(wall_curve_index),
+        railing_path_index=railing_paths,
         curtain_cells=curtain_cells,
         curtain_cell_bodies=curtain_bodies,
         curtain_mullions=curtain_mullions,

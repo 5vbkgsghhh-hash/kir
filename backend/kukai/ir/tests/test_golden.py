@@ -210,6 +210,17 @@ PROGRAMS = {
                  "position": "treads",
                  "type": {"by": "name", "value": "Ограждение 900"}}],
     },
+    # wave/room (2026-08-03): разделитель помещений. Ломаная буквой П — три
+    # звена, — чтобы диф показывал СРАЗУ и посегментную сборку CurveArray, и
+    # свидетеля концов по каждому звену. Оси версий у операции нет (6/6), так
+    # что эталон снят на версии по умолчанию и обязан совпадать на всех.
+    "room_separator": {
+        "ir_version": "1.0",
+        "intent": "отделить кухню-нишу от гостиной без стены",
+        "ops": [{"op": "create_room_separator", "id": "RS1",
+                 "path": [[0, 0], [3200, 0], [3200, 2400], [0, 2400]],
+                 "level": {"by": "name", "value": "Этаж 1"}}],
+    },
     # wave hosted-flips-wall-vertical (audit F5): door with the full enforced
     # swing/mirror state + window with a facing flip — the MirrorElements
     # plane (normal along the host wall's direction), CanFlip* guards and the
@@ -304,6 +315,43 @@ PROGRAMS = {
                  "height_mm": 3000,
                  "top_level": {"by": "name", "value": "Этаж 2"}}],
     },
+    # wave/opening (2026-08-03): проём КАК ОТДЕЛЬНЫЙ ЭЛЕМЕНТ — по файлу на
+    # ветку, та же дисциплина, что у фундамента isolated/slab и ограждения
+    # path/hosted. Оси версий у операции НЕТ (все четыре перегрузки
+    # NewOpening живут 6/6), поэтому ожидаемых отказов в gate_runner для них
+    # заводить не нужно — в отличие от потолка.
+    #
+    # Оба значения `cut` стоят отдельными эталонами намеренно: у
+    # вертикального реза свидетель сверяет РАВЕНСТВО габаритов, у
+    # перпендикулярного — ВКЛЮЧЕНИЕ (на скате план проёма законно шире
+    # контура), то есть это две разные эмиссии, и будущий диф обязан
+    # показывать, какая именно поехала.
+    "opening_wall_rect": {
+        "ir_version": "1.0",
+        "intent": "прямоугольный проём в существующей стене",
+        "ops": [{"op": "create_opening", "id": "O1", "variety": "wall_rect",
+                 "host": {"by": "element_id", "value": 8145901},
+                 "p0_mm": [1000.0, 0.0, 900.0],
+                 "p1_mm": [2500.0, 0.0, 2400.0]}],
+    },
+    "opening_host_face_vertical": {
+        "ir_version": "1.0",
+        "intent": "проём в существующем перекрытии, вертикальный рез",
+        "ops": [{"op": "create_opening", "id": "O1", "variety": "host_face",
+                 "host": {"by": "element_id", "value": 8145901},
+                 "outline": [[1000, 1000], [3000, 1000],
+                             [3000, 3000], [1000, 3000]],
+                 "cut": "vertical"}],
+    },
+    "opening_host_face_perpendicular": {
+        "ir_version": "1.0",
+        "intent": "проём в скатной кровле, рез перпендикулярно грани",
+        "ops": [{"op": "create_opening", "id": "O1", "variety": "host_face",
+                 "host": {"by": "element_id", "value": 8145901},
+                 "outline": [[5000, 1000], [7000, 1000],
+                             [7000, 3000], [5000, 3000]],
+                 "cut": "perpendicular"}],
+    },
 }
 
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
@@ -322,6 +370,7 @@ class Golden(unittest.TestCase):
                     "hosted_door_flips", "wall_base_offset", "wall_top_attached",
                     "native_group", "place_family_point_and_curve",
                     "arch_ceiling", "arch_railing_path", "arch_railing_hosted",
+                    "room_separator",
                 ) else None
                 out = compile_program(prog, snapshot=snap)
                 self.assertTrue(out.ok, name)

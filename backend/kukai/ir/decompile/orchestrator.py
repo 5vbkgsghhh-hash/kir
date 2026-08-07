@@ -1,9 +1,11 @@
 """Single offline entry point for the composed DECOMPILE pipeline.
 
 The read-side extractors run before this module.  Their parsed products enter
-here as a frozen-L0 :class:`L0Document` and optional geometry, Sketch,
-FamilyInstance-placement, and group side indexes; no bridge, Revit process,
-or emitted C# is involved.
+here as a frozen-L0 :class:`L0Document` and optional side indexes; no bridge,
+Revit process, or emitted C# is involved.  Offline and live orchestration both
+cross the same ``cached_lift_document_detailed`` boundary.  The offline path
+keeps its default cache-disabled behaviour while preserving the exact lift
+input contract used by the live path.
 """
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ from kukai.ir.decompile.family_placement_extract import (
 )
 from kukai.ir.decompile.group_extract import GroupExtraction, parse_group_index
 from kukai.ir.decompile.l1_schema import L1Node
-from kukai.ir.decompile.lift import lift_document
+from kukai.ir.decompile.lift_cache import cached_lift_document_detailed
 from kukai.ir.decompile.name import NameResult, name_document
 from kukai.ir.decompile.honesty import (
     BuildStatuses,
@@ -180,10 +182,11 @@ def decompile(
     family_placement_index: (
         FamilyPlacementExtraction | Mapping[str, Any] | None
     ) = None,
-    # Curtain side index (28.07 tail of aaa44b45): threaded straight through
-    # to lift_document, same as profile_index — no retained/parsed form here,
-    # since nothing downstream of LIFT needs it yet.
+    wall_curve_index: Any = None,
     curtain_index: Any = None,
+    annotation_index: Any = None,
+    tag_index: Any = None,
+    mep_system_index: Any = None,
     group_index: GroupExtraction | Mapping[str, Any] | None = None,
     target_contract: TargetContract | str = TargetContract.SAME_ENVIRONMENT,
     equivalence_scope: EquivalenceScope | str = EquivalenceScope.NATIVE_SEMANTIC,
@@ -197,12 +200,17 @@ def decompile(
         else parse_family_placement_index(family_placement_index)
     )
     retained_groups = parse_group_index(group_index)
-    l1_nodes = tuple(lift_document(
+    lift_result = cached_lift_document_detailed(
         document,
         profile_index=profile_index,
         family_placement_index=retained_placements,
+        wall_curve_index=wall_curve_index,
         curtain_index=curtain_index,
-    ))
+        annotation_index=annotation_index,
+        tag_index=tag_index,
+        mep_system_index=mep_system_index,
+    )
+    l1_nodes = lift_result.nodes
     tree = fold_document(
         document,
         l1_nodes,

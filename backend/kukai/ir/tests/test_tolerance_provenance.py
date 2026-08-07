@@ -62,6 +62,9 @@ from kukai.ir.emit_model import (                              # noqa: E402
     tolerance,
 )
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT            # noqa: E402
+from kukai.ir.tests.registry_variants import (                 # noqa: E402
+    perturbed_tolerance,
+)
 from kukai.ir.tests.test_emitter_scope_contract import (       # noqa: E402
     PROGRAMS,
     VERSIONS,
@@ -296,15 +299,13 @@ class L3_DeclaredProvenanceIsReal(unittest.TestCase):
                     for c in _checks(n, o, v) if c.tol_key == key]
                 if not claimants:
                     continue
-                tolerances[key] = float(value) * 1000.0 + 7.77
-                try:
+                with perturbed_tolerance(
+                        name, key, float(value) * 1000.0 + 7.77):
                     moved = any(
                         next((x for x in _checks(n, o, v)
                               if x.obligation_key == c.obligation_key),
                              None) != c
                         for n, o, v, c in claimants)
-                finally:
-                    tolerances[key] = value
                 if not moved:
                     offenders.append(
                         f"{name}.{key}: witnesses declare tol_key={key!r} but "
@@ -330,13 +331,11 @@ class L4_NoDeadRegistryNumber(unittest.TestCase):
         for name in WRITE_OPS:
             tolerances = spec.OPS[name].tolerances
             for key, value in list(tolerances.items()):
-                tolerances[key] = float(value) * 1000.0 + 7.77
-                try:
+                with perturbed_tolerance(
+                        name, key, float(value) * 1000.0 + 7.77):
                     moved = any(
                         _rendered(*FULL[i]) != baseline[i]
                         for i in range(len(FULL)) if FULL[i][0] == name)
-                finally:
-                    tolerances[key] = value
                 if not moved:
                     offenders.append(
                         f"{name}.tolerances[{key!r}] = {value} — ничего из "
@@ -362,13 +361,11 @@ class L5_CorpusReachesEveryTolerance(unittest.TestCase):
         for name in WRITE_OPS:
             tolerances = spec.OPS[name].tolerances
             for key, value in list(tolerances.items()):
-                tolerances[key] = float(value) * 1000.0 + 7.77
-                try:
+                with perturbed_tolerance(
+                        name, key, float(value) * 1000.0 + 7.77):
                     moved = any(
                         _rendered(*SHIPPED[i]) != baseline[i]
                         for i in range(len(SHIPPED)) if SHIPPED[i][0] == name)
-                finally:
-                    tolerances[key] = value
                 if not moved:
                     unreached.append(f"{name}.{key}")
         self.assertEqual(

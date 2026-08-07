@@ -520,7 +520,34 @@ class TestExpectationDerivation(unittest.TestCase):
             check_acceptance(expectation, {}, {("OST_Floors", L3): 2}).accepted)
 
     def test_a_derived_category_never_gets_an_upper_bound(self) -> None:
-        """Лестница сама делает ограждения — «ровно 1 ограждение» соврало бы."""
+        """Лестница сама делает ограждения — «ровно 1 ограждение» соврало бы.
+
+        Программа СОЛЬНАЯ, и это не косметика. До 04.08 здесь стояли лестница
+        И ограждение вместе — программа, которую `emit_program` отказывался
+        собирать всегда (KIR-L002: `StairsEditScope` владеет собственными
+        транзакциями). План её тогда принимал, поэтому тест проходил, проверяя
+        поведение на входе, который до Revit не доехал бы никогда. Правило
+        переехало на план, и вход пришлось привести к законному — утверждение
+        теста от этого не изменилось: ограждение выводится ИЗ ЛЕСТНИЦЫ, своего
+        `create_railing` для этого не нужно.
+        """
+        program = {"ir_version": "1.0", "ops": [
+            {"op": "create_stairs", "id": "s", "p0_mm": [0.0, 0.0],
+             "p1_mm": [3000.0, 0.0],
+             "base_level": {"by": "name", "value": L3},
+             "top_level": {"by": "name", "value": L4}},
+        ]}
+        expectation = derive_expectation(program)
+        self.assertIn("OST_StairsRailing", expectation.derived_categories)
+        verdict = check_acceptance(
+            expectation, {},
+            {("OST_Stairs", ""): 1, ("OST_StairsRailing", L3): 5})
+        self.assertTrue(verdict.accepted, verdict.summary_ru())
+
+    def test_a_stairs_program_with_a_neighbour_fails_closed_by_name(self) -> None:
+        """И обратная сторона: незаконная программа обязана не «дать пустую
+        перепись», а НАЗВАТЬ причину. Приёмка держится fail-closed, и её отказ
+        несёт код правила, а не общую фразу."""
         program = {"ir_version": "1.0", "ops": [
             {"op": "create_stairs", "id": "s", "p0_mm": [0.0, 0.0],
              "p1_mm": [3000.0, 0.0],
@@ -531,11 +558,9 @@ class TestExpectationDerivation(unittest.TestCase):
              "level": {"by": "name", "value": L3}},
         ]}
         expectation = derive_expectation(program)
-        self.assertIn("OST_StairsRailing", expectation.derived_categories)
-        verdict = check_acceptance(
-            expectation, {},
-            {("OST_Stairs", ""): 1, ("OST_StairsRailing", L3): 5})
-        self.assertTrue(verdict.accepted, verdict.summary_ru())
+        self.assertEqual(expectation.derived_categories, ())
+        self.assertTrue(any("KIR-L002" in note for note in expectation.notes),
+                        expectation.notes)
 
     def test_type_ops_add_no_elements(self) -> None:
         """Перепись §18.1 — WhereElementIsNotElementType(); типы в неё не идут."""
@@ -652,8 +677,14 @@ class TestRegistryCoverage(unittest.TestCase):
             _LEVEL_FROM_PARAM, _OPS_BLIND, _OPS_WITHOUT_ELEMENTS,
             _OP_CATEGORIES,
         )
+        # «special» — опы, чья категория выводится ВЕТКОЙ в _category_of_op, а
+        # не строкой таблицы (у них категория зависит от собственного поля).
+        # create_opening здесь потому же, почему create_foundation: род проёма
+        # решает `variety` — wall_rect даёт ровно OST_SWallRectOpening, а
+        # host_face зависит от категории НОСИТЕЛЯ, которая из программы не
+        # читается, и сверяется суммой по трём родам.
         special = {"create_column", "create_directshape", "create_foundation",
-                   "create_group"}
+                   "create_group", "create_opening"}
         classified = (set(_OP_CATEGORIES) | set(_OPS_BLIND)
                       | set(_OPS_WITHOUT_ELEMENTS) | special)
         writing = {name for name, op in spec.OPS.items() if op.writes_model}

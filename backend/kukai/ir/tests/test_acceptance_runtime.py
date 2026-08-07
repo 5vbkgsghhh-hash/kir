@@ -17,6 +17,7 @@ from kukai.ir.acceptance_runtime import (
 )
 from kukai.ir.compiler import plan_program
 from kukai.ir.contracts import DocumentFingerprint
+from kukai.ir.ground import ground_program
 from kukai.ir.outcome import (
     AcceptanceState,
     WitnessState,
@@ -108,6 +109,40 @@ async def test_pre_read_and_fsync_precede_write_authority(tmp_path: Path):
     reopened = AcceptanceJournal.open(session.journal.path)
     assert reopened.state.finalized
     assert session.evidence_wire(evidence)["journal"]["durable"] is True
+
+
+@pytest.mark.asyncio
+async def test_production_registration_binds_exact_grounding(tmp_path: Path):
+    plan = _wall_plan()
+    grounded = ground_program(plan, GROUND_SNAPSHOT)
+
+    async def reader(_code, phase, _timeout):
+        count = 10 if phase == "acceptance_before" else 11
+        return _payload(
+            plan,
+            {("OST_Walls", "Этаж 1"): count},
+            phase="before" if phase == "acceptance_before" else "after",
+        )
+
+    with mock.patch(
+            "kukai.ir.acceptance_runtime.new_acceptance_run_id",
+            return_value=RUN_ID):
+        session = await prepare_acceptance(
+            grounded, GROUND_SNAPSHOT, _document(), reader,
+            revit_version="2026",
+            timeout_ms=1000, evidence_root=tmp_path)
+
+    assert session.registration.ground_digest == grounded.ground_digest
+    assert session.registration.to_dict()["schema_version"] == (
+        "kir-acceptance-registration/2")
+    assert session.registration_wire()["ground_digest"] == (
+        grounded.ground_digest)
+
+    evidence = await session.assess_after(reader, timeout_ms=1000)
+    assert evidence.to_dict()["schema_version"] == (
+        "kir-acceptance-evidence/2")
+    assert session.evidence_wire(evidence)["ground_digest"] == (
+        grounded.ground_digest)
 
 
 @pytest.mark.asyncio

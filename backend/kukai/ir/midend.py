@@ -24,6 +24,7 @@ from kukai.ir.registry_base import EffectKind, ResultSpec
 
 
 PLAN_SCHEMA = "kir-planned-program/1"
+GROUND_SCHEMA = "kir-grounded-program/1"
 
 
 class PlanEncodingError(ValueError):
@@ -264,4 +265,215 @@ class PlannedProgram:
     def to_evidence_dict(self) -> dict[str, Any]:
         payload = self._unsigned_evidence()
         payload["plan_digest"] = self.plan_digest
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class GroundingResolution:
+    """One explicit model-dependent decision made by the ground stage."""
+
+    op_id: str
+    field_name: str
+    via: str
+    resolved_id: int | str | None
+    resolved_name: str | None
+    _detail_json: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.op_id, str) or not self.op_id:
+            raise ValueError("grounding resolution needs an op id")
+        if not isinstance(self.field_name, str) or not self.field_name:
+            raise ValueError("grounding resolution needs a field name")
+        if not isinstance(self.via, str) or not self.via:
+            raise ValueError("grounding resolution needs a named rule")
+        if isinstance(self.resolved_id, bool) or not isinstance(
+                self.resolved_id, (int, str, type(None))):
+            raise TypeError("resolved id must be int, str, or None")
+        if self.resolved_name is not None and not isinstance(
+                self.resolved_name, str):
+            raise TypeError("resolved name must be a string or None")
+        try:
+            detail = json.loads(self._detail_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("grounding detail must be canonical JSON") from exc
+        if not isinstance(detail, dict) or _canonical_json(detail) != self._detail_json:
+            raise ValueError("grounding detail must be a canonical object")
+
+    @classmethod
+    def from_dict(
+        cls,
+        *,
+        op_id: str,
+        field_name: str,
+        detail: dict[str, Any],
+    ) -> "GroundingResolution":
+        return cls(
+            op_id=op_id,
+            field_name=field_name,
+            via=str(detail.get("via") or "unknown"),
+            resolved_id=detail.get("id", detail.get("ref")),
+            resolved_name=detail.get("name"),
+            _detail_json=_canonical_json(detail),
+        )
+
+    @classmethod
+    def collect(
+        cls,
+        *,
+        op_id: str,
+        payload: dict[str, Any],
+    ) -> tuple["GroundingResolution", ...]:
+        """Collect grounded selectors recursively with stable field paths."""
+        found: list[GroundingResolution] = []
+
+        def visit(value: Any, path: str) -> None:
+            if isinstance(value, dict):
+                detail = value.get("__grounded__")
+                if isinstance(detail, dict):
+                    found.append(cls.from_dict(
+                        op_id=op_id,
+                        field_name=path,
+                        detail=detail,
+                    ))
+                    return
+                for key in sorted(value):
+                    child_path = f"{path}.{key}" if path else key
+                    visit(value[key], child_path)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    visit(child, f"{path}[{index}]")
+
+        visit(payload, "")
+        return tuple(found)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "op_id": self.op_id,
+            "field_name": self.field_name,
+            "via": self.via,
+            "resolved_id": self.resolved_id,
+            "resolved_name": self.resolved_name,
+            "detail": json.loads(self._detail_json),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedOp:
+    """Canonical grounded payload corresponding to exactly one planned op."""
+
+    op_id: str
+    op_name: str
+    _payload_json: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        try:
+            payload = json.loads(self._payload_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("grounded op payload must be canonical JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("grounded op payload must be an object")
+        if payload.get("id") != self.op_id or payload.get("op") != self.op_name:
+            raise ValueError("grounded op identity disagrees with payload")
+        if _canonical_json(payload) != self._payload_json:
+            raise ValueError("grounded op payload is not canonical")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "GroundedOp":
+        return cls(
+            op_id=payload["id"],
+            op_name=payload["op"],
+            _payload_json=_canonical_json(payload),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._payload_json)
+
+    @property
+    def payload_digest(self) -> str:
+        return hashlib.sha256(self._payload_json.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedProgram:
+    """Immutable result of grounding one exact :class:`PlannedProgram`."""
+
+    planned: PlannedProgram
+    ops: tuple[GroundedOp, ...]
+    resolutions: tuple[GroundingResolution, ...]
+    ground_digest: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.planned, PlannedProgram):
+            raise TypeError("grounded program needs a typed parent plan")
+        if not isinstance(self.ops, tuple) or any(
+                not isinstance(op, GroundedOp) for op in self.ops):
+            raise TypeError("grounded operations must be a typed tuple")
+        if not isinstance(self.resolutions, tuple) or any(
+                not isinstance(item, GroundingResolution)
+                for item in self.resolutions):
+            raise TypeError("grounding resolutions must be a typed tuple")
+        planned_identity = [
+            (op.op_id, op.op_name) for op in self.planned.ops
+        ]
+        grounded_identity = [(op.op_id, op.op_name) for op in self.ops]
+        if grounded_identity != planned_identity:
+            raise ValueError("grounded operations disagree with parent plan")
+        for planned_op, grounded_op in zip(self.planned.ops, self.ops):
+            if not set(planned_op.to_dict()).issubset(grounded_op.to_dict()):
+                raise ValueError("grounding removed a planned field")
+        known_ids = {op.op_id for op in self.ops}
+        if any(item.op_id not in known_ids for item in self.resolutions):
+            raise ValueError("grounding report references an unknown op")
+        expected_resolutions = tuple(
+            item
+            for op in self.ops
+            for item in GroundingResolution.collect(
+                op_id=op.op_id,
+                payload=op.to_dict(),
+            )
+        )
+        if ([item.to_dict() for item in self.resolutions]
+                != [item.to_dict() for item in expected_resolutions]):
+            raise ValueError(
+                "grounding report must cover every grounded selector exactly")
+        computed = hashlib.sha256(
+            _canonical_json(self._unsigned_evidence()).encode("utf-8")
+        ).hexdigest()
+        if self.ground_digest and self.ground_digest != computed:
+            raise ValueError("ground_digest disagrees with grounded payload")
+        object.__setattr__(self, "ground_digest", computed)
+
+    @classmethod
+    def from_ops(
+        cls,
+        planned: PlannedProgram,
+        ops: list[dict[str, Any]],
+        resolutions: tuple[GroundingResolution, ...],
+    ) -> "GroundedProgram":
+        return cls(
+            planned=planned,
+            ops=tuple(GroundedOp.from_dict(op) for op in ops),
+            resolutions=resolutions,
+        )
+
+    def _unsigned_evidence(self) -> dict[str, Any]:
+        return {
+            "schema": GROUND_SCHEMA,
+            "plan_digest": self.planned.plan_digest,
+            "ops": [
+                {"payload": op.to_dict(), "payload_digest": op.payload_digest}
+                for op in self.ops
+            ],
+            "resolutions": [item.to_dict() for item in self.resolutions],
+        }
+
+    def to_ops(self) -> list[dict[str, Any]]:
+        return [op.to_dict() for op in self.ops]
+
+    def resolution_report(self) -> list[dict[str, Any]]:
+        return [item.to_dict() for item in self.resolutions]
+
+    def to_evidence_dict(self) -> dict[str, Any]:
+        payload = self._unsigned_evidence()
+        payload["ground_digest"] = self.ground_digest
         return payload

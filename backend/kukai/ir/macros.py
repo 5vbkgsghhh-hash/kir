@@ -41,6 +41,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from kukai.ir import relate
 from kukai.ir.diag import Diagnostic, KirRefusal
 from kukai.ir.emit_utils import is_finite_number
 
@@ -220,6 +221,14 @@ def _apply_transform(op: dict, tr: dict, t: float, mid: str) -> None:
         v = op.get(key)
         if isinstance(v, list) and 2 <= len(v) <= 3 and all(_num(x) for x in v):
             op[key] = move(v)
+        elif relate.is_address(v):
+            raise _err(
+                "stack.transform: адрес от осей не переносится сужением и "
+                "поворотом — ось от преобразования не переезжает, а точка "
+                "обязана остаться НА НЕЙ. Молча пропустить адрес значило бы "
+                "поставить все этажи в одну и ту же точку сетки. Либо убери "
+                "transform, либо задай эту точку литералом [x, y]",
+                mid, field_name=key, got=v)
 
     # A curved wall is how a facade reads smooth inside the op budget — six arcs
     # per storey beat twenty-four chords. The arc must ride the transform with
@@ -255,6 +264,19 @@ def _apply_transform(op: dict, tr: dict, t: float, mid: str) -> None:
                 got=outer.get("shape"))
         pts = outer.get("points_mm")
         if isinstance(pts, list):
+            # Тот же закон, что и для _XY_FIELDS выше: якорь от осей
+            # преобразованию не подчиняется, и «пропустить его молча» — это
+            # контур, который на каждом этаже один и тот же (шиппед-поведение
+            # до 04.08: `else p` оставлял якорь нетронутым).
+            for point in pts:
+                if relate.is_address(point):
+                    raise _err(
+                        "stack.transform + at_grid: якорь от осей не "
+                        "переносится сужением и поворотом — оси на верхнем "
+                        "этаже те же самые, и контур получился бы "
+                        "неотличимым от нижнего. Задай углы этого контура "
+                        "литералами [x, y]",
+                        mid, field_name="contour.outer.points_mm", got=point)
             outer["points_mm"] = [move(p) if isinstance(p, list) and len(p) >= 2
                                   and all(_num(x) for x in p[:2]) else p
                                   for p in pts]
@@ -290,8 +312,14 @@ def _expand_stack(m: dict) -> list[dict]:
             raise _err(f"stack.floor: '{f.get('op')}' не тиражируется по этажам "
                        f"(допустимы {list(_STACKABLE)})", mid, got=f.get("op"))
         if "level" in f:
+            # `_err(msg, op_id=None, **kw)`: `mid` уже занимает `op_id`
+            # позиционно, и второй `op_id=None` рвал вызов TypeError'ом.
+            # Отказ существовал, но был НЕДОСТИЖИМ: автор, задавший level
+            # внутри stack, получал «KIR-P000 внутренняя ошибка компилятора:
+            # TypeError» вместо правила, которое он нарушил. Найдено
+            # 04.08.2026 первым же адресным stack-тестом.
             raise _err("stack.floor: у опов внутри stack не задаётся level — "
-                       "его назначает экспансия", mid, op_id=None)
+                       "его назначает экспансия", mid, field_name="level")
         if "id" in f and (not isinstance(f.get("id"), str)
                            or not (1 <= len(f["id"]) <= 64)):
             raise _err("stack.floor[].id — строка длиной 1..64", mid,
@@ -316,6 +344,14 @@ def _expand_stack(m: dict) -> list[dict]:
                         and all(_num(v) for v in c[key]):
                     c[key] = [c[key][0], c[key][1],
                               c[key][2] + e0 + (k - 1) * h]
+                elif relate.is_address(c.get(key)) and _num(c[key].get("z_mm")):
+                    # Адрес НЕСЁТ свою отметку явно (`z_mm` обязателен в
+                    # pt_xyz — у сетки осей нет Z), и переносить её по этажам
+                    # надо ровно так же, как у литерала. XY при этом не
+                    # трогается: оси на всех этажах одни и те же, и это ровно
+                    # то, чего от адреса и ждут.
+                    c[key] = dict(c[key])
+                    c[key]["z_mm"] = float(c[key]["z_mm"]) + e0 + (k - 1) * h
             out.append(c)
     return out
 

@@ -40,6 +40,7 @@ from kukai.ir.compiler import (  # noqa: E402
     MAX_OPS_PER_PROGRAM,
     _parse_and_check,
     compile_program,
+    plan_program,
 )
 from kukai.ir.diag import Diagnostic, KirRefusal  # noqa: E402
 from kukai.ir.decompile.fold import iter_l1_leaves  # noqa: E402
@@ -49,6 +50,7 @@ from kukai.ir.decompile.materialize import (  # noqa: E402
     MaterializeError,
     MaterializeResult,
     ProgramPlanCheck,
+    SkipRecord,
     _op_id,
     component_to_group_program,
     leaves_to_program,
@@ -282,9 +284,47 @@ class TMatSynthetic(unittest.TestCase):
         for plan, check in zip(result.plans, result.plan_checks):
             self.assertIsNotNone(plan)
             self.assertTrue(check.accepted)
+            self.assertRegex(check.source_digest, r"^[0-9a-f]{64}$")
             self.assertEqual(check.plan_digest, plan.plan_digest)
             self.assertEqual(check.diagnostic_codes, ())
             self.assertEqual(check.as_dict()["plan_digest"], plan.plan_digest)
+
+    def test_detached_programs_cannot_mutate_an_accepted_plan(self):
+        result = leaves_to_program(_hosted_chain(), chunk_target=250)
+        self.assertTrue(result.compiler_ready)
+        original_id = result.programs[0]["ops"][0]["id"]
+        plan_digest = result.plans[0].plan_digest
+
+        detached = result.programs
+        detached[0]["ops"][0]["id"] = "forged"
+        detached.append({"ir_version": "1.0", "ops": []})
+
+        self.assertEqual(result.programs[0]["ops"][0]["id"], original_id)
+        self.assertEqual(len(result.programs), len(result.plans))
+        self.assertEqual(result.plans[0].plan_digest, plan_digest)
+        self.assertEqual(
+            plan_program(result.programs[0], bulk=True).plan_digest,
+            plan_digest,
+        )
+
+    def test_constructor_defensively_copies_programs_and_record_lists(self):
+        source = leaves_to_program(_hosted_chain(), chunk_target=250)
+        programs = source.programs
+        skipped = source.skipped
+        clone = MaterializeResult(
+            programs=programs,
+            skipped=skipped,
+            escrowed=source.escrowed,
+            stats=source.stats,
+            plans=source.plans,
+            plan_checks=source.plan_checks,
+        )
+
+        programs[0]["ops"][0]["id"] = "forged"
+        skipped.append(SkipRecord("x", "atom", "forged"))
+
+        self.assertNotEqual(clone.programs[0]["ops"][0]["id"], "forged")
+        self.assertFalse(clone.skipped)
 
     def test_plan_refusal_is_evidence_and_does_not_erase_raw_program(self):
         refusal = KirRefusal([Diagnostic(
@@ -305,13 +345,31 @@ class TMatSynthetic(unittest.TestCase):
 
     def test_plan_evidence_cannot_claim_acceptance_without_a_digest(self):
         with self.assertRaises(ValueError):
-            ProgramPlanCheck(program_index=0, accepted=True)
+            ProgramPlanCheck(
+                program_index=0, accepted=True, source_digest="0" * 64)
         with self.assertRaises(ValueError):
-            ProgramPlanCheck(program_index=0, accepted=False)
+            ProgramPlanCheck(
+                program_index=0, accepted=False, source_digest="0" * 64)
         with self.assertRaises(ValueError):
             MaterializeResult(programs=[{
                 "ir_version": "1.0", "ops": [],
             }])
+
+    def test_plan_check_is_bound_to_exact_raw_program(self):
+        result = leaves_to_program(_hosted_chain(), chunk_target=250)
+        forged_check = replace(
+            result.plan_checks[0],
+            source_digest="0" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "source digest"):
+            MaterializeResult(
+                programs=result.programs,
+                skipped=result.skipped,
+                escrowed=result.escrowed,
+                stats=result.stats,
+                plans=result.plans,
+                plan_checks=(forged_check,),
+            )
 
 
 # ---------------------------------------------------------------------------

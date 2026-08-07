@@ -13,10 +13,16 @@ of them is a Fable-level language change, not a patch):
    express an open or self-intersecting region at all; only `poly` needs the
    full static law (normalize closure, short edges, self-intersection with
    arcs sampled at 8 chords — deterministic documented approximation).
-3. ANCHORS: any point is a literal [x,y] OR {"at_grid": ["1","А"],
-   "offset_mm": [dx,dy]} resolved at ground time from the grids pool
-   (id/name/p0_mm/p1_mm); parallel or non-intersecting grid pair is a typed
-   refusal with candidates. No other anchor kinds in v2.0 of CONTOUR.
+3. ANCHORS: any point is a literal [x,y] OR an ADDRESS resolved at ground
+   time from the grids pool (id/name/p0_mm/p1_mm); a missing / duplicate /
+   geometry-less / near-parallel grid is a typed refusal with candidates.
+   No other anchor kinds in v2.0 of CONTOUR.
+   ОБНОВЛЕНО 04.08.2026: грамматика адреса переехала целиком в `relate.py`
+   (RELATE), и CONTOUR стал её потребителем — `resolve_anchor` больше не
+   владеет ни разбором, ни отказами. Легаси-форма `offset_mm: [dx,dy]`
+   (МИРОВАЯ рамка) сохранена ровно здесь и ровно ради голденов `region`;
+   новая форма отступа — узловая, `{"grid": "Б", "offset_mm": 200,
+   "toward": "В"}`, и она работает и в `region` тоже.
 4. A REGION = {"outer": <shape>, "holes": [<shape>...]} — holes obey the
    same shape laws recursively, must lie strictly inside the outer (arc
    sample points included), pairwise disjoint. Same law set as v1.1 geom.py,
@@ -37,6 +43,7 @@ from __future__ import annotations
 import math
 from typing import Any, Optional
 
+from kukai.ir import relate
 from kukai.ir.diag import Diagnostic, TYPE_BAD_TYPE, TYPE_BOUNDS, TYPE_GEOM_RELATION
 from kukai.ir.emit_utils import is_finite_number
 from kukai.ir.geom import _dist, _seg_intersect, check_holes_relation
@@ -46,7 +53,14 @@ _MAX_BULGE = 1.5
 _MIN_AREA = 1e4
 _ARC_SAMPLES = 8
 
-GRID_ANCHOR_UNRESOLVED = "KIR-G105"   # at_grid pair missing/parallel
+#: `KIR-G105` (`GRID_ANCHOR_UNRESOLVED`) ВЫВЕДЕН ИЗ УПОТРЕБЛЕНИЯ 04.08.2026.
+#:
+#: Он покрывал три разных случая — «имени нет», «геометрии нет», «пересечения
+#: нет» — то есть три РАЗНЫХ РЕМОНТА одним кодом, и потому не мог назвать
+#: следующий ход ни в одном из них. Расщеплён на `relate.GRID_NOT_FOUND`
+#: (G108), `GRID_NO_GEOMETRY` (G111) и `GRID_NO_INTERSECTION` (G110).
+#: Имя не переиспользуется: код, который значил три вещи, не должен получить
+#: четвёртую.
 
 
 # ── anchors ──────────────────────────────────────────────────────────────────
@@ -57,59 +71,32 @@ def anchor_is_literal(a) -> bool:
 
 
 def anchor_is_grid(a) -> bool:
-    return (isinstance(a, dict) and isinstance(a.get("at_grid"), list)
-            and len(a["at_grid"]) == 2
-            and all(isinstance(g, str) and g.strip() for g in a["at_grid"]))
-
-
-def _line_intersection(p0, p1, q0, q1) -> Optional[tuple]:
-    """Infinite-line intersection (grids are lines, not segments)."""
-    d1 = (p1[0] - p0[0], p1[1] - p0[1])
-    d2 = (q1[0] - q0[0], q1[1] - q0[1])
-    den = d1[0] * d2[1] - d1[1] * d2[0]
-    if abs(den) < 1e-9:
-        return None
-    t = ((q0[0] - p0[0]) * d2[1] - (q0[1] - p0[1]) * d2[0]) / den
-    return (p0[0] + t * d1[0], p0[1] + t * d1[1])
+    return relate.is_address(a)
 
 
 def resolve_anchor(a, grids_pool: list, oid, field: str, diags: list) -> Optional[list]:
-    """Literal passes through; at_grid resolves to the grid-pair intersection.
-    grids_pool rows: {"id", "name", "p0_mm": [x,y], "p1_mm": [x,y]}."""
+    """Literal passes through; `at_grid` resolves through :mod:`relate`.
+
+    ОДНА ГРАММАТИКА, ОДИН РЕЗОЛВЕР. До 04.08 адресация от осей жила ЗДЕСЬ и
+    несла три латентных дефекта (мировая рамка отступа, тихий выбор при
+    совпадении имён, непроверенная обусловленность). Обобщать её на все
+    точечные параметры, не починив, значило бы размножить дефект фундамента
+    на двадцать два новых параметра — поэтому починка живёт в одном месте, а
+    CONTOUR стал её потребителем, а не вторым владельцем.
+
+    ``allow_world_offset=True`` — ИМЕНОВАННАЯ легаси-дверь ровно для `region`:
+    форма ``{"at_grid": [...], "offset_mm": [dx, dy]}`` шиппится с 17.07 и
+    стоит в голденах. В новых слотах она закрыта (см. `relate`).
+    """
     if anchor_is_literal(a):
         return [float(a[0]), float(a[1])]
-    if not anchor_is_grid(a):
+    if not isinstance(a, dict) or "at_grid" not in a:
         diags.append(Diagnostic(
             code=TYPE_BAD_TYPE, op_id=oid, field_name=field, got=a,
             message_ru=f"{field}: точка — [x,y] мм или {{at_grid:[имя,имя], offset_mm?}}"))
         return None
-    by_name = {str(g.get("name", "")).strip(): g for g in grids_pool or []}
-    ga, gb = (a["at_grid"][0].strip(), a["at_grid"][1].strip())
-    rows = []
-    for gname in (ga, gb):
-        row = by_name.get(gname)
-        if row is None or not anchor_is_literal(row.get("p0_mm")) \
-                or not anchor_is_literal(row.get("p1_mm")):
-            diags.append(Diagnostic(
-                code=GRID_ANCHOR_UNRESOLVED, op_id=oid, field_name=field,
-                got=gname, candidates=sorted(by_name)[:8],
-                message_ru=f"{field}: ось «{gname}» не найдена в снапшоте (или без геометрии)"))
-            return None
-        rows.append(row)
-    pt = _line_intersection(rows[0]["p0_mm"], rows[0]["p1_mm"],
-                            rows[1]["p0_mm"], rows[1]["p1_mm"])
-    if pt is None:
-        diags.append(Diagnostic(
-            code=GRID_ANCHOR_UNRESOLVED, op_id=oid, field_name=field,
-            got=a["at_grid"], message_ru=f"{field}: оси «{ga}»/«{gb}» параллельны — пересечения нет"))
-        return None
-    off = a.get("offset_mm", [0, 0])
-    if not anchor_is_literal(off):
-        diags.append(Diagnostic(
-            code=TYPE_BAD_TYPE, op_id=oid, field_name=field, got=off,
-            message_ru=f"{field}: offset_mm — [dx,dy]"))
-        return None
-    return [pt[0] + float(off[0]), pt[1] + float(off[1])]
+    return relate.resolve_address(a, grids_pool, oid, field, diags, dims=2,
+                                  allow_world_offset=True)
 
 
 # ── arc math (ALL at compile time) ───────────────────────────────────────────

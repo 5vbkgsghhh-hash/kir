@@ -1,0 +1,535 @@
+{
+ "note": "Заморожено руками. Новая категория обязана уронить тест.",
+ "row_count": 61,
+ "rows": {
+  "DirectShape": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "direct_shape",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "ImportInstance": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "import_instance",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_Areas": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "area",
+   "mvp_side": null,
+   "refusal": "аннотация"
+  },
+  "OST_CLines": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "refplane",
+   "mvp_side": null,
+   "refusal": "датум"
+  },
+  "OST_CableTray": {
+   "eligible": true,
+   "hull_sources": [
+    "axis_section",
+    "bbox"
+   ],
+   "label": "tray",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_CableTrayFitting": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "tray_fitting",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_Casework": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "casework",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_Ceilings": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "ceiling",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_Columns": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "column",
+   "mvp_side": "struct",
+   "refusal": ""
+  },
+  "OST_Conduit": {
+   "eligible": true,
+   "hull_sources": [
+    "axis_section",
+    "bbox"
+   ],
+   "label": "conduit",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_ConduitFitting": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "conduit_fitting",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_CurtaSystem": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "curtain_system",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_CurtainGridsCurtaSystem": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "curtain_grid",
+   "mvp_side": null,
+   "refusal": "датум"
+  },
+  "OST_CurtainGridsRoof": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "curtain_grid",
+   "mvp_side": null,
+   "refusal": "датум"
+  },
+  "OST_CurtainGridsWall": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "curtain_grid",
+   "mvp_side": null,
+   "refusal": "датум"
+  },
+  "OST_CurtainWallMullions": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "mullion",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_CurtainWallPanels": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "curtain_panel",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_Dimensions": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "dimension",
+   "mvp_side": null,
+   "refusal": "аннотация"
+  },
+  "OST_Doors": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "door",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_DuctAccessory": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "duct_accessory",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_DuctCurves": {
+   "eligible": true,
+   "hull_sources": [
+    "axis_section",
+    "bbox"
+   ],
+   "label": "duct",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_DuctCurvesInsulation": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "duct_insulation",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_DuctFitting": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "duct_fitting",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_DuctInsulations": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "duct_insulation",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_DuctLinings": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "duct_lining",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_DuctTerminal": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "duct_terminal",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_ElectricalEquipment": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "electrical_equipment",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_ElectricalFixtures": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "electrical_fixture",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_FabricationPipeworkInsulation": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "pipe_insulation",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_FlexDuctCurves": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "duct",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_FlexPipeCurves": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "pipe",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_Floors": {
+   "eligible": true,
+   "hull_sources": [
+    "profile",
+    "bbox"
+   ],
+   "label": "floor",
+   "mvp_side": "struct",
+   "refusal": ""
+  },
+  "OST_Furniture": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "furniture",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_GenericModel": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "generic",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_Grids": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "grid",
+   "mvp_side": null,
+   "refusal": "датум"
+  },
+  "OST_Levels": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "level",
+   "mvp_side": null,
+   "refusal": "датум"
+  },
+  "OST_LightingDevices": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "lighting_device",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_LightingFixtures": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "lighting_fixture",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_Lines": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "line",
+   "mvp_side": null,
+   "refusal": "аннотация"
+  },
+  "OST_MEPSpaces": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "mep_space",
+   "mvp_side": null,
+   "refusal": "пространство, не тело"
+  },
+  "OST_MechanicalEquipment": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "equipment",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_PipeAccessory": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "pipe_accessory",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_PipeCurves": {
+   "eligible": true,
+   "hull_sources": [
+    "axis_section",
+    "bbox"
+   ],
+   "label": "pipe",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_PipeFitting": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "pipe_fitting",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_PipeInsulations": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "pipe_insulation",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_PlumbingFixtures": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "fixture",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_Ramps": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "ramp",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_RasterImages": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "raster",
+   "mvp_side": null,
+   "refusal": "аннотация"
+  },
+  "OST_Roofs": {
+   "eligible": true,
+   "hull_sources": [
+    "profile",
+    "bbox"
+   ],
+   "label": "roof",
+   "mvp_side": "struct",
+   "refusal": ""
+  },
+  "OST_Rooms": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "room",
+   "mvp_side": null,
+   "refusal": "пространство, не тело"
+  },
+  "OST_SketchLines": {
+   "eligible": false,
+   "hull_sources": [],
+   "label": "sketch",
+   "mvp_side": null,
+   "refusal": "аннотация"
+  },
+  "OST_SpecialityEquipment": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "equipment",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_Sprinklers": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "sprinkler",
+   "mvp_side": "mep",
+   "refusal": ""
+  },
+  "OST_Stairs": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "stairs",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_StairsRailing": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "railing",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_StructuralColumns": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "column",
+   "mvp_side": "struct",
+   "refusal": ""
+  },
+  "OST_StructuralFoundation": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "foundation",
+   "mvp_side": "struct",
+   "refusal": ""
+  },
+  "OST_StructuralFraming": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "beam",
+   "mvp_side": "struct",
+   "refusal": ""
+  },
+  "OST_StructuralTruss": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "truss",
+   "mvp_side": null,
+   "refusal": ""
+  },
+  "OST_Walls": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "wall",
+   "mvp_side": "struct",
+   "refusal": ""
+  },
+  "OST_Windows": {
+   "eligible": true,
+   "hull_sources": [
+    "bbox"
+   ],
+   "label": "window",
+   "mvp_side": null,
+   "refusal": ""
+  }
+ }
+}

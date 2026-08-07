@@ -394,10 +394,27 @@ class AnOlderSnapshotIsNamedNotReinterpreted(unittest.TestCase):
                 ex.EXTRACT_CATEGORIES)
             self.assertEqual(reader.dialect().version, expected.version)
             # Недостающее НАЗВАНО поимённо, а не досчитано нулями.
+            #
+            # Проверяется РАВЕНСТВО множеству «всё, что дописано в таблицу
+            # ПОСЛЕ этого поколения», а не одной волне: после волны рабочей
+            # документации таблица росла снова (03.08 — проёмы отдельными
+            # элементами), и прибитая к одной волне константа превращала
+            # ЗАКОННЫЙ рост в падение. Смысл теста при этом не ослаб: хвост
+            # по-прежнему сверяется ПОИМЁННО и целиком — он просто берётся у
+            # самой таблицы, а не переписывается от руки на каждую волну.
             absent = categories_outside_dialect(
                 reader.dialect(), ex.EXTRACT_CATEGORIES)
-            self.assertEqual(
-                set(absent), set(MEASURED_DOCUMENTATION_CATEGORIES))
+            added_since = set(
+                ex.EXTRACT_CATEGORIES[
+                    len(CATEGORIES_BEFORE_THE_DOCUMENTATION_WAVE):])
+            self.assertEqual(set(absent), added_since)
+            # ...и внутри него ОБЯЗАНЫ лежать обе волны поимённо: замеренная
+            # рабочая документация и проёмы.
+            self.assertLessEqual(
+                set(MEASURED_DOCUMENTATION_CATEGORIES), set(absent))
+            self.assertLessEqual(
+                {"OST_SWallRectOpening", "OST_FloorOpening",
+                 "OST_RoofOpening", "OST_ShaftOpening"}, set(absent))
 
     def test_a_stream_of_an_invented_table_size_is_still_refused(self) -> None:
         """ОПРОВЕРГАЮЩИЙ: послабление касается ПОКОЛЕНИЙ, а не любого хвоста.

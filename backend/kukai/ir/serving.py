@@ -20,11 +20,13 @@ chains show_elements (the existing selection tool) on them (D5 §1 note).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
 import os
 import re
+from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
 from kukai.ir.a5_recovery import (
@@ -150,7 +152,7 @@ def inject_revit_ir_schema(tools: list) -> None:
     if any(t.get("function", {}).get("name") == "revit_ir" for t in tools):
         return
     from kukai.ir.schema_gen import program_schema
-    from kukai.ir.tool_doc import build_tool_description
+    from kukai.ir.tool_doc import build_tool_description, program_py_schema
     tools.append({
         "type": "function",
         "function": {
@@ -166,8 +168,27 @@ def inject_revit_ir_schema(tools: list) -> None:
             "description": build_tool_description(),
             "parameters": {
                 "type": "object",
-                "properties": {"program": program_schema()},
-                "required": ["program"],
+                # ДВЕ ФОРМЫ ВХОДА, РОВНО ОДНА ЗА РАЗ.
+                #
+                # ПОЧЕМУ НЕ `oneOf`/`required` НА ВЕРХНЕМ УРОВНЕ. «Ровно одно
+                # из двух» выражается в JSON Schema только `oneOf`, и это
+                # была бы правда — но `oneOf` В КОРНЕ `parameters` ни один
+                # инструмент этой установки ещё не возил, а поставщик,
+                # отвергший пачку инструментов целиком, ломает ХОД, а не одну
+                # способность. Цена ошибки несимметрична: непринятая схема —
+                # мёртвый ход у админского устройства, отсутствующий
+                # `required` — один типизированный отказ, который УЧИТ
+                # (`_authored_input` ниже). Поэтому правило названо словами, а
+                # держится рантаймом.
+                "description": (
+                    "Программа задаётся РОВНО ОДНИМ из двух полей: `program` "
+                    "(операции JSON) либо `program_py` (питон, который их "
+                    "порождает). Оба сразу или ни одного — типизированный "
+                    "отказ."),
+                "properties": {
+                    "program": program_schema(),
+                    "program_py": program_py_schema(),
+                },
             },
         },
     })
@@ -476,6 +497,50 @@ _KIR_A_TO_ERRCODE = {
     "KIR-A008": ErrCode.KIR_UNCONFIRMED,
 }
 
+# ПЕСОЧНИЦА ИСХОДНОГО ЯЗЫКА (`KIR-B*`, kukai/ir/sandbox.py).
+#
+# ОТВЕТ НА «RETRYABLE?» — И ОН НЕ ПО АНАЛОГИИ, А ПО ДВУМ ФАКТАМ.
+#
+# ФАКТ ПЕРВЫЙ, РЕШАЮЩИЙ: НИЧЕГО НЕ ПРОИЗОШЛО. Песочница стоит ДО компилятора,
+# ДО моста и ДО любой транзакции; её единственный выход — список операций, и
+# при отказе его нет. Значит запрет на повтор здесь нечего защищать: `retryable
+# = false` в этой системе означает ровно одно — «эффект мог случиться, повтор
+# задвоит» (`kir.unconfirmed`, `transport.execution_unknown`). Скрипт, упавший
+# на синтаксисе, не создал ни одного элемента, и следующий ход обязан быть.
+#
+# ФАКТ ВТОРОЙ: ОТКАЗ ДЕТЕРМИНИРОВАН. Тот же исходник даст ту же ошибку —
+# на этом и стоит `author_digest`. Поэтому `transient=false` у всех: ждать и
+# слать то же самое бессмысленно, чинить надо ИСХОДНИК. Это в точности
+# семантика `kir.program_refused` (retryable=True, transient=False), а не
+# `transport.*`: код отказа называет строку скрипта, то есть адрес правки.
+#
+# ЕДИНСТВЕННОЕ ИСКЛЮЧЕНИЕ — `KIR-B012`, и оно противоположно по причине.
+# Это НАШ дефект (`blame="sandbox"`): не создалось пространство имён, не
+# загрузился язык, ребёнок не отдал результата. Модель чинить тут нечего, и
+# сказать ей «retryable» значило бы отправить её переписывать исправный
+# скрипт. `internal.unhandled` (False, False) говорит правду: повторять
+# бессмысленно. Что делать — сказано текстом отказа: ту же программу можно
+# прислать полем `ops`, путь исполнения от этого не меняется.
+#
+# B002/B003/B011 (стена/память/смерть процесса) взвешены отдельно и НАМЕРЕННО
+# оставлены не-transient: они выглядят «плавающими», но их причина — цикл без
+# выхода или накопление в памяти, то есть свойство скрипта. Объявить их
+# transient значит посоветовать модели прислать тот же вечный цикл ещё раз.
+_KIR_B_TO_ERRCODE = {
+    "KIR-B001": ErrCode.KIR_PROGRAM_REFUSED,   # синтаксис
+    "KIR-B002": ErrCode.KIR_PROGRAM_REFUSED,   # не завершился
+    "KIR-B003": ErrCode.KIR_PROGRAM_REFUSED,   # память
+    "KIR-B004": ErrCode.KIR_PROGRAM_REFUSED,   # импорт вне белого списка
+    "KIR-B005": ErrCode.KIR_PROGRAM_REFUSED,   # закрытый builtin
+    "KIR-B006": ErrCode.KIR_PROGRAM_REFUSED,   # исключение скрипта
+    "KIR-B007": ErrCode.KIR_PROGRAM_REFUSED,   # программы не выдал
+    "KIR-B008": ErrCode.KIR_PROGRAM_REFUSED,   # выдал не-IR
+    "KIR-B009": ErrCode.KIR_PROGRAM_REFUSED,   # транспортный потолок
+    "KIR-B010": ErrCode.KIR_PROGRAM_REFUSED,   # недетерминизм
+    "KIR-B011": ErrCode.KIR_PROGRAM_REFUSED,   # процесс умер молча
+    "KIR-B012": ErrCode.INTERNAL_UNHANDLED,    # НАШ дефект, см. выше
+}
+
 # Плоская форма `{"ok": false, "error": "<строка>"}` — так отказывают
 # `_typed_error` и `rebuild_runner`. Строка уже НАЗЫВАЕТ причину; таблица лишь
 # сообщает читателю, что с ней делать.
@@ -511,6 +576,10 @@ _FLAT_ERROR_TO_ERRCODE = {
     # на каждый из них KIR отвечал «внутренняя ошибка». См. `_transport_stage`.
     "bridge_disconnected": ErrCode.TRANSPORT_BRIDGE_DISCONNECTED,
     "bridge_timeout": ErrCode.TRANSPORT_BRIDGE_TIMEOUT,
+    # ФОРМА ВЫЗОВА: `program` и `program_py` сразу, ни одного, или скрипт не
+    # текстом. Программы не было вовсе — чинится правкой аргументов, повтор
+    # безопасен по построению.
+    "program_form": ErrCode.TOOL_INVALID_ARGS,
     "internal": ErrCode.INTERNAL_UNHANDLED,
 }
 
@@ -599,6 +668,12 @@ def _fix_hint(diag: dict) -> Optional[str]:
     не угадывается моделью по сообщению Revit."""
     if not isinstance(diag, dict):
         return None
+    if diag.get("script_line") is not None:
+        # Отказ песочницы адресуется НЕ операцией, а строкой ИСХОДНИКА МОДЕЛИ:
+        # операций ещё нет, а место правки уже известно точно.
+        text = str(diag.get("script_line_text") or "").strip()
+        head = f"в скрипте, строка {diag['script_line']}"
+        return f"{head}: {text}" if text else head
     where = diag.get("op_id") or (
         f"оп #{diag['op_index']}" if diag.get("op_index") is not None else None)
     field = diag.get("field_name")
@@ -638,6 +713,13 @@ def _classify_refusal(res: dict) -> tuple[ErrCode, Optional[dict]]:
     if kir_code.startswith("KIR-A"):
         return _KIR_A_TO_ERRCODE.get(
             kir_code, ErrCode.KIR_RUNTIME_REFUSED), lead
+    if kir_code.startswith("KIR-B"):
+        # Песочница исходного языка: ничего не исполнялось (см. таблицу).
+        # Умолчание — «отказ программы», а не «наш дефект»: неизвестный
+        # B-код скорее новая ошибка автора, чем новая наша поломка, и
+        # ошибиться в эту сторону дешевле (модель получит следующий ход).
+        return _KIR_B_TO_ERRCODE.get(
+            kir_code, ErrCode.KIR_PROGRAM_REFUSED), lead
     flat = res.get("error")
     if isinstance(flat, str) and flat in _FLAT_ERROR_TO_ERRCODE:
         return _FLAT_ERROR_TO_ERRCODE[flat], lead
@@ -795,6 +877,277 @@ def _acceptance_diagnostic(
     }
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ШЛЮЗ ИСХОДНОГО ЯЗЫКА — питон становится операциями РОВНО ЗДЕСЬ
+#
+# Модель пишет либо программу операциями (`program`), либо скрипт, который её
+# порождает (`program_py`). Скрипт исполняется в отдельном процессе
+# (`kukai/ir/sandbox.py`), НИКОГДА не касается Revit и выпускает наружу ровно
+# одну вещь — список операций IR.
+#
+# И ДАЛЬШЕ НАЧИНАЕТСЯ ТОТ ЖЕ ПУТЬ, ЧТО У JSON: `plan_program`, заземление,
+# эмиссия, свидетель в транзакции, независимая приёмка, журнал. Ниже шлюза нет
+# НИ ОДНОЙ ветки «а если это был скрипт» — потому что граница безопасности и
+# доказуемости проходит по IR, а не по языку, на котором IR написали. Место
+# конверсии одно, и оно ЗДЕСЬ, до входа в тело: тело не должно уметь отличать.
+#
+# ЧТО ДОБАВЛЯЕТСЯ К ДОКАЗАТЕЛЬСТВУ. `plan_digest` подписывает программу;
+# `author_digest` подписывает ИСХОДНИК, её породивший. Вместе они читаются как
+# «эта программа порождена вот этим скриптом» — воспроизводимость, которой на
+# пути JSON не бывает вовсе. Отсюда же `replay_check` ниже: подпись, которую
+# никто не проверял, — обещание, а не доказательство.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SCRIPT_FIELD = "program_py"
+
+#: Политика песочницы прод-пути.
+#:
+#: `replay_check=True` — И ЭТО ГЛАВНОЕ РЕШЕНИЕ ЗДЕСЬ. Скрипт исполняется ДВАЖДЫ
+#: и дайджесты двух программ сверяются. Цена замерена: счастливый путь стоит
+#: ~170 мс на 104 операции, то есть повтор добавляет к ходу ~0.2% (живая запись
+#: в Revit — десятки секунд). Плата за то, что `author_digest` перестаёт быть
+#: обещанием: подпись недетерминированного скрипта не удостоверяет НИЧЕГО, и
+#: узнать об этом обязаны мы, а не читатель квитанции через полгода.
+#: Экраны песочницы (адрес объекта в выходе, запрет random/time/os) ловят
+#: только то, что оставляет след; сверка прогонок ловит всё, что меняет ВЫХОД.
+_AUTHOR_SANDBOX_POLICY = None       # ленивая инициализация: см. _sandbox_policy
+
+
+def _sandbox_policy():
+    """Политика песочницы. Ленивая, чтобы импорт serving не тянул песочницу."""
+    global _AUTHOR_SANDBOX_POLICY
+    if _AUTHOR_SANDBOX_POLICY is None:
+        from kukai.ir.sandbox import SandboxPolicy
+        _AUTHOR_SANDBOX_POLICY = SandboxPolicy(replay_check=True)
+    return _AUTHOR_SANDBOX_POLICY
+
+
+@dataclass(frozen=True)
+class _AuthoredInput:
+    """Чем задана программа — и чем это подписано.
+
+    ``args`` — то, что уходит в тело инструмента: всегда обычный
+    ``{"program": {...}}``, независимо от того, написала его модель или питон.
+    """
+
+    args: Any
+    refusal: Optional[dict] = None
+    from_script: bool = False
+    author_digest: str = ""
+    receipt: Optional[dict] = None
+
+
+def _form_refusal(message: str) -> dict:
+    """Отказ ФОРМЫ ВЫЗОВА: неверна не программа, а способ её задать.
+
+    `handoff` тут пуст намеренно. «recipe-path» означает «задача вне области
+    KIR» — а здесь задача как раз внутри, и следующий ход чинится одной
+    правкой аргументов. Совет уйти к другим инструментам был бы ложным."""
+    return _with_outcome(
+        {"ok": False, "kir": True, "refused": True, "error": "program_form",
+         "message_ru": message, "handoff": None},
+        program_not_started())
+
+
+def _authorship_receipt(result: Any, *, source_bytes: int) -> dict:
+    """Блок квитанции «эта программа порождена вот этим скриптом».
+
+    Едет рядом с `plan_digest` и на успехе, и на отказе: подпись исходника,
+    который НЕ собрался, — такое же свидетельство, как подпись собравшегося.
+
+    `stdout` здесь не украшение. Образцы формы (`tower_numpy.py`) печатают
+    ЧИСЛОМ расхождение ломаной с кривой, которую они приближают; отрезать этот
+    канал значит вернуть «сказал синус, построил ломаную, промолчал» — ровно
+    тот молчаливо-неверный ответ, против которого стоит весь дом."""
+    isolation = dict(getattr(result, "isolation", None) or {})
+    receipt = {
+        "language": "python",
+        "author_digest": getattr(result, "author_digest", "") or "",
+        "op_count": len(getattr(result, "ops", None) or []),
+        "source_bytes": source_bytes,
+        "duration_ms": round(float(getattr(result, "duration_s", 0.0)) * 1000.0, 1),
+        # Замер, а не намерение: что песочница СДЕЛАЛА на этом запуске.
+        "isolation": {key: isolation[key]
+                      for key in ("namespaces", "filesystem", "network_probe")
+                      if key in isolation},
+        "replay_checked": bool(isolation.get("replay_checked")),
+    }
+    digest = getattr(result, "program_digest", "") or ""
+    if digest:
+        receipt["program_digest"] = digest
+    stdout = getattr(result, "stdout", "") or ""
+    if stdout:
+        receipt["stdout"] = stdout
+    return receipt
+
+
+def _script_refusal_result(refusal: Any, receipt: dict) -> dict:
+    """Отказ песочницы наружу — типизированным, с НОМЕРОМ СТРОКИ МОДЕЛИ.
+
+    Ни одного нашего кадра: чинить надо СВОЙ скрипт, и отказ обязан показывать
+    место в нём. `render()` уже складывает «код: суть / строка N: текст»;
+    поля дублируются машиночитаемо, потому что `err.fix` собирается из них, а
+    не из прозы."""
+    diagnostic: dict[str, Any] = {
+        "code": refusal.code,
+        "message_ru": refusal.render(),
+        "kind": refusal.kind,
+        # ЧЬЯ ЭТО ОШИБКА — отдельным полем, а не догадкой по коду:
+        # "author" чинит модель, "sandbox" чиним мы.
+        "blame": refusal.blame,
+    }
+    if refusal.line is not None:
+        diagnostic["script_line"] = refusal.line
+        diagnostic["script_line_text"] = refusal.line_text
+    if refusal.script_frames:
+        diagnostic["script_frames"] = list(refusal.script_frames)
+    if refusal.detail:
+        diagnostic["detail"] = dict(refusal.detail)
+    message = refusal.render()
+    if refusal.blame == "sandbox":
+        # НАШ ДЕФЕКТ — и модели надо сказать, что делать, потому что чинить ей
+        # нечего. Песочница этой фразы произнести не может: она не знает, что
+        # у инструмента есть вторая форма входа. Знает шлюз, здесь и говорит.
+        message += ("\nЭто дефект песочницы, а не скрипта. Ту же программу "
+                    "можно прислать полем `program` (операциями) — путь "
+                    "исполнения ниже от этого не меняется.")
+        diagnostic["message_ru"] = message
+    return _with_outcome({
+        "ok": False, "kir": True, "refused": True, "stage": "author_script",
+        "diagnostics": [diagnostic],
+        "message_ru": message,
+        "handoff": None,
+        "program_source": receipt,
+    }, program_not_started())
+
+
+def _stamp_authorship(result: Any, authored: _AuthoredInput) -> Any:
+    """Поставить подпись исходника на КВИТАНЦИЮ. Аддитивно и fail-open.
+
+    Одно место на все исходы, а не правка каждого `return`, — тем же приёмом,
+    которым ставится блок `err`: список мест забыть можно, структурное правило
+    нельзя."""
+    try:
+        if (not authored.from_script or not isinstance(result, dict)
+                or not authored.receipt):
+            return result
+        result.setdefault("program_source", authored.receipt)
+    except Exception:  # noqa: BLE001 — квитанция не может ломать ход
+        logger.debug("KIR authorship stamping failed", exc_info=True)
+    return result
+
+
+def _building_watch() -> tuple[Any, int]:
+    """Отметка «сколько программ у здания было ДО этого хода».
+
+    Снимается ДО тела и сравнивается ПОСЛЕ — так вопрос «этот ход что-нибудь
+    добавил зданию?» отвечается ЖУРНАЛОМ, а не флагом, который тело обязано
+    было бы протащить через полтора десятка `return`. Забыть протащить флаг
+    можно, разойтись с журналом — нет.
+    """
+    from kukai.live import journal as _live_journal
+    from kukai.live import verdict as _building
+
+    key = _live_journal.key_for(_turn_device_id())
+    return key, _building.programs_seen(key)
+
+
+async def _stamp_building_verdict(result: Any, watch: tuple[Any, int]) -> Any:
+    """ВЕРДИКТ О ЗДАНИИ — на КВИТАНЦИЮ, одним местом на все исходы.
+
+    ЧТО ЭТО ЧИНИТ. Пачка сессии уезжала витрине и исполнителю — человеку и
+    Revit'у, — а к судье не приходила никогда: у `check_bundle` был ровно один
+    прод-вызывающий, `course.design_check` внутри песочницы. Здание при этом
+    строится ПО ЧАСТЯМ по закону Revit (`create_stairs` обязан быть единственным
+    опом своей программы), поэтому вердикт о звене всегда говорит не о том.
+
+    ТОЛЬКО ЕСЛИ ЖУРНАЛ ВЫРОС. Читающий ход зданию не принадлежит (замер 29.07 —
+    176 чтений на 5 записей), и повторять на нём вчерашний вердикт значило бы
+    учить модель на числе, которое она уже не меняет.
+
+    В ПОТОКЕ, А НЕ В ЦИКЛЕ. `check_bundle` считает питоном под GIL (замер: ~0.4
+    мс на операцию), и держать на нём цикл событий значило бы подвесить чужие
+    ходы на чужом здании.
+
+    `setdefault`, а не присваивание: если тело когда-нибудь начнёт говорить о
+    здании само, оно окажется ближе к предмету и его слово будет старше.
+    """
+    try:
+        if not isinstance(result, dict):
+            return result
+        from kukai.live import verdict as _building
+
+        key, before = watch
+        if _building.programs_seen(key) <= before:
+            return result
+        block = await asyncio.to_thread(_building.judge, key)
+        if block:
+            result.setdefault("building", block)
+    except Exception:  # noqa: BLE001 — вердикт не может ломать ход, где Revit
+        logger.debug("KIR building verdict stamping failed", exc_info=True)
+    return result
+
+
+async def _authored_input(args: Any) -> _AuthoredInput:
+    """ЕДИНСТВЕННОЕ место, где питон становится операциями.
+
+    Возвращает либо готовый `{"program": {...}}` для тела инструмента, либо
+    типизированный отказ. Ничего не бросает: сбой песочницы — тоже результат.
+    """
+    if not isinstance(args, dict):
+        return _AuthoredInput(args=args, refusal=_form_refusal(
+            "аргументы инструмента должны быть объектом с полем `program` "
+            "либо `program_py`"))
+
+    program = args.get("program")
+    if program is None and "ops" in args:
+        program = args                    # tolerate un-nested programs
+    source = args.get(_SCRIPT_FIELD)
+
+    if source is None:
+        if program is None:
+            # НИ ОДНОЙ ФОРМЫ. Раньше такой вызов доезжал до компилятора и
+            # получал «программа отклонена компилятором» — неправду: никакой
+            # программы не присылали, и чинить надо ВЫЗОВ, а не программу.
+            return _AuthoredInput(args=args, refusal=_form_refusal(
+                "не задано ни `program`, ни `program_py`: программа — это "
+                "либо операции (`program`), либо питон, который их порождает "
+                "(`program_py`). Ровно одно из двух"))
+        return _AuthoredInput(args=args)   # обычный путь JSON, ничего не менялось
+    if program is not None:
+        return _AuthoredInput(args=args, refusal=_form_refusal(
+            "заданы СРАЗУ `program` и `program_py`. Форма ровно одна за вызов: "
+            "либо программа операциями, либо скрипт, который их порождает — "
+            "иначе непонятно, что подписывать квитанцией"))
+    if not isinstance(source, str):
+        return _AuthoredInput(args=args, refusal=_form_refusal(
+            f"`program_py` — это ТЕКСТ скрипта на питоне, а пришло "
+            f"{type(source).__name__}"))
+
+    from kukai.ir.sandbox import execute_author_script
+
+    # Отдельный поток: песочница синхронна (subprocess + стена), и держать на
+    # ней цикл событий значило бы подвесить чужие ходы на чужом цикле.
+    result = await asyncio.to_thread(
+        execute_author_script, source, policy=_sandbox_policy())
+    receipt = _authorship_receipt(
+        result, source_bytes=len(source.encode("utf-8", "surrogatepass")))
+
+    if not result.ok:
+        return _AuthoredInput(
+            args=args, from_script=True, author_digest=result.author_digest,
+            receipt=receipt,
+            refusal=_script_refusal_result(result.refusal, receipt))
+
+    # Конверт, выставленный скриптом (`intent`/`defaults`/`allow_destructive`/
+    # `ir_version`), доезжает ЦЕЛИКОМ: пересобирать его здесь на глазок значило
+    # бы потерять то, что автор назвал явно.
+    program = {**(result.envelope or {}), "ops": result.ops}
+    return _AuthoredInput(
+        args={"program": program}, from_script=True,
+        author_digest=result.author_digest, receipt=receipt)
+
+
 async def handle_revit_ir(args: Any, llm_client, bridge_callback,
                           query_id: str = "") -> dict:
     """ЧАТ-ДВЕРЬ — публичный вход инструмента. Тонкая обёртка над телом:
@@ -809,10 +1162,28 @@ async def handle_revit_ir(args: Any, llm_client, bridge_callback,
     а замысел: договорённость «не передавать флаг» забывается, отсутствующий
     параметр — нет. Всё, что модель кладёт во вход, попадает в `args`; ни одно
     поле `args` здесь не читается как переключатель бюджета, поэтому «попросить
-    bulk» из чата нельзя ПО ПОСТРОЕНИЮ (см. tests/test_op_budget_seam.py)."""
-    return _stamp_refusal(
-        await _handle_revit_ir_inner(args, llm_client, bridge_callback,
-                                     query_id=query_id, bulk=False))
+    bulk» из чата нельзя ПО ПОСТРОЕНИЮ (см. tests/test_op_budget_seam.py).
+
+    ОГОВОРКА, КОТОРУЮ НАДО ЧИТАТЬ ВМЕСТЕ С ПРЕДЫДУЩИМ АБЗАЦЕМ: `program_py`
+    поднимает ПРЕДМАКРОСНЫЙ бюджет до внутреннего — см. `authored_in_python`
+    в теле, там же обоснование. Абзац выше остаётся правдой дословно: ни одно
+    поле не поднимает бюджет ПЕРЕЧИСЛЕНИЯ, потому что перечисление и есть то,
+    что этот бюджет меряет."""
+    authored = await _authored_input(args)
+    if authored.refusal is not None:
+        return _stamp_refusal(_stamp_authorship(authored.refusal, authored))
+    # Отметка снимается ДО тела: врезка журнала стоит внутри него, и «вырос ли
+    # журнал» — единственный честный ответ на «добавил ли этот ход зданию».
+    watch = _building_watch()
+    return _stamp_refusal(_stamp_authorship(
+        await _stamp_building_verdict(
+            await _handle_revit_ir_inner(
+                authored.args, llm_client, bridge_callback,
+                query_id=query_id, bulk=False,
+                authored_in_python=authored.from_script,
+                author_digest=authored.author_digest),
+            watch),
+        authored))
 
 
 async def handle_revit_ir_bulk(args: Any, llm_client, bridge_callback,
@@ -845,14 +1216,23 @@ async def handle_revit_ir_bulk(args: Any, llm_client, bridge_callback,
         # инструмента, а «внутренний вход только с админского устройства» —
         # утверждение, которое не должно зависеть от значения флага.
         return _typed_error("gate", admin_gate_message_ru("revit_ir (bulk)"))
-    return _stamp_refusal(
-        await _handle_revit_ir_inner(args, llm_client, bridge_callback,
-                                     query_id=query_id, bulk=True))
+    authored = await _authored_input(args)
+    if authored.refusal is not None:
+        return _stamp_refusal(_stamp_authorship(authored.refusal, authored))
+    return _stamp_refusal(_stamp_authorship(
+        await _handle_revit_ir_inner(
+            authored.args, llm_client, bridge_callback,
+            query_id=query_id, bulk=True,
+            authored_in_python=authored.from_script,
+            author_digest=authored.author_digest),
+        authored))
 
 
 async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                                  query_id: str = "", *,
-                                 bulk: bool = False) -> dict:
+                                 bulk: bool = False,
+                                 authored_in_python: bool = False,
+                                 author_digest: str = "") -> dict:
     """The tool handler. NEVER raises; every outcome is a typed dict.
 
     ``bulk`` is set by the CALLING DOOR, never by anything inside ``args``:
@@ -870,14 +1250,79 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         if program is None and isinstance(args, dict) and "ops" in args:
             program = args                    # tolerate un-nested programs
         from kukai.ir.compiler import compile_program, plan_program
+
+        # ЕДИНИЦА АВТОРСТВА РЕШАЕТ, КАКОЙ БЮДЖЕТ ЕЁ МЕРЯЕТ.
+        #
+        # Авторский бюджет (20) меряет ПЕРЕЧИСЛЕНИЕ, написанное моделью, и
+        # мал намеренно: 210 из 586 живых отказов 30.07 — именно он, и это
+        # работающий сигнал «выбрана не та форма». Когда модель прислала
+        # СКРИПТ, авторская вещь — двенадцать строк питона, а сто четыре
+        # операции написал фронт-энд; мерить их авторским бюджетом — то же
+        # самое, что мерить им чанк материализатора, а этот стык уже стоил
+        # 318 раундов вместо 26 (30.07, Snowdon Towers).
+        #
+        # ЧТО ЭТО НЕ ОСЛАБЛЯЕТ, названо прямо:
+        #   * `MAX_VALIDATED_OPS` (320, послемакросный) не трогается ничем —
+        #     это предел эмиттера, а не политика;
+        #   * `dsl._append` сам отказывает на 300-й операции, называя
+        #     чанкование прямого хода следующей работой, — то есть потолок
+        #     стоит и в языке, а не только здесь;
+        #   * ПОЛИТИКА КОМПИЛЯЦИИ НЕ МЕНЯЕТСЯ: скрипт идёт `compile_program`
+        #     (одна транзакция, строгие постусловия, откат целиком), а НЕ
+        #     `compile_rebuild_chunk` с per-op изоляцией и `report`. Поднят
+        #     ровно бюджет, и ничего кроме;
+        #   * перечисление по-прежнему упирается в 20: поле `program` этой
+        #     строки не видит.
+        # Разрешить модели ТРИСТА операций из одного цикла — не то же самое,
+        # что разрешить ей набрать их руками; макросы (`stack`/`series`) дают
+        # 320 после раскрытия уже сегодня, и природа регулярности там та же.
+        pre_macro_bulk = bulk or authored_in_python
+
         # Planning does not need a model snapshot.  Keep the accepted object so
         # family routing, open-model preflight, lowering and result validation
         # all share one semantic program. Invalid input is compiled below to
         # preserve the public typed-refusal/coverage-feed path.
         try:
-            routed_plan = plan_program(program, bulk=bulk)
+            routed_plan = plan_program(program, bulk=pre_macro_bulk)
         except Exception:  # noqa: BLE001 — compile_program owns the refusal
             routed_plan = None
+
+        # ЕДИНСТВЕННАЯ ВРЕЗКА ЖИВОГО ПЛАНА. Одна строка, один кран.
+        #
+        # ПОЧЕМУ ЗДЕСЬ, А НЕ У ДВЕРЕЙ. Форм входа три (чат `handle_revit_ir`,
+        # админская `handle_revit_ir_bulk` и питоновская через
+        # `_authored_input`), и все три сходятся ровно в этом теле. Четыре
+        # крана разъехались бы за месяц — так уже было с политикой пересборки,
+        # которую три вызывающих независимо забыли 21.07. Единственность
+        # проверяется обходом `ast` по всему дереву, а не договорённостью
+        # (`tests/test_live_plan_stream.py::test_single_publish_call_site`).
+        #
+        # ПОЧЕМУ ИМЕННО В ЭТОЙ ТОЧКЕ. Она ПОСЛЕ планирования (макросы
+        # раскрыты, умолчания проставлены, бюджет проверен — на лист попадает
+        # то, что пойдёт вниз) и ДО первого обращения к мосту. Строкой ниже
+        # начинается ground-снапшот, а он требует живого Revit: врежься поток
+        # туда, и в офлайн-прогоне не было бы ни одного кадра. Запись при этом
+        # ещё не начиналась — журнал хранит ЗАМЫСЕЛ и помечен `planned`.
+        #
+        # ТОЛЬКО ПИШУЩИЕ. Журнал — исходный код ЗДАНИЯ, а запрос зданию не
+        # принадлежит: 176 чтений против 5 записей за один ход (замер 29.07)
+        # разнесли бы историю в мусор. Семью спрашиваем у мидэнда той же
+        # функцией, что и остальной путь, — второго классификатора здесь нет.
+        #
+        # Поток отсюда УХОДИТ И НЕ ВОЗВРАЩАЕТСЯ: `publish` синхронный, без
+        # единой точки ожидания, и его исключения не выходят наружу.
+        try:
+            if routed_plan is not None and _program_writes(
+                    routed_plan, bulk=pre_macro_bulk):
+                from kukai.live import plan_stream as _plan_stream
+                _plan_stream.publish(
+                    device_id=_turn_device_id(),
+                    program=routed_plan,
+                    author_digest=author_digest,
+                    source="bulk" if bulk else "chat")
+        except Exception:  # noqa: BLE001 — экран не может ломать стройку
+            logger.debug("live plan publish failed (fail-open)", exc_info=True)
+
         try:
             revit_version = llm_client._revit_version or "2026"
         except Exception:  # noqa: BLE001
@@ -892,7 +1337,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         model_preflight = None
         if _program_writes(
                 routed_plan if routed_plan is not None else program,
-                bulk=bulk):
+                bulk=pre_macro_bulk):
             try:
                 snap_res = await _run_declarative(
                     llm_client, bridge_callback, _snapshot_cs(program),
@@ -995,6 +1440,10 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 revit_version=revit_version,
                 query_id=query_id,
                 snapshot=snapshot,
+                # Только предмакросный бюджет. Изоляция остаётся "atomic",
+                # постусловия — строгими: скрипт не покупает права на
+                # частично закоммиченную программу.
+                bulk=pre_macro_bulk,
                 expected_document=expected_document,
                 expected_identities=identity_proofs,
                 open_model_profile=open_profile,
@@ -1039,7 +1488,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 assert snapshot is not None
                 assert document_fingerprint is not None
                 acceptance_session = await prepare_acceptance(
-                    out.planned,
+                    out.grounded,
                     snapshot,
                     document_fingerprint,
                     _acceptance_reader,
@@ -1081,7 +1530,10 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 )
                 if (guarded_out is None or not guarded_out.ok
                         or guarded_out.planned.plan_digest
-                        != out.planned.plan_digest):
+                        != out.planned.plan_digest
+                        or guarded_out.grounded is None
+                        or guarded_out.grounded.ground_digest
+                        != acceptance_session.registration.ground_digest):
                     outcome = program_not_started()
                     registration = acceptance_session.registration_wire()
                     detail = {
@@ -1201,6 +1653,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 duration_ms=_dur_ms, diag_code=diag["code"],
                 violations=diag.get("violations"),
                 outcome=outcome.to_dict(),
+                author_digest=author_digest,
                 acceptance_evidence=acceptance_registration)
             # Доклад на экран и об ОТКАЗЕ тоже. Первая версия рапортовала
             # только об успехе — и живой ход 29.07 это сразу поймал: программа
@@ -1282,6 +1735,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 ok=False, witness=_derive_witness(False, family, contract_diag),
                 duration_ms=_dur_ms, diag_code=contract_diag["code"],
                 outcome=outcome.to_dict(),
+                author_digest=author_digest,
                 result_payload=(payload if commit_confirmed else None),
                 acceptance_evidence=acceptance_wire)
             diagnostics = [contract_diag]
@@ -1353,6 +1807,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
             duration_ms=_dur_ms, violations=_violations or None,
             result_payload=_payload if isinstance(_payload, dict) else None,
             outcome=_outcome.to_dict(),
+            author_digest=author_digest,
             acceptance_evidence=_acceptance_wire)
         # The turn's end-of-turn review reads what was actually built, so only
         # a program that reached this point — compiled, executed, witnessed —

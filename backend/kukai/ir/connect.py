@@ -124,6 +124,7 @@ from typing import Any, Optional
 from kukai.ir.diag import Diagnostic, TYPE_BAD_TYPE, TYPE_BOUNDS, TYPE_GEOM_RELATION
 from kukai.ir.emit_utils import (cs_line_comment_fragment,
                                  is_finite_number, refuse_stmt)
+from kukai.ir.numeric_contracts import MODEL_COORD_LIMIT_MM
 
 _EDGE_TOL = 1.0          # mm: shorter segment = runtime ShortCurveTolerance
 _MAX_DEGREE = 3          # v2.0: tee is the max junction; 4-way = v2.1
@@ -201,7 +202,7 @@ def _num(x) -> bool:
     return is_finite_number(x)
 
 
-_COORD_LIMIT_MM = 16_000_000.0   # same static sanity bound as authoring (F12)
+_COORD_LIMIT_MM = MODEL_COORD_LIMIT_MM
 
 
 def _pt_ok(v) -> bool:
@@ -563,10 +564,17 @@ def emit_connectivity_witness_cs(seg_meta: list, oid, cs_str) -> str:
         f"    var __ids = new HashSet<string>();\n"
         f"    foreach (var __e in __segs) __ids.Add(__e.Id.ToString());\n"
         f"    var __seen = new HashSet<string>();\n"
-        f"    var __stack = new Stack<Element>();\n"
-        f"    __stack.Push(__segs[0]); __seen.Add(__segs[0].Id.ToString());\n"
+        # A List used as a stack, NOT Stack<T>. On .NET Framework 4.8
+        # System.Collections.Generic.Stack<T> is declared in System.dll, which
+        # is absent from the reference closure on part of the fleet — the same
+        # CS1069 "forwarded to assembly 'System'" that killed Regex and
+        # Stopwatch on 2026-08-04. List<T> is mscorlib and binds everywhere.
+        # See tests/bridge_reference_closure.py (`deployed` profile).
+        f"    var __stack = new List<Element>();\n"
+        f"    __stack.Add(__segs[0]); __seen.Add(__segs[0].Id.ToString());\n"
         f"    while (__stack.Count > 0) {{\n"
-        f"        var __cur = __stack.Pop();\n"
+        f"        var __cur = __stack[__stack.Count - 1];\n"
+        f"        __stack.RemoveAt(__stack.Count - 1);\n"
         f"        ConnectorManager __cm = null;\n"
         f"        try {{ if (__cur is MEPCurve) __cm = ((MEPCurve)__cur).ConnectorManager;\n"
         f"               else if (__cur is FamilyInstance) __cm = ((FamilyInstance)__cur).MEPModel.ConnectorManager; }} catch {{ }}\n"
@@ -577,8 +585,8 @@ def emit_connectivity_witness_cs(seg_meta: list, oid, cs_str) -> str:
         f"                if (__owner == null) continue;\n"
         f"                var __k = __owner.Id.ToString();\n"
         f"                if (!__seen.Contains(__k)) {{ __seen.Add(__k);\n"
-        f"                    if (__ids.Contains(__k)) __stack.Push(__owner);\n"
-        f"                    else __stack.Push(__owner); }}\n"
+        f"                    if (__ids.Contains(__k)) __stack.Add(__owner);\n"
+        f"                    else __stack.Add(__owner); }}\n"
         f"            }}\n"
         f"        }}\n"
         f"    }}\n"

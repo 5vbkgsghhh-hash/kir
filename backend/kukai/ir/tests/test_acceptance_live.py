@@ -176,6 +176,64 @@ class TestLiveCensusContract:
                 payload, expectation, _document(), run_id=RUN_ID,
                 phase="before")
 
+    def test_device_side_census_sorts_ordinally_not_by_culture(self):
+        """`OrderBy` без компаратора — КУЛЬТУРНАЯ сортировка, и на ru-RU она
+        не совпадает с питоновской порядковой ни в одной позиции.
+
+        Замер живьём 04.08 (устройство оператора, `CurrentCulture=ru-RU`,
+        те же имена уровней, что в «Проект1»)::
+
+            culture=[Основание B.O.]   ordinal=[KIR_GAP_CEIL]   <<< расхождение
+            culture=[Уровень 1]        ordinal=[KIR_GAP_CP]     <<< расхождение
+            ...
+            culture=[KIR_ST_TOP]       ordinal=[Фунд. стена T.O.]
+            culture=[OST_Rooms]        ordinal=[OST_RoomSeparationLines]
+
+        `ScopeCensusObservation` требует ПОРЯДКОВОГО порядка
+        (`tuple(sorted(set(rows)))` над python-строками). Значит перепись,
+        отсортированная культурой, отвергается — и приёмка падает
+        fail-closed ещё ДО записи (`KIR-A002`) либо после неё
+        (`post_read_invalid`). Ровно это и случилось на живых прогонах
+        04.08, как только рядом с латинскими `KIR_GAP_*` появился
+        кириллический «Уровень 1».
+
+        Поэтому C# обязан сортировать ЯВНО порядково."""
+        code = build_scope_census_cs(
+            _expectation(), _document(), run_id=RUN_ID, phase="before")
+        # Пробелы схлопнуты: перенос строки не должен прятать компаратор и не
+        # должен ломать проверку.
+        flat = " ".join(code.split())
+        sites = [flat[i:i + 140] for i in range(len(flat))
+                 if flat.startswith("OrderBy(", i)]
+        assert sites, "в переписи не осталось ни одной сортировки"
+        bare = [s for s in sites if "StringComparer.Ordinal" not in s]
+        assert bare == [], bare
+
+    def test_culture_ordered_rows_are_refused(self):
+        """Тот же дефект со стороны данных: перепись в порядке ru-RU
+        (кириллица раньше латиницы) обязана быть отвергнутой."""
+        cyrillic, latin = "Уровень 1", "KIR_GAP_CEIL"
+        assert sorted([cyrillic, latin]) == [latin, cyrillic]  # питон: ordinal
+        expectation = replace(
+            _expectation(),
+            rows=(replace(_expectation().rows[0], level=latin),
+                  replace(_expectation().rows[0], level=cyrillic,
+                          op_ids=("W2",))),
+            op_count=2,
+        )
+        payload = observation_from_census(
+            expectation, _document(),
+            {("OST_Walls", latin): 1, ("OST_Walls", cyrillic): 4},
+            run_id=RUN_ID, phase="before",
+        ).to_dict()
+        # ru-RU кладёт кириллицу ПЕРВОЙ — ровно то, что вернуло устройство.
+        payload["rows"].sort(key=lambda r: (r["category"],
+                                            r["level_name"] != cyrillic))
+        with pytest.raises(ScopeCensusError, match="sorted"):
+            parse_scope_census(
+                payload, expectation, _document(), run_id=RUN_ID,
+                phase="before")
+
 
 class TestAcceptanceEvidence:
     def test_exact_delta_is_accepted_and_replayable(self):

@@ -166,6 +166,16 @@ def _semantic_name(body: dict) -> str | None:
         shape = props.get("shape")
         if isinstance(shape, dict) and isinstance(shape.get("const"), str):
             return f"region_{shape['const']}"
+        # RELATE: адрес от осей — объект с `at_grid`. Размерность видна по
+        # наличию `z_mm`, и это ровно тот случай, для которого правило и
+        # написано: форма УЗНАЁТСЯ структурно, а не угадывается.
+        if "at_grid" in props:
+            if "offset_mm" in props:
+                return "grid_address_world_offset"
+            return "grid_address_xyz" if "z_mm" in props else "grid_address_xy"
+        # Узел <линия> в его полной форме: имя оси плюс необязательный отступ.
+        if set(props) <= {"grid", "offset_mm", "toward"} and "grid" in props:
+            return "grid_line"
 
     # Объединение селекторов — перечисляем роды, это и есть его смысл.
     if keys == {"oneOf"} and isinstance(body["oneOf"], list):

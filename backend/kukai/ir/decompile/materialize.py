@@ -60,6 +60,8 @@ sort is explicit (I4).
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
@@ -89,8 +91,10 @@ Vec3 = tuple[float, float, float]
 
 # Datum ops are pinned to existing elements in same_document rebuild (Д3).
 _DATUM_OPS = frozenset({"create_level", "create_grid"})
-# create_stairs must be the sole op of its program (KIR-L002, ops_authoring).
-_SOLO_OPS = frozenset({"create_stairs"})
+# Ops that must be the sole op of their program (KIR-L002). Read from the
+# registry, not restated: the same fact used to live here, in the emitter and in
+# the prose, and a fact spelled three times drifts in two of them.
+_SOLO_OPS = spec.SOLO_OPS
 # create_room needs its enclosure already in the model -> trailing chunks (Д5b).
 _TAIL_OPS = frozenset({"create_room"})
 
@@ -240,6 +244,7 @@ class ProgramPlanCheck:
 
     program_index: int
     accepted: bool
+    source_digest: str
     plan_digest: str | None = None
     diagnostic_codes: tuple[str, ...] = ()
     error_type: str | None = None
@@ -255,6 +260,14 @@ class ProgramPlanCheck:
                 not isinstance(code, str) or not code
                 for code in self.diagnostic_codes):
             raise TypeError("diagnostic_codes must be immutable strings")
+        source_is_sha256 = (
+            isinstance(self.source_digest, str)
+            and len(self.source_digest) == 64
+            and all(char in "0123456789abcdef"
+                    for char in self.source_digest)
+        )
+        if not source_is_sha256:
+            raise ValueError("plan check needs a source SHA-256 digest")
         digest_is_sha256 = (
             isinstance(self.plan_digest, str)
             and len(self.plan_digest) == 64
@@ -278,6 +291,7 @@ class ProgramPlanCheck:
         payload: dict[str, Any] = {
             "program_index": self.program_index,
             "accepted": self.accepted,
+            "source_digest": self.source_digest,
             "diagnostic_codes": list(self.diagnostic_codes),
         }
         if self.plan_digest is not None:
@@ -287,7 +301,7 @@ class ProgramPlanCheck:
         return payload
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class MaterializeResult:
     """Raw programs, their immutable plans, skips and run statistics.
 
@@ -298,44 +312,120 @@ class MaterializeResult:
     machine-checkable fact instead of a comment.
     """
 
-    programs: list[dict] = field(default_factory=list)
-    skipped: list[SkipRecord] = field(default_factory=list)
-    escrowed: list[EscrowRecord] = field(default_factory=list)
+    _programs_json: tuple[str, ...] = field(
+        default_factory=tuple, repr=False)
+    _skipped: tuple[SkipRecord, ...] = field(
+        default_factory=tuple, repr=False)
+    _escrowed: tuple[EscrowRecord, ...] = field(
+        default_factory=tuple, repr=False)
     stats: MaterializeStats = field(default_factory=MaterializeStats)
     plans: tuple[PlannedProgram | None, ...] = field(
         default_factory=tuple, repr=False, compare=False)
     plan_checks: tuple[ProgramPlanCheck, ...] = field(default_factory=tuple)
 
+    def __init__(
+        self,
+        programs: Sequence[Mapping[str, Any]] = (),
+        skipped: Sequence[SkipRecord] = (),
+        escrowed: Sequence[EscrowRecord] = (),
+        stats: MaterializeStats | None = None,
+        plans: Sequence[PlannedProgram | None] = (),
+        plan_checks: Sequence[ProgramPlanCheck] = (),
+    ) -> None:
+        if (isinstance(programs, (str, bytes, bytearray))
+                or not isinstance(programs, Sequence)):
+            raise TypeError("programs must be a sequence of mappings")
+        encoded_programs: list[str] = []
+        for index, program in enumerate(programs):
+            if not isinstance(program, Mapping):
+                raise TypeError(f"programs[{index}] must be a mapping")
+            try:
+                encoded = json.dumps(
+                    program,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"programs[{index}] is not canonical JSON: {exc}") from exc
+            if not isinstance(json.loads(encoded), dict):
+                raise TypeError(f"programs[{index}] must encode an object")
+            encoded_programs.append(encoded)
+
+        object.__setattr__(self, "_programs_json", tuple(encoded_programs))
+        object.__setattr__(self, "_skipped", tuple(skipped))
+        object.__setattr__(self, "_escrowed", tuple(escrowed))
+        object.__setattr__(
+            self, "stats", stats if stats is not None else MaterializeStats())
+        object.__setattr__(self, "plans", tuple(plans))
+        object.__setattr__(self, "plan_checks", tuple(plan_checks))
+        self.__post_init__()
+
+    @property
+    def programs(self) -> list[dict[str, Any]]:
+        """Detached legacy view; mutating it cannot rewrite accepted plans."""
+
+        return [json.loads(encoded) for encoded in self._programs_json]
+
+    @property
+    def skipped(self) -> list[SkipRecord]:
+        """Detached list view over immutable skip records."""
+
+        return list(self._skipped)
+
+    @property
+    def escrowed(self) -> list[EscrowRecord]:
+        """Detached list view over immutable escrow records."""
+
+        return list(self._escrowed)
+
     def __post_init__(self) -> None:
+        if any(not isinstance(record, SkipRecord) for record in self._skipped):
+            raise TypeError("skipped must contain SkipRecord values")
         if any(not isinstance(record, EscrowRecord)
-               for record in self.escrowed):
+               for record in self._escrowed):
             raise TypeError("escrowed must contain EscrowRecord values")
-        if self.stats.atoms_escrowed != len(self.escrowed):
+        if not isinstance(self.stats, MaterializeStats):
+            raise TypeError("stats must be MaterializeStats")
+        if self.stats.atoms_escrowed != len(self._escrowed):
             raise ValueError("atoms_escrowed must match escrow evidence")
-        escrow_sources = [record.source_id for record in self.escrowed]
+        escrow_sources = [record.source_id for record in self._escrowed]
         if len(escrow_sources) != len(set(escrow_sources)):
             raise ValueError("one source atom cannot be escrowed twice")
-        if len(self.plans) != len(self.programs):
+        if len(self.plans) != len(self._programs_json):
             raise ValueError("plans must align with materialized programs")
-        if len(self.plan_checks) != len(self.programs):
+        if len(self.plan_checks) != len(self._programs_json):
             raise ValueError("plan_checks must align with materialized programs")
+        if any(plan is not None and not isinstance(plan, PlannedProgram)
+               for plan in self.plans):
+            raise TypeError("plans must contain PlannedProgram or None")
+        if any(not isinstance(check, ProgramPlanCheck)
+               for check in self.plan_checks):
+            raise TypeError("plan_checks must be typed")
         for index, (plan, check) in enumerate(zip(
                 self.plans, self.plan_checks)):
             if check.program_index != index:
                 raise ValueError("plan check indices must be contiguous")
+            source_digest = hashlib.sha256(
+                self._programs_json[index].encode("utf-8")).hexdigest()
+            if check.source_digest != source_digest:
+                raise ValueError("plan check source digest disagrees with program")
             if check.accepted is not (plan is not None):
                 raise ValueError("plan and plan check acceptance disagree")
             if plan is not None and check.plan_digest != plan.plan_digest:
                 raise ValueError("plan check digest disagrees with plan")
-        for record in self.escrowed:
+        programs = self.programs
+        for record in self._escrowed:
             index = record.program_index
-            if index >= len(self.programs):
+            if index >= len(programs):
                 raise ValueError("escrow expectation points outside programs")
             plan = self.plans[index]
             if plan is None or plan.plan_digest != record.plan_digest:
                 raise ValueError(
                     "escrow expectation is not bound to its accepted plan")
-            ops = self.programs[index].get("ops") or ()
+            ops = programs[index].get("ops") or ()
             if (len(ops) != 1 or not isinstance(ops[0], dict)
                     or ops[0].get("id") != record.op_id
                     or ops[0].get("op") != "create_directshape"):
@@ -375,6 +465,15 @@ def _plan_materialized_programs(
     plans: list[PlannedProgram | None] = []
     checks: list[ProgramPlanCheck] = []
     for index, program in enumerate(programs):
+        source_json = json.dumps(
+            program,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        source_digest = hashlib.sha256(
+            source_json.encode("utf-8")).hexdigest()
         try:
             planned = plan_program(program, bulk=True)
         except KirRefusal as refusal:
@@ -382,6 +481,7 @@ def _plan_materialized_programs(
             checks.append(ProgramPlanCheck(
                 program_index=index,
                 accepted=False,
+                source_digest=source_digest,
                 diagnostic_codes=tuple(
                     diagnostic.code for diagnostic in refusal.diagnostics),
             ))
@@ -393,6 +493,7 @@ def _plan_materialized_programs(
             checks.append(ProgramPlanCheck(
                 program_index=index,
                 accepted=False,
+                source_digest=source_digest,
                 diagnostic_codes=("KIR-P000",),
                 error_type=type(exc).__name__,
             ))
@@ -401,6 +502,7 @@ def _plan_materialized_programs(
             checks.append(ProgramPlanCheck(
                 program_index=index,
                 accepted=True,
+                source_digest=source_digest,
                 plan_digest=planned.plan_digest,
             ))
     return tuple(plans), tuple(checks)

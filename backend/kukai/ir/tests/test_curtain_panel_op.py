@@ -12,6 +12,13 @@
   per-op изоляция: иначе отказ одной ячейки утащил бы за собой всю программу,
   и тест на компиляцию этого не заметил бы.
 """
+
+# 04.08.2026: класс объекта читается помощником ``__ClassName`` из преамбулы, а
+# не обращением к среде выполнения за типом — прежняя идиома целиком
+# отвергается валидатором безопасности моста версий до 06.07.2026 (живой отказ
+# на Revit 2023, «Заблокировано: GetType() (runtime type resolution)»). Все
+# проверки ниже сохранили СВОЙ контракт (тип исключения назван, внутреннее
+# исключение донесено, улика несёт классы операндов) — сменилась только запись.
 from __future__ import annotations
 
 import os
@@ -256,7 +263,7 @@ class TheTypeDrivenPanelIsUnlockedFirst(unittest.TestCase):
         block = block[:block.index("ChangePanelType")]
         self.assertIn("catch (Exception __cux_CP1)", block)
         self.assertIn("замок ячейки не снимается для", block)
-        self.assertIn("__cp_CP1.GetType().Name", block)
+        self.assertIn("__ClassName(__cp_CP1)", block)
         self.assertIn("__t.RollBack(); return __Refuse(", block)
 
     def test_the_panel_is_never_locked_back(self) -> None:
@@ -301,7 +308,7 @@ class TheFailureNamesItself(unittest.TestCase):
 
     def test_the_exception_type_is_named(self) -> None:
         _decl, create, _post, _readback = _emit(_cell_op())
-        self.assertIn("__cex_CP1.GetType().Name", create)
+        self.assertIn("__ClassName(__cex_CP1)", create)
 
     def test_an_empty_revit_message_is_called_empty(self) -> None:
         _decl, create, _post, _readback = _emit(_cell_op())
@@ -311,7 +318,7 @@ class TheFailureNamesItself(unittest.TestCase):
     def test_the_inner_exception_is_carried(self) -> None:
         _decl, create, _post, _readback = _emit(_cell_op())
         self.assertIn("__cex_CP1.InnerException", create)
-        self.assertIn("InnerException.GetType().Name", create)
+        self.assertIn("__ClassName(__cex_CP1.InnerException)", create)
 
     def test_the_evidence_carries_the_operands_and_the_lock_state(
             self) -> None:
@@ -321,7 +328,7 @@ class TheFailureNamesItself(unittest.TestCase):
 
         _decl, create, _post, _readback = _emit(_cell_op())
         tail = create[create.index("catch (Exception __cex_CP1)"):]
-        for token in ("__cp_CP1.GetType().Name", "__ct_CP1.GetType().Name",
+        for token in ("__ClassName(__cp_CP1)", "__ClassName(__ct_CP1)",
                       "GetUnlockedPanelIds", "разблокирована=",
                       "__ch_CP1.Id.ToString()"):
             with self.subTest(token=token):
@@ -366,7 +373,7 @@ class ChangingTheTypeReplacesTheElement(unittest.TestCase):
         _decl, _create, post, readback = _emit(_cell_op())
         rendered = post_to_string("CP1", post)
         self.assertNotIn("__ccEffTypeCP1(__cp_CP1)", rendered)
-        self.assertNotIn("__cp_CP1.GetType()", readback)
+        self.assertNotIn("__ClassName(__cp_CP1)", readback)
         self.assertIn("__ccEffTypeCP1(__co_CP1)", rendered)
 
     def test_the_returned_element_is_accepted_only_inside_this_grid(
@@ -461,7 +468,7 @@ class TheRequestedTypeIsChasedNotAssumed(unittest.TestCase):
     def test_a_failed_chase_is_a_typed_refusal(self) -> None:
         _decl, create, _post, _readback = _emit(_cell_op())
         self.assertIn("догон типа ячейки не прошёл", create)
-        self.assertIn("__ctx_CP1.GetType().Name", create)
+        self.assertIn("__ClassName(__ctx_CP1)", create)
         self.assertIn("__t.RollBack(); return __Refuse(", create)
 
     def test_the_receipt_says_whether_the_chase_was_needed(self) -> None:

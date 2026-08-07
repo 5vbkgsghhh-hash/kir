@@ -4,7 +4,7 @@
 acceptance session so that the handler cannot accidentally reorder the
 correctness loop:
 
-    typed plan -> pre-read -> fsynced registration -> write -> post-read
+    grounded program -> pre-read -> fsynced registration -> write -> post-read
     -> code-computed verdict -> fsynced terminal evidence
 
 Every write routed through the regular serving body enters this state machine,
@@ -23,7 +23,6 @@ from kukai.ir.acceptance import (
     expectation_categories,
 )
 from kukai.ir.acceptance_evidence import (
-    ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
     AcceptanceEvidence,
     AcceptanceReason,
     AcceptanceRegistration,
@@ -52,7 +51,7 @@ from kukai.ir.acceptance_journal import (
 )
 from kukai.ir.bridge_result import extract_error
 from kukai.ir.contracts import DocumentFingerprint, ElementIdentityProof
-from kukai.ir.midend import PlannedProgram
+from kukai.ir.midend import GroundedProgram, PlannedProgram
 from kukai.ir.outcome import AcceptanceState, ProgramOutcome, WitnessState
 
 
@@ -253,7 +252,7 @@ class AcceptanceSession:
         # UniqueIds or pre-existing parameter values would widen private model
         # state into the conversation for no correctness benefit.
         payload = {
-            "schema_version": ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
+            "schema_version": evidence.schema_version,
             "run_id": self.registration.run_id,
             "state": evidence.state.value,
             "reason": evidence.reason.value,
@@ -272,6 +271,8 @@ class AcceptanceSession:
                 if evidence.mutation_verdict is not None else None
             ),
         }
+        if self.registration.ground_digest is not None:
+            payload["ground_digest"] = self.registration.ground_digest
         payload["journal"] = {
             "schema_version": ACCEPTANCE_JOURNAL_SCHEMA_VERSION,
             "durable": self.journal.state.finalized,
@@ -284,7 +285,7 @@ class AcceptanceSession:
     def registration_wire(self) -> dict[str, Any]:
         """Small proof that the predicate was durable before execution."""
 
-        return {
+        payload = {
             "schema_version": ACCEPTANCE_JOURNAL_SCHEMA_VERSION,
             "state": "prepared",
             "run_id": self.registration.run_id,
@@ -297,10 +298,13 @@ class AcceptanceSession:
             "journal_checksum": self.journal.state.checksum,
             "durable": True,
         }
+        if self.registration.ground_digest is not None:
+            payload["ground_digest"] = self.registration.ground_digest
+        return payload
 
 
 async def prepare_acceptance(
-    planned: PlannedProgram,
+    planned: PlannedProgram | GroundedProgram,
     snapshot: Mapping[str, Any],
     document: DocumentFingerprint,
     reader: AcceptanceReader,
@@ -311,8 +315,13 @@ async def prepare_acceptance(
 ) -> AcceptanceSession:
     """Pre-read and fsync the predicate before returning write authority."""
 
+    ground_digest = None
+    if isinstance(planned, GroundedProgram):
+        ground_digest = planned.ground_digest
+        planned = planned.planned
     if not isinstance(planned, PlannedProgram):
-        raise TypeError("acceptance preparation requires PlannedProgram")
+        raise TypeError(
+            "acceptance preparation requires PlannedProgram or GroundedProgram")
     if planned.family.value != "write":
         raise ValueError("independent mutation acceptance requires a write plan")
     if not isinstance(snapshot, Mapping):
@@ -369,6 +378,7 @@ async def prepare_acceptance(
         categories=expectation_categories(expectation),
         before=before,
         mutation_before=mutation_before,
+        ground_digest=ground_digest,
     )
     try:
         journal = AcceptanceJournal.create(root, registration)

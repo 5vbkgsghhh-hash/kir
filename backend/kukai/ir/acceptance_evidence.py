@@ -38,8 +38,11 @@ from kukai.ir.contracts import DocumentFingerprint
 from kukai.ir.outcome import AcceptanceState
 
 
-ACCEPTANCE_REGISTRATION_SCHEMA_VERSION = "kir-acceptance-registration/1"
-ACCEPTANCE_EVIDENCE_SCHEMA_VERSION = "kir-acceptance-evidence/1"
+LEGACY_ACCEPTANCE_REGISTRATION_SCHEMA_VERSION = (
+    "kir-acceptance-registration/1")
+ACCEPTANCE_REGISTRATION_SCHEMA_VERSION = "kir-acceptance-registration/2"
+LEGACY_ACCEPTANCE_EVIDENCE_SCHEMA_VERSION = "kir-acceptance-evidence/1"
+ACCEPTANCE_EVIDENCE_SCHEMA_VERSION = "kir-acceptance-evidence/2"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _RUN_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 
@@ -105,10 +108,13 @@ class AcceptanceRegistration:
     categories: tuple[str, ...]
     before: ScopeCensusObservation | None
     mutation_before: MutationObservation | None
+    ground_digest: str | None = None
 
     def __post_init__(self) -> None:
         _run_id(self.run_id)
         _sha256(self.plan_digest, "plan_digest")
+        if self.ground_digest is not None:
+            _sha256(self.ground_digest, "ground_digest")
         if self.revit_version not in spec.REVIT_VERSIONS:
             raise AcceptanceEvidenceError(
                 "registration Revit version is outside the shipped matrix")
@@ -225,9 +231,17 @@ class AcceptanceRegistration:
     def registration_digest(self) -> str:
         return _digest(self.to_dict())
 
+    @property
+    def schema_version(self) -> str:
+        return (
+            ACCEPTANCE_REGISTRATION_SCHEMA_VERSION
+            if self.ground_digest is not None
+            else LEGACY_ACCEPTANCE_REGISTRATION_SCHEMA_VERSION
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": ACCEPTANCE_REGISTRATION_SCHEMA_VERSION,
+        payload = {
+            "schema_version": self.schema_version,
             "run_id": self.run_id,
             "plan_digest": self.plan_digest,
             "revit_version": self.revit_version,
@@ -252,6 +266,9 @@ class AcceptanceRegistration:
                 if self.mutation_before is not None else None
             ),
         }
+        if self.ground_digest is not None:
+            payload["ground_digest"] = self.ground_digest
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,9 +397,17 @@ class AcceptanceEvidence:
     def evidence_digest(self) -> str:
         return _digest(self._unsigned_dict())
 
+    @property
+    def schema_version(self) -> str:
+        return (
+            ACCEPTANCE_EVIDENCE_SCHEMA_VERSION
+            if self.registration.ground_digest is not None
+            else LEGACY_ACCEPTANCE_EVIDENCE_SCHEMA_VERSION
+        )
+
     def _unsigned_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
+            "schema_version": self.schema_version,
             "registration": self.registration.to_dict(),
             "registration_digest": self.registration.registration_digest,
             "state": self.state.value,
@@ -520,6 +545,8 @@ def incomplete_acceptance(
 __all__ = [
     "ACCEPTANCE_EVIDENCE_SCHEMA_VERSION",
     "ACCEPTANCE_REGISTRATION_SCHEMA_VERSION",
+    "LEGACY_ACCEPTANCE_EVIDENCE_SCHEMA_VERSION",
+    "LEGACY_ACCEPTANCE_REGISTRATION_SCHEMA_VERSION",
     "AcceptanceEvidence",
     "AcceptanceEvidenceError",
     "AcceptanceReason",

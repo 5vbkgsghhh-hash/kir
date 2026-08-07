@@ -449,7 +449,13 @@ class FamilyPlacementCSharpEmitterTests(unittest.TestCase):
             "__instance.SuperComponent",
             "__instance.GroupId",
             "__instance.Host",
-            ".GetType().Name",
+            # Класс носителя читается БЕЗ обращения к среде выполнения за
+            # типом: та форма записи целиком отвергается валидатором
+            # безопасности моста версий до 06.07.2026 (живой отказ
+            # 04.08.2026 на Revit 2023). Контракт — «класс носителя
+            # прочитан», а не «прочитан рефлексией», поэтому здесь
+            # проверяется вызов помощника, а не прежняя идиома.
+            "__fpClassName(__host)",
             "__instance.HandOrientation",
             "__instance.FacingOrientation",
             # ``Location`` читается ЧЕРЕЗ СВОЙ СТРАЖ (2026-07-29): раньше
@@ -485,11 +491,18 @@ class FamilyPlacementCSharpEmitterTests(unittest.TestCase):
     def test_cooperative_element_and_call_budget_harness_is_emitted(
             self) -> None:
         for token in (
-            "System.Diagnostics.Stopwatch.StartNew()",
+            # Budgets are timed with mscorlib only. Stopwatch lives in
+            # System.dll, which is absent from the reference closure on part of
+            # the fleet — measured live 2026-08-04, CS1069 "forwarded to
+            # assembly 'System'". Full qualification does not help: CS1069 is a
+            # REFERENCE fault, not a using fault. See
+            # tests/bridge_reference_closure.py.
+            "DateTime.UtcNow.Ticks",
+            "TimeSpan.TicksPerMillisecond",
             "long __fpElementBudgetMs = 2000L;",
             "long __fpCallBudgetMs = 20000L;",
-            "__fpElementWatch.ElapsedMilliseconds",
-            "__fpCallWatch.ElapsedMilliseconds",
+            "__fpElementWatchT0",
+            "__fpCallWatchT0",
         ):
             self.assertIn(token, self.body)
         self.assertIn(
@@ -608,7 +621,6 @@ class GroupCSharpEmitterTests(unittest.TestCase):
             "((Element)__groupType).Name",
             "__group.GetMemberIds()",
             "__group.GroupId",
-            "GetAvailableAttachedDetailGroupTypeIds()",
             "__group.Location as LocationPoint",
             "__location.Point",
             # "__location.Rotation" is deliberately NOT here: Autodesk
@@ -621,6 +633,19 @@ class GroupCSharpEmitterTests(unittest.TestCase):
             '__row["origin_level_offset_ft"]',
         ):
             self.assertIn(token, self.body)
+        # ВЫЗОВА ЗДЕСЬ БОЛЬШЕ НЕТ, И ЭТО ЗАКОН, А НЕ ПРОПУСК (04.08.2026).
+        # `GetAvailableAttachedDetailGroupTypeIds` возвращает `ISet<ElementId>`,
+        # а `ISet<>` на net48 живёт в `System.dll`, которой нет в замыкании
+        # ссылок РАЗВЁРНУТОГО плагина. Живой замер: `CS0012` на тип и `CS0030`
+        # следом (без интерфейса `.Count` вырождается в метод-группу LINQ) —
+        # всё тело браковалось, и извлечение групп не шло ВООБЩЕ. Обойти
+        # приведением нельзя: любое использование выражения требует загрузки
+        # его типа. Поле необязательное (парсер принимает >= 0), группы —
+        # обязательны, поэтому цена уплачена полем.
+        self.assertNotIn("GetAvailableAttachedDetailGroupTypeIds()", self.body)
+        # Ключ ряда обязан остаться: «прочитали и там ноль» и «не читали»
+        # снаружи не различить, если ключ пропадёт.
+        self.assertIn('__row["attached_detail_type_count"]', self.body)
 
     def test_no_write_geometry_or_conversion_side_effects_are_emitted(
             self) -> None:
@@ -642,9 +667,11 @@ class GroupCSharpEmitterTests(unittest.TestCase):
         self.assertIn("OrderBy(__item => __grIdOrder(__item.Id))", self.body)
 
     def test_cooperative_call_budget_harness_is_emitted(self) -> None:
-        self.assertIn("System.Diagnostics.Stopwatch.StartNew()", self.body)
+        # mscorlib-only budget clock — see tests/bridge_reference_closure.py
+        self.assertIn("DateTime.UtcNow.Ticks", self.body)
+        self.assertIn("TimeSpan.TicksPerMillisecond", self.body)
         self.assertIn("long __grCallBudgetMs = 20000L;", self.body)
-        self.assertIn("__grCallWatch.ElapsedMilliseconds", self.body)
+        self.assertIn("__grCallWatchT0", self.body)
 
     def test_emitter_returns_exact_protocol_shell(self) -> None:
         for token in (
@@ -784,7 +811,11 @@ class GroupRotationIsUnsupportedByTheApiTests(unittest.TestCase):
         # the row already states `level_binding_available` / the count
         # explicitly, so the row itself is the record and a second voice would
         # only double-count. Two guards, neither of them the element-wide one.
-        self.assertGreaterEqual(self.body.count("catch (Exception)"), 2)
+        # Было два тихих guard'а; счётчик привязанных деталей вместе со своим
+        # вызовом снят 04.08 (см. `test_read_only_group_contract_is_emitted`),
+        # поэтому остался один — у привязки к уровню. Порог опущен ровно на
+        # снятый guard, а не «до зелёного»: если исчезнет и этот, тест упадёт.
+        self.assertGreaterEqual(self.body.count("catch (Exception)"), 1)
         # …and the element-wide catch stays last-resort, for identity reads.
         self.assertIn("catch (Exception __groupError)", self.body)
 

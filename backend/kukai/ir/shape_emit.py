@@ -5,7 +5,7 @@
 другой *_emit.py. authoring.py получает аддитивно импорт и одну строку в
 _EMITTERS — тот же минимальный шов, которым подключились волны каркаса и АР.
 
-Переиспользовано из authoring.py БЕЗ ИЗМЕНЕНИЙ (импортом, не копией): _cs,
+Переиспользовано из authoring_emit_support.py БЕЗ ИЗМЕНЕНИЙ: _cs,
 _safe, _stamp_block, _stamp_readback. Все имена Revit API взяты из замера на
 живом компайл-сервисе (:52412, 2021-2026, 29.07) — таблица замера в шапке
 ops_shape.py.
@@ -69,7 +69,9 @@ TARGET=MESH / FALLBACK=SALVAGE — И ПОЧЕМУ НЕ ABORT, ХОТЯ ХОТЕ
 """
 from __future__ import annotations
 
-from kukai.ir.authoring import _cs, _safe, _stamp_block, _stamp_readback
+from kukai.ir.authoring_emit_support import (
+    _cs, _safe, _stamp_block, _stamp_readback,
+)
 from kukai.ir.emit_model import WitnessCheck
 from kukai.ir.emit_utils import cs_line_comment_fragment, refuse_stmt
 from kukai.ir.mesh import mesh_bbox

@@ -361,6 +361,9 @@ _OP_CATEGORIES: Mapping[str, tuple[str, ...]] = {
     "route_duct_system": ("OST_DuctCurves",),
     "create_text": ("OST_TextNotes",),
     "create_dimension": ("OST_Dimensions",),
+    # wave/room (2026-08-03): категория известна ТОЧНО — её задаёт сам вызов
+    # NewRoomBoundaryLines, а не селектор типа (типа у операции нет вовсе).
+    "create_room_separator": ("OST_RoomSeparationLines",),
     # Колонна: категорию выбирает ЗАКРЫТОЕ перечисление самого опа, поэтому
     # она известна точно — см. _category_of_op.
     "create_column": ("OST_StructuralColumns", "OST_Columns"),
@@ -418,6 +421,10 @@ _LEVEL_FROM_PARAM: frozenset[str] = frozenset({
     "create_ceiling", "create_column", "create_room", "create_pipe",
     "create_duct", "create_cable_tray", "create_foundation",
     "create_pipe_system", "route_pipe_system", "route_duct_system",
+    # wave/room: плоскость эскиза строится ИЗ САМОГО УРОВНЯ
+    # (SketchPlane.Create(doc, levelId)), поэтому уровень результата равен
+    # разрешённому селектору по построению, а не по совпадению.
+    "create_room_separator",
 })
 
 #: Пишущие опы, которые НЕ добавляют ни одного элемента в перепись.
@@ -509,6 +516,21 @@ def _category_of_op(op: Mapping[str, Any]) -> tuple[str, ...] | None:
         if built_in is None:
             return None
         return tuple(sorted((built_in, "DirectShape")))
+    if name == "create_opening":
+        # ПРОЁМ ОБЯЗАН НАЗВАТЬ СВОЮ КАТЕГОРИЮ, иначе одна новая операция
+        # ослабила бы L2 для ВСЕЙ программы: оп с неизвестной категорией
+        # снимает верхние границы целиком (на настоящем фасаде это уже стоило
+        # 270 опов из 2 720).
+        if op.get("variety") == "wall_rect":
+            # Перегрузка NewOpening(Wall, XYZ, XYZ) даёт ровно один род.
+            return ("OST_SWallRectOpening",)
+        # variety="host_face": род определяет КАТЕГОРИЯ НОСИТЕЛЯ, а носитель —
+        # id или ссылка, то есть из программы не читается. Сумма по трём
+        # родам, которые эта перегрузка вообще умеет («Creates a new opening
+        # in a roof, floor and ceiling» — документация метода, а не догадка о
+        # модели). Потолочный проём в переписи восьми зданий не встретился ни
+        # разу; он здесь потому, что его умеет ОПЕРАЦИЯ.
+        return ("OST_FloorOpening", "OST_RoofOpening", "OST_CeilingOpening")
     if name == "create_foundation":
         if op.get("variety") == "isolated":
             # Символ грунтуется пулом foundation_symbols — это
@@ -533,6 +555,17 @@ def _plural_count(op: Mapping[str, Any]) -> tuple[int, Certainty, str]:
         # Одно ребро — одна строка Create (connect.emit_segments_cs).
         return (len(segments), Certainty.EXACT,
                 "одно ребро графа = один отрезок трубы/воздуховода")
+    if name == "create_room_separator":
+        # Ломаная из n точек = n-1 ModelCurve, и это ТОЧНОЕ число, а не
+        # нижняя граница: NewRoomBoundaryLines кладёт по кривой на каждый
+        # элемент CurveArray. EXACT важнее удобства — только он ловит
+        # ЛИШНИЕ элементы, а лишняя граница режет помещение надвое.
+        path = op.get("path")
+        if not isinstance(path, Sequence) or isinstance(path, str) \
+                or len(path) < 2:
+            return (0, Certainty.UNKNOWN, "path не ломаная из >=2 точек")
+        return (len(path) - 1, Certainty.EXACT,
+                "одно звено ломаной = один сегмент границы")
     if name == "create_railing":
         if op.get("variety") == "hosted":
             return (1, Certainty.AT_LEAST,

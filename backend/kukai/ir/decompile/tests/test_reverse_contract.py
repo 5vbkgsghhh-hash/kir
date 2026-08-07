@@ -28,11 +28,20 @@ class ReverseContractTests(unittest.TestCase):
             if op_spec.family in spec.WRITE_FAMILIES
         }
         self.assertEqual(set(REVERSE_CONTRACTS), write_ops)
-        self.assertEqual(len(REVERSE_CONTRACTS), 35)
+        # 35 -> 37 (03.08.2026): +create_room_separator (волна разделителей)
+        # и +create_opening (волна проёмов). Число здесь — ЗАМОК, а не
+        # статистика: манифест обязан расти вместе с реестром, а не молча
+        # отставать от него.
+        self.assertEqual(len(REVERSE_CONTRACTS), 37)
+        # 23 -> 24 (03.08.2026): create_railing переведён из capture_gap в
+        # direct. Захват путей ограждений едет с 29.07, и k2_ar_rd_v9 несёт
+        # 31 строку захвата — прежняя формулировка «L0 has neither a railing
+        # path nor …» перестала быть правдой. Число здесь и есть тот замок,
+        # который не даёт манифесту протухнуть молча.
         self.assertEqual(
             sum(contract.direct_same_op_lift
                 for contract in REVERSE_CONTRACTS.values()),
-            23,
+            25,
         )
         with self.assertRaises(TypeError):
             REVERSE_CONTRACTS["delete"] = REVERSE_CONTRACTS["create_wall"]  # type: ignore[index]
@@ -67,7 +76,10 @@ class ReverseContractTests(unittest.TestCase):
     def test_l1_emission_guard_refuses_non_direct_operations(self):
         self.assertEqual(assert_lift_emission("create_wall").op_name,
                          "create_wall")
-        for op_name in ("create_railing", "delete", "load_family"):
+        # create_railing уехал отсюда 03.08 вместе с подключением захвата;
+        # на его месте — create_dimension, последний оставшийся capture_gap
+        # (вида-владельца и Dimension.References чтение не снимает).
+        for op_name in ("create_dimension", "delete", "load_family"):
             with self.subTest(op=op_name), self.assertRaises(
                     ReverseContractError):
                 assert_lift_emission(op_name)
@@ -84,12 +96,15 @@ class ReverseContractTests(unittest.TestCase):
     def test_report_is_stable_json_and_exposes_honest_modes(self):
         report = reverse_contract_report()
         self.assertEqual(report["schema"], REVERSE_CONTRACT_SCHEMA)
-        self.assertEqual(report["write_ops"], 35)
-        self.assertEqual(report["direct_same_op_lifts"], 23)
+        self.assertEqual(report["write_ops"], 37)
+        self.assertEqual(report["direct_same_op_lifts"], 25)
         self.assertEqual(
             report["modes"],
             {
-                "direct": 23,
+                "direct": 25,
+                # 1 -> 2: create_opening объявлен capture_gap честно — L0 1.0
+                # не несёт ни Opening.Host, ни границы проёма, и DIRECT здесь
+                # обещал бы подъём, которого нет.
                 "capture_gap": 2,
                 "decomposed": 3,
                 "composed": 1,

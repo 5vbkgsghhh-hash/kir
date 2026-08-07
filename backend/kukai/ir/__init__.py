@@ -12,7 +12,12 @@ from kukai.ir.compiler import (                                      # noqa: F40
     compile_program,
     plan_program,
 )
-from kukai.ir.midend import PlannedProgram                            # noqa: F401
+from kukai.ir.midend import (                                        # noqa: F401
+    GroundedProgram,
+    PlannedProgram,
+)
+from kukai.ir.lowering import LoweredProgram                         # noqa: F401
+from kukai.ir.emitted_artifact import EmittedArtifact                # noqa: F401
 from kukai.ir.schema_gen import program_schema                        # noqa: F401
 from kukai.ir.spec import export_capability_cells, IR_VERSION         # noqa: F401
 # NOTE: kukai.ir.compile_cache (CachedCompileClient) is deliberately NOT

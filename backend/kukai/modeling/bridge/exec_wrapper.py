@@ -12,46 +12,18 @@ code *exactly as given* (``ParseText`` + ``OutputKind.Dll``) — it does NOT inj
 validate EXACTLY what L4 (execute) runs, the compile gate must apply this identical
 wrapper itself.
 
-These constants are a verbatim copy of ``kukai.api.chat_ws._WRAPPER_HEADER`` /
-``_WRAPPER_FOOTER``. ``tests/bridge/test_exec_wrapper_sync.py`` reads that file's
-source and asserts byte-for-byte equality so the two never drift. When the modeling
-framework is folded into the backend proper, chat_ws should import FROM HERE and the
-duplication collapses to one definition.
+The constants are aliases of :mod:`kukai.compiler_unit`, which also owns the
+provenance-aware KIR compile-unit transform.  ``wrap_execute`` intentionally
+retains its legacy concatenation semantics because its callers pass an already
+indented epilogue body.
 """
 from __future__ import annotations
 
-# Verbatim copy of chat_ws._WRAPPER_HEADER — keep in sync (guarded by sync test).
-WRAPPER_HEADER = (
-    "using System;\n"
-    "using System.Linq;\n"
-    "using System.Collections.Generic;\n"
-    "using System.Text;\n"
-    "using System.Text.RegularExpressions;\n"
-    "using Autodesk.Revit.DB;\n"
-    "using Autodesk.Revit.DB.Architecture;\n"
-    "using Autodesk.Revit.DB.Structure;\n"
-    "using Autodesk.Revit.DB.Mechanical;\n"
-    "using Autodesk.Revit.DB.Electrical;\n"
-    "using Autodesk.Revit.DB.Plumbing;\n"
-    "using Autodesk.Revit.UI;\n"
-    "\n"
-    "namespace Kukai\n"
-    "{\n"
-    "    public class UserCode\n"
-    "    {\n"
-    "        public static object Execute(Document doc, UIDocument uidoc)\n"
-    "        {\n"
+from kukai.compiler_unit import (
+    WRAPPER_FOOTER,
+    WRAPPER_HEADER,
+    WRAPPER_LINE_OFFSET,
 )
-WRAPPER_FOOTER = (
-    "\n"
-    "        }\n"
-    "    }\n"
-    "}\n"
-)
-
-# Number of lines the header occupies. User-code line N appears in the wrapped
-# code at line N + WRAPPER_LINE_OFFSET (so wrapped_line - offset == user_line).
-WRAPPER_LINE_OFFSET = WRAPPER_HEADER.count("\n")
 
 
 def wrap_execute(snippet: str) -> str:

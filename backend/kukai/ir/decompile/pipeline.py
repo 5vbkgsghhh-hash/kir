@@ -9,14 +9,13 @@ existing offline stages.
 Why a new module (not an extension of ``orchestrator.py``)
 ---------------------------------------------------------
 ``orchestrator.decompile`` is the *pure offline* composed pipeline: it takes an
-already-materialized :class:`L0Document` in RAM and runs LIFT→passport with the
-plain (uncached) ``lift_document``.  A1 needs the orthogonal concern of driving
-the bridge (executor, probe protocol, batching, ``status.json``, resume) *and*
-the cached detailed lift (``cached_lift_document_detailed`` — 64× proven).
-Rebuilding the offline path here would duplicate it; instead this module calls
-the bridge-facing extractors, persists their products, and composes the
-frozen offline stages directly so the cache can be injected.  ``orchestrator``
-is left byte-identical (I3).
+already-materialized :class:`L0Document` in RAM and runs LIFT→passport through
+the cache-disabled ``cached_lift_document_detailed`` contract.  A1 needs the
+orthogonal concern of driving the bridge (executor, probe protocol, batching,
+``status.json``, resume) and enables that same detailed-lift cache (64×
+proven).  This module calls the bridge-facing extractors, persists their
+products, and composes the frozen offline stages directly so timing, resume,
+and cache policy remain live-orchestration concerns.
 
 Bridge Load Contract (master-design Д1)
 ---------------------------------------
@@ -338,10 +337,18 @@ class DecompileRunResult:
     # доезжает до того же файла, в котором лежат проценты, — чтобы прочитать
     # процент и не увидеть срезы стало невозможно.
     side_failures: dict[str, Any] = field(default_factory=dict)
+    # ДЛИТЕЛЬНОСТЬ ПРОГОНА. Её не было НИ В ОДНОМ из 78 слепков на диске:
+    # run.json нёс `elements_total`, паспорт и отпечаток ревизии — а сколько
+    # это заняло, приходилось угадывать по временам файлов, и на резюме
+    # угадывание давало 69 часов там, где работы был час.  I4 разрешает
+    # время в метаданных прогона (запрещено оно в детерминированных
+    # артефактах — L0 и программах), и живёт оно ровно здесь.
+    timing: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "ok": self.ok,
+            "timing": dict(self.timing),
             "out_dir": self.out_dir,
             "change_stamp": self.change_stamp,
             "stages": list(self.stages),
@@ -387,6 +394,40 @@ class _RunState:
     # §18.2: срезы видны ВО ВРЕМЯ прогона, а не только в паспорте после него —
     # по той же причине, по какой там же оказалась пометка частичного чтения.
     side_failures: dict[str, Any] = field(default_factory=dict)
+    # ── ПРИБОР ВРЕМЕНИ ───────────────────────────────────────────────────
+    # Длительность стадии в мс, ключ — имя стадии. Пишется ПО ЗАВЕРШЕНИИ
+    # стадии, поэтому идущая стадия в словаре отсутствует, а не стоит нулём:
+    # «ещё идёт» и «прошла мгновенно» обязаны отличаться.
+    stage_ms: dict[str, float] = field(default_factory=dict)
+    # Покатегорийная/постадийная разбивка моста и нашей стороны —
+    # см. extract._TIMING_KEYS о том, где проходит граница замера.
+    timing_extract: dict[str, Any] = field(default_factory=dict)
+    timing_sides: dict[str, Any] = field(default_factory=dict)
+    #: monotonic-отметка старта прогона; настенного времени в ней нет.
+    started_at: float = field(default_factory=time.monotonic)
+
+    def timing_dict(self) -> dict[str, Any]:
+        """Собрать раздел ``timing`` для status.json/run.json.
+
+        ГРАНИЦА ОБЪЯВЛЕНА ЗДЕСЬ ЖЕ, В САМОМ АРТЕФАКТЕ (`boundary`), а не
+        только в докладе: прибор, чей охват известен лишь автору, — это
+        прибор на часть диапазона, и читатель вправе принять его за полный.
+        """
+
+        return {
+            "schema": 1,
+            "elapsed_ms": round(
+                (time.monotonic() - self.started_at) * 1000.0, 1),
+            "stage_ms": {k: round(v, 1) for k, v in self.stage_ms.items()},
+            "extract": dict(self.timing_extract),
+            "sides": dict(self.timing_sides),
+            "boundary": (
+                "bridge_ms = вебсокет + UI-поток Revit + Roslyn + коллектор + "
+                "сериализация в плагине; ИЗ ПИТОНА НЕ ДЕЛИТСЯ (плагин своего "
+                "времени не возвращает). parse_ms/write_ms — наша сторона. "
+                "probe_ms/pages — верхняя оценка постоянной цены вызова."
+            ),
+        }
 
     def status_dict(self) -> dict[str, Any]:
         # No wall-clock in the deterministic artifacts; status carries a single
@@ -405,6 +446,11 @@ class _RunState:
             "worksets_closed": self.worksets_closed,
             **dict(self.census),
             **dict(self.side_failures),
+            # Длительность видна ВО ВРЕМЯ прогона, а не только в run.json
+            # после него: «сколько уже идёт и куда ушло» — первый вопрос
+            # оператора на сороковой минуте, и отвечать на него размером
+            # файла мы уже пробовали.
+            "timing": self.timing_dict(),
             "updated_at": time.time(),
         }
 
@@ -480,6 +526,50 @@ async def _offload(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         if not completed:
             future.cancel()
         executor.shutdown(wait=completed, cancel_futures=True)
+
+
+class _stage_clock:
+    """Замерить одну стадию и записать её длительность в состояние.
+
+    Записывает и при исключении: стадия, упавшая на сороковой минуте, стоила
+    сорок минут, и потерять их значит потерять самый дорогой замер прогона.
+    Повторный вход в ту же стадию (резюм, ретрай) СУММИРУЕТСЯ — ключ хранит
+    работу, а не последнюю попытку.
+    """
+
+    __slots__ = ("state", "name", "_t0")
+
+    def __init__(self, state: _RunState, name: str) -> None:
+        self.state = state
+        self.name = name
+
+    def __enter__(self) -> "_stage_clock":
+        self._t0 = time.monotonic()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        elapsed = (time.monotonic() - self._t0) * 1000.0
+        self.state.stage_ms[self.name] = (
+            self.state.stage_ms.get(self.name, 0.0) + elapsed)
+        return None
+
+
+async def _timed(state: _RunState, name: str, coro: Awaitable[Any]) -> Any:
+    """Заводит часы вокруг УЖЕ созданной корутины — обёртка без переноса кода.
+
+    Нужна там, где стадия — одно многострочное выражение (``_offload`` хвоста):
+    ``with`` потребовал бы переотступить весь вызов, а diff обязан оставаться
+    читаемым. Время записывается и при исключении: упавший лифт стоил столько
+    же, сколько успешный.
+    """
+
+    t0 = time.monotonic()
+    try:
+        return await coro
+    finally:
+        state.stage_ms[name] = (
+            state.stage_ms.get(name, 0.0)
+            + (time.monotonic() - t0) * 1000.0)
 
 
 def _write_status(state: _RunState, status_cb: Optional[StatusCallback]) -> None:
@@ -850,9 +940,22 @@ async def _run_side_stage(
                 executor, code, timeout_ms=timeout_ms,
                 retries=EXTRACT_RETRIES, budget=window_budget,
                 what=f"боковая стадия {stage} пачка {index + 1}/{len(batches)}")
-            if (time.monotonic() - t0) * 1000.0 > _SLO_CALL_MS:
+            t1 = time.monotonic()
+            # СЧЁТЧИК НАРУШЕНИЙ УЖЕ МЕРИЛ ЭТО ВРЕМЯ И ВЫБРАСЫВАЛ ЕГО.
+            # `slo_violations` считал пересечения порога и терял саму
+            # длительность: «три нарушения» не отличить от «три раза по
+            # 21 секунде» и от «три раза по девять минут». Замер тот же,
+            # цена та же — теперь он ещё и сохраняется.
+            if (t1 - t0) * 1000.0 > _SLO_CALL_MS:
                 state.slo_violations += 1
             part = parse(payload)
+            slot = state.timing_sides.setdefault(
+                stage, {"bridge_ms": 0.0, "parse_ms": 0.0, "batches": 0})
+            slot["bridge_ms"] = round(
+                slot["bridge_ms"] + (t1 - t0) * 1000.0, 3)
+            slot["parse_ms"] = round(
+                slot["parse_ms"] + (time.monotonic() - t1) * 1000.0, 3)
+            slot["batches"] += 1
             # §18.2: стадия сверяет ЗАПРОШЕННОЕ с ПОЛУЧЕННЫМ прямо здесь, на
             # своей пачке — потерянный id называется поимённо, а не всплывает
             # через две стадии дырой в покрытии. Полномодельные стадии (group)
@@ -869,20 +972,28 @@ async def _run_side_stage(
     state.stage = stage
     _write_status(state, status_cb)
 
-    before = await _probe_categories(
-        executor, probe_cats, timeout_ms=timeout_ms, link_title=link_title)
-    result = await _drive()
-    after = await _probe_categories(
-        executor, probe_cats, timeout_ms=timeout_ms, link_title=link_title)
-    if probe_cats and not _probes_agree(before, after):
-        # One automatic retry (Д2) before failing closed.
-        state.errors.append(f"{stage}: probe divergence — one retry")
-        _write_status(state, status_cb)
+    with _stage_clock(state, stage):
         before = await _probe_categories(
-            executor, probe_cats, timeout_ms=timeout_ms, link_title=link_title)
+            executor, probe_cats, timeout_ms=timeout_ms,
+            link_title=link_title)
         result = await _drive()
         after = await _probe_categories(
-            executor, probe_cats, timeout_ms=timeout_ms, link_title=link_title)
+            executor, probe_cats, timeout_ms=timeout_ms,
+            link_title=link_title)
+    if probe_cats and not _probes_agree(before, after):
+        # One automatic retry (Д2) before failing closed.  Часы той же
+        # стадии заводятся ВТОРОЙ раз и суммируются: повтор — это работа,
+        # которую прогон действительно проделал, а не бесплатная оговорка.
+        state.errors.append(f"{stage}: probe divergence — one retry")
+        _write_status(state, status_cb)
+        with _stage_clock(state, stage):
+            before = await _probe_categories(
+                executor, probe_cats, timeout_ms=timeout_ms,
+                link_title=link_title)
+            result = await _drive()
+            after = await _probe_categories(
+                executor, probe_cats, timeout_ms=timeout_ms,
+                link_title=link_title)
         if not _probes_agree(before, after):
             raise PipelineError(
                 "model_edited_during_decompile",
@@ -1389,17 +1500,27 @@ async def run_decompile(
             state.elements_total = progress.elements
             _write_status(state, status_cb)
 
-        extraction = await extract_document(
-            guarded_executor,
-            change_stamp=change_stamp,
-            output_path=str(l0_path),
-            checkpoint_path=str(checkpoint),
-            resume=True,
-            timeout_ms=timeout_ms,
-            window_budget=window_budget,
-            on_progress=_extract_progress,
-            link_title=link_title,
-        )
+        with _stage_clock(state, "extract"):
+            extraction = await extract_document(
+                guarded_executor,
+                change_stamp=change_stamp,
+                output_path=str(l0_path),
+                checkpoint_path=str(checkpoint),
+                resume=True,
+                timeout_ms=timeout_ms,
+                window_budget=window_budget,
+                on_progress=_extract_progress,
+                link_title=link_title,
+            )
+        # РАЗБИВКА ИЗВЛЕЧЕНИЯ ДОЕЗЖАЕТ ДО run.json. Держать её только в
+        # чекпойнте значило бы: чтобы узнать, куда ушёл час, надо знать про
+        # существование служебного файла резюма. Итог — рядом с процентами,
+        # покатегорийные строки остаются в чекпойнте.
+        from kukai.ir.decompile.extract import _timing_totals
+        state.timing_extract = {
+            **_timing_totals(extraction.timing),
+            "by_category": dict(extraction.timing),
+        }
         state.elements_total = extraction.element_count
         if extraction.partial_categories:
             # ``stream_complete`` means the JSONL transaction has a committed
@@ -1410,7 +1531,8 @@ async def run_decompile(
                 "snapshot_non_authoritative",
                 "L0 extraction contains partial categories; lift is blocked",
                 ", ".join(extraction.partial_categories)))
-        document = await _offload(L0JSONLReader(l0_path).materialize)
+        document = await _timed(state, "materialize_l0",
+            _offload(L0JSONLReader(l0_path).materialize))
         # §18.4: пометка поднимается СРАЗУ после материализации — до боковых
         # индексов, лифта и любого процента. Замер 27.07: 17 закрытых наборов
         # из 18 дали 11 элементов вместо 2016 при всех статусах complete.
@@ -1421,7 +1543,8 @@ async def run_decompile(
         # (извлечено больше, чем есть в документе) — типизированная ошибка
         # прогона, а не строчка в логе: утверждение «прочитано N» опровергнуто
         # переписью, и всё, что построено дальше, стояло бы на нём.
-        balance = await _offload(reconcile_census, document)
+        balance = await _timed(state, "census",
+            _offload(reconcile_census, document))
         state.census = balance.to_dict()
         if not balance.balanced:
             state.stages_done.append("extract")
@@ -1541,11 +1664,11 @@ async def run_decompile(
             if family is not None else {})
         group_idx = parse_group_index(groups) if groups is not None else None
 
-        lift_result = await _offload(
+        lift_result = await _timed(state, "lift", _offload(
             cached_lift_document_detailed,
             document,
-            profile_index,
-            family_index,
+            profile_index=profile_index,
+            family_placement_index=family_index,
             # Индекс кривых собран выше (round-trip в мост + curve.index.json) и
             # раньше здесь ТЕРЯЛСЯ: дуговые стены поднимались хордой, тогда как
             # A5-релифт тот же индекс передаёт — оригинал видел меньше контекста,
@@ -1565,7 +1688,7 @@ async def run_decompile(
             mep_system_index=mep_systems,
             enabled=True,
             cache_dir=str(directory / "lift_cache"),
-        )
+        ))
         l1_nodes = lift_result.nodes
 
         # ── stage 4: Tier G only for atoms that semantics could not lift ──
@@ -1631,33 +1754,35 @@ async def run_decompile(
 
         state.stage = "fold"
         _write_status(state, status_cb)
-        tree = await _offload(
-            fold_document, document, l1_nodes, group_index=group_idx)
+        tree = await _timed(state, "fold", _offload(
+            fold_document, document, l1_nodes, group_index=group_idx))
 
         state.stage = "name"
         _write_status(state, status_cb)
-        name_result = await _offload(name_document, document, tree)
+        name_result = await _timed(state, "name",
+            _offload(name_document, document, tree))
 
         state.stage = "verify"
         _write_status(state, status_cb)
-        manifest = await _offload(build_dependency_manifest, document)
+        manifest = await _timed(state, "verify",
+            _offload(build_dependency_manifest, document))
         build_status = BuildStatuses.initial(
             unresolved_dependencies=manifest.unresolved_count)
         equivalence = EquivalenceClaim.unverified(
             EquivalenceScope.NATIVE_SEMANTIC)
-        verify_result = await _offload(
+        verify_result = await _timed(state, "verify", _offload(
             verify_document,
-            document, tree, l1_nodes, dependency_manifest=manifest)
+            document, tree, l1_nodes, dependency_manifest=manifest))
         _atomic_write_json(directory / "verify.json", verify_result.to_dict())
 
         state.stage = "passport"
         _write_status(state, status_cb)
-        passport = await _offload(
+        passport = await _timed(state, "passport", _offload(
             build_passport,
             document, tree, name_result, verify_result,
             geometry=geometry,
             dependencies=manifest, build_status=build_status,
-            equivalence=equivalence, group_index=group_idx)
+            equivalence=equivalence, group_index=group_idx))
         # §18.4: проценты паспорта считаются по тому, что УВИДЕЛИ. Пометка
         # частичного чтения кладётся в ту же секцию, что и проценты, — чтобы
         # её нельзя было прочитать отдельно от них.
@@ -1705,6 +1830,7 @@ async def run_decompile(
             stages=tuple(state.stages_done),
             passport_path=str(passport_md),
             slo_violations=state.slo_violations,
+            timing=state.timing_dict(),
             elements_total=state.elements_total,
             is_partial_read=state.is_partial_read,
             worksets_closed=state.worksets_closed,
@@ -1823,6 +1949,7 @@ def _fail(
         stages=tuple(state.stages_done),
         error=exc.to_dict(),
         slo_violations=state.slo_violations,
+        timing=state.timing_dict(),
         elements_total=state.elements_total,
         is_partial_read=state.is_partial_read,
         worksets_closed=state.worksets_closed,
@@ -1849,6 +1976,7 @@ def _cancelled(
         error={"code": "cancelled", "message": "прогон отменён; можно продолжить"},
         cancelled=True,
         slo_violations=state.slo_violations,
+        timing=state.timing_dict(),
         elements_total=state.elements_total,
         is_partial_read=state.is_partial_read,
         worksets_closed=state.worksets_closed,

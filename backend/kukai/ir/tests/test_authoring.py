@@ -1073,6 +1073,30 @@ class QueryTypes(unittest.TestCase):
         self.assertIn('__row["category"]', out.csharp)
         self.assertIn('__row["family_name"]', out.csharp)
         self.assertIn('__row["type_name"]', out.csharp)
+
+    def test_family_pool_says_whether_a_symbol_holds_a_point(self):
+        """Каталог обязан отдавать `FamilyPlacementType`.
+
+        Замер живьём 04.08 («Проект1», 320 типоразмеров): 279 ViewBased,
+        20 OneLevelBased, 16 OneLevelBasedHosted, 4 TwoLevelsBased. Без
+        этого поля выбрать типоразмер под `place_family` НЕЛЬЗЯ: ни имя, ни
+        категория не отвечают на вопрос «держит ли он точку». Живая проба
+        (транзакция откачена) в одной точке (200000,290000,0):
+
+            407  «50 x 150 мм»          -> LocationPoint (0,0,0) — точка
+                                          ПРОИГНОРИРОВАНА (MullionType)
+            5290 «С остеклением»        -> LocationPoint == null
+            4275 «Строительный прицеп»  -> ровно запрошенная точка
+            132630 «Опора»              -> ровно запрошенная точка
+
+        Матрица 04.08 взяла №0 = 407 и получила честный
+        `KIR-X004: PF: location mismatch (geometry)`."""
+        out = compile_program({"ir_version": "1.0", "ops": [
+            {"op": "query_types", "id": "q1", "pool": "family_symbols"}
+        ]})
+        self.assertTrue(out.ok, [item.as_dict() for item in out.diagnostics])
+        self.assertIn('__row["placement"]', out.csharp)
+        self.assertIn("FamilyPlacementType", out.csharp)
         self.assertNotIn("IntegerValue", out.csharp)
 
     def test_unknown_pool_is_typed_refusal_not_panic(self):
@@ -1245,6 +1269,61 @@ class NativeGroup(unittest.TestCase):
         # create_group must be a decodable op in the program schema (no
         # unknown-param-kind crash on member_ops/placements).
         self.assertIn("create_group", str(sch))
+
+
+class RoomNameIsNotTheNameProperty(unittest.TestCase):
+    """`Room.Name` НЕ отдаёт то, что в него положили — замер живьём 04.08.
+
+    Живая проба на «Проект1» (Revit 2026, ru-RU, транзакция откачена):
+
+        rm.Name = "KIR_GAP_ROOM_1";
+        rm.Name                                   -> "KIR_GAP_ROOM_1 1"
+        rm.Name == "KIR_GAP_ROOM_1"               -> False
+        ROOM_NAME.AsString()                      -> "KIR_GAP_ROOM_1"
+        ROOM_NAME.AsString() == "KIR_GAP_ROOM_1"  -> True
+
+    Геттер `Room.Name` склеивает ИМЯ и НОМЕР («KIR_GAP_ROOM_1» + " " + "1"),
+    а сеттер кладёт только имя.  Постусловие, сверяющее геттер с запрошенным
+    именем, поэтому нарушается ВСЕГДА — и живая матрица 04.08 честно
+    откатывала ИСПРАВНУЮ постройку с `KIR-X004: RM: name mismatch`.
+
+    Это ложный КРАСНЫЙ: свидетель мерил не то, чем оп писал.  Читать имя
+    обязан `BuiltInParameter.ROOM_NAME` — тот же параметр, в который пишет
+    сеттер."""
+
+    def _room_cs(self, name="Зал"):
+        op = {"op": "create_room", "id": "RM", "xy": [2000, 1500],
+              "level": {"by": "name", "value": "Этаж 1"}, "name": name}
+        diagnostics = []
+        normalized = authoring.validate(op, "create_room", 0, "RM", diagnostics)
+        self.assertEqual(diagnostics, [])
+        return authoring.emit_program(ground.ground([normalized], SNAPSHOT),
+                                      "2026")
+
+    def test_name_postcondition_reads_room_name_parameter(self):
+        cs = self._room_cs()
+        self.assertIn("BuiltInParameter.ROOM_NAME", cs)
+
+    def test_name_postcondition_never_compares_the_name_property(self):
+        # Ровно та строка, которая откатывала исправное помещение.
+        cs = self._room_cs()
+        self.assertNotIn('__el_RM.Name != "Зал"', cs)
+
+    def test_readback_reports_the_requested_name_not_name_plus_number(self):
+        # Квитанция обязана называть ИМЯ. `.Name` вернул бы «Зал 1» и увёл
+        # бы читателя от того, что программа на самом деле поставила.
+        cs = self._room_cs()
+        self.assertNotIn('__rb["name"] = __el_RM.Name;', cs)
+
+    def test_room_without_a_name_emits_no_name_postcondition(self):
+        op = {"op": "create_room", "id": "RM", "xy": [2000, 1500],
+              "level": {"by": "name", "value": "Этаж 1"}}
+        diagnostics = []
+        normalized = authoring.validate(op, "create_room", 0, "RM", diagnostics)
+        self.assertEqual(diagnostics, [])
+        cs = authoring.emit_program(ground.ground([normalized], SNAPSHOT),
+                                    "2026")
+        self.assertNotIn("RM: name mismatch", cs)
 
 
 if __name__ == "__main__":
