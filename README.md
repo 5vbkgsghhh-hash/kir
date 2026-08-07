@@ -1,4 +1,3 @@
-🇷🇺 [Русская версия](README.ru.md)
 
 <p align="center">
   <img src="assets/logo.png" width="96" alt="KIR logo"/>
@@ -25,7 +24,6 @@
   <a href="#show-me-code">Code</a> ·
   <a href="#measured-not-promised">Measured results</a> ·
   <a href="#the-five-laws">Invariants</a> ·
-  <a href="docs/ARCHITECTURE.md">Architecture</a> ·
   <a href="examples/README.md">Examples</a> ·
   <a href="#repository-state">Repository state</a>
 </p>
@@ -115,7 +113,7 @@ reason code*, never a silent drop. That reverse direction is what turns "we can 
 edit what already exists".
 
 A stage-by-stage account of both pipelines — the registry as one source of truth, isolation modes,
-the census, fold, rebuild verification — lives in [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md).
+the census, fold, rebuild verification — lives in **docs/ARCHITECTURE.md**.
 
 ## Repository layout
 
@@ -278,18 +276,18 @@ flowchart LR
     CORE -.->|forbidden by construction| R3["silently wrong"]
 ```
 
-Full account: [**Five Conservation Laws of Honesty for an AI Agent in CAD**](docs/articles/2026-07-five-laws-of-honesty.md).
+Full account: **Five Conservation Laws of Honesty for an AI Agent in CAD**.
 
 ## Read more
 
-- [**A Building Is a Program**](docs/articles/2026-07-a-building-is-a-program.md) — the long-form
+- **A Building Is a Program** — the long-form
   technical case: what the IR expresses, why it runs in both directions, and the measured number
   behind each claim.
-- [**Five Conservation Laws of Honesty for an AI Agent in CAD**](docs/articles/2026-07-five-laws-of-honesty.md)
+- **Five Conservation Laws of Honesty for an AI Agent in CAD**
   — the five laws, the catch behind each, and how each one is mechanically enforced.
-- [**A Day of Measured Revit API Traps**](docs/articles/2026-07-revit-api-traps.md) — fourteen Revit
+- **A Day of Measured Revit API Traps** — fourteen Revit
   API behaviours as symptom, wrong hypothesis, measurement, rule. Useful even if you never touch KIR.
-- [**One Day Inside an AI-led Compiler Team**](docs/articles/2026-07-one-day-chronicle.md) — a
+- **One Day Inside an AI-led Compiler Team** — a
   first-person account of one working day on this project.
 
 <a id="repository-state"></a>
