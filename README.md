@@ -314,3 +314,14 @@ The source snapshot is deliberately free of machine-specific paths, credentials 
 <p align="center">
   <sub>Apache License 2.0 — see <a href="LICENSE">LICENSE</a>.</sub>
 </p>
+
+## For auditors
+
+Beyond the compiler core (`backend/kukai/ir/`, `compile-service/`):
+
+- **Language contracts:** `backend/kukai/ir/specs/` (`SPEC_V1.md`, decompile spec)
+- **Laws of honesty / cert / merkle:** `docs/laws/`
+- **NN authoring skill + sandbox course:** `backend/kukai/ir/skill.py`, `backend/kukai/ir/course/`
+- **CI evidence & secret boundary:** `.github/workflows/kir-evidence.yml`, `kir-security.yml`
+- **Audit / matrix tools:** `backend/tools/{bounds_audit,api_trap_audit}.py`, `backend/scripts/*matrix*`
+
