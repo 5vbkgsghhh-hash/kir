@@ -1,6 +1,6 @@
 
 <p align="center">
-  <img src="assets/logo.png" width="96" alt="KIR logo"/>
+  <img src="assets/logo.png" width="256" alt="KIR building graph logo"/>
 </p>
 
 <h1 align="center">KIR</h1>
@@ -324,4 +324,3 @@ Beyond the compiler core (`backend/kukai/ir/`, `compile-service/`):
 - **NN authoring skill + sandbox course:** `backend/kukai/ir/skill.py`, `backend/kukai/ir/course/`
 - **CI evidence & secret boundary:** `.github/workflows/kir-evidence.yml`, `kir-security.yml`
 - **Audit / matrix tools:** `backend/tools/{bounds_audit,api_trap_audit}.py`, `backend/scripts/*matrix*`
-
