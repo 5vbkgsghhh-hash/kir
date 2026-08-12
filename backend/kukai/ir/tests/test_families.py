@@ -232,7 +232,10 @@ class LoadFamilyHappyPath(unittest.TestCase):
         cs = out.csharp
         self.assertIn("doc.LoadFamily(", cs)
         self.assertIn("File.Exists(", cs)
-        self.assertIn("GetFamilySymbolIds()", cs)
+        # НЕ ``GetFamilySymbolIds()``: он возвращает ``ISet<ElementId>`` из
+        # ``System.dll``, которой нет у развёрнутого плагина (CS0012).
+        self.assertNotIn("GetFamilySymbolIds()", cs)
+        self.assertIn("OfClass(typeof(FamilySymbol))", cs)
         self.assertIn("IsActive", cs)
         self.assertIn('__results["F1"]', cs)
 

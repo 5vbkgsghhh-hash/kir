@@ -7,7 +7,8 @@ decoding can always terminate; the compiler answers it with a typed handoff.
 """
 from __future__ import annotations
 
-from kukai.ir import relate, spec
+from kukai.ir import faceref, relate, spec
+from kukai.ir.authoring_validation import _FACE_SEL_SITES
 from kukai.ir.emit_utils import ELEMENT_ID_MAX
 
 #: RELATE, СХЕМА: адрес выписывается ВСЮДУ ДОСЛОВНО, а `$defs`/`$ref` делает
@@ -79,6 +80,51 @@ def _address_schema(dims: int) -> dict:
             "required": ["at_grid", "z_mm"], "additionalProperties": False}
 
 
+#: Та же экономия, что у :data:`_ADDRESS_DOC`, и по той же причине: описание
+#: платится столько раз, сколько точечных параметров в реестре. Полная идиома
+#: живёт ОДИН раз в `tool_doc.TRAPS`, здесь — короткая строка.
+_ELEMENT_ADDRESS_DOC = (
+    'точка от ЭЛЕМЕНТА этой же программы: '
+    '{"at_element": {"by": "ref", "value": "<id опа выше>"}, "point": "center"}')
+
+
+def _element_address_schema(dims: int) -> dict:
+    """Адрес от элемента для параметра размерности ``dims``.
+
+    Форма ЗАКРЫТА и совпадает с реестром `relate.ELEMENT_ADDRESS_FORMS`.
+    Трёхмерный случай выписан через `oneOf` из ДВУХ объектов, а не одним с
+    двумя необязательными ключами: отметка обязательна, и назвать её можно
+    ровно одним способом из двух — «оба сразу» и «ни одного» одинаково
+    неоднозначны, и схема обязана говорить это сама, а не оставлять
+    компилятору (тот всё равно скажет, но кругом дороже).
+    """
+    sel = {"type": "object",
+           "properties": {"by": {"const": "ref"},
+                          "value": {"type": "string", "minLength": 1}},
+           "required": ["by", "value"], "additionalProperties": False}
+    point = {"type": "string", "enum": list(relate.PLAN_POINTS)}
+    if dims == 2:
+        return {"type": "object", "description": _ELEMENT_ADDRESS_DOC,
+                "properties": {"at_element": sel, "point": point},
+                "required": ["at_element", "point"],
+                "additionalProperties": False}
+    return {"oneOf": [
+        {"type": "object",
+         "description": _ELEMENT_ADDRESS_DOC + ' + z: "base"|"top"|"axis"',
+         "properties": {"at_element": sel, "point": point,
+                        "z": {"type": "string",
+                              "enum": list(relate.ELEVATIONS)}},
+         "required": ["at_element", "point", "z"],
+         "additionalProperties": False},
+        {"type": "object",
+         "description": _ELEMENT_ADDRESS_DOC + " + z_mm (отметка числом)",
+         "properties": {"at_element": sel, "point": point,
+                        "z_mm": {"type": "number"}},
+         "required": ["at_element", "point", "z_mm"],
+         "additionalProperties": False},
+    ]}
+
+
 def _kind_enum() -> list:
     return sorted(spec.KINDS) + [spec.KIND_ESCAPE]
 
@@ -119,6 +165,38 @@ def _disambiguate_by_schema() -> dict:
             ]},
         },
         "required": ["param", "value"],
+        "additionalProperties": False,
+    }
+
+
+def _face_selector(inner_variants: list) -> dict:
+    """Вторая ступень селектора: ГРАНЬ элемента (`kukai/ir/faceref.py`).
+
+    `of` берёт ТЕ ЖЕ варианты, что и сам параметр, — не свой список. Второй
+    список форм ступени 1 разъехался бы с первым на первой же правке, а
+    расхождение схемы с проверкой означает форму, которую декод выдаёт, а
+    компилятор отвергает.
+
+    `minProperties: 1` у предиката — это тот же закон, что и в
+    `faceref.validate_face_sel`: описание, которому отвечает КАЖДАЯ грань, не
+    адресует ни одной."""
+    return {
+        "type": "object",
+        "properties": {
+            "by": {"const": faceref.BY_FACE},
+            "of": {"oneOf": list(inner_variants)},
+            "predicate": {
+                "type": "object",
+                "properties": {
+                    "side": {"enum": list(faceref.SIDES)},
+                    "normal": {"type": "array", "minItems": 3, "maxItems": 3,
+                               "items": {"type": "number"}},
+                },
+                "minProperties": 1,
+                "additionalProperties": False,
+            },
+        },
+        "required": ["by", "of", "predicate"],
         "additionalProperties": False,
     }
 
@@ -216,7 +294,8 @@ def _op_schema(op: spec.OpSpec) -> dict:
             # Сжатие — работа `schema_dedup.hoist` (см. заметку у
             # `_ADDRESS_DEF` выше): здесь один источник правды о форме.
             if p.name in relate.addressable_params(op.name):
-                props[p.name] = {"oneOf": [literal, _address_schema(lo)]}
+                props[p.name] = {"oneOf": [literal, _address_schema(lo),
+                                           _element_address_schema(lo)]}
             else:
                 props[p.name] = literal
         elif p.kind == "mm":
@@ -248,6 +327,27 @@ def _op_schema(op: spec.OpSpec) -> dict:
                              "x_axis", "y_axis", "start_angle_rad",
                              "end_angle_rad"],
                 "additionalProperties": False}
+        elif p.kind == "spiral":
+            # Винтовой марш (09.08): аргументы StairsRun.CreateSpiralRun в
+            # авторских единицах KIR — миллиметры и ГРАДУСЫ (радианы в языке
+            # бывают только у канонической дуги, которую пишет обратный ход).
+            # Необязателен на create_stairs: отсутствие означает прямой марш
+            # p0_mm/p1_mm, а взаимную обязательность держит компилятор
+            # (KIR-P007) — схема выразить её не может.
+            props[p.name] = {
+                "type": "object",
+                "properties": {
+                    "center_mm": {"type": "array", "minItems": 2,
+                                  "maxItems": 2, "items": {"type": "number"}},
+                    "radius_mm": {"type": "number", "exclusiveMinimum": 0},
+                    "start_angle_deg": {"type": "number"},
+                    "included_angle_deg": {"type": "number",
+                                           "exclusiveMinimum": 0,
+                                           "maximum": 360},
+                    "clockwise": {"type": "boolean"}},
+                "required": ["center_mm", "radius_mm", "start_angle_deg",
+                             "included_angle_deg", "clockwise"],
+                "additionalProperties": False}
         elif p.kind == "deg":
             # Angle in degrees.  Any finite JSON number is meaningful here;
             # the emitter compares rotations modulo 2*pi instead of imposing
@@ -262,6 +362,27 @@ def _op_schema(op: spec.OpSpec) -> dict:
             if p.ref_kinds:
                 selector_kinds.append("ref")
             props[p.name] = _catalog_selector(selector_kinds)
+        elif p.kind == "sel_list":
+            # Список селекторов ТОГО ЖЕ рода, что и `sel` — не новый язык
+            # адресации, а его множественное число (ровно как `refs_w`
+            # относится к `target_w`).  Заводится ради
+            # `create_multistory_stairs.levels`: `MultistoryStairs.
+            # ConnectLevels` принимает МНОЖЕСТВО уровней одним вызовом, и
+            # список element_id вместо имён был бы регрессом — уровни в KIR
+            # адресуются именем везде.
+            #
+            # Нижняя граница 1, а не 2: лестница на ОДНОМ уровне — законный
+            # (пусть и вырожденный) запрос, и это тот же довод, по которому
+            # у `path` минимум 2, а не 3.  Верхняя 64 — столько же, сколько
+            # точек у `path`/`pts`; этажей больше 64 одной программой всё
+            # равно не адресуют.
+            selector_kinds = ["name", "element_id", "default"]
+            if p.ref_kinds:
+                selector_kinds.append("ref")
+            props[p.name] = {
+                "type": "array", "minItems": 1, "maxItems": 64,
+                "items": _catalog_selector(selector_kinds),
+            }
         elif p.kind == "target_w":
             variants = [_element_id_selector()]
             if p.ref_kinds:
@@ -288,12 +409,27 @@ def _op_schema(op: spec.OpSpec) -> dict:
             # unset); documentation only (SPEC 12.9 — the compiler enforces
             # the real cap in authoring.validate(), kept in lockstep here so
             # the schema never UNDER-states what a caller may send).
-            props[p.name] = {"type": "string", "minLength": 1,
+            props[p.name] = {"type": "string",
+                             "minLength": 0 if p.exact_string else 1,
                              "maxLength": p.max_val if p.max_val is not None else 64}
         elif p.kind == "pts":
             props[p.name] = {"type": "array", "minItems": 3, "maxItems": 64,
                              "items": {"type": "array", "minItems": 2, "maxItems": 2,
                                         "items": {"type": "number"}}}
+        elif p.kind == "pts_xyz":
+            # wave/site: облако точек поверхности. Пределы читаются из
+            # mesh.py, чтобы число жило в ОДНОМ месте (там же и замер, которым
+            # оно обосновано) — тот же приём, что у рода `mesh` ниже.
+            from kukai.ir.mesh import MAX_VERTICES
+            props[p.name] = {
+                "type": "array", "minItems": 3, "maxItems": MAX_VERTICES,
+                "items": {"type": "array", "minItems": 3, "maxItems": 3,
+                          "items": {"type": "number"}},
+                "description": ("точки поверхности [[x,y,z], ...] в мм; Z — "
+                                "отметка земли В САМОЙ ТОЧКЕ, а не смещение "
+                                "от уровня. Две точки с одинаковым планом — "
+                                "типизированный отказ"),
+            }
         elif p.kind == "path":
             props[p.name] = {
                 "type": "array", "minItems": 2, "maxItems": 64,
@@ -301,6 +437,15 @@ def _op_schema(op: spec.OpSpec) -> dict:
                           "items": {"type": "number"}},
                 "description": ("открытая ломаная [[x,y], ...] в мм; "
                                 "замыкающий сегмент НЕ подразумевается"),
+            }
+        elif p.kind == "path3":
+            props[p.name] = {
+                "type": "array", "minItems": 2, "maxItems": 64,
+                "items": {"type": "array", "minItems": 3, "maxItems": 3,
+                          "items": {"type": "number"}},
+                "description": ("открытая ТРЁХМЕРНАЯ ломаная [[x,y,z], ...] "
+                                "в мм; замыкающий сегмент НЕ подразумевается, "
+                                "совпадающие соседние точки — отказ"),
             }
         elif p.kind == "pts_list":
             props[p.name] = {"type": "array", "minItems": 1, "maxItems": 8,
@@ -423,6 +568,15 @@ def _op_schema(op: spec.OpSpec) -> dict:
             variants = [_element_id_selector()]
             if p.ref_kinds:
                 variants.append(_string_selector("ref"))
+            # ВТОРАЯ СТУПЕНЬ (`{"by": "face", ...}`, `kukai/ir/faceref.py`) —
+            # ТОЛЬКО за флагом оператора и только у названного носителя.
+            # Схема fail-closed: пока варианта здесь нет, ограниченный декод
+            # физически не может выдать селектор грани, и это ровно то, чего
+            # закон выключенного флага требует — при выключенном флаге схема
+            # обязана быть побайтово прежней.
+            if (faceref.face_ref_enabled()
+                    and (op.name, p.name) in _FACE_SEL_SITES):
+                variants.append(_face_selector(variants))
             props[p.name] = {"type": "array", "minItems": 2, "maxItems": 16,
                              "items": {"oneOf": variants}}
         elif p.kind == "str_long":
@@ -497,7 +651,21 @@ def _op_schema(op: spec.OpSpec) -> dict:
                     "перекрытий, кровель, колонн и балок есть настоящие "
                     "операции — меш их не заменяет и не изображает"),
             }
-        else:  # pragma: no cover — registry lint keeps kinds closed
+        else:  # pragma: no cover — второй из трёх замков, см. ниже
+            # ЧЕСТНОЕ ОПИСАНИЕ ЗАМКА. Здесь стояло «registry lint keeps kinds
+            # closed» — ссылка на гарантию, которой НЕ СУЩЕСТВОВАЛО:
+            # `spec._lint_registry` проверял клетки способности, эффекты,
+            # результаты и пулы снапшота, а про `ParamSpec.kind` не знал
+            # ничего. Комментарий утверждал закрытость словаря, который был
+            # открыт, — ровно тот род дефекта, против которого стоит сам
+            # `raise`.
+            #
+            # С 07.08.2026 словарь ДЕЙСТВИТЕЛЬНО закрыт (`spec.PARAM_KINDS`,
+            # проверяется на импорте реестра), и ссылаться теперь есть на что.
+            # Но этот замок остаётся НЕЗАВИСИМЫМ и потому не лишним: он ловит
+            # вид, для которого ветвь схемы не написана, даже если вид честно
+            # назван в словаре. Три прохода — импорт реестра, сборка схемы,
+            # разбор программы — падают по трём разным причинам.
             raise AssertionError(f"unknown param kind {p.kind}")
         if p.required:
             required.append(p.name)

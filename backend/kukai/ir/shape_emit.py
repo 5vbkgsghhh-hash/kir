@@ -5,7 +5,7 @@
 другой *_emit.py. authoring.py получает аддитивно импорт и одну строку в
 _EMITTERS — тот же минимальный шов, которым подключились волны каркаса и АР.
 
-Переиспользовано из authoring_emit_support.py БЕЗ ИЗМЕНЕНИЙ: _cs,
+Переиспользовано из authoring.py БЕЗ ИЗМЕНЕНИЙ (импортом, не копией): _cs,
 _safe, _stamp_block, _stamp_readback. Все имена Revit API взяты из замера на
 живом компайл-сервисе (:52412, 2021-2026, 29.07) — таблица замера в шапке
 ops_shape.py.
@@ -66,15 +66,70 @@ TARGET=MESH / FALLBACK=SALVAGE — И ПОЧЕМУ НЕ ABORT, ХОТЯ ХОТЕ
 
 Поэтому свидетель числа граней здесь НЕСУЩИЙ, а не украшение: удалить его —
 значит вернуть тихое усечение.
+
+СВИДЕТЕЛЬ ПОВЕРХНОСТИ (09.08.2026) — ВТОРАЯ ПОЛОВИНА ТОГО ЖЕ ЗАКРЫТИЯ.
+
+Число граней ловит Salvage, который ГРАНЬ ОТБРОСИЛ. Оно слепо к Salvage,
+который грань ПЕРЕСОБРАЛ: пересборка, сохранившая количество и сдвинувшая
+вершину, проходила и габарит (±5 мм держат крайние точки), и счётчик. Мера
+разрыва замерена на этом же эмиттере: внутреннюю вершину сетки 2×2 можно
+унести на 400 мм — габарит не шелохнётся, число граней не изменится, оба
+прежних свидетеля МОЛЧАТ.
+
+Точный предикат существовал с первого дня Tier-G и был доказан живьём —
+``decompile/geometry_acceptance.py`` (квантование на ``GEOM_CANON_MM``,
+мультимножество треугольников, независимое от нумерации вершин, порядка граней
+и намотки). Стенд идемпотентности читает им ПОСТРОЕННЫЙ элемент отдельным
+пост-коммитным чтением. Авторская ветка не звала его НИ ОДНИМ импортом.
+
+Теперь зовёт — и внутри транзакции, потому что снаружи несовпадение можно
+только описать, а внутри — откатить.
+
+СРАВНИВАЕТСЯ ПРООБРАЗ, А НЕ ХЕШ, И ЭТО ЗАМЕР, А НЕ ВКУС. Живой компайл-сервис
+(:52412, 09.08.2026, 2021-2026):
+
+    System.Security.Cryptography.SHA256.Create()          4/6
+        2025, 2026: CS1069 'SHA256' ... has been forwarded to assembly
+                    'System.Security.Cryptography' — сборки нет в замыкании
+    System.Security.Cryptography.SHA256Managed            4/6  (тот же CS1069)
+    SHA256.HashData(byte[])                               0/6
+    Mesh.NumTriangles / Mesh.get_Triangle(int)            6/6
+    MeshTriangle.get_Vertex(int) / Mesh.Vertices          6/6
+    List<long[]>.Sort(Comparison<long[]>)                 6/6
+    long.ToString(CultureInfo.InvariantCulture)           6/6
+
+Хеш в эмитируемой C# невозможен на двух из шести поставляемых версий (ту же
+асимметрию ``tests/bridge_reference_closure.py`` уже записал про MD5). Поэтому
+Python пред-регистрирует ПРООБРАЗ дайджеста, а C# строит его же из
+построенного элемента и сравнивает строки. Равенство прообраза строго сильнее
+равенства хеша, канонизатор в коде остаётся ОДИН, и деградации «на 2025/2026
+проверим послабее» здесь нет ни одной.
+
+ЦЕНА, ЗАМЕРЕНА (эмиссия одного опа, 2026, atomic; сетка n×n):
+
+    треуг.   было C#   стало C#   рост
+         8      7 906     11 952   1.51x
+       128     10 971     20 273   1.85x
+       512     21 547     48 603   2.26x
+     2 048     64 508    163 618   2.54x
+     4 050    125 720    319 272   2.54x
+
+То есть ~48 байт на треугольник сверху плюс 2 097 байт объявлений ОДИН раз на
+программу. Roslyn это не заметил: 4 050 треугольников собираются за 99-206 мс
+на шести версиях (было 82-354 мс без свидетеля — разброс сервиса шире эффекта).
+Ленивый импорт ``geometry_acceptance`` стоит 0.138 с ОДИН раз на процесс и
+только у программ с мешем.
+
+Свидетель поверхности читает ТОТ ЖЕ ``__ge_``, что и свидетель числа граней:
+два постусловия одного элемента обязаны судить одно прочтение геометрии.
 """
 from __future__ import annotations
 
-from kukai.ir.authoring_emit_support import (
-    _cs, _safe, _stamp_block, _stamp_readback,
-)
+from kukai.ir.authoring import _cs, _safe, _stamp_block, _stamp_readback
+from kukai.ir.diag import Diagnostic, KirRefusal
 from kukai.ir.emit_model import WitnessCheck
 from kukai.ir.emit_utils import cs_line_comment_fragment, refuse_stmt
-from kukai.ir.mesh import mesh_bbox
+from kukai.ir.mesh import MESH_DEGENERATE, mesh_bbox
 from kukai.ir.ops_shape import DIRECTSHAPE_CATEGORIES
 
 #: Короткая метка в ALL_MODEL_MARK. Comments занят штампом владения A5
@@ -84,10 +139,68 @@ from kukai.ir.ops_shape import DIRECTSHAPE_CATEGORIES
 HONEST_MARK = "KIR DirectShape: геометрия без BIM-смысла (нет типа/параметров)"
 
 
+#: Знаков после запятой в вершинном литерале (см. :func:`_xyz_literals`).
+#: НЕСУЩЕЕ ЧИСЛО, а не форматирование: ожидание поверхности обязано считаться
+#: ИМЕННО от этих значений, потому что в Revit едут именно они. Считать его от
+#: сырого входа значило бы завести расхождение в 0.005 мм между ожиданием и
+#: отправленным мешем — а на решётке 0.5 мм такое расхождение меняет ячейку у
+#: любой координаты, легшей ближе 0.005 мм к её границе (≈2% случайных
+#: координат), то есть давало бы ЛОЖНЫЕ отказы на верно построенных мешах.
+_EMITTED_DECIMALS = 2
+
+
+def _emitted_vertices(verts: list) -> list:
+    """Вершины ровно в том виде, в каком они попадут в C#."""
+
+    return [[round(v[0], _EMITTED_DECIMALS),
+             round(v[1], _EMITTED_DECIMALS),
+             round(v[2], _EMITTED_DECIMALS)] for v in verts]
+
+
 def _xyz_literals(verts: list) -> str:
     return ", ".join(
-        f"P({round(v[0], 2)}, {round(v[1], 2)}, {round(v[2], 2)})"
+        f"P({round(v[0], _EMITTED_DECIMALS)}, {round(v[1], _EMITTED_DECIMALS)}, "
+        f"{round(v[2], _EMITTED_DECIMALS)})"
         for v in verts)
+
+
+def _surface_expectation(oid: str, verts: list, tris: list) -> tuple[str, str, str]:
+    """(ожидаемый прообраз, голова оболочки, хвост оболочки) для свидетеля.
+
+    Считается ТЕМ ЖЕ канонизатором, что и живой пост-коммитный предикат
+    Tier-G — ``decompile.geometry_acceptance``. Импорт ленивый: пакет разбора
+    тянет за собой ~0.57 с (замер 09.08), и авторская ветка не обязана платить
+    их за программы без меша.
+
+    ОТКАЗ, А НЕ ДЕГРАДАЦИЯ. Округление до сотых может СХЛОПНУТЬ длинный тонкий
+    треугольник, который прошёл законы mesh.py (min ребро 1 мм, min площадь
+    1 мм² — иглу с основанием 1 м и высотой 2e-6 мм они пропускают). Такой меш
+    уже сегодня уезжает в Revit вырожденной гранью; молча оставить его без
+    свидетеля поверхности значило бы вернуть ровно то тихое усечение, против
+    которого написан этот эмиттер, поэтому здесь типизированный отказ,
+    привязанный к опу.
+    """
+    from kukai.ir.decompile.geometry_acceptance import (   # ленивый: см. выше
+        mesh_surface_payload, surface_payload_envelope,
+    )
+    from kukai.ir.decompile.recompile import GmMesh, GeometrySchemaError
+
+    try:
+        gm = GmMesh(
+            vertices_mm=tuple(tuple(v) for v in verts),
+            triangles=tuple(tuple(t) for t in tris),
+        )
+    except GeometrySchemaError as exc:
+        raise KirRefusal([Diagnostic(
+            code=MESH_DEGENERATE, op_id=oid, field_name="mesh",
+            message_ru=(
+                f"меш нельзя подписать свидетелем поверхности: в эмиссии "
+                f"координаты округляются до {_EMITTED_DECIMALS} знаков, и "
+                f"после округления грань вырождается ({exc}). Такой меш "
+                f"уехал бы в Revit вырожденной гранью — раздвинь вершины или "
+                f"перестрой этот треугольник"))]) from exc
+    head, tail = surface_payload_envelope()
+    return mesh_surface_payload(gm), head, tail
 
 
 def emit_directshape(op: dict, ver: str, stamp: str,
@@ -157,7 +270,15 @@ def emit_directshape(op: dict, ver: str, stamp: str,
 
     from kukai.ir.emit_model import tolerance
     tol = tolerance("create_directshape", "bbox_mm")
+    surf_tol = tolerance("create_directshape", "surface_canon_mm")
     xmin, ymin, zmin, xmax, ymax, zmax = mesh_bbox(verts)
+    # ОЖИДАНИЕ ПРЕД-РЕГИСТРИРУЕТСЯ ДО ЛЮБОГО ЭФФЕКТА и считается ИМЕННО от
+    # вершин, которые уедут в C# (см. _emitted_vertices). Именно это делает
+    # проверку независимой, а не самоподтверждающей: сторону «ожидание» строит
+    # Python, сторону «наблюдение» — Revit, и совпасть они могут только если
+    # построено то, что послано.
+    surf_expected, surf_head, surf_tail = _surface_expectation(
+        oid, _emitted_vertices(verts), tris)
 
     checks: list[WitnessCheck] = [
         # ГАБАРИТ ПО ТРЁМ ОСЯМ. Общий bbox_extents_witness проверяет только XY
@@ -201,6 +322,57 @@ def emit_directshape(op: dict, ver: str, stamp: str,
                 f"    }}\n"),
             message="built mesh triangle count mismatch (geometry)",
             style="guard"),
+        # ПОВЕРХНОСТЬ ЦЕЛИКОМ, А НЕ ЕЁ ЧИСЛО. Свидетель числа граней закрывает
+        # молчание Salvage только наполовину: пересборка, сохранившая ЧИСЛО и
+        # сдвинувшая вершину, проходит его молча, и снаружи это успех. Точный
+        # предикат уже существовал и был доказан живьём — тот же
+        # `mesh_surface_payload`, которым стенд идемпотентности читает
+        # построенный элемент ОТДЕЛЬНЫМ пост-коммитным чтением. До 09.08 он не
+        # был подключён к авторской ветке ни одним импортом.
+        #
+        # ЧИТАЕТСЯ ТОТ ЖЕ __ge_{s}, что и у числа граней, и это НЕСУЩЕЕ
+        # решение, а не экономия: два свидетеля одного элемента обязаны судить
+        # ОДНУ прочитанную геометрию, иначе «граней столько» и «поверхность
+        # такая» могли бы относиться к разным чтениям. Порядок проверок в этом
+        # списке поэтому обязателен — держится тестом.
+        WitnessCheck(
+            obligation_key="surface",
+            reader_cs=(
+                f"    string __csf_{s} = null;\n"
+                f"    if (__ge_{s} != null)\n    {{\n"
+                f"        var __csr_{s} = new List<long[]>();\n"
+                f"        foreach (GeometryObject __csg_{s} in __ge_{s})\n        {{\n"
+                f"            Mesh __csm_{s} = __csg_{s} as Mesh;\n"
+                f"            if (__csm_{s} == null) continue;\n"
+                f"            for (int __csi_{s} = 0; __csi_{s} < __csm_{s}.NumTriangles; __csi_{s}++)\n"
+                f"            {{\n"
+                f"                MeshTriangle __cst_{s} = __csm_{s}.get_Triangle(__csi_{s});\n"
+                f"                var __csp_{s} = new List<long[]>();\n"
+                f"                for (int __csv_{s} = 0; __csv_{s} < 3; __csv_{s}++)\n"
+                f"                {{\n"
+                f"                    XYZ __csx_{s} = __cst_{s}.get_Vertex(__csv_{s});\n"
+                f"                    __csp_{s}.Add(new long[] {{ "
+                f"__KirCanonUnit(MM(__csx_{s}.X), {surf_tol}), "
+                f"__KirCanonUnit(MM(__csx_{s}.Y), {surf_tol}), "
+                f"__KirCanonUnit(MM(__csx_{s}.Z), {surf_tol}) }});\n"
+                f"                }}\n"
+                f"                __csp_{s}.Sort(__KirCanonCmp);\n"
+                f"                long[] __csq_{s} = new long[9];\n"
+                f"                for (int __csa_{s} = 0; __csa_{s} < 3; __csa_{s}++)\n"
+                f"                    for (int __csb_{s} = 0; __csb_{s} < 3; __csb_{s}++)\n"
+                f"                        __csq_{s}[__csa_{s} * 3 + __csb_{s}] = __csp_{s}[__csa_{s}][__csb_{s}];\n"
+                f"                __csr_{s}.Add(__csq_{s});\n"
+                f"            }}\n"
+                f"        }}\n"
+                f"        __csf_{s} = __KirCanonPayload(__csr_{s}, {_cs(surf_head)}, {_cs(surf_tail)});\n"
+                f"    }}\n"),
+            verdict_cs=(
+                f"    if (__csf_{s} == null)\n"
+                f"        __post.Add({_cs(oid + ': поверхность построенного меша не читается (geometry)')});\n"
+                f"    else if (__csf_{s} != {_cs(surf_expected)})\n"
+                f"        __post.Add({_cs(oid + ': built mesh surface differs from the authored surface on the canon grid (geometry)')});\n"),
+            message="built mesh surface mismatch on the canon grid (geometry)",
+            tol=surf_tol, style="guard"),
     ]
 
     # КВИТАНЦИЯ СВОЯ, А НЕ _readback_block: общий блок сообщает LocationCurve и

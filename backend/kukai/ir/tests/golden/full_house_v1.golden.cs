@@ -95,7 +95,7 @@ using (Transaction __t = new Transaction(doc, "KIR: полный дом v1"))
         if (__el_C1 == null) { __t.RollBack(); return __Refuse("C1", "NewFamilyInstance вернул null"); }
         try { Parameter __cm = __el_C1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:242410e8:C1"); } catch { }
 
-        doc.Regenerate();  // finalize wall enclosures before rooms (v0 rule)
+        doc.Regenerate();  // realise everything created above before the enclosure is resolved
         // create_room R1
         Level __lv_R1 = __el_L1;
         __el_R1 = doc.Create.NewRoom(__lv_R1, new UV(U(4000), U(3000)));
@@ -353,6 +353,8 @@ using (Transaction __t = new Transaction(doc, "KIR: полный дом v1"))
     __rb["id"] = __el_R1.Id.ToString();
     try { Parameter __rnb_R1 = __el_R1.get_Parameter(BuiltInParameter.ROOM_NAME);
         __rb["name"] = __rnb_R1 != null ? __rnb_R1.AsString() : __el_R1.Name; } catch { }
+    try { Parameter __rno_rb_R1 = __el_R1.get_Parameter(BuiltInParameter.ROOM_NUMBER);
+        __rb["number"] = __rno_rb_R1 != null ? __rno_rb_R1.AsString() : null; } catch { }
     try { __rb["name_and_number"] = __el_R1.Name; } catch { }
     try { __rb["area_m2"] = Math.Round(UnitUtils.ConvertFromInternalUnits(__el_R1.Area, UnitTypeId.SquareMeters), 2); } catch { }
     __results["R1"] = __rb;

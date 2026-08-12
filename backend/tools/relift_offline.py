@@ -70,6 +70,14 @@ _SIDE_INDEX_FILES = (
     # уже стоила нам групп (задача #34).
     ("annotation", "annotation.index.json"),
     ("mep_system", "mep_system.index.json"),
+    # Стадия МАРОК. Отсутствовала здесь с момента своего появления, и из-за
+    # этого её квитанции не попадали в разбивку срезов НИ В ОДНОМ замере
+    # покрытия: k2_ar_rd_v8 держит 317 отказов в tag.index.json, а
+    # side_failures_by_stage печатал только curtain/family_placement/sketch.
+    ("tag", "tag.index.json"),
+    # Стадия РАЗМЕРОВ — вместе со стадией, а не позже, ровно по причине,
+    # записанной строкой выше про марки.
+    ("dimension", "dimension.index.json"),
 )
 
 
@@ -191,6 +199,11 @@ def relift(directory: pathlib.Path) -> dict[str, Any]:
         # СО стадией дал бы марки, а офлайновый переподъём того же разбора
         # показал бы source_contract_gap — и это списали бы на лифтер.
         tag_index=_load_envelope(directory, "tag.index.json"),
+        # Индекс размеров — КОНВЕРТОМ, как и остальные. Забыть его здесь
+        # значит мерить компилятор на деградированном представлении: разбор
+        # СО стадией дал бы размеры, а офлайновый переподъём того же разбора
+        # показал бы source_contract_gap — и это списали бы на лифтер.
+        dimension_index=_load_envelope(directory, "dimension.index.json"),
         mep_system_index=_load_envelope(directory, "mep_system.index.json"),
     )
 
@@ -215,6 +228,13 @@ def relift(directory: pathlib.Path) -> dict[str, Any]:
     ops: collections.Counter[str] = collections.Counter()
     atoms: collections.Counter[str] = collections.Counter()
     atom_detail: collections.Counter[str] = collections.Counter()
+    # Опы по КАТЕГОРИИ элемента-источника. Нужны тому, кто делит опы на
+    # знаменатель: числитель и знаменатель обязаны быть про один класс
+    # содержания, а класс определяется категорией, а не именем опа (имена
+    # опов двигаются каждую неделю). Замер 10.08: без этой разбивки
+    # `content_coverage` печатал 100.07% на `snowdon_plumb_v4`.
+    category_of = {element.element_id: element.category for element in elements}
+    ops_by_category: collections.Counter[str] = collections.Counter()
     # Nodes are plain L1 dicts: an op carries ``op_name``, an atom carries the
     # reason it could not become one.
     for node in getattr(result, "nodes", ()):
@@ -222,6 +242,9 @@ def relift(directory: pathlib.Path) -> dict[str, Any]:
             continue
         if node.get("kind") == "op":
             ops[str(node.get("op_name") or "?")] += 1
+            ops_by_category[
+                category_of.get(str(node.get("source_element_id")),
+                                "no_category")] += 1
             continue
         # An atom's reason is a NESTED dict ({"code": ..., "detail": ...}), not
         # two sibling keys.  Reading it as siblings left ``atom_details`` empty
@@ -254,6 +277,7 @@ def relift(directory: pathlib.Path) -> dict[str, Any]:
         "elements": len(elements),
         "lifted_nodes": total,
         "ops": dict(ops.most_common()),
+        "ops_by_category": dict(ops_by_category.most_common()),
         "op_total": sum(ops.values()),
         "atoms": dict(atoms.most_common()),
         "atom_total": sum(atoms.values()),

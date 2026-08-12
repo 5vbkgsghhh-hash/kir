@@ -1362,6 +1362,31 @@ class HonestAtomAndTotalityTests(unittest.TestCase):
         self.assertIn("symbol", result.nodes[0]["params"])
         self.assertIn("symbol", result.nodes[1]["params"])
         self.assertIn("tray_type", result.nodes[2]["params"])
+        self.assertNotIn("width_mm", result.nodes[2]["params"])
+        self.assertNotIn("height_mm", result.nodes[2]["params"])
+
+    def test_a_cable_tray_lifts_the_instance_section_when_present(self) -> None:
+        row = make_element("OST_CableTray", 9805, ordinal=0)
+        row["params"] = {
+            "RBS_CABLETRAY_WIDTH_PARAM": 300.0,
+            "RBS_CABLETRAY_HEIGHT_PARAM": 100.0,
+        }
+
+        result = lift_document_detailed(_document([row]))
+
+        self.assertEqual(result.nodes[0]["op_name"], "create_cable_tray")
+        self.assertEqual(result.nodes[0]["params"]["width_mm"], 300.0)
+        self.assertEqual(result.nodes[0]["params"]["height_mm"], 100.0)
+
+    def test_half_a_tray_section_lifts_as_half_not_as_an_atom(self) -> None:
+        row = make_element("OST_CableTray", 9806, ordinal=0)
+        row["params"] = {"RBS_CABLETRAY_WIDTH_PARAM": 300.0}
+
+        result = lift_document_detailed(_document([row]))
+
+        self.assertEqual(result.nodes[0]["op_name"], "create_cable_tray")
+        self.assertEqual(result.nodes[0]["params"]["width_mm"], 300.0)
+        self.assertNotIn("height_mm", result.nodes[0]["params"])
 
     def test_rotated_foundation_remains_an_honest_atom(self) -> None:
         row = make_element(

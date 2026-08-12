@@ -29,7 +29,7 @@ from kukai.clash import geom as G
 from kukai.clash import hulls as H
 from kukai.clash.snapshot import ClashGeometrySnapshot, SnapshotIntegrityError
 
-REPORT_SCHEMA = "clash-report/2"
+REPORT_SCHEMA = "clash-report/3"
 
 #: Сколько ячеек одна оболочка вправе занять, прежде чем её признают гигантом.
 #: Не вкус: при большем числе стоимость раскладки перевешивает выигрыш сетки.
@@ -51,8 +51,15 @@ EPS_NUMERIC_MM = 1e-6
 #: никогда не выше истинного, поэтому даёт лишние находки, но не пропуски.
 SEPARATION_SEMANTICS = (
     "signed_distance_mm: <0 — глубина перекрытия ОБОЛОЧЕК; >0 — расстояние. "
-    "Для пар призма×призма это lower_bound по лучшей разделяющей оси (SAT), "
-    "не евклидово расстояние: оценка снизу завышает клеш, но не прячет его."
+    "С волны DECOMPOSE положительная величина ТОЧНА для всех видов оболочек: "
+    "зазор пары выпуклых подошв считается перебором «вершина–ребро», а не "
+    "лучшей разделяющей осью SAT (прежнее lower_bound давало 1.0 там, где "
+    "истинное расстояние √2). Нижней оценкой осталась РОВНО ОДНА величина, и "
+    "она помечена флагом separation_is_lower_bound: глубина перекрытия двух "
+    "ОБЪЕДИНЕНИЙ выпуклых кусков (hull_source=profile с вырезами/вогнутостью). "
+    "Развести два объединения обязан ОДИН перенос, гасящий все пересекающиеся "
+    "пары кусков разом, поэтому требуемый ход не меньше самой глубокой пары и "
+    "вообще говоря больше неё; публикуется именно самая глубокая пара."
 )
 
 #: Ревью №13: область поиска обязана называться в каноне. Произвольный
@@ -243,12 +250,30 @@ class Finding:
     def as_dict(self) -> dict:
         def r(x):
             return G._norm_zero(round(float(x), 3))
+
+        def rsd(x):
+            """Знаковое расстояние округляется ТОЧНЕЕ остальных полей.
+
+            Замер 10.08.2026: при округлении до 3 знаков 1 490 находок из
+            209 395 (`sklnk_eom_r26_v8`) публиковали `signed_distance_mm: 0.0`
+            и одновременно `hull_relation: overlap` — читатель не мог
+            воспроизвести отношение по опубликованному числу, хотя отношение
+            из него и выводится (`relation_of`). Настоящие значения там
+            -1.6e-05…-3.9e-04 мм, то есть отношение решалось разрядами,
+            которых в отчёте уже не было.
+
+            Девять знаков покрывают порог `EPS_NUMERIC_MM` = 1e-6 с запасом в
+            три порядка, поэтому `relation_of(опубликованное)` совпадает с
+            опубликованным `hull_relation` тождественно. Остальные поля
+            округляются до 3 знаков по-прежнему: от них отношение не зависит.
+            """
+            return G._norm_zero(round(float(x), 9))
         v = self.certified_separating_translation_mm
         return {
             "finding_id": self.finding_id,
             "a": self.a, "b": self.b,
             "pair_class": self.pair_class,
-            "signed_distance_mm": r(self.signed_distance_mm),
+            "signed_distance_mm": rsd(self.signed_distance_mm),
             "separation_is_lower_bound": self.separation_is_lower_bound,
             "hull_overlap_depth_mm": r(self.hull_overlap_depth_mm),
             "clearance_mm": r(self.clearance_mm),
@@ -291,23 +316,113 @@ def pair_grade(a: H.HullRecord, b: H.HullRecord) -> str:
 #: Допуск совпадения оболочек: численный шум перевода футов в мм, и ничего
 #: больше. Два элемента, чьи габариты совпали в его пределах, стоят на одном
 #: месте — признак СТРУКТУРНЫЙ, никаких имён типов.
+#:
+#: Тем же допуском сравниваются ОСИ и ПОДОШВЫ (ниже): это те же самые
+#: миллиметры из того же перевода футов, отдельного порога у них нет и взяться
+#: ему неоткуда.
 DUPLICATE_EPS_MM = 1.0
 
 PAIR_KINDS = ("interference", "coincident_duplicate")
 
 
+def _points_match(pa, pb, eps: float) -> bool:
+    """Две последовательности точек — покоординатно и в том же порядке."""
+    return len(pa) == len(pb) and all(
+        len(u) == len(v) and all(abs(x - y) <= eps for x, y in zip(u, v))
+        for u, v in zip(pa, pb))
+
+
+def hulls_coincide(a: H.HullRecord, b: H.HullRecord, *,
+                   eps: float = DUPLICATE_EPS_MM) -> bool | None:
+    """Совпадают ли ТЕЛА оболочек. `None` — оболочки об этом не знают.
+
+    Габарит на этот вопрос не отвечает: у двух диагоналей квадрата он ОДИН
+    (воспроизведено 09.08 — капсулы (0,0,0)→(4000,4000,0) и (4000,0,0)→(0,4000,0)
+    с r=200 дают ((-200,-200,-200),(4200,4200,200)) обе). Но там, где оболочка
+    построена не по боксу, недостающее уже лежит в ней самой:
+
+    * капсула несёт ОСЬ и радиус — тело задано ими полностью; обход оси в
+      обратную сторону даёт то же тело, поэтому сравнение симметрично;
+    * призма несёт ПОДОШВУ и [z0, z1]; подошва выпуклая, поэтому она
+      определена МНОЖЕСТВОМ вершин, а не их порядком — сравниваем множества.
+
+    `None` (габаритный бокс с обеих сторон или разные виды оболочек) означает
+    ровно «сказать нечего», а не «не совпадают»: выдумывать ось у бокса
+    запрещено. Что делать с этим ответом — решает `pair_kind_of`, а насколько
+    громко о нём говорить — `duplicate_claim_is_proven`.
+    """
+    ha, hb = a.hull, b.hull
+    if isinstance(ha, G.Capsule) and isinstance(hb, G.Capsule):
+        if abs(ha.radius - hb.radius) > eps:
+            return False
+        return (_points_match(ha.path, hb.path, eps)
+                or _points_match(ha.path, tuple(reversed(hb.path)), eps))
+    za, zb = G.z_span(ha), G.z_span(hb)
+    fa, fb = G.footprint_pieces(ha), G.footprint_pieces(hb)
+    prism_like = (isinstance(ha, (G.Prism, G.PrismSet))
+                  and isinstance(hb, (G.Prism, G.PrismSet)))
+    if prism_like and za is not None and zb is not None:
+        if abs(za[0] - zb[0]) > eps or abs(za[1] - zb[1]) > eps:
+            return False
+        # У объединения тело задано НАБОРОМ кусков, поэтому сравниваются
+        # наборы: порядок кусков — след заметания, а не факт о теле, и
+        # сортировка снимает его так же, как сортировка вершин снимает
+        # порядок обхода выпуклой подошвы. Без этой ветки две плиты с
+        # совпавшими габаритами и РАЗНЫМИ вырезами получали бы `None`, то есть
+        # «сказать нечего», и `pair_kind_of` объявлял бы их дубликатом —
+        # советом удалить настоящий элемент.
+        if len(fa) != len(fb):
+            return False
+        return _points_match([p for fp in sorted(sorted(f) for f in fa) for p in fp],
+                             [p for fp in sorted(sorted(f) for f in fb) for p in fp],
+                             eps)
+    return None
+
+
 def pair_kind_of(a: H.HullRecord, b: H.HullRecord, *,
                  eps: float = DUPLICATE_EPS_MM) -> str:
     """Дубликат или обычное пересечение. Замер v19 нашёл две такие пары —
-    одна ось, один габарит, разные id."""
+    одна ось, один габарит, разные id.
+
+    Совпадение габаритов — НЕОБХОДИМОЕ условие (тела совпали ⇒ совпали и их
+    боксы), но не достаточное. Поэтому там, где оболочка знает больше бокса,
+    спрашиваем её: разные оси при общем габарите — не дубликат, и совет
+    «удалить одну из них» на такой паре стирает настоящий элемент.
+    """
     if a.category != b.category:
         return "interference"
     alo, ahi = a.bounds()
     blo, bhi = b.bounds()
-    if all(abs(alo[k] - blo[k]) <= eps and abs(ahi[k] - bhi[k]) <= eps
-           for k in range(3)):
-        return "coincident_duplicate"
-    return "interference"
+    if not all(abs(alo[k] - blo[k]) <= eps and abs(ahi[k] - bhi[k]) <= eps
+               for k in range(3)):
+        return "interference"
+    if hulls_coincide(a, b, eps=eps) is False:
+        return "interference"
+    return "coincident_duplicate"
+
+
+def duplicate_claim_is_proven(finding: dict) -> bool:
+    """Доказан ли дубликат ГЕОМЕТРИЕЙ, а не совпадением габаритов.
+
+    Живёт здесь, а не в обзоре: род пары назначает детектор, ему и отвечать,
+    чем он это обосновал. Нового поля в находке нет намеренно — всё нужное в
+    ней уже лежит (`hull_grade` и `hull_source` обеих сторон), а лишний ключ
+    сдвинул бы канон у находок, которых правка не касается.
+
+    Доказательство есть ровно тогда, когда обе стороны построены ОДНИМ
+    источником тоньше бокса: тогда `hulls_coincide` сравнивал оси с осями либо
+    подошвы с подошвами и вернул `True` (иначе рода `coincident_duplicate` бы
+    не было). Пара, где хоть одна сторона — габаритный бокс, остаётся
+    дубликатом-подозрением: это лучшая догадка, доступная по боксу, но
+    указывать по ней удаление нельзя.
+    """
+    if finding.get("pair_kind") != "coincident_duplicate":
+        return False
+    a = finding.get("a") or {}
+    b = finding.get("b") or {}
+    src = a.get("hull_source")
+    return (finding.get("hull_grade") in ("exact", "conservative")
+            and src is not None and src != "bbox" and src == b.get("hull_source"))
 
 
 def relation_of(sd: float, *, eps: float = EPS_NUMERIC_MM) -> str:
@@ -351,7 +466,22 @@ def evaluate_with_reason(a: H.HullRecord, b: H.HullRecord, *,
         vec = G.certified_separating_translation(lo.hull, hi.hull)
         if vec is None:
             why = G.mtv_unavailable_reason(lo.hull, hi.hull)
-    both_prisms = all(not isinstance(r.hull, G.Capsule) for r in (lo, hi))
+        # У объединения перенос НЕ выдумывается и не подавляется: он
+        # ПРОВЕРЯЕТСЯ переносом (`geom.separates`) ровно так же, как у
+        # выпуклой пары, и потому законен. Причина сюда не пишется — поле
+        # называется `translation_unavailable_reason` и отвечает на вопрос
+        # «почему хода НЕТ»; заполнить его при ЕСТЬ значило бы вернуть
+        # склейку двух осей в одно поле, ради снятия которой писался ревью №14.
+        # Чем ход у объединения хуже — сказано в `SEPARATION_SEMANTICS` и в
+        # `geom.certified_separating_translation`: он разводит, но НЕ минимален,
+        # и минимальность у невыпуклого тела больше не доказывается бисекцией.
+    # Ревью №7 закрыто формулой, а не именем поля: в РАЗДЕЛЁННОМ случае
+    # публикуется точное евклидово расстояние (`geom.poly_poly_gap`). Флаг
+    # остался ровно за той величиной, которая оценкой БЫТЬ НЕ ПЕРЕСТАЛА, —
+    # глубиной перекрытия двух ОБЪЕДИНЕНИЙ: |MTV(A,B)| ≥ maxᵢⱼ|MTV(Aᵢ,Bⱼ)|,
+    # и равенство здесь не гарантировано ничем.
+    union_depth = (relation == "overlap"
+                   and any(isinstance(r.hull, G.PrismSet) for r in (lo, hi)))
     return Finding(
         finding_id=f"{lo.source_id}~{hi.source_id}", a=_side(lo), b=_side(hi),
         # Класс пары — НЕУПОРЯДОЧЕННЫЙ ключ: стороны A/B упорядочены по
@@ -360,7 +490,7 @@ def evaluate_with_reason(a: H.HullRecord, b: H.HullRecord, *,
         # значит делить одно число пополам случайным образом.
         pair_class="~".join(sorted((lo.label, hi.label))),
         signed_distance_mm=sd,
-        separation_is_lower_bound=both_prisms,
+        separation_is_lower_bound=union_depth,
         hull_overlap_depth_mm=max(0.0, -sd),
         clearance_mm=clearance_mm, clearance_deficit_mm=deficit,
         ranking_tol_mm=tol, ranking_significant=(sd < -tol or deficit > tol),
@@ -488,6 +618,7 @@ def detect(snapshot: ClashGeometrySnapshot, *, clearance_mm: float = 0.0,
         "census": snapshot.census.as_dict(),
         "by_grade": snapshot.by_grade(),
         "coverage_matrix": H.coverage_matrix(),
+        "vocabulary": vocabulary_audit(clearance_mm=clearance_mm),
         "search": {
             "scope_id": scope,
             "scope_definition": SCOPES[scope],
@@ -509,6 +640,7 @@ def detect(snapshot: ClashGeometrySnapshot, *, clearance_mm: float = 0.0,
         "_timings_ms": {"grid": round((t_grid - t0) * 1000, 1),
                         "broad": round((t_broad - t_grid) * 1000, 1),
                         "narrow": round((t_narrow - t_broad) * 1000, 1)},
+        "overlap_depth": overlap_depth_histogram(f.as_dict() for f in findings),
         "verdict_counts": dict(collections.Counter(f.verdict for f in findings)),
         "pair_kind_counts": dict(sorted(
             collections.Counter(f.pair_kind for f in findings).items())),
@@ -524,9 +656,141 @@ def detect(snapshot: ClashGeometrySnapshot, *, clearance_mm: float = 0.0,
             "ход ремонта из него строить нельзя (ревью №14).",
             "Это не оракульный замер: recall/precision против "
             "ElementIntersectsElementFilter — волна D2 (§6).",
+            "КОРПУС ОДНОРАЗДЕЛЬНЫЙ, и это ограничивает КАЖДОЕ число точности "
+            "ниже. В сохранённых разборах стороны MVP почти никогда не "
+            "встречаются в одной модели: `snowdon_plumb_v4` — 31 000 оболочек "
+            "`mep` против 5 `struct`, фасад и `k2_ar_rd` — 0 `mep`. Поэтому "
+            "область `mvp_v2` на этом складе почти пуста, а все замеры "
+            "точности сняты в `all_physical_diagnostic`, где ПОДАВЛЯЮЩЕЕ "
+            "большинство перекрытий — законные узлы сборки (дверь в стене, "
+            "панель в витраже, примыкание плиты к стене), а не конфликты. "
+            "МЕЖРАЗДЕЛЬНЫЙ клеш на этом корпусе НЕ ИЗМЕРЕН: для него нужны "
+            "связанные модели, а их элементы оболочек не получают "
+            "(`census.linked_elements_unscored`).",
         ],
     }
 
+
+
+#: Почему вердикт недостижим. `confirmed` читается ТОЛЬКО из грейда `exact`
+#: (см. `evaluate_with_reason`), а `exact` не выдаёт ни один источник оболочки
+#: — значит недостижим и он. Это не «пока не встречалось»: это следствие
+#: таблицы `hulls.GRADE_BY_SOURCE`, и оно пересчитывается, а не помнится.
+UNREACHABLE_VERDICT_REASONS: dict[str, str] = {
+    "confirmed": (
+        "вердикт выдаётся только при `pair_grade == \"exact\"`, а грейд "
+        "`exact` недостижим (`hulls.grade_reachability`). Пока оболочка не "
+        "равна телу, обвинение в проникании ТЕЛ подписать нечем."
+    ),
+}
+
+#: Отношения, достижимые не всегда. `separated` попадает в находку только
+#: когда задан положительный `clearance_mm`: без него разведённая пара
+#: находкой не становится вовсе (`evaluate_with_reason`).
+CONDITIONAL_RELATIONS: dict[str, str] = {
+    "separated": "только при clearance_mm > 0: это нарушение ЗАЗОРА, а не "
+                 "пересечение",
+}
+
+
+def vocabulary_audit(*, clearance_mm: float = 0.0) -> dict:
+    """Что из словаря отчёта ДОСТИЖИМО, а что — нет, и почему.
+
+    Существует затем, что схема, обещающая исход, которого код выдать не
+    может, врёт молча: читатель видит `confirmed` в списке вердиктов и ждёт
+    доказанных клешей, которых не будет никогда. Ноль, который нельзя
+    отличить от невозможности, — это не факт, а украшение.
+    """
+    grades = H.grade_reachability()
+    verdicts = {}
+    for v in VERDICTS:
+        reachable = grades["exact"]["reachable"] if v == "confirmed" else True
+        verdicts[v] = {"reachable": reachable,
+                       "reason": "" if reachable
+                       else UNREACHABLE_VERDICT_REASONS.get(v, "")}
+    relations = {}
+    for r in HULL_RELATIONS:
+        cond = CONDITIONAL_RELATIONS.get(r)
+        relations[r] = {"reachable": True if cond is None else clearance_mm > 0.0,
+                        "reason": cond or ""}
+    return {
+        "hull_grades": grades,
+        "verdicts": verdicts,
+        "hull_relations": relations,
+        "pair_kinds": {k: {"reachable": True, "reason": ""} for k in PAIR_KINDS},
+        "note": ("недостижимое НЕ удалено из словаря намеренно: удаление "
+                 "сделало бы старые отчёты нечитаемыми, а молчание — "
+                 "неотличимым от нуля. Схема обязана называть невозможность "
+                 "невозможностью."),
+    }
+
+
+# ─────────────────────────────────────────── глубина перекрытия как РАСПРЕДЕЛЕНИЕ
+
+#: ПОЧЕМУ ЗДЕСЬ НЕТ ПОРОГА «МЕЛКОГО» ПЕРЕКРЫТИЯ, ХОТЯ ОН НАПРАШИВАЛСЯ.
+#:
+#: Замер 10.08.2026 нашёл на `sklnk_eom_r26_v8` 1 542 находки (1.13 % всех
+#: перекрытий) глубиной меньше 0.01 мм — доли микрометра, которых на стройке
+#: не существует. Соблазн назвать это «модельной пылью» и провести границу
+#: очень велик, и по трём зданиям она даже выглядела очевидной: между 1e-3 и
+#: 1e-1 мм зияла пустая декада.
+#:
+#: ГРАНИЦА НЕ ПРОВЕДЕНА, ПОТОМУ ЧТО НА ПЯТИ ЗДАНИЯХ ДАННЫЕ НЕ РВУТСЯ. Методика
+#: взята у `ground.MOST_USED_MIN_RATIO` — наибольший ЗАЗОР между наблюдениями,
+#: — и она дала следующее (крупнейший мультипликативный разрыв в
+#: подмиллиметровой области):
+#:
+#:   здание               перекрытий <1мм   разрыв   на глубине
+#:   sob62_fas_r23_v19            66        267.8x   0.00015 -> 0.0403 мм
+#:   sklnk_eom_r26_v8          1 602         30.1x   0.00487 -> 0.1464 мм
+#:   sob62_r23_v5                 18         11.1x   0.0357  -> 0.3953 мм
+#:   snowdon_plumb_v5            299          3.5x   0.00778 -> 0.0269 мм
+#:   k2_ar_rd_v15             11 001          1.2x   3.46e-05 -> 4.32e-05 мм
+#:   ПУЛ (506 137 перекрытий)                 1.2x
+#:
+#: Разрывы стоят в РАЗНЫХ местах и различаются в 200 раз, а на здании с самой
+#: обильной статистикой (`k2_ar_rd_v15`, 11 001 наблюдение) распределение
+#: НЕПРЕРЫВНО: максимальный разрыв 1.2x. Пул тоже непрерывен. «Пустая декада»
+#: из первых трёх зданий была артефактом малой выборки, а не свойством данных.
+#:
+#: Поэтому здесь публикуется РАСПРЕДЕЛЕНИЕ, а не приговор: читатель видит, что
+#: у него 1 542 находки в подмикронной декаде и 95 052 в декаде 100 мм, и
+#: судит сам. Ни одна находка не подавляется и не помечается «мелкой» — черту
+#: провёл бы наш вкус, а не замер, а вкус в этом модуле числами не считается.
+OVERLAP_DEPTH_NOTE = (
+    "распределение глубин перекрытия ОБОЛОЧЕК по декадам. Порога «мелкого» "
+    "перекрытия модуль не проводит: на пяти зданиях наибольший разрыв в "
+    "данных стоит в разных местах (267.8x…1.2x), а на самом обильном "
+    "(k2_ar_rd_v15, 11 001 наблюдение) распределение непрерывно. Черта здесь "
+    "была бы вкусом, а не замером."
+)
+
+
+def overlap_depth_histogram(findings: Iterable) -> dict:
+    """Сколько перекрытий в каждой ДЕКАДЕ глубины.
+
+    Декада, а не линейная корзина: глубины тянутся на девять порядков
+    (1e-6 … 1e3 мм), и линейная сетка склеила бы всю модельную пыль в одну
+    корзину с настоящими конфликтами.
+    """
+    hist: dict[str, int] = {}
+    total = 0
+    for f in findings:
+        rel = f.get("hull_relation") if isinstance(f, dict) else f.hull_relation
+        if rel != "overlap":
+            continue
+        sd = float(f["signed_distance_mm"] if isinstance(f, dict)
+                   else f.signed_distance_mm)
+        d = -sd
+        if d <= 0:
+            continue
+        total += 1
+        key = "1e%d" % math.floor(math.log10(d))
+        hist[key] = hist.get(key, 0) + 1
+    return {"overlaps": total,
+            "by_decade_mm": {k: hist[k] for k in
+                             sorted(hist, key=lambda x: int(x[2:]))},
+            "note": OVERLAP_DEPTH_NOTE}
 
 def migrate_report(old: dict) -> dict:
     """`clash-report/1` -> `/2`. Ревью №14: канон нельзя сохранить байт-в-байт,
@@ -536,10 +800,21 @@ def migrate_report(old: dict) -> dict:
     """
     if old.get("schema_version") == REPORT_SCHEMA:
         return old
-    if old.get("schema_version") != "clash-report/1":
-        raise ValueError(f"неизвестная схема отчёта: {old.get('schema_version')!r}")
+    was = old.get("schema_version")
+    if was not in ("clash-report/1", "clash-report/2"):
+        raise ValueError(f"неизвестная схема отчёта: {was!r}")
     rep = dict(old)
     rep["schema_version"] = REPORT_SCHEMA
+    # /2 -> /3: добавлен `vocabulary`. Ничего не пересчитывается — аудит
+    # словаря есть факт о КОДЕ, а не о здании, поэтому он одинаков для любого
+    # отчёта, прочитанного этой версией модуля.
+    rep.setdefault("vocabulary", vocabulary_audit(
+        clearance_mm=float((old.get("search") or {}).get("clearance_mm") or 0.0)))
+    if was == "clash-report/2":
+        rep.setdefault("notes", []).append(
+            "МИГРАЦИЯ clash-report/2 -> /3: добавлен `vocabulary` — "
+            "достижимость словаря отчёта. Числа не пересчитывались.")
+        return rep
     out = []
     for f in old.get("findings") or []:
         g = dict(f)

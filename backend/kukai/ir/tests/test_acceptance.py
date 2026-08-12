@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from unittest import mock
 
@@ -412,12 +413,22 @@ class TestExpectationDerivation(unittest.TestCase):
                             "p0_mm": [0.0, 0.0], "p1_mm": [6000.0, 0.0]}]}
         self.assertEqual(derive_expectation(program).rows[0].level, L4)
 
-    def test_graph_op_counts_segments_and_declares_fittings_derived(self) -> None:
-        """Один оп — много труб; фитинги Revit делает сам и они НЕ сверяются.
+    def test_graph_op_counts_segments_and_leaves_fitting_count_unclaimed(self) -> None:
+        """Один оп — много труб; ЧИСЛО фитингов не объявляется.
 
-        Snowdon 30.07: 2 652 фитинга и 152 единицы арматуры при НУЛЕ
-        авторских. Объявить их числом значило бы валить каждую честную
-        разводку.
+        Имя и докстрока правлены 10.08.2026. Было: «фитинги Revit делает сам»
+        со ссылкой на «2 652 фитинга и 152 арматуры при НУЛЕ авторских». И то,
+        и другое неверно: фитинги создаёт сам оп (`emit_fittings_cs` ->
+        NewElbowFitting/NewTeeFitting/NewTransitionFitting в каждом узле
+        степени >= 2), а числа — перепись snowdon_plumb_v3 (PF=2652, DF=152,
+        PA=126), где «152» это фитинги воздуховодов, а не арматура, и арматуру
+        не создаёт ни один эмиттер пакета.
+
+        Проверяемое утверждение поэтому уже и честнее: оп называет число ТРУБ
+        (= len(segments)) и НЕ называет числа фитингов — оно не выведено ни
+        одним замером, потому что стык может свестись к Connector.ConnectTo без
+        элемента, а семейство выбирают routing preferences. Объявить его числом
+        значило бы валить каждую честную разводку.
         """
         program = {"ir_version": "1.0", "ops": [{
             "op": "route_pipe_system", "id": "r",
@@ -619,6 +630,253 @@ class TestExpectationDerivation(unittest.TestCase):
         self.assertFalse(verdict.upper_bounds_checked)
 
 
+FURNITURE = "OST_Furniture"
+
+
+def _symbol_pool(**overrides):
+    """Одна строка пула family_symbols — форма ровно как у open_model."""
+    row = {"id": 800, "name": "Стол 1200", "category": FURNITURE,
+           "family_name": "Стол офисный", "type_name": "Стол 1200",
+           "instances": 4}
+    row.update(overrides)
+    return [row]
+
+
+def _place_program(symbol=None, *, count=1):
+    ops = []
+    for index in range(count):
+        op = {"op": "place_family", "id": f"f{index}",
+              "xyz": [1000.0 * index, 1000.0, 0.0],
+              "level": {"by": "name", "value": L3}}
+        if symbol is not None:
+            op["symbol"] = symbol
+        ops.append(op)
+    return {"ir_version": "1.0", "ops": ops}
+
+
+_BY_TYPE = {"by": "family_type", "category": FURNITURE,
+            "family_name": "Стол офисный", "type_name": "Стол 1200"}
+
+
+class TestPlaceFamilyScope(unittest.TestCase):
+    """Самый нагруженный пишущий оп реестра обязан ДОХОДИТЬ до приёмки.
+
+    7 000 построенных экземпляров против 6 обвинённых — и до 09.08 ни один из
+    них не мог получить независимого «сошлось»: `place_family` был безусловно
+    слепым, а слепой оп в программе делает вердикт INCONCLUSIVE при любой,
+    сколь угодно верной постройке. Слепота была НЕ ТАМ, где её записали:
+    категория действительно не читается из программы, но она лежит в снимке
+    модели — той же строкой BuiltInCategory, которой ключует живая перепись.
+
+    Порядок этого класса тот же, что у файла: сначала отказ от суждения (его
+    легко потерять молча), потом ложный отказ верной постройки (он дороже
+    всего), и только потом зелёный.
+    """
+
+    def test_the_control_program_compiles_against_the_same_snapshot(self) -> None:
+        """Якорь: предикат выведен из программы, которую компилятор ПРИНИМАЕТ."""
+        from kukai.ir.compiler import compile_program
+        from kukai.ir.tests.fixtures import GROUND_SNAPSHOT
+
+        program = _place_program(_BY_TYPE)
+        program["ops"][0]["level"] = {
+            "by": "name", "value": GROUND_SNAPSHOT["levels"][0]["name"]}
+        out = compile_program(program, revit_version="2023",
+                              snapshot=GROUND_SNAPSHOT)
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+
+        expectation = acceptance.derive_expectation(
+            out.planned,
+            family_symbols=acceptance.symbol_rows_from_snapshot(GROUND_SNAPSHOT))
+        self.assertEqual(expectation.blind_ops, ())
+        self.assertEqual(len(expectation.rows), 1)
+        self.assertEqual(expectation.rows[0].categories, (FURNITURE,))
+        self.assertTrue(expectation.checkable)
+
+    # ── отказ от суждения: каждая ветка НАЗВАНА ──────────────────────────
+
+    def _blind_reason(self, expectation) -> str:
+        self.assertEqual(expectation.rows, ())
+        self.assertEqual([b.op_name for b in expectation.blind_ops],
+                         ["place_family"])
+        self.assertFalse(expectation.checkable,
+                         "неизмеренная ветка обязана остаться ok:false")
+        return expectation.blind_ops[0].reason
+
+    def test_without_a_snapshot_pool_it_abstains(self) -> None:
+        """Пула нет — категорию брать неоткуда, и это НАЗВАНО."""
+        reason = self._blind_reason(
+            acceptance.derive_expectation(_place_program(_BY_TYPE)))
+        self.assertIn("пул family_symbols", reason)
+
+    def test_a_truncated_pool_abstains(self) -> None:
+        """За срезом мог остаться символ другой категории (тот же довод F7)."""
+        snapshot = {"family_symbols": _symbol_pool(),
+                    "family_symbols__truncated": True}
+        self.assertIsNone(acceptance.symbol_rows_from_snapshot(snapshot))
+        reason = self._blind_reason(acceptance.derive_expectation(
+            _place_program(_BY_TYPE),
+            family_symbols=acceptance.symbol_rows_from_snapshot(snapshot)))
+        self.assertIn("обрезан", reason)
+
+    def test_candidates_of_different_categories_abstain(self) -> None:
+        """Одно имя на два рода вещей — какая клетка вырастет, неизвестно."""
+        pool = _symbol_pool() + [{
+            "id": 801, "name": "Стол 1200", "category": "OST_Casework",
+            "family_name": "Стол лабораторный", "type_name": "Стол 1200"}]
+        reason = self._blind_reason(acceptance.derive_expectation(
+            _place_program({"by": "name", "value": "Стол 1200"}),
+            family_symbols=pool))
+        self.assertIn("2 разных категорий", reason)
+
+    def test_a_symbol_made_by_this_same_program_abstains(self) -> None:
+        """create_type/load_family — тот самый partial_blind_scope контракта.
+
+        Символа, который создаётся в этой же программе, в снимке ДО записи
+        нет по построению, и выдумать его категорию нечем.
+        """
+        program = {"ir_version": "1.0", "ops": [
+            {"op": "create_type", "id": "t",
+             "source_type": {"by": "name", "value": "К 300x300"},
+             "new_name": "К2", "width_mm": 400.0},
+            {"op": "place_family", "id": "f", "xyz": [0.0, 0.0, 0.0],
+             "level": {"by": "name", "value": L3},
+             "symbol": {"by": "name", "value": "К2"}},
+        ]}
+        reason = self._blind_reason(acceptance.derive_expectation(
+            program, family_symbols=_symbol_pool()))
+        self.assertIn("нет в снимке ДО записи", reason)
+
+    def test_a_category_the_census_cannot_isolate_abstains(self) -> None:
+        """Числовой ключ снимка живая перепись НЕ ВЫДЕЛИТ — значит отказ.
+
+        Снимок падает на `__categoryId.ToString()`, когда имени в
+        BuiltInCategory нет; перепись же ключует ТОЛЬКО именем и такую строку
+        отбросит. Утверждать про клетку, которой в переписи не будет, значит
+        завернуть верную постройку.
+        """
+        reason = self._blind_reason(acceptance.derive_expectation(
+            _place_program({"by": "element_id", "value": 800}),
+            family_symbols=_symbol_pool(category="-2000151")))
+        self.assertIn("BuiltInCategory", reason)
+
+    def test_the_census_key_rule_is_what_refuses(self) -> None:
+        """МУТАЦИЯ: сломай правило ключа — и отказ ПЕРЕСТАЁТ случаться.
+
+        Иначе тест выше доказывал бы лишь то, что где-то что-то отказало.
+        """
+        with mock.patch.object(acceptance, "_CENSUS_CATEGORY_RE",
+                               re.compile(r".*")):
+            expectation = acceptance.derive_expectation(
+                _place_program({"by": "element_id", "value": 800}),
+                family_symbols=_symbol_pool(category="-2000151"))
+        self.assertEqual(expectation.blind_ops, ())
+
+    # ── ложный отказ верной постройки — дороже всего ─────────────────────
+
+    def test_extra_nested_children_are_not_a_rejection(self) -> None:
+        """Вложенные общие семейства Revit создаёт САМ (21 555 на башне).
+
+        `EXACT` здесь завернул бы каждую честную постройку такого семейства,
+        поэтому число объявлено «не менее».
+        """
+        expectation = acceptance.derive_expectation(
+            _place_program(_BY_TYPE), family_symbols=_symbol_pool())
+        self.assertEqual(expectation.rows[0].certainty, Certainty.AT_LEAST)
+        verdict = check_acceptance(expectation, {(FURNITURE, ""): 0},
+                                   {(FURNITURE, ""): 4})
+        self.assertTrue(verdict.accepted, verdict.summary_ru())
+
+    def test_the_level_is_never_asserted(self) -> None:
+        """Уровень FamilyInstance не объявляется — замер по двери (76/15 569).
+
+        Экземпляр лёг на СОСЕДНИЙ уровень: L2 обязан промолчать, а не
+        завернуть постройку по неизмеренной оси.
+        """
+        expectation = acceptance.derive_expectation(
+            _place_program(_BY_TYPE), family_symbols=_symbol_pool())
+        self.assertIsNone(expectation.rows[0].level)
+        verdict = check_acceptance(expectation, {}, {(FURNITURE, L4): 1})
+        self.assertTrue(verdict.accepted, verdict.summary_ru())
+
+    def test_upper_bounds_stay_off_for_the_whole_program(self) -> None:
+        """Вложенный ребёнок вправе лечь в категорию СОСЕДНЕГО опа.
+
+        Поэтому верх снимается целиком — ровно как было при слепоте, потери
+        нет. Причина обязана быть видна в самом ожидании.
+        """
+        program = {"ir_version": "1.0", "ops": [
+            {"op": "create_wall", "id": "w", "p0_mm": [0.0, 0.0],
+             "p1_mm": [6000.0, 0.0], "level": {"by": "name", "value": L3}},
+            {"op": "place_family", "id": "f", "xyz": [0.0, 0.0, 0.0],
+             "level": {"by": "name", "value": L3}, "symbol": _BY_TYPE},
+        ]}
+        expectation = acceptance.derive_expectation(
+            program, family_symbols=_symbol_pool())
+        self.assertEqual(expectation.blind_ops, ())
+        self.assertFalse(expectation.upper_bounds_valid)
+        self.assertTrue(any("верхние границы" in note
+                            for note in expectation.notes))
+        # Одна стена по программе, ЧЕТЫРЕ в модели: перебор не судится.
+        verdict = check_acceptance(expectation, {},
+                                   {("OST_Walls", L3): 4, (FURNITURE, ""): 1})
+        self.assertTrue(verdict.accepted, verdict.summary_ru())
+        self.assertFalse(verdict.upper_bounds_checked)
+
+    # ── и только теперь зелёное и красное ────────────────────────────────
+
+    def test_a_placement_that_did_not_happen_is_refused(self) -> None:
+        expectation = acceptance.derive_expectation(
+            _place_program(_BY_TYPE), family_symbols=_symbol_pool())
+        verdict = check_acceptance(expectation, {(FURNITURE, ""): 7},
+                                   {(FURNITURE, ""): 7})
+        self.assertFalse(verdict.accepted)
+        self.assertEqual([m.code for m in verdict.mismatches],
+                         [MismatchCode.CATEGORY_SHORTFALL])
+        self.assertEqual((verdict.mismatches[0].expected,
+                          verdict.mismatches[0].observed), (1, 0))
+
+    def test_two_placements_short_by_one_are_refused(self) -> None:
+        expectation = acceptance.derive_expectation(
+            _place_program(_BY_TYPE, count=2), family_symbols=_symbol_pool())
+        self.assertEqual(expectation.rows[0].count, 2)
+        verdict = check_acceptance(expectation, {(FURNITURE, ""): 7},
+                                   {(FURNITURE, ""): 8})
+        self.assertFalse(verdict.accepted)
+
+    def test_the_category_follows_the_SNAPSHOT_not_the_program(self) -> None:
+        """Ключевое отличие от «объявленного ожидания»: это ДАННЫЕ О МОДЕЛИ.
+
+        Тот же селектор по имени против пула с другой категорией даёт другую
+        клетку — значит утверждение не переписано из программы, а прочитано
+        у Revit.
+        """
+        selector = {"by": "name", "value": "Стол 1200"}
+        first = acceptance.derive_expectation(_place_program(selector),
+                                              family_symbols=_symbol_pool())
+        second = acceptance.derive_expectation(
+            _place_program(selector),
+            family_symbols=_symbol_pool(category="OST_Casework"))
+        self.assertEqual(first.rows[0].categories, (FURNITURE,))
+        self.assertEqual(second.rows[0].categories, ("OST_Casework",))
+        self.assertNotEqual(expectation_digest(first), expectation_digest(second))
+
+    def test_group_placements_multiply_the_member(self) -> None:
+        """Оп внутри группы считается по числу занятий, как и все остальные."""
+        program = {"ir_version": "1.0", "ops": [{
+            "op": "create_group", "id": "g",
+            "members": [{"op": "place_family", "id": "f",
+                         "xyz": [0.0, 0.0, 0.0],
+                         "level": {"by": "name", "value": L3},
+                         "symbol": _BY_TYPE}],
+            "placements": [[5000.0, 0.0], [10000.0, 0.0]],
+        }]}
+        expectation = acceptance.derive_expectation(
+            program, family_symbols=_symbol_pool())
+        rows = [r for r in expectation.rows if r.categories == (FURNITURE,)]
+        self.assertEqual([r.count for r in rows], [3])
+
+
 class TestPurityAndStability(unittest.TestCase):
     """Ожидание сериализуемо и одинаково между процессами."""
 
@@ -683,8 +941,18 @@ class TestRegistryCoverage(unittest.TestCase):
         # решает `variety` — wall_rect даёт ровно OST_SWallRectOpening, а
         # host_face зависит от категории НОСИТЕЛЯ, которая из программы не
         # читается, и сверяется суммой по трём родам.
+        # create_topography здесь по той же причине, что create_foundation:
+        # разновидность рельефа выбирает КАТЕГОРИЮ (OST_Topography против
+        # OST_Toposolid), и ветка в _category_of_op называет её точно —
+        # сумма по двум ключам скрыла бы ровно ту подмену, которую операция
+        # запрещает.
+        # wave/solid (09.08): оба тела кладут результат в DirectShape той же
+        # категории из той же закрытой таблицы, поэтому едут ТОЙ ЖЕ веткой,
+        # что и меш, — не строкой таблицы. Множества СЛОЖЕНЫ, а не выбрано
+        # одно: у каждой волны здесь свои опы и ни одна не знала о чужих.
         special = {"create_column", "create_directshape", "create_foundation",
-                   "create_group", "create_opening"}
+                   "create_group", "create_opening", "create_topography",
+                   "create_solid_extrusion", "create_solid_revolve"}
         classified = (set(_OP_CATEGORIES) | set(_OPS_BLIND)
                       | set(_OPS_WITHOUT_ELEMENTS) | special)
         writing = {name for name, op in spec.OPS.items() if op.writes_model}

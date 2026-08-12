@@ -124,7 +124,6 @@ from typing import Any, Optional
 from kukai.ir.diag import Diagnostic, TYPE_BAD_TYPE, TYPE_BOUNDS, TYPE_GEOM_RELATION
 from kukai.ir.emit_utils import (cs_line_comment_fragment,
                                  is_finite_number, refuse_stmt)
-from kukai.ir.numeric_contracts import MODEL_COORD_LIMIT_MM
 
 _EDGE_TOL = 1.0          # mm: shorter segment = runtime ShortCurveTolerance
 _MAX_DEGREE = 3          # v2.0: tee is the max junction; 4-way = v2.1
@@ -202,7 +201,7 @@ def _num(x) -> bool:
     return is_finite_number(x)
 
 
-_COORD_LIMIT_MM = MODEL_COORD_LIMIT_MM
+_COORD_LIMIT_MM = 16_000_000.0   # same static sanity bound as authoring (F12)
 
 
 def _pt_ok(v) -> bool:

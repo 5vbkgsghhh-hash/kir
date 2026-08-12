@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import unittest
 
-from kukai.ir import spec
-from kukai.ir.tool_doc import NOTES, UNPROVEN, build_tool_description
+from kukai.ir import dsl, spec
+from kukai.ir.registry_base import DISCIPLINES
+from kukai.ir.tool_doc import (
+    NOTES, OP_NOTES, UNPROVEN, build_tool_description)
 
 
 class ToolDescriptionCoversRegistry(unittest.TestCase):
@@ -49,9 +51,15 @@ class ToolDescriptionCoversRegistry(unittest.TestCase):
             "query_types",      # спроси каталог до селектора
             "create_stairs",    # единственный оп своей программы
             "ПРОСТРАНСТВО ВИДА",   # аннотации живут в 2D вида
-            "allow_destructive",   # delete не бывает случайным
         ):
             self.assertIn(probe.lower(), self.text.lower(), probe)
+        # `allow_destructive` УЕХАЛ, А НЕ ПРОПАЛ (09.08). Проба осталась в
+        # тесте, но спрашивает НОВЫЙ адрес: требование конверта нужно тому,
+        # кто `delete` уже написал, а не тому, кто выбирает операцию. Убрать
+        # пробу вовсе значило бы снять храповик с замера, который её сюда и
+        # поставил.
+        self.assertIn("allow_destructive",
+                      dsl.OP_FUNCTIONS["delete"].__doc__ or "")
 
     def test_ref_rule_matches_the_compiler(self):
         """`ref` is legal for what the program itself creates (level/host/
@@ -62,6 +70,79 @@ class ToolDescriptionCoversRegistry(unittest.TestCase):
         self.assertIn("host", self.text)
         self.assertIn("target", self.text)
         self.assertIn("`type`/`symbol` ref НЕ работает", self.text)
+
+    def test_the_op_list_is_grouped_by_discipline_not_by_a_compiler_field(self):
+        """Перечень опов читают ПО РАЗДЕЛАМ, потому что работу ведут по ним.
+
+        До 09.08 здесь печаталось внутреннее поле реестра (`element`,
+        `category/element: create_column, create_wall`, `element/mep_system`).
+        Прочитанный глазами автора, тот перечень не отвечал ни на один его
+        вопрос: из текста не следовало, почему `create_wall` отделён от
+        `create_floor`. Это тест не на красоту, а на то, что компиляторное
+        поле больше не протекает на поверхность.
+        """
+        for discipline, names in spec.ops_by_discipline(writes=True):
+            self.assertIn(f"  {spec.DISCIPLINE_RU[discipline]}: "
+                          + ", ".join(names), self.text)
+        # Свод из реестра не печатает `capability` НИ ОДНОЙ группой.
+        for kind, _names in spec.ops_by_object_kind(writes=True):
+            self.assertNotIn(f"\n  {kind}: ", self.text)
+
+    def test_every_discipline_label_is_the_one_dictionary(self):
+        """Ярлык — ПЕРЕВОД словаря разделов, а не второй словарь.
+
+        Разойдись ключи — и в тексте появился бы раздел, которого реестр не
+        знает, либо пропал бы раздел, который он знает. Оба случая молчаливы.
+        """
+        self.assertEqual(set(spec.DISCIPLINE_RU), set(DISCIPLINES))
+        self.assertEqual(set(spec.DISCIPLINE_ORDER), set(DISCIPLINES))
+
+    def test_the_discipline_of_every_op_is_derived_or_named_as_underived(self):
+        """Каждый пишущий оп либо в разделе, либо в списке невыведенных.
+
+        Третьего не дано: оп, пропавший из обоих, исчез бы из перечня целиком,
+        а `shared` для невыведенного — прямая ложь (словарь говорит, что
+        `shared` значит «принадлежит всем», а не «неизвестно»).
+        """
+        writing = {n for n, o in spec.OPS.items() if o.writes_model}
+        placed = {n for _d, names in spec.ops_by_discipline(writes=True)
+                  for n in names}
+        undecided = {n for n, _why in spec.ops_without_discipline(writes=True)}
+        self.assertEqual(placed | undecided, writing)
+        self.assertEqual(placed & undecided, set())
+        # У КАЖДОГО невыведенного причина СЛОВАМИ, а не пустая строка: пробел
+        # учёта без причины неотличим от забытого опа.
+        for name, why in spec.ops_without_discipline(writes=True):
+            self.assertTrue(why.strip(), name)
+
+    def test_a_single_op_trap_lives_in_that_op_and_not_in_the_description(self):
+        """ВЫТЕСНЕНИЕ — ЭТО ПЕРЕЕЗД, А НЕ УДАЛЕНИЕ, и проверяется он с двух
+        сторон сразу.
+
+        Ловушка, называющая РОВНО ОДИН оп и нужная ПОСЛЕ того, как он выбран,
+        не имеет права стоять в постоянно загружаемом тексте: описание
+        платится каждым ходом, докстрока — только тем, где её спросили. Но
+        «вытеснил» без второй половины проверки — это «удалил»: знание
+        считается доехавшим, только если по новому адресу оно ЧИТАЕТСЯ.
+        """
+        self.assertTrue(OP_NOTES)
+        for op_name, notes in OP_NOTES.items():
+            self.assertIn(op_name, spec.OPS, op_name)
+            doc = dsl.OP_FUNCTIONS[op_name].__doc__ or ""
+            for note in notes:
+                self.assertIn(note, doc, f"{op_name}: не доехало в докстроку")
+                self.assertNotIn(note, self.text,
+                                 f"{op_name}: осталось и в описании — "
+                                 f"платим дважды")
+
+    def test_the_displaced_traps_have_a_named_address_in_the_description(self):
+        """Знание, до которого нет пути от постоянного текста, — тёмное.
+
+        Тот же закон достижимости, что у указателя на курс: способность,
+        о которой модель не может узнать, не существует. Поэтому вытеснение
+        оплачивается ОДНОЙ строкой, называющей дверь.
+        """
+        self.assertIn("spec(", self.text)
 
     def test_description_stays_small_next_to_the_schema(self):
         """The generated JSON Schema already costs ~23k tokens per turn. The

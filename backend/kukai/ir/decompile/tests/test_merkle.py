@@ -359,7 +359,41 @@ class MerkleHashProperties(unittest.TestCase):
             any(len(occs) == 4 for occs in floor_occurrences),
             "identical floors must collapse onto one hash")
 
-    def test_node_origin_is_rounded_bbox_min(self) -> None:
+    def test_node_origin_is_not_bbox_min_where_they_must_differ(self) -> None:
+        # ЭТОТ ТЕСТ БЫЛ ИМЕНОВАН `..._is_rounded_bbox_min` И УТВЕРЖДАЛ РАВЕНСТВО
+        # РОВНО С ТЕМ, ЧТО ДОКСТРОКА `node_origin` НАЗЫВАЕТ НЕПРИГОДНЫМ.
+        # Он проходил не по контракту, а по совпадению фикстуры: один этаж на
+        # отметке 0, где обе величины нули. Замер 09.08.2026 на трёх этажах:
+        # у подеревьев на 3000 и 6000 мм `facts.bbox_min_mm` == (0,0,0) —
+        # fold зануляет z двумерных точек параметров, — а `node_origin` даёт
+        # (0,0,3000) и (0,0,6000). Если кто-нибудь «починит» `node_origin` на
+        # `bbox_min`, прежний тест позеленеет, а локализация содержимого
+        # относительно начала перестанет быть инвариантной к переносу по
+        # высоте: все поднятые этажи прижмутся к мировому нулю и перестанут
+        # совпадать по хешу с таким же этажом на другой отметке.
+        tree = _fold(_grid_building(floors=3))
+        floors = tree["children"][0]["children"]
+        elevations = [0.0, 3_000.0, 6_000.0]
+        for floor, elevation in zip(floors, elevations, strict=True):
+            with self.subTest(elevation=elevation):
+                origin = node_origin(floor)
+                bbox_min = floor["facts"]["bbox_min_mm"]
+                assert bbox_min is not None
+                self.assertEqual(
+                    origin[2], elevation,
+                    "начало узла обязано следовать за отметкой этажа")
+                self.assertEqual(
+                    bbox_min[2], 0.0,
+                    "предпосылка теста: bbox_min зануляет z — если это "
+                    "изменилось, тест нужно перемерить, а не подправить")
+                if elevation:
+                    self.assertNotEqual(
+                        (origin[0], origin[1], origin[2]),
+                        (bbox_min[0], bbox_min[1], bbox_min[2]))
+
+    def test_node_origin_equals_bbox_min_only_on_the_ground_floor(self) -> None:
+        # Сохранённая половина прежнего утверждения — но названная тем, чем она
+        # является: совпадением на отметке 0, а не определением величины.
         tree = _fold(_grid_building(floors=1))
         origin = node_origin(tree)
         bbox_min = tree["facts"]["bbox_min_mm"]

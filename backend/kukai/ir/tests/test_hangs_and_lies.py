@@ -72,8 +72,14 @@ class RefusalMessageMustNotInventACause(unittest.TestCase):
                        "message": message}})
 
     def test_api_null_is_not_reported_as_a_vanished_element(self):
+        """09.08.2026: КОД здесь тоже поменялся, и это продолжение той же
+        починки, а не её отмена. Правка 27.07 развела два мира по ТЕКСТУ, но
+        оставила им один код X003 — а читатель корпуса видит код, не прозу:
+        замер по 1306 строкам показал, что все 38 живых X003 неприписываемы
+        именно поэтому. Отказ рантайма теперь несёт собственный KIR-X009,
+        X003 остался тем, чем его объявляет `diag.py`, — дрейфом модели."""
         diag = self._translate("NewFamilyInstance (балка) вернул null")
-        self.assertEqual(diag["code"], "KIR-X003")
+        self.assertEqual(diag["code"], "KIR-X009")
         self.assertNotIn("исчез", diag["message_ru"])
         self.assertIn("null", diag["detail"])
 

@@ -24,30 +24,32 @@ Grid.Create) are stable 2021-2026; the live divergence is ElementId literals —
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from typing import Any, Mapping, Sequence
 
-from kukai.ir import spec, docspace
+from kukai.ir import spec, docspace, faceref, ops_room
 from kukai.ir.ops_authoring import WALL_LOCATION_LINE_ORDINALS
 
 from kukai.ir.contracts import ElementIdentityProof
 from kukai.ir.emit_model import (BarePost, WitnessCheck, post_to_string,
                                  tolerance, tolerances)
 from kukai.ir.diag import (Diagnostic, KirRefusal, PLAN_SOLO_OP, TYPE_BAD_TYPE,
-                           GROUND_BAD_SELECTOR)
+                           GROUND_BAD_SELECTOR, PARSE_EXCLUSIVE_FIELDS)
+from kukai.ir.ground import IN_EMIT_DEFAULT
 from kukai.ir.emit_utils import (
+    ELEMENT_ID_MAX,
+    cs_element_id_literal,
+    cs_identifier_fragment,
     cs_line_comment_fragment,
+    cs_string_literal,
     program_refusal_tokens,
     refuse_stmt,
 )
-from kukai.ir.emitted_artifact import EmittedArtifact
-from kukai.ir.lowering import (
-    LoweredProgram,
-    program_hash,
-    program_stamp as _program_stamp,
-)
 
+EMIT_ID_RANGE = "KIR-E002"     # grounded id unrepresentable on this Revit version
 # Внутренний контракт эмиссии, не пользовательский ввод: op-локальный гард,
 # написанный мимо emit_utils.refuse_stmt(), уносит семантику ЦЕЛОЙ программы
 # внутрь SubTransaction.  Своя буква намеренно вне занятого разбором
@@ -78,37 +80,84 @@ from kukai.ir.authoring_validation import (
     _validate_arc,
     validate,
 )
-from kukai.ir.authoring_emit_support import (
-    EMIT_ID_RANGE,
-    EMIT_UNSUPPORTED,
-    IN_EMIT_DEFAULT,
-    _cs,
-    _eid,
-    _endpoint_check,
-    _gid,
-    _level_chain_check,
-    _level_check_expr,
-    _level_expr,
-    _loop_pts,
-    _pt3,
-    _readback_block,
-    _safe,
-    _split_witness,
-    _stamp_block,
-    _stamp_readback,
-    _symbol_res,
-    bbox_extents_witness,
-    endpoint_witness,
-    level_binding_witness,
-    level_chain_witness,
-)
 
 
 # ── emit ─────────────────────────────────────────────────────────────────────
 
+def _cs(s: str) -> str:
+    return cs_string_literal(s)
+
+
 def _indent(block: str, pad: str) -> str:
     return "\n".join(pad + ln if ln.strip() else ln
                      for ln in block.splitlines())
+
+
+def _safe(s: str) -> str:
+    return cs_identifier_fragment(s)
+
+
+def _eid(val: int, ver: str, op_id: str) -> str:
+    """ElementId literal, version-aware (the gate-caught divergence)."""
+    try:
+        return cs_element_id_literal(val, ver)
+    except ValueError:
+        if not (isinstance(val, int) and not isinstance(val, bool)
+                and 1 <= val <= ELEMENT_ID_MAX):
+            message = (
+                f"id {val} вне положительного 64-битного пространства "
+                "ElementId")
+        else:
+            message = (
+                f"id {val} вне 32-битного пространства ElementId Revit {ver}")
+        raise KirRefusal([Diagnostic(
+            code=EMIT_ID_RANGE, op_id=op_id, got=val,
+            message_ru=message)])
+
+
+def _gid(op: dict, param: str) -> dict:
+    return op[param]["__grounded__"]
+
+
+def _level_expr(op: dict, s: str, ver: str, oid: str,
+                isolation: str = "atomic") -> tuple[str, str]:
+    """(resolution C#, level id C#-expr for topology checks). Ref -> the
+    created level variable; pinned -> GetElement + stale guard.
+
+    The guard distinguishes WHY ``as Level`` failed.  Measured live 27.07
+    twice (``create_beam`` x16, two runs ~74 min apart, one editor, one local
+    file, journalctl kukai-backend): X003 claimed "уровень не найден (модель
+    изменилась после grounding)" 130-460ms after ``ground_snapshot`` had just
+    returned the SAME level catalogue — too little time for a human edit.
+    ``doc.GetElement(id) as Level`` returns null for two different reasons
+    that used to share one fixed message: the id no longer resolves at all
+    (consistent with genuine drift) and the id resolves to something that
+    was never a Level.  The second case does NOT by itself prove a grounding
+    bug: ``ground.py``'s ``by: element_id`` path is a documented, deliberate
+    pass-through (existence/kind re-checked only here, at runtime — see
+    ``ground.py`` module docstring) — a wrong id can equally come from the
+    calling side.  So the message states the observed FACT (wrong runtime
+    type) and stops there; it must not invent a cause the guard cannot see,
+    same discipline as the lie ``test_hangs_and_lies.py`` already found and
+    fixed for "NewFamilyInstance вернул null" / "NewElbowFitting: failed to
+    insert elbow" — one layer deeper: baked into this guard's own static C#
+    string rather than a raw Revit message, so the earlier fix (which only
+    reads ``serving._translate_runtime``'s input) never saw it.
+    """
+    lv = _gid(op, "level")
+    if lv.get("via") == "ref":
+        rv = "__el_" + _safe(lv["ref"])
+        return (f"Level __lv_{s} = {rv};", f"{rv}.Id.ToString()")
+    raw = f"__lv_raw_{s}"
+    vanished = _cs("уровень не найден (модель изменилась после grounding)")
+    wrong_type = _cs("id уровня резолвится не в Level, а в ")
+    tail = _cs(" — причина (дрейф модели или неверный id) не определена рантаймом")
+    msg_expr = (f"({raw} == null ? {vanished} : "
+                f"{wrong_type} + __ClassName({raw}) + {tail})")
+    res = (f"Element {raw} = doc.GetElement({_eid(lv['id'], ver, oid)});\n"
+           f"Level __lv_{s} = {raw} as Level;\n"
+           f"if (__lv_{s} == null) {{ {refuse_stmt(oid, msg_expr, isolation)} }}")
+    return res, _cs(str(lv["id"]))
 
 
 _AUTH_PREAMBLE = r"""
@@ -178,6 +227,255 @@ def _with_class_name_helper(program: str) -> str:
             "объявление было бы потеряно, и это CS0103 на машине пользователя")
     return program.replace(anchor, _CLASS_NAME_HELPER_CS + anchor, 1)
 
+
+#: КАНОНИЗАЦИЯ ПОВЕРХНОСТИ МЕША. Объявляется по тому же правилу, что
+#: ``__ClassName``: только если программа его зовёт — иначе объявление ехало бы
+#: в каждую эмиссию и двигало замороженные байты у программ, которых правка не
+#: касается.
+#:
+#: ЗАЧЕМ ЭТО ВООБЩЕ ЕСТЬ. Свидетель числа граней у ``create_directshape``
+#: закрывает молчание ``Fallback.Salvage`` только наполовину: пересборка,
+#: сохранившая ЧИСЛО граней и сдвинувшая вершину, проходит его молча. Точный
+#: предикат уже написан и доказан живьём — ``mesh_surface_payload`` в
+#: ``decompile/geometry_acceptance.py`` (стенд идемпотентности читает им
+#: построенный элемент ОТДЕЛЬНЫМ пост-коммитным чтением). Здесь ровно он и
+#: считается — но ВНУТРИ транзакции, чтобы несовпадение откатывало, а не
+#: описывало.
+#:
+#: ПОЧЕМУ СРАВНИВАЕТСЯ ПРООБРАЗ, А НЕ SHA-256. Замер живого компайл-сервиса
+#: (:52412, 09.08.2026): ``System.Security.Cryptography.SHA256`` и
+#: ``SHA256Managed`` собираются 4/6 и дают CS1069 на 2025 и 2026 — тип
+#: переадресован в сборку, которой нет в замыкании ссылок клиента (ровно та
+#: асимметрия, которую ``tests/bridge_reference_closure.py`` уже записал про
+#: ``MD5``). Хеша в эмитируемой C# быть не может. Поэтому Python
+#: пред-регистрирует ПРООБРАЗ дайджеста, а C# строит его же из построенного
+#: элемента и сравнивает строки: равенство прообраза строго сильнее равенства
+#: хеша, и канонизация в коде по-прежнему ОДНА.
+#:
+#: InvariantCulture — не педантизм: ``NegativeSign`` и сами цифры зависят от
+#: локали машины пользователя, а прообраз обязан быть теми же байтами, что
+#: посчитал Python.
+_MESH_CANON_HELPER_CS = """\
+// Округление половиной ОТ НУЛЯ на решётке канона — тот же закон, что у
+// decompile.geom_extract._round_mm (floor(s+0.5) / ceil(s-0.5)), а не
+// Math.Round: Math.Round(MidpointRounding.ToEven) увёл бы ровно половину
+// граничных вершин в соседнюю ячейку и прообраз разошёлся бы с питоновским.
+Func<double, double, long> __KirCanonUnit = (__cuMm, __cuGrid) =>
+{
+    double __cuS = __cuMm / __cuGrid;
+    return __cuS >= 0.0
+        ? (long)Math.Floor(__cuS + 0.5)
+        : (long)Math.Ceiling(__cuS - 0.5);
+};
+// Лексикографический порядок по целым — тот же, что у python sorted() над
+// кортежами: сначала поэлементно, при равенстве — по длине.
+Comparison<long[]> __KirCanonCmp = (__ccA, __ccB) =>
+{
+    int __ccN = __ccA.Length < __ccB.Length ? __ccA.Length : __ccB.Length;
+    for (int __ccI = 0; __ccI < __ccN; __ccI++)
+    {
+        if (__ccA[__ccI] < __ccB[__ccI]) return -1;
+        if (__ccA[__ccI] > __ccB[__ccI]) return 1;
+    }
+    return __ccA.Length.CompareTo(__ccB.Length);
+};
+// Оболочку JSON (__cpHead/__cpTail) присылает Python — она выведена из того же
+// канонизатора, а не набрана здесь второй раз. List.Sort нестабилен, и это
+// безразлично: порядок полный по ВСЕМ девяти числам, значит равные строки
+// неразличимы по значению.
+Func<List<long[]>, string, string, string> __KirCanonPayload =
+    (__cpRows, __cpHead, __cpTail) =>
+{
+    __cpRows.Sort(__KirCanonCmp);
+    var __cpSb = new StringBuilder(__cpHead);
+    for (int __cpI = 0; __cpI < __cpRows.Count; __cpI++)
+    {
+        if (__cpI > 0) __cpSb.Append(',');
+        long[] __cpR = __cpRows[__cpI];
+        for (int __cpJ = 0; __cpJ < 3; __cpJ++)
+        {
+            __cpSb.Append(__cpJ == 0 ? "[[" : ",[");
+            for (int __cpK = 0; __cpK < 3; __cpK++)
+            {
+                if (__cpK > 0) __cpSb.Append(',');
+                __cpSb.Append(__cpR[__cpJ * 3 + __cpK].ToString(
+                    System.Globalization.CultureInfo.InvariantCulture));
+            }
+            __cpSb.Append(']');
+        }
+        __cpSb.Append(']');
+    }
+    __cpSb.Append(__cpTail);
+    return __cpSb.ToString();
+};
+"""
+
+
+def _with_mesh_canon_helper(program: str) -> str:
+    """Вставить канонизатор поверхности ТОЛЬКО если программа его зовёт.
+
+    Тот же шов и тот же якорь, что у ``__ClassName``: объявление обязано стоять
+    до любого кода операций, иначе свидетель ``create_directshape`` получит
+    CS0103 на машине пользователя, а не у нас.
+    """
+    if "__KirCanonPayload(" not in program:
+        return program
+    anchor = "var __results = new Dictionary<string, object>();"
+    if anchor not in program:
+        raise AssertionError(
+            "программа зовёт __KirCanonPayload, но в ней нет якоря преамбулы — "
+            "объявление было бы потеряно, и это CS0103 на машине пользователя")
+    return program.replace(anchor, _MESH_CANON_HELPER_CS + anchor, 1)
+
+
+def _with_program_helpers(program: str) -> str:
+    """Оба условных объявления преамбулы, каждое — только если его зовут."""
+
+    return _with_mesh_canon_helper(_with_class_name_helper(program))
+
+
+
+def _stamp_block(el_var: str, stamp: str) -> str:
+    if not stamp.startswith("kir:a5:"):
+        # Public/chat emission remains byte-compatible.  Only an A5 run treats
+        # this value as an authoritative ownership receipt used for orphan
+        # reconciliation and cleanup.
+        return (f'try {{ Parameter __cm = {el_var}.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); '
+                f'if (__cm != null && !__cm.IsReadOnly) __cm.Set({_cs(stamp)}); }} catch {{ }}')
+    return (
+        f'try {{ Parameter __cm = {el_var}.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); '
+        f'if (__cm == null) throw new InvalidOperationException("A5 stamp parameter missing"); '
+        f'if (__cm.IsReadOnly) throw new InvalidOperationException("A5 stamp parameter is read-only"); '
+        f'if (!__cm.Set({_cs(stamp)}) || __cm.AsString() != {_cs(stamp)}) '
+        f'throw new InvalidOperationException("A5 stamp readback mismatch"); }} '
+        f'catch (Exception __stampEx) {{ throw new InvalidOperationException('
+        f'"A5 stamp write failed: " + __stampEx.Message, __stampEx); }}')
+
+
+def _stamp_readback(el_var: str, rb_var: str = "__rb", type_level: bool = False) -> str:
+    """Read the stamp from Revit; never echo the value we merely attempted."""
+    bip = ("ALL_MODEL_TYPE_COMMENTS" if type_level
+           else "ALL_MODEL_INSTANCE_COMMENTS")
+    return (f"    try {{ var __stampParam = {el_var}.get_Parameter(BuiltInParameter.{bip}); "
+            f"if (__stampParam != null) {rb_var}[\"stamp\"] = __stampParam.AsString(); }} catch {{ }}\n")
+
+
+def _pt3(pt: list) -> tuple:
+    return (pt[0], pt[1], pt[2] if len(pt) > 2 else 0)
+
+
+def _endpoint_check(el_var: str, oid: str, p0, p1, tol: float, three_d: bool) -> str:
+    x0, y0, z0 = _pt3(p0)
+    x1, y1, z1 = _pt3(p1)
+    orient_z = (f' + Math.Pow(MM(__a.Z) - {z0}, 2)' if three_d else '')
+    orient_z_b = (f' + Math.Pow(MM(__b.Z) - {z0}, 2)' if three_d else '')
+    zc = (f' || Math.Abs(MM(__e0.Z) - {z0}) > {tol} || Math.Abs(MM(__e1.Z) - {z1}) > {tol}'
+          if three_d else "")
+    return (
+        f"var __lc = {el_var}.Location as LocationCurve;\n"
+        f"    if (__lc == null) __post.Add({_cs(oid + ': нет LocationCurve')});\n"
+        f"    else\n    {{\n"
+        f"        var __a = __lc.Curve.GetEndPoint(0); var __b = __lc.Curve.GetEndPoint(1);\n"
+        f"        double __da = Math.Pow(MM(__a.X) - {x0}, 2) + Math.Pow(MM(__a.Y) - {y0}, 2){orient_z};\n"
+        f"        double __db = Math.Pow(MM(__b.X) - {x0}, 2) + Math.Pow(MM(__b.Y) - {y0}, 2){orient_z_b};\n"
+        f"        var __e0 = __da <= __db ? __a : __b; var __e1 = __da <= __db ? __b : __a;\n"
+        f"        if (Math.Abs(MM(__e0.X) - {x0}) > {tol} || Math.Abs(MM(__e0.Y) - {y0}) > {tol} ||\n"
+        f"            Math.Abs(MM(__e1.X) - {x1}) > {tol} || Math.Abs(MM(__e1.Y) - {y1}) > {tol}{zc})\n"
+        f"            __post.Add({_cs(oid + ': endpoints mismatch (geometry)')});\n"
+        f"    }}")
+
+
+def _level_check_expr(el_var: str, oid: str, bip: str, id_expr: str) -> str:
+    """id_expr is a C# string expression (literal or <var>.Id.ToString())."""
+    return (
+        f"var __bp = {el_var}.get_Parameter(BuiltInParameter.{bip});\n"
+        f"    if (__bp == null || __bp.AsElementId() == null || __bp.AsElementId().ToString() != {id_expr})\n"
+        f"        __post.Add({_cs(oid + ': level binding mismatch (topology)')});")
+
+
+# ── Wave A2: witness-model wrappers over the string helpers ─────────────────
+# Each wrapper partitions the legacy fragment at its first newline (reader
+# statement vs guard+verdict) and pins the surrounding glue (lead indent /
+# trailing newline) INSIDE the check, so render_post's concatenation is
+# byte-identical to the historical hand-built post block.
+
+def _split_witness(
+    key: str, body: str, message: str, *,
+    lead: str = "    ", tail: str = "\n",
+    tol=None,
+    style: str = "else_block",
+) -> WitnessCheck:
+    reader, sep, verdict = body.partition("\n")
+    return WitnessCheck(
+        obligation_key=key,
+        reader_cs=lead + reader + sep,
+        verdict_cs=verdict + tail,
+        message=message,
+        tol=tol,
+        style=style,  # type: ignore[arg-type]
+    )
+
+
+def endpoint_witness(
+    el_var: str, oid: str, p0, p1, tol, three_d: bool,
+    *, lead: str = "    ", tail: str = "\n",
+) -> WitnessCheck:
+    """Model form of :func:`_endpoint_check` (public: struct_emit uses it).
+
+    ``tol`` — отчеканенный реестром :class:`Tolerance`, а не число: провенанс
+    допуска предъявляется объектом (закон 1, emit_model.py).
+    """
+
+    return _split_witness(
+        "endpoints", _endpoint_check(el_var, oid, p0, p1, tol, three_d),
+        "endpoints mismatch (geometry)", lead=lead, tail=tail,
+        tol=tol, style="else_block")
+
+
+def level_chain_witness(
+    el_var: str, oid: str, id_expr: str,
+    *, key: str = "level_binding", lead: str = "    ", tail: str = "\n",
+) -> WitnessCheck:
+    """Model form of :func:`_level_chain_check` (public: struct_emit uses it)."""
+
+    return _split_witness(
+        key, _level_chain_check(el_var, oid, id_expr),
+        "level binding mismatch (topology)", lead=lead, tail=tail,
+        style="guard")
+
+
+def bbox_extents_witness(
+    el_var: str, oid: str, xmin, xmax, ymin, ymax, tol,
+    *, key: str = "bbox",
+) -> WitnessCheck:
+    """Shared floor/roof/slab bbox-extents witness (public for struct_emit).
+
+    ``tol`` — :class:`Tolerance` из реестра (ключ ``bbox_mm`` своего опа).
+    """
+
+    return WitnessCheck(
+        obligation_key=key,
+        reader_cs=f"    var __bb = {el_var}.get_BoundingBox(null);\n",
+        verdict_cs=(
+            f"    if (__bb == null) __post.Add({_cs(oid + ': нет BoundingBox')});\n"
+            f"    else if (Math.Abs(MM(__bb.Min.X) - {xmin}) > {tol} || Math.Abs(MM(__bb.Max.X) - {xmax}) > {tol} ||\n"
+            f"             Math.Abs(MM(__bb.Min.Y) - {ymin}) > {tol} || Math.Abs(MM(__bb.Max.Y) - {ymax}) > {tol})\n"
+            f"        __post.Add({_cs(oid + ': bbox extents mismatch (geometry)')});\n"),
+        message="bbox extents mismatch (geometry)",
+        tol=tol,
+        style="else_block")
+
+
+def level_binding_witness(
+    el_var: str, oid: str, bip: str, id_expr: str,
+    *, key: str = "base_constraint", lead: str = "    ", tail: str = "\n",
+) -> WitnessCheck:
+    """Model form of :func:`_level_check_expr` (public: struct_emit uses it)."""
+
+    return _split_witness(
+        key, _level_check_expr(el_var, oid, bip, id_expr),
+        "level binding mismatch (topology)", lead=lead, tail=tail,
+        style="guard")
 
 
 def _arc_curve_cs(arc: dict) -> str:
@@ -569,6 +867,50 @@ def _emit_grid(op: dict, ver: str, stamp: str,
     return decl, create, checks, readback
 
 
+def _readback_block(
+    s: str,
+    oid: str,
+    stamp: str,
+    *,
+    location_rotation: bool = False,
+    family_state: bool = False,
+) -> str:
+    rotation = (
+        f"    try {{ var __lp2 = __el_{s}.Location as LocationPoint;\n"
+        f"        if (__lp2 != null) __rb[\"rotation_deg\"] = "
+        f"Math.Round(__lp2.Rotation * 180.0 / Math.PI, 6); }} catch {{ }}\n"
+        if location_rotation else ""
+    )
+    state = (
+        f"    try {{ var __fi2 = __el_{s} as FamilyInstance;\n"
+        f"        if (__fi2 != null) {{\n"
+        f"            __rb[\"mirrored\"] = __fi2.Mirrored;\n"
+        f"            __rb[\"hand_flipped\"] = __fi2.HandFlipped;\n"
+        f"            __rb[\"facing_flipped\"] = __fi2.FacingFlipped;\n"
+        f"        }} }} catch {{ }}\n"
+        if family_state else ""
+    )
+    return (
+        f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
+        f"    var __rb = new Dictionary<string, object>();\n"
+        f"    __rb[\"id\"] = __el_{s}.Id.ToString();\n"
+        + _stamp_readback(f"__el_{s}") +
+        f"    try {{ var __lc2 = __el_{s}.Location as LocationCurve;\n"
+        f"        if (__lc2 != null) {{\n"
+        f"            var __s2 = __lc2.Curve.GetEndPoint(0); var __e2 = __lc2.Curve.GetEndPoint(1);\n"
+        f"            __rb[\"start_mm\"] = new double[] {{ Math.Round(MM(__s2.X), 1), Math.Round(MM(__s2.Y), 1), Math.Round(MM(__s2.Z), 1) }};\n"
+        f"            __rb[\"end_mm\"] = new double[] {{ Math.Round(MM(__e2.X), 1), Math.Round(MM(__e2.Y), 1), Math.Round(MM(__e2.Z), 1) }};\n"
+        f"        }} }} catch {{ }}\n"
+        f"    try {{ var __tid = __el_{s}.GetTypeId();\n"
+        f"        if (__tid != null && __tid != ElementId.InvalidElementId) {{\n"
+        f"            var __te = doc.GetElement(__tid);\n"
+        f"            if (__te != null && __te.Name != null) __rb[\"type_name\"] = __te.Name;\n"
+        f"        }} }} catch {{ }}\n"
+        + rotation +
+        state +
+        f"    __results[{_cs(oid)}] = __rb;\n}}")
+
+
 def _emit_level(op: dict, ver: str, stamp: str,
                 isolation: str = "atomic") -> tuple[str, str, str, str]:
     oid = op["id"]
@@ -914,6 +1256,53 @@ def _emit_move_elements(op: dict, ver: str, stamp: str,
     return decl, create, post, readback
 
 
+EMIT_UNSUPPORTED = "KIR-E003"     # feature unsupported on this Revit version
+
+
+def _level_chain_check(el_var: str, oid: str, id_expr: str) -> str:
+    """Topology: level binding via the version-safe BIP chain (witness pattern).
+
+    ЗВЕНО ПРИНИМАЕТСЯ, ТОЛЬКО ЕСЛИ ДЕРЖИТ НАСТОЯЩИЙ ElementId. Раньше условием
+    перехода был `HasValue`, а он у параметра-ссылки истинен и когда значение
+    равно InvalidElementId: замерено 27.07 на балке —
+    `FAMILY_LEVEL_PARAM: HasValue=True, AsElementId=-1`. Цепочка обрывалась на
+    пустом звене, сравнивала «-1» с ожидаемым id и обвиняла правильно
+    построенный элемент. «Параметр заполнен» и «параметр существует» — разные
+    вещи, и различать их обязана сама цепочка."""
+    def link(bip: str, first: bool = False) -> str:
+        head = (f"Parameter __lp = {el_var}.get_Parameter(BuiltInParameter.{bip});\n"
+                if first else
+                f"    if (__lp == null || !__lp.HasValue "
+                f"|| __lp.AsElementId() == null "
+                f"|| __lp.AsElementId() == ElementId.InvalidElementId) "
+                f"__lp = {el_var}.get_Parameter(BuiltInParameter.{bip});\n")
+        return head
+    return (
+        link("FAMILY_BASE_LEVEL_PARAM", first=True)
+        + link("FAMILY_LEVEL_PARAM")
+        + link("SCHEDULE_LEVEL_PARAM")
+        + link("LEVEL_PARAM")
+        + f"    if (__lp == null || __lp.AsElementId() == null || __lp.AsElementId().ToString() != {id_expr})\n"
+        f"        __post.Add({_cs(oid + ': level binding mismatch (topology)')});")
+
+
+def _symbol_res(op: dict, s: str, oid: str, ver: str,
+                isolation: str = "atomic") -> str:
+    g = _gid(op, "symbol")
+    return (f"FamilySymbol __sy_{s} = doc.GetElement({_eid(g['id'], ver, oid)}) as FamilySymbol;\n"
+            f"if (__sy_{s} == null) {{ {refuse_stmt(oid, _cs('типоразмер не найден (модель изменилась после grounding)'), isolation)} }}\n"
+            f"if (!__sy_{s}.IsActive) {{ __sy_{s}.Activate(); doc.Regenerate(); }}")
+
+
+def _loop_pts(pts: list, name: str, z: str = "0") -> list:
+    out = [f"CurveLoop {name} = new CurveLoop();"]
+    n = len(pts)
+    for k in range(n):
+        a, b = pts[k], pts[(k + 1) % n]
+        out.append(f"{name}.Append(Line.CreateBound(P({a[0]}, {a[1]}, {z}), P({b[0]}, {b[1]}, {z})));")
+    return out
+
+
 def _emit_floor(op: dict, ver: str, stamp: str,
                 isolation: str = "atomic") -> tuple[str, str, str, str]:
     oid = op["id"]
@@ -1066,9 +1455,21 @@ def _emit_column(op: dict, ver: str, stamp: str,
         constrain = base_set + top_set
     else:
         tx, ty = top_xy[0], top_xy[1]
-        base_z = f"__lv_{s}.Elevation" + (
+        # Отметки концов оси ВЫНЕСЕНЫ в decl и лишь присваиваются в create.
+        # Свидетель наклонной колонны читает их после закрытия блока, а
+        # `__lv_`/`__ctl_` объявлены ВНУТРИ create — при per_op обёртке имя
+        # умирает на скобке, и это CS0103. Замер 10.08 на настоящем разборе
+        # `night_b13`: 6 отказов Roslyn из 6 проверок, «The name
+        # '__lv_e287178' does not exist in the current context», все шесть
+        # версий. Тот же контракт областей видимости, что у `__pfh_`/`__hl_`;
+        # структурный сторож — `test_emitter_scope_contract`, который эту
+        # ветвь не видел, пока в корпус не добавили наклонную колонну.
+        base_z = f"__axz0_{s}"
+        top_z = f"__axz1_{s}"
+        decl += f"\ndouble __axz0_{s} = 0.0;\ndouble __axz1_{s} = 0.0;"
+        base_z_expr = f"__lv_{s}.Elevation" + (
             "" if base_offset is None else f" + U({base_offset})")
-        top_z = f"__ctl_{s}.Elevation" + (
+        top_z_expr = f"__ctl_{s}.Elevation" + (
             "" if op.get("top_offset_mm") is None
             else f" + U({op['top_offset_mm']})")
         # P() converts mm->feet for the plan coords; Level.Elevation is
@@ -1077,6 +1478,8 @@ def _emit_column(op: dict, ver: str, stamp: str,
         place = (
             f"XYZ __b_{s} = P({x}, {y}, 0);\n"
             f"XYZ __tp_{s} = P({tx}, {ty}, 0);\n"
+            f"__axz0_{s} = {base_z_expr};\n"
+            f"__axz1_{s} = {top_z_expr};\n"
             f"Line __axis_{s} = Line.CreateBound(\n"
             f"    new XYZ(__b_{s}.X, __b_{s}.Y, {base_z}),\n"
             f"    new XYZ(__tp_{s}.X, __tp_{s}.Y, {top_z}));\n"
@@ -1396,32 +1799,73 @@ def _emit_hosted(op: dict, ver: str, stamp: str, kind: str,
     # hosted»), но в код доведён не был.  Правило, заведённое рассуждением и
     # не сомкнутое с кодом, — главный класс дефекта этого пакета.
     #
-    # Недостигнутый флип не молчит: постусловие ниже сравнивает состояние и
-    # НАЗЫВАЕТ причину (CanFlip*), поэтому strict честно откатывает, а report
-    # записывает расхождение.  Потерять навеску у одной двери — цена, которую
-    # видно; потерять геометрию у чужой двери — цена, которой не видно.
+    # НЕДОСТИЖИМЫЙ ФЛИП — ФАКТ О СЕМЕЙСТВЕ, А НЕ БРАК ПОСТРОЙКИ (09.08).
+    #
+    # `CanFlipHand`/`CanFlipFacing=false` — это отказ REVIT менять навеску
+    # этого типа, а не наша ошибка и не признак того, что дверь построена
+    # неправильно.  Живой корпус (`kir_witness.jsonl`, 16 красных строк
+    # create_door 21.07) показывает цену прежней формы дословно:
+    #
+    #     16:26:28  KIR-X004  committed=false  geometry_ok=true topology_ok=true
+    #       ["PD: hand flip state mismatch (semantic)",
+    #        "PD: facing flip state mismatch (semantic)"]
+    #
+    # Геометрия и топология ЗЕЛЁНЫЕ: дверь встала в нужную стену, в нужную
+    # точку, на нужной отметке.  Не сошлась одна створка — и откатилась ВСЯ
+    # программа, потому что нарушенное постусловие имеет программный масштаб.
+    # Цена по корпусу — одна правильная стена на дверь (все 16 строк это
+    # двухопные пробы `create_wall`+`create_door`); важно не это число, а то,
+    # что масштаб ПРОГРАММНЫЙ: на перестройке тем же дефектом платит целый
+    # чанк материализатора (MAX_BULK_OPS = 300).
+    #
+    # Флип теперь ОТКАЗЫВАЕТ НА МЕСТЕ, и отказ типизированный: он называет
+    # СЕМЕЙСТВО (какой именно тип не флипается) и СЛЕДУЮЩИЙ ХОД (взять другой
+    # тип) — единственный ход, который тут вообще есть, потому что обойти
+    # `CanFlip*` нечем: `MirrorElements` запрещён навсегда (см. выше).
+    # Под `per_op` отказ уносит только свой оп — соседи остаются
+    # закоммиченными; под `atomic` откат тот же, что и был, но теперь у него
+    # названа причина, а не «postconditions_violated».
+    #
+    # Ровно эта форма уже стоит у `place_family` (тот же файл, ветка
+    # `hand`/`facing`): компилятор вёл себя двумя разными способами в одной
+    # ситуации, и hosted-сторона была той, где расплачивалась вся программа.
+    #
+    # Постусловия ниже СОХРАНЕНЫ: после отказа они срабатывают только когда
+    # `CanFlip*` был true, а флип всё равно не встал — то есть на настоящем
+    # дефекте.  Хвост «— семейство не допускает флипа» остаётся верным
+    # остаточным пояснением, но основной путь теперь не он.
     #
     # NB зеркало у place_family (mirrorCopies=FALSE, на месте, не hosted)
     # трогать нечем: живых улик против него нет, и оно не создаёт копий.
-    def _flip_if_allowed(prop: str, flipper: str, canflip: str,
-                         want: str) -> str:
+    kind_ru = "двери" if kind == "door" else "окна"
+
+    def _flip_or_refuse(prop: str, flipper: str, canflip: str,
+                        want: str, human: str) -> str:
+        # `FamilySymbol.FamilyName` НЕ документирован ни в одном из шести
+        # RevitAPI.xml (замер 09.08), а `FamilySymbol.Family` документирован
+        # во всех шести — имя семейства берём через него.
+        msg = (f"{_cs('семейство «')} + __sy_{s}.Family.Name + \" / \" "
+               f"+ __sy_{s}.Name + "
+               + _cs(f"» не допускает {human} ({canflip}=false) — "
+                     f"выберите другой тип {kind_ru}"))
         return (
             f"if (__el_{s}.{prop} != {want})\n{{\n"
-            f"    if (__el_{s}.{canflip})\n    {{\n"
-            f"        __el_{s}.{flipper}();\n"
-            f"    }}\n"
+            f"    if (!__el_{s}.{canflip}) {{ {refuse_stmt(oid, msg, isolation)} }}\n"
+            f"    __el_{s}.{flipper}();\n"
             f"}}\n")
 
     mirror = ""
     hand = ""
     if has_hand:
         wantH = "true" if bool(op.get("hand_flipped", False)) else "false"
-        hand = _flip_if_allowed("HandFlipped", "flipHand", "CanFlipHand", wantH)
+        hand = _flip_or_refuse("HandFlipped", "flipHand", "CanFlipHand", wantH,
+                               "смену стороны навески")
     facing = ""
     if has_facing:
         wantF = "true" if bool(op.get("facing_flipped", False)) else "false"
-        facing = _flip_if_allowed(
-            "FacingFlipped", "flipFacing", "CanFlipFacing", wantF)
+        facing = _flip_or_refuse(
+            "FacingFlipped", "flipFacing", "CanFlipFacing", wantF,
+            "смену направления открывания")
     # __hl_<s> is read by the post block (sill check) — declared here, not in
     # the create block, so per_op isolation (create inside its own try scope)
     # never cuts it off from the post (the emitter scope contract).  The
@@ -1512,16 +1956,34 @@ def _emit_room(op: dict, ver: str, stamp: str,
     s = _safe(oid)
     x, y = op["xy"][0], op["xy"][1]
     nm = op.get("name")
+    has_number = "number" in op
+    number = op.get("number")
     lv_res, lv_idexpr = _level_expr(op, s, ver, oid, isolation)
     decl = f"Autodesk.Revit.DB.Architecture.Room __el_{s} = null;"
     rename = ""
     if nm:
         rename = (f"\ntry {{ __el_{s}.Name = {_cs(nm)}; }}\n"
                   f"catch (Exception __ex_{s}) {{ {refuse_stmt(oid, f'\"имя помещения: \" + __ex_{s}.Message', isolation)} }}")
+    renumber = ""
+    if has_number:
+        renumber = (
+            f"\nParameter __rno_set_{s} = null;\n"
+            f"try {{ __rno_set_{s} = __el_{s}.get_Parameter("
+            f"BuiltInParameter.ROOM_NUMBER); }}\n"
+            f"catch (Exception __rno_get_ex_{s})\n"
+            f"{{ {refuse_stmt(oid, f'\"чтение номера помещения: \" + __rno_get_ex_{s}.Message', isolation)} }}\n"
+            f"if (__rno_set_{s} == null || __rno_set_{s}.IsReadOnly)\n"
+            f"{{ {refuse_stmt(oid, _cs('номер помещения недоступен для записи'), isolation)} }}\n"
+            f"bool __rno_ok_{s} = false;\n"
+            f"try {{ __rno_ok_{s} = __rno_set_{s}.Set({_cs(number)}); }}\n"
+            f"catch (Exception __rno_set_ex_{s})\n"
+            f"{{ {refuse_stmt(oid, f'\"номер помещения: \" + __rno_set_ex_{s}.Message', isolation)} }}\n"
+            f"if (!__rno_ok_{s})\n"
+            f"{{ {refuse_stmt(oid, _cs('запись номера помещения отклонена Revit'), isolation)} }}")
     create = (f"// create_room {cs_line_comment_fragment(oid)}\n{lv_res}\n"
               f"__el_{s} = doc.Create.NewRoom(__lv_{s}, new UV(U({x}), U({y})));\n"
               f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('NewRoom вернул null'), isolation)} }}"
-              + rename + "\n"
+              + rename + renumber + "\n"
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
     # ИМЯ ПОМЕЩЕНИЯ ЧИТАЕТСЯ ПАРАМЕТРОМ, А НЕ `Room.Name`.
     #
@@ -1568,6 +2030,16 @@ def _emit_room(op: dict, ver: str, stamp: str,
                         f"    if (__rnm_{s} == null || __rnm_{s}.AsString() != {_cs(nm)}) "
                         f"__post.Add({_cs(oid + ': name mismatch')});\n"),
             message="name mismatch", style="guard"))
+    if has_number:
+        checks.append(WitnessCheck(
+            obligation_key="number", reader_cs="",
+            verdict_cs=(
+                f"\n    Parameter __rno_{s} = "
+                f"__el_{s}.get_Parameter(BuiltInParameter.ROOM_NUMBER);\n"
+                f"    if (__rno_{s} == null || "
+                f"__rno_{s}.AsString() != {_cs(number)}) "
+                f"__post.Add({_cs(oid + ': number mismatch (semantic)')});\n"),
+            message="number mismatch (semantic)", style="guard"))
     post = checks
     readback = (
         f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
@@ -1579,6 +2051,9 @@ def _emit_room(op: dict, ver: str, stamp: str,
         f"    try {{ Parameter __rnb_{s} = "
         f"__el_{s}.get_Parameter(BuiltInParameter.ROOM_NAME);\n"
         f"        __rb[\"name\"] = __rnb_{s} != null ? __rnb_{s}.AsString() : __el_{s}.Name; }} catch {{ }}\n"
+        f"    try {{ Parameter __rno_rb_{s} = "
+        f"__el_{s}.get_Parameter(BuiltInParameter.ROOM_NUMBER);\n"
+        f"        __rb[\"number\"] = __rno_rb_{s} != null ? __rno_rb_{s}.AsString() : null; }} catch {{ }}\n"
         f"    try {{ __rb[\"name_and_number\"] = __el_{s}.Name; }} catch {{ }}\n"
         f"    try {{ __rb[\"area_m2\"] = Math.Round(UnitUtils.ConvertFromInternalUnits(__el_{s}.Area, UnitTypeId.SquareMeters), 2); }} catch {{ }}\n"
         f"    __results[{_cs(oid)}] = __rb;\n}}")
@@ -1702,12 +2177,242 @@ def _emit_place_curve(op: dict, ver: str, stamp: str, isolation: str = "atomic")
     return decl, create, checks, readback
 
 
+def _emit_place_work_plane(op: dict, ver: str, stamp: str,
+                           isolation: str = "atomic"):
+    """`place_family` НА РАБОЧЕЙ ПЛОСКОСТИ — третья перегрузка.
+
+    Отдельная функция, а не ветка внутри точечной, по той же причине, что у
+    кривой: точечный путь заморожен корпусом байт-паритета (18 700
+    экземпляров демо), и единственный способ не сдвинуть его ни на байт — не
+    заходить в него.
+
+    ПОВОД ЗАМЕРЕН ПО КОРПУСУ (`tools/coverage_matrix.py`, 11 различных
+    документов, 11.08.2026). Лифтер отказывает «place_family ставит только
+    точечные размещения (OneLevelBased/OneLevelBasedHosted)» на:
+
+        'WorkPlaneBased'   483 элемента на 7 документах из 11
+        'TwoLevelsBased'  9392 элемента на 4 документах
+
+    Семь документов из одиннадцати — самый широкий разброс по зданиям среди
+    всех действенных строк корпуса, а по логике самой карты покрытия широкий
+    разброс означает, что неверно НАШЕ правило вообще, а не особенность
+    одного проекта.
+
+    API СНЯТ С СБОРОК, А НЕ С ДОКУМЕНТАЦИИ (11.08, рефлексия по шести
+    `RevitAPI.dll` + живая компиляция на :52412 по отдельному прогону на
+    каждую версию):
+
+        NewFamilyInstance(XYZ, FamilySymbol, XYZ refDir, Element,
+                          StructuralType)                            6/6
+        NewFamilyInstance(Reference, XYZ, XYZ, FamilySymbol)         6/6
+        FamilyPlacementType — все 10 членов                          6/6
+        FamilyInstance.HandOrientation / FacingOrientation / Host    6/6
+
+    ОСИ ВЕРСИЙ У ЭТОЙ ВЕТКИ НЕТ, и это замер, а не надежда. Попутно замерена
+    ловушка чтения рефлексии: `(XYZ, FamilySymbol, Level, StructuralType)`
+    объявлен на `Creation.Document` в 2021-2023 и на `Creation.ItemFactoryBase`
+    в 2024-2026 — он НЕ ИСЧЕЗАЛ, он переехал по цепочке наследования, и
+    дамп объявленных членов показывает это как пропажу. Тот же капкан, что
+    у `SpatialElement.Name`: спрашивать надо всю цепочку, а не класс.
+
+    ПОЧЕМУ ВЗЯТА ПЕРЕГРУЗКА С ХОСТОМ, А НЕ СО ССЫЛКОЙ НА ГРАНЬ. Вторая
+    (`Reference, XYZ, XYZ, FamilySymbol`) требует `Reference` на КОНКРЕТНУЮ
+    ГРАНЬ, а грань адресуется faceref-слоем, который живёт за флагом и
+    решает свою задачу. Перегрузка с хостом принимает элемент целиком —
+    ровно то, чем `place_family` уже адресует носителя в точечной и кривой
+    ветках. Один способ назвать хост на все три ветки, а не третий.
+
+    ═══ ЧЕГО ЭТА ВЕТКА НЕ ДАЁТ, И ЭТО НАДО ЗНАТЬ ЗАРАНЕЕ ═══
+
+    ОБРАТНОГО ХОДА У НЕЁ НЕТ, и не будет, пока не изменится ЗАХВАТ.
+    `schema.L0Element` несёт РОВНО ОДИН уровень (`level_id`) и НЕ несёт
+    ссылки на рабочую плоскость вовсе — ни поля, ни бокового индекса. То
+    есть эта волна расширяет ПРЯМОЙ ход (то, что инженер может попросить), а
+    поднять такой экземпляр обратно по-прежнему нечем: лифтер продолжит
+    отказывать, и это правильный ответ, а не регресс. Записано здесь, а не в
+    сообщении коммита, чтобы следующий замер не переоткрывал это как находку.
+    """
+    oid = op["id"]
+    s = _safe(oid)
+    x, y, z = _pt3(op["xyz"])
+    dx, dy, dz = _pt3(op["ref_dir"])
+    host = op.get("host") or {}
+    host_ref = host.get("value")
+    grounded_host = host.get("__grounded__") or {}
+    if isinstance(host_ref, str) and not grounded_host:
+        host_expr = "__el_" + _safe(host_ref)
+    elif grounded_host.get("id") is not None:
+        host_expr = f"doc.GetElement({_eid(grounded_host['id'], ver, oid)})"
+    else:
+        # Нижняя половина взаимной обязательности живёт в ветке рода —
+        # ровно тем же швом, которым её держат create_opening и
+        # create_railing: план родов не разбирает, а без носителя у этой
+        # перегрузки нет рабочей плоскости, к которой крепиться.
+        raise KirRefusal([Diagnostic(
+            code=GROUND_BAD_SELECTOR, op_id=oid, field_name="host",
+            message_ru="place_family на рабочей плоскости: носитель "
+                       "обязателен и задаётся ссылкой на оп этой же "
+                       "программы или element_id — именно он несёт "
+                       "плоскость, к которой крепится экземпляр")])
+    decl = f"FamilyInstance __el_{s} = null;\nElement __pfh_{s} = null;"
+    create = (
+        f"// place_family (рабочая плоскость) {cs_line_comment_fragment(oid)}\n"
+        + _symbol_res(op, s, oid, ver, isolation) + "\n"
+        f"__pfh_{s} = {host_expr};\n"
+        f"if (__pfh_{s} == null) {{ {refuse_stmt(oid, _cs('хост не найден'), isolation)} }}\n"
+        # РОД РАЗМЕЩЕНИЯ — ФАКТ О СЕМЕЙСТВЕ, И ОТКАЗ НАЗЫВАЕТ ЕГО ВСЛУХ.
+        #
+        # Тот же класс, что у неповорачиваемой створки двери: `CanFlip*=false`
+        # — факт о СЕМЕЙСТВЕ, и Revit не станет его переставлять. Здесь так
+        # же: попросить размещение на рабочей плоскости у семейства, которое
+        # так не ставится, — не дефект постройки, а невыполнимая просьба.
+        # Поэтому типизированный ОТКАЗ (стоит свой оп под per_op), а не
+        # нарушение постусловия (стоило бы всю программу), и в тексте едет
+        # ФАКТИЧЕСКИЙ род, чтобы автору было что исправить.
+        f"if (__sy_{s}.Family == null || __sy_{s}.Family.FamilyPlacementType "
+        f"!= FamilyPlacementType.WorkPlaneBased)\n{{ "
+        + refuse_stmt(
+            oid,
+            f'"place_family на рабочей плоскости: у семейства род размещения "'
+            f' + (__sy_{s}.Family == null ? "неизвестен"'
+            f' : __sy_{s}.Family.FamilyPlacementType.ToString())'
+            f' + ", а не WorkPlaneBased — выберите другой тип или ставьте '
+            f'точкой"',
+            isolation)
+        + " }\n"
+        # НАПРАВЛЕНИЕ — ВЕКТОР, А НЕ ТОЧКА, поэтому БЕЗ U(): перевод мм->футы
+        # на направление не влияет (масштаб направления не меняет), и
+        # написать его здесь значило бы соврать в коде о роде величины.
+        f"XYZ __pfp_{s} = new XYZ(U({x}), U({y}), U({z}));\n"
+        f"XYZ __pfd_{s} = new XYZ({dx}, {dy}, {dz});\n"
+        f"if (__pfd_{s}.IsZeroLength()) {{ "
+        + refuse_stmt(oid, _cs("ref_dir нулевой длины: направление отсчёта "
+                               "не задано"), isolation)
+        + " }\n"
+        f"try {{ __el_{s} = doc.Create.NewFamilyInstance(__pfp_{s}, __sy_{s}, "
+        f"__pfd_{s}, __pfh_{s}, "
+        f"Autodesk.Revit.DB.Structure.StructuralType.NonStructural); }}\n"
+        f"catch (Exception __ex_{s}) {{ "
+        + refuse_stmt(oid, f'"NewFamilyInstance: " + __ex_{s}.Message',
+                      isolation)
+        + " }\n"
+        f"if (__el_{s} == null) {{ "
+        + refuse_stmt(oid, _cs("NewFamilyInstance вернул null"), isolation)
+        + " }\n"
+        + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
+
+    wtol = tolerance("place_family", "location_mm")
+    checks: list[WitnessCheck] = [
+        # ГДЕ. `Location` считает Revit, а не мы: под §18.3 подпись
+        # «(geometry)» законна ровно при таком читателе.
+        WitnessCheck(
+            obligation_key="location",
+            reader_cs=f"    var __wloc_{s} = __el_{s}.Location as LocationPoint;\n",
+            verdict_cs=(
+                f"    if (__wloc_{s} == null\n"
+                f"        || Math.Abs(MM(__wloc_{s}.Point.X) - {x}) > {wtol}\n"
+                f"        || Math.Abs(MM(__wloc_{s}.Point.Y) - {y}) > {wtol}\n"
+                f"        || Math.Abs(MM(__wloc_{s}.Point.Z) - {z}) > {wtol})\n"
+                f"        __post.Add({_cs(oid + ': location mismatch (geometry)')});\n"),
+            message="location mismatch (geometry)",
+            tol=wtol, style="guard"),
+        # НА ЧЁМ. Носитель читается обратно, а не принимается на веру.
+        WitnessCheck(
+            obligation_key="host", reader_cs="",
+            verdict_cs=(
+                f"    if (__el_{s}.Host == null "
+                f"|| __el_{s}.Host.Id.ToString() != __pfh_{s}.Id.ToString())\n"
+                f"        __post.Add({_cs(oid + ': host mismatch (topology)')});\n"),
+            message="host mismatch (topology)", style="guard"),
+        # КАК ПОВЁРНУТ. Единственное, что эта ветка добавляет к точечной, —
+        # направление отсчёта, и не проверить его значило бы принять оп,
+        # чей главный операнд никто не читал.
+        #
+        # ЧИТАЕТСЯ `HandOrientation` — ВЕКТОР, КОТОРЫЙ СЧИТАЕТ REVIT по
+        # размещённому экземпляру, а не параметр, который писали мы: подпись
+        # «(geometry)» законна по §18.3 именно поэтому.
+        #
+        # СВЕРКА ПО ПАРАЛЛЕЛЬНОСТИ, А НЕ ПО РАВЕНСТВУ, и это не послабление:
+        # Revit вправе выбрать противоположный смысл того же направления
+        # (та же оговорка, что у концов стены и сегментов разделителя, где
+        # ориентацию кривой выбирает он же). Требовать один смысл значило бы
+        # заворачивать верную постройку по знаку.
+        WitnessCheck(
+            obligation_key="reference_direction",
+            reader_cs=(
+                f"    XYZ __wdir_{s} = null;\n"
+                f"    try {{ __wdir_{s} = __el_{s}.HandOrientation; }} catch {{ }}\n"
+                f"    XYZ __wwant_{s} = new XYZ({dx}, {dy}, {dz});\n"),
+            verdict_cs=(
+                f"    if (__wdir_{s} == null || __wdir_{s}.IsZeroLength())\n"
+                f"        __post.Add({_cs(oid + ': reference direction unreadable (geometry)')});\n"
+                f"    else\n"
+                f"    {{\n"
+                f"        double __wang_{s} = __wdir_{s}.AngleTo(__wwant_{s});\n"
+                f"        if (Math.Min(__wang_{s}, Math.PI - __wang_{s}) > "
+                f"Math.PI / {tolerance('place_family', 'rotation_deg').deg_rad_divisor})\n"
+                f"            __post.Add({_cs(oid + ': reference direction mismatch (geometry)')});\n"
+                f"    }}\n"),
+            message="reference direction mismatch (geometry)",
+            style="plain"),
+        # УРОВЕНЬ СВИДЕТЕЛЬСТВУЕТСЯ И ЗДЕСЬ, хотя перегрузка его не
+        # принимает: план ТРЕБУЕТ назвать уровень у любого точечного
+        # размещения (KIR-P005), а обязательство `level_binding`
+        # условно по наличию поля — значит названный уровень обязан
+        # быть прочитан обратно, иначе сертификат честно объявит
+        # клаузулу недоказанной. Читатель — ТОТ ЖЕ помощник цепочки
+        # уровня, что у точечной ветки: один вопрос, один судья.
+        level_chain_witness(f"__el_{s}", oid, _level_expr(
+            op, s, ver, oid, isolation)[1]),
+    ]
+    readback = (
+        f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
+        f"    var __rb = new Dictionary<string, object>();\n"
+        f"    __rb[\"id\"] = __el_{s}.Id.ToString();\n"
+        f"    try {{ var __wl_{s} = __el_{s}.Location as LocationPoint;\n"
+        f"        if (__wl_{s} != null) __rb[\"xyz_mm\"] = new double[] {{ "
+        f"Math.Round(MM(__wl_{s}.Point.X), 1), "
+        f"Math.Round(MM(__wl_{s}.Point.Y), 1), "
+        f"Math.Round(MM(__wl_{s}.Point.Z), 1) }}; }} catch {{ }}\n"
+        f"    try {{ if (__el_{s}.Host != null) "
+        f"__rb[\"host_id\"] = __el_{s}.Host.Id.ToString(); }} catch {{ }}\n"
+        f"    try {{ var __wo_{s} = __el_{s}.HandOrientation;\n"
+        f"        if (__wo_{s} != null) __rb[\"hand_orientation\"] = new double[] {{ "
+        f"Math.Round(__wo_{s}.X, 4), Math.Round(__wo_{s}.Y, 4), "
+        f"Math.Round(__wo_{s}.Z, 4) }}; }} catch {{ }}\n"
+        # Род размещения едет в квитанцию ФАКТОМ О СЕМЕЙСТВЕ: он объясняет и
+        # успех, и отказ выше, и его нельзя вывести из программы.
+        f"    try {{ __rb[\"placement_type\"] = "
+        f"__el_{s}.Symbol.Family.FamilyPlacementType.ToString(); }} catch {{ }}\n"
+        + _stamp_readback(f"__el_{s}") +
+        f"    __results[{_cs(oid)}] = __rb;\n}}")
+    return decl, create, checks, readback
+
+
 def _emit_place(op: dict, ver: str, stamp: str,
                 isolation: str = "atomic") -> tuple[str, str, str, str]:
     # Кривая обслуживается отдельной функцией: точечный путь ниже заморожен
     # байт-в-байт корпусом паритета и не смеет сдвинуться.
     if "p0_mm" in op and "p1_mm" in op:
+        if "ref_dir" in op:
+            # МОЛЧА ПРОГЛОТИТЬ ОПЕРАНД — ХУЖЕ, ЧЕМ ОТКАЗАТЬ. Кривая
+            # ставится перегрузкой по ссылке на носитель, у которой
+            # направления отсчёта нет вовсе; принять `ref_dir` и не
+            # использовать его значило бы построить не то, о чём
+            # просили, и отчитаться успехом.
+            raise KirRefusal([Diagnostic(
+                code=PARSE_EXCLUSIVE_FIELDS, op_id=op["id"],
+                field_name="ref_dir",
+                expected="ref_dir ЛИБО p0_mm/p1_mm",
+                got="и направление, и кривая",
+                message_ru="place_family по кривой не принимает "
+                           "ref_dir: у перегрузки по ссылке на "
+                           "носитель направления отсчёта нет — "
+                           "ориентацию задаёт сама кривая")])
         return _emit_place_curve(op, ver, stamp, isolation)
+    # Рабочая плоскость — тоже отдельная функция и по той же причине.
+    if "ref_dir" in op:
+        return _emit_place_work_plane(op, ver, stamp, isolation)
     oid = op["id"]
     s = _safe(oid)
     x, y, z = _pt3(op["xyz"])
@@ -1814,10 +2519,81 @@ def _emit_place(op: dict, ver: str, stamp: str,
             f"XYZ __pfp_{s} = new XYZ(U({x}), U({y}), U({z}) - __lv_{s}.Elevation);\n"
             f"__el_{s} = doc.Create.NewFamilyInstance(__pfp_{s}, __sy_{s}, __lv_{s}, "
             f"Autodesk.Revit.DB.Structure.StructuralType.NonStructural);\n")
+    # ── ДВА УРОВНЯ (11.08.2026): TwoLevelsBased ────────────────────────
+    #
+    # Отдельной перегрузки у Revit для этого рода НЕТ — экземпляр
+    # ставится той же точечной перегрузкой, а «до какого уровня» задаётся
+    # ПАРАМЕТРАМИ после размещения. Поэтому это не третья ветка, а
+    # ДОПИСКА к точечной, и она пуста, когда `top_level` не назван:
+    # байты каждой уже написанной программы place_family не двигаются
+    # (тот же приём, которым живут rotate/mirror/hand/facing выше).
+    #
+    # Имена параметров — те же, что у create_column, который держит этот
+    # род для колонн с 21.07: FAMILY_TOP_LEVEL_PARAM и пара смещений.
+    # Второй словарь для «верха привязки» означал бы двух судей о нём.
+    two_levels = ""
+    tl = op.get("top_level")
+    tl_idexpr = None
+    if isinstance(tl, dict) and "__grounded__" in tl:
+        # ЧИТАЕТСЯ ТЕМ ЖЕ СПОСОБОМ, ЧТО У create_column, а не вторым
+        # своим: заземлённый селектор приходит в конверте
+        # `__grounded__`, и «ссылка на оп» отличается от «готовый id»
+        # полем `via`, а не формой value. Своя проверка формы здесь
+        # давала KIR-G002 на ВЕРНОЙ программе (замер на своей же
+        # правке 11.08) — ровно тот второй судья, которого этот файл
+        # запрещает.
+        gtl = _gid(op, "top_level")
+        if gtl.get("via") == "ref":
+            tl_expr = "__el_" + _safe(gtl["ref"]) + ".Id"
+            tl_idexpr = "__el_" + _safe(gtl["ref"]) + ".Id.ToString()"
+        else:
+            tl_expr = _eid(gtl["id"], ver, oid)
+            tl_idexpr = _cs(str(gtl["id"]))
+    if tl_idexpr is not None:
+        two_levels = (
+            f"Parameter __ptl_{s} = __el_{s}.get_Parameter("
+            f"BuiltInParameter.FAMILY_TOP_LEVEL_PARAM);\n"
+            # РОД РАЗМЕЩЕНИЯ — ФАКТ О СЕМЕЙСТВЕ. Параметра верхнего
+            # уровня у одноуровневого семейства нет вовсе, и просьба
+            # невыполнима не потому, что постройка плоха, а потому, что
+            # тип другой. Отказ называет фактический род — автору есть
+            # что исправить.
+            f"if (__ptl_{s} == null || __ptl_{s}.IsReadOnly)\n{{ "
+            + refuse_stmt(
+                oid,
+                f'"place_family: у семейства нет записываемого верхнего "'
+                f' + "уровня (род размещения " + (__sy_{s}.Family == null'
+                f' ? "неизвестен" : __sy_{s}.Family.FamilyPlacementType'
+                f'.ToString()) + "), а top_level задан"',
+                isolation)
+            + " }\n"
+            f"if (!__ptl_{s}.Set({tl_expr})) {{ "
+            + refuse_stmt(oid, _cs("запись верхнего уровня отклонена "
+                                   "Revit"), isolation)
+            + " }\n")
+        for pname, bip in (("base_offset_mm",
+                            "FAMILY_BASE_LEVEL_OFFSET_PARAM"),
+                           ("top_offset_mm",
+                            "FAMILY_TOP_LEVEL_OFFSET_PARAM")):
+            if pname not in op:
+                continue
+            short = "bo" if pname == "base_offset_mm" else "to"
+            two_levels += (
+                f"Parameter __p{short}_{s} = __el_{s}.get_Parameter("
+                f"BuiltInParameter.{bip});\n"
+                f"if (__p{short}_{s} == null || __p{short}_{s}.IsReadOnly) {{ "
+                + refuse_stmt(oid, _cs(f"{pname} недоступен для записи "
+                                       f"у этого семейства"), isolation)
+                + " }\n"
+                f"if (!__p{short}_{s}.Set(U({float(op[pname])}))) {{ "
+                + refuse_stmt(oid, _cs(f"запись {pname} отклонена Revit"),
+                              isolation)
+                + " }\n")
     create = (f"// place_family {cs_line_comment_fragment(oid)}\n"
               + _symbol_res(op, s, oid, ver, isolation) + f"\n{lv_res}\n"
               + place_cs +
               f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('NewFamilyInstance вернул null'), isolation)} }}\n"
+              + two_levels
               + rotate
               + mirror
               + hand
@@ -1906,6 +2682,56 @@ def _emit_place(op: dict, ver: str, stamp: str,
                 f"        __post.Add({_cs(oid + ': facing flip state mismatch (semantic)')}\n"
                 f"            + (__el_{s}.CanFlipFacing ? \"\" : \" — семейство не допускает флипа\"));\n"),
             message="facing flip state mismatch (semantic)", style="guard"))
+    # ── СВИДЕТЕЛИ ДВУХ УРОВНЕЙ (11.08) ────────────────────────────────
+    #
+    # Сеттер без свидетеля — главный рецидивный дефект этого кода: он
+    # проходит все тесты и не доказывает ничего. Всё, что дописка выше
+    # ЗАПИСАЛА, здесь ПЕРЕЧИТЫВАЕТСЯ из документа.
+    if tl_idexpr is not None:
+        # ОСЬ — ТОПОЛОГИЯ, И ЧИТАЕТСЯ ИМЕННО ОНА: связь экземпляра с
+        # уровнем есть отношение, а не размер. Тот же род свидетеля и тот
+        # же BIP-читатель, что у базового уровня стены и опорного уровня
+        # трубы, — один вопрос, один судья.
+        checks.append(WitnessCheck(
+            obligation_key="top_level_binding",
+            reader_cs=(
+                f"    Parameter __rtl_{s} = __el_{s}.get_Parameter("
+                f"BuiltInParameter.FAMILY_TOP_LEVEL_PARAM);\n"),
+            verdict_cs=(
+                f"    if (__rtl_{s} == null\n"
+                f"        || __rtl_{s}.AsElementId() == ElementId.InvalidElementId\n"
+                f"        || __rtl_{s}.AsElementId().ToString() != {tl_idexpr})\n"
+                f"        __post.Add({_cs(oid + ': top level binding mismatch (topology)')});\n"),
+            message="top level binding mismatch (topology)", style="guard"))
+    # СМЕЩЕНИЯ ПОДПИСАНЫ СЕМАНТИКОЙ, А НЕ ГЕОМЕТРИЕЙ, И ЭТО НЕ РОБОСТЬ.
+    # §18.3: проверка, подписанная «(geometry)», чей читатель состоит
+    # ТОЛЬКО из `get_Parameter(...)`, геометрию не разряжает — читатель
+    # тут именно такой. Утверждение, которое он ДЕЙСТВИТЕЛЬНО доказывает,
+    # семантическое: «параметр держит запрошенное число». Подписать его
+    # геометрией значило бы просить исключение в списке
+    # `_ALLOWED_PARAMETER_GEOMETRY` под утверждение, которого никто не
+    # мерил; у create_column такие исключения есть и каждое оплачено
+    # разбором — здесь платить нечем, поэтому подпись честная и узкая.
+    for pname, bip, short, key in (
+            ("base_offset_mm", "FAMILY_BASE_LEVEL_OFFSET_PARAM", "rbo",
+             "base_offset"),
+            ("top_offset_mm", "FAMILY_TOP_LEVEL_OFFSET_PARAM", "rto",
+             "top_offset")):
+        if pname not in op:
+            continue
+        want = float(op[pname])
+        otol = tolerance("place_family", pname)
+        checks.append(WitnessCheck(
+            obligation_key=key,
+            reader_cs=(
+                f"    Parameter __{short}_{s} = __el_{s}.get_Parameter("
+                f"BuiltInParameter.{bip});\n"),
+            verdict_cs=(
+                f"    if (__{short}_{s} == null\n"
+                f"        || Math.Abs(MM(__{short}_{s}.AsDouble()) - {want}) > {otol})\n"
+                f"        __post.Add({_cs(oid + ': ' + pname + ' mismatch (semantic)')});\n"),
+            message=pname + " mismatch (semantic)",
+            tol=otol, style="guard"))
     checks.append(level_chain_witness(f"__el_{s}", oid, lv_idexpr))
     return decl, create, checks, _readback_block(
         s,
@@ -1979,6 +2805,12 @@ def _emit_duct(op: dict, ver: str, stamp: str,
     return decl, create, checks, _readback_block(s, oid, stamp)
 
 
+_TRAY_SECTION = (
+    ("width_mm", "RBS_CABLETRAY_WIDTH_PARAM", "width", "__twp"),
+    ("height_mm", "RBS_CABLETRAY_HEIGHT_PARAM", "height", "__thp"),
+)
+
+
 def _emit_cable_tray(op: dict, ver: str, stamp: str,
                      isolation: str = "atomic") -> tuple[str, str, str, str]:
     """Electrical.CableTray.Create(Document, trayTypeId, XYZ, XYZ, levelId)
@@ -1991,22 +2823,54 @@ def _emit_cable_tray(op: dict, ver: str, stamp: str,
     x1, y1, z1 = _pt3(op["p1_mm"])
     decl = f"Autodesk.Revit.DB.Electrical.CableTray __el_{s} = null;"
     lv_res, lv_idexpr = _level_expr(op, s, ver, oid, isolation)
+    section = ""
+    for field, bip, _key, var in _TRAY_SECTION:
+        value = op.get(field)
+        if value is None:
+            continue
+        # CableTray.Create has no sized overload; size is writable only on
+        # the new instance.  A swallowed setter error cannot become success:
+        # the independent readback below then records a mismatch and rolls
+        # the transaction back.
+        section += (
+            f"\ntry {{ Parameter {var}_{s} = __el_{s}.get_Parameter("
+            f"BuiltInParameter.{bip}); if ({var}_{s} != null && "
+            f"!{var}_{s}.IsReadOnly) {var}_{s}.Set(U({value})); }} catch {{ }}")
     create = (
         f"// create_cable_tray {cs_line_comment_fragment(oid)}\n"
         + lv_res + "\n"
         f"__el_{s} = Autodesk.Revit.DB.Electrical.CableTray.Create(doc, {_eid(tt['id'], ver, oid)}, "
         f"P({x0}, {y0}, {z0}), P({x1}, {y1}, {z1}), __lv_{s}.Id);\n"
-        f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('CableTray.Create вернул null'), isolation)} }}\n"
+        f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('CableTray.Create вернул null'), isolation)} }}"
+        + section + "\n"
         + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
     # Wave A2 model post.
+    has_section = any(op.get(field) is not None for field, *_ in _TRAY_SECTION)
     checks: list[WitnessCheck] = [
         endpoint_witness(
             f"__el_{s}", oid, op["p0_mm"], op["p1_mm"],
             tolerance("create_cable_tray", "endpoint_mm"), True),
         level_binding_witness(
             f"__el_{s}", oid, "RBS_START_LEVEL_PARAM", lv_idexpr,
-            key="reference_level"),
+            key="reference_level", tail=("" if has_section else "\n")),
     ]
+    section_tol = tolerance("create_cable_tray", "section_mm")
+    for field, bip, key, var in _TRAY_SECTION:
+        value = op.get(field)
+        if value is None:
+            continue
+        checks.append(WitnessCheck(
+            obligation_key=key,
+            reader_cs=(
+                f"\n    var {var} = __el_{s}.get_Parameter("
+                f"BuiltInParameter.{bip});\n"),
+            verdict_cs=(
+                f"    if ({var} == null)\n"
+                f"        __post.Add({_cs(oid + f': {key} mismatch — у элемента нет параметра сечения лотка')});\n"
+                f"    else if (Math.Abs(MM({var}.AsDouble()) - {value}) > "
+                f"{section_tol})\n"
+                f"        __post.Add({_cs(oid + f': {key} mismatch')});\n"),
+            message=f"{key} mismatch", tol=section_tol, style="guard"))
     return decl, create, checks, _readback_block(s, oid, stamp)
 
 
@@ -2332,15 +3196,69 @@ def _network_geometry_post(graph: dict, seg_meta: list, oid: str,
             f"            __d1 > {etol:g} || __t1 < -{etol:g} || __t1 > {lit(trim_b)})\n"
             f"          __post.Add({_cs(oid + f': segment {i} endpoints (geometry)')}); }} }}")
         if diameter is not None:
-            dia_checks.append(
-                f"    {{ try {{ var __dp = {var}.get_Parameter(BuiltInParameter.{diameter_bip});\n"
-                f"        if (__dp == null || Math.Abs(MM(__dp.AsDouble())-{lit(diameter)})>{dtol:g})\n"
-                f"          __post.Add({_cs(oid + f': segment {i} diameter (semantic)')}); }}\n"
-                f"      catch {{ __post.Add({_cs(oid + f': segment {i} diameter unreadable (semantic)')}); }} }}")
+            if op_name == "route_duct_system":
+                # У Duct отсутствие diameter — не числовое расхождение:
+                # выбранное сечение не круглое.  Разделяем причины так же,
+                # как одиночный create_duct, не меняя сам отказ или допуск.
+                dia_checks.append(
+                    f"    {{ try {{ var __dp = {var}.get_Parameter(BuiltInParameter.{diameter_bip});\n"
+                    f"        if (__dp == null)\n"
+                    f"          __post.Add({_cs(oid + f': segment {i} diameter mismatch — у элемента нет параметра диаметра: сечение не круглое, а диаметр применим только к круглому (semantic)')});\n"
+                    f"        else if (Math.Abs(MM(__dp.AsDouble())-{lit(diameter)})>{dtol:g})\n"
+                    f"          __post.Add({_cs(oid + f': segment {i} diameter (semantic)')}); }}\n"
+                    f"      catch {{ __post.Add({_cs(oid + f': segment {i} diameter unreadable (semantic)')}); }} }}")
+            else:
+                dia_checks.append(
+                    f"    {{ try {{ var __dp = {var}.get_Parameter(BuiltInParameter.{diameter_bip});\n"
+                    f"        if (__dp == null || Math.Abs(MM(__dp.AsDouble())-{lit(diameter)})>{dtol:g})\n"
+                    f"          __post.Add({_cs(oid + f': segment {i} diameter (semantic)')}); }}\n"
+                    f"      catch {{ __post.Add({_cs(oid + f': segment {i} diameter unreadable (semantic)')}); }} }}")
 
     # Возвращаются и САМИ допуски: витнес обязан объявить ТОТ объект,
     # который отрендерил число в его C# (закон 2, emit_model.py).
     return "\n".join(checks), "\n".join(dia_checks), etol, dtol
+
+
+def _network_level_post(seg_meta: list, oid: str, lv_idexpr: str) -> str:
+    """Per-segment reference-level readback for the CONNECT emitters.
+
+    ЧТО ЗДЕСЬ АВТОРСКОЕ.  ``level`` у сетевых опов — обязательный параметр, и
+    эмиттер САМ передаёт его четвёртым аргументом в ``Pipe.Create`` /
+    ``Duct.Create``.  Значит это ровно тот случай, который правило «кто
+    присваивает значение в построенном элементе» называет честным для
+    свидетеля: обещание наше, и держим его мы, а не Revit (ср. `height_mm`
+    стены под верхней привязкой — там значение выбирает Revit, и спрашивать
+    его с элемента нельзя).
+
+    ПОЧЕМУ ЭТО НЕ ВЫДУМАННЫЙ ДОПУСК.  Проверка ТОЧНАЯ: сверяется ElementId
+    уровня, число здесь не участвует вовсе, поэтому ей нечего изобретать.
+    Механизм не новый: `create_pipe` и `create_duct` читают ТОТ ЖЕ
+    ``RBS_START_LEVEL_PARAM`` тем же способом с 21.07, и живой корпус
+    (`tools/live_op_rates.py`, 1306 записей) даёт по ним 3434 и 215 построек
+    при НУЛЕ обвинений и НИ ОДНОГО нарушения «level binding» — все 35 таких
+    нарушений в корпусе принадлежат `create_beam` (29) и `create_floor` (5),
+    то есть опам, где уровень Revit ВЫВОДИТ, а не получает. Перенос допуска
+    здесь не нужен, а перенос МЕХАНИЗМА измерен.
+
+    ЗАЧЕМ ВООБЩЕ.  `acceptance._LEVEL_FROM_PARAM` уже числит все три сетевых
+    опа среди тех, у кого «уровень результата РАВЕН разрешённому селектору», и
+    строит на этом послекоммитную перепись category x level.  До сих пор это
+    утверждение нигде не проверялось: судья на нём стоял, а свидетель его не
+    читал.
+
+    Ось подписи — ``(topology)``: читается ссылка на элемент, а не координата
+    (§18.3, `tests/test_witness_axis_honesty.py`).
+    """
+    lines = []
+    for i, (var, _a, _b, _dia) in enumerate(seg_meta):
+        # Своя пара скобок на участок: имя `__lvp` иначе переобъявляется во
+        # втором сегменте — та же дисциплина, что у `__lc` выше.
+        lines.append(
+            f"    {{ var __lvp = {var}.get_Parameter(BuiltInParameter.RBS_START_LEVEL_PARAM);\n"
+            f"      if (__lvp == null || __lvp.AsElementId() == null\n"
+            f"          || __lvp.AsElementId().ToString() != {lv_idexpr})\n"
+            f"        __post.Add({_cs(oid + f': segment {i} level binding (topology)')}); }}")
+    return "\n".join(lines)
 
 
 def _hoist_segments(seg_lines: str, seg_meta: list, seg_var: str) -> tuple[str, str]:
@@ -2497,6 +3415,15 @@ def _emit_route_pipe_system(op: dict, ver: str, stamp: str,
             verdict_cs=witness,
             message="network not fully connected (topology)",
             style="guard"),
+        # Уровень стоит СРАЗУ ЗА связностью: обе проверки топологические, и
+        # общий с create_pipe_system префикс (концы / диаметр / связность)
+        # остаётся на месте — диффы трёх сетевых золотых по-прежнему
+        # читаются рядом.
+        WitnessCheck(
+            obligation_key="reference_level", reader_cs="",
+            verdict_cs="\n" + _network_level_post(seg_meta, oid, lv_idexpr) + "\n",
+            message="segment level binding (topology)",
+            style="guard"),
     ]
     if slope_witness:
         checks.append(WitnessCheck(
@@ -2586,6 +3513,12 @@ def _emit_route_duct_system(op: dict, ver: str, stamp: str,
             obligation_key="connectivity", reader_cs="",
             verdict_cs=witness,
             message="network not fully connected (topology)",
+            style="guard"),
+        # Порядок — как у route_pipe_system (см. там же).
+        WitnessCheck(
+            obligation_key="reference_level", reader_cs="",
+            verdict_cs="\n" + _network_level_post(seg_meta, oid, lv_idexpr) + "\n",
+            message="segment level binding (topology)",
             style="guard"),
     ]
     if slope_witness:
@@ -2820,8 +3753,19 @@ def _emit_load_family(op: dict, ver: str, stamp: str,
             f"    catch (Exception __ex_{s}) {{ {refuse_stmt(oid, f'\"LoadFamily: \" + __ex_{s}.Message', isolation)} }}\n"
             f"    if (!__loaded_{s} || __fam_{s} == null) {{ {refuse_stmt(oid, _cs('LoadFamily не загрузил семейство'), isolation)} }}\n"
             f"}}\n"
-            f"__el_{s} = __fam_{s}.GetFamilySymbolIds().Select(__id => doc.GetElement(__id) as FamilySymbol)\n"
-            f"    .Where(__x => __x != null).OrderBy(__x => __x.Name, StringComparer.Ordinal)\n"
+            # The symbols are found with a COLLECTOR, not with
+            # `Family.GetFamilySymbolIds()`, and that is not a preference:
+            # that member returns `ISet<ElementId>`, and on net48 `ISet<>` is
+            # declared in `System.dll`, which the DEPLOYED plugin does not
+            # reference — CS0012, the same mine that killed the decompile tag
+            # stage live on 2026-08-04. `FamilySymbol.Family` exists on all six
+            # versions and answers the same question with types from mscorlib.
+            # Same set, same ordering, same FirstOrDefault.
+            f"__el_{s} = new FilteredElementCollector(doc).OfClass(typeof(FamilySymbol))\n"
+            f"    .Cast<FamilySymbol>()\n"
+            f"    .Where(__x => __x != null && __x.Family != null\n"
+            f"                  && __x.Family.Id.ToString() == __fam_{s}.Id.ToString())\n"
+            f"    .OrderBy(__x => __x.Name, StringComparer.Ordinal)\n"
             f"    .ThenBy(__x => __x.Id.ToString(), StringComparer.Ordinal).FirstOrDefault();\n"
             f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('семейство не содержит ни одного типоразмера, который резолвится'), isolation)} }}\n"
             f"if (!__el_{s}.IsActive) {{ __el_{s}.Activate(); doc.Regenerate(); }}\n"
@@ -2899,11 +3843,167 @@ def _annot_elem_res(sel: dict, var: str, ver: str, oid: str, label: str,
             f"if ({var} == null) {{ {refuse_stmt(oid, f'\"{label}: элемент не найден (модель изменилась после grounding)\"', isolation)} }}")
 
 
+def _dim_geom_helpers_cs(s: str) -> str:
+    """C# local functions (one set per create_dimension op) that turn an
+    ELEMENT into the GEOMETRIC reference ``NewDimension`` demands, plus the
+    model-space plane that reference names.
+
+    Local functions rather than unrolled text because the same walk is needed
+    once per ref AND again for nested family geometry (recursion); they are
+    emitted into ``decl`` so ``per_op`` isolation, which wraps every create
+    block in its own scope, still sees them (scope contract).
+
+    THREE SHAPES OF GEOMETRY, ONE OF THEM DOCUMENTED-DANGEROUS:
+
+    * ``Solid`` at the top level — a wall/floor/roof/in-place body: take a
+      ``PlanarFace`` and its own ``Reference``.
+    * ``Curve`` at the top level — a datum (grid, level, reference plane) or a
+      model line.  ``Options.IncludeNonVisibleObjects`` is what makes datum
+      geometry appear at all; without it ``Grid.get_Geometry`` yields an EMPTY
+      GeometryElement, which is why every grid refused before 09.08 while the
+      registry entry advertised "элементов ИЛИ ОСЕЙ".  The measured plane of a
+      datum is the vertical plane through the line: normal = direction ×
+      View.ViewDirection.
+    * ``GeometryInstance`` — EVERY family instance (column, beam, door,
+      window, furniture, generic model): Revit stores one copy of the symbol
+      geometry and transforms it per instance, so the top level carries NO
+      Solid at all.  The old walk tested ``go as Solid`` and skipped, so the
+      op refused on the entire FamilyInstance class.
+
+      The obvious repair — ``GetInstanceGeometry()`` — is the WRONG reference,
+      and RevitAPI.xml says so verbatim for both transformed accessors: "because
+      it returns a copy the references found in the geometry objects contained
+      in this element are not suitable for creating new Revit elements
+      referencing the original element (for example, dimensioning). Only the
+      geometry returned by GetSymbolGeometry() with no transform can be used
+      for that purpose."  ``GetSymbolGeometry()`` (no argument) answers: "This
+      method returns the actual Revit geometry ... suitable for creating new
+      Revit elements referencing the original element (for example,
+      dimensioning)."  So the REFERENCE comes from symbol geometry, and the
+      POSITION does not: symbol geometry is in the symbol's local coordinate
+      space, so the point/normal are pushed through ``GeometryInstance.Transform``
+      (composed for nesting) to get back into model space.  Taking the
+      reference from one accessor and the coordinates from another is the whole
+      trick, and it is why this cannot be a single ``as Solid`` cast.
+
+    WHICH face, and why it is no longer arbitrary.  A dimension between "the
+    first planar face of A" and "the first planar face of B" is a number with
+    no meaning — Solid.Faces has no documented order, so an end face and a side
+    face could be measured against each other and the result would look fine.
+    Two rules remove the arbitrariness, both using Revit's OWN zero-length test
+    (``XYZ.IsZeroLength``) so no threshold is invented here:
+
+      1. a candidate is usable only if its normal has a non-zero projection
+         into the view plane (a face edge-on to the view cannot carry an
+         in-plane dimension direction at all);
+      2. the FIRST ref fixes the measurement normal; every later ref prefers a
+         candidate PARALLEL to it (cross product zero-length).  Preference, not
+         a gate: when nothing parallel exists the first usable candidate is
+         still handed over and ``NewDimension`` itself judges it — refusing
+         earlier than Revit would would refuse dimensions Revit accepts.
+
+    The chosen plane travels out of here (``__gpt``/``__gn``) because the
+    VALUE witness needs it: see ``_emit_dimension``."""
+    return f"""bool __dimTake_{s}(Reference __r, XYZ __o, XYZ __n, XYZ __want,
+    ref Reference __gr, ref XYZ __gp, ref XYZ __gn,
+    ref Reference __fr, ref XYZ __fp, ref XYZ __fn)
+{{
+    if (__r == null || __o == null || __n == null) return false;
+    XYZ __vd = __vw_{s}.ViewDirection;
+    XYZ __ip = __n.Subtract(__vd.Multiply(__n.DotProduct(__vd)));
+    if (__ip.IsZeroLength()) return false;
+    __ip = __ip.Normalize();
+    if (__fr == null) {{ __fr = __r; __fp = __o; __fn = __ip; }}
+    if (__want != null && !__ip.CrossProduct(__want).IsZeroLength()) return false;
+    __gr = __r; __gp = __o; __gn = __ip;
+    return true;
+}}
+void __dimWalk_{s}(GeometryElement __ge, Transform __tf, XYZ __want,
+    ref Reference __gr, ref XYZ __gp, ref XYZ __gn,
+    ref Reference __fr, ref XYZ __fp, ref XYZ __fn)
+{{
+    if (__ge == null) return;
+    foreach (GeometryObject __go in __ge)
+    {{
+        Solid __sol = __go as Solid;
+        if (__sol != null)
+        {{
+            foreach (Face __fc in __sol.Faces)
+            {{
+                PlanarFace __pf = __fc as PlanarFace;
+                if (__pf == null || __pf.Reference == null) continue;
+                if (__dimTake_{s}(__pf.Reference, __tf.OfPoint(__pf.Origin),
+                        __tf.OfVector(__pf.FaceNormal), __want,
+                        ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn)) return;
+            }}
+            continue;
+        }}
+        Curve __cv = __go as Curve;
+        if (__cv != null)
+        {{
+            if (__cv.Reference == null) continue;
+            XYZ __ca = null; XYZ __cd = null;
+            Line __cl = __cv as Line;
+            if (__cl != null) {{ __ca = __cl.Origin; __cd = __cl.Direction; }}
+            else if (__cv.IsBound) {{ __ca = __cv.GetEndPoint(0); __cd = __cv.GetEndPoint(1).Subtract(__ca); }}
+            if (__ca == null || __cd == null || __cd.IsZeroLength()) continue;
+            XYZ __cn = __cd.Normalize().CrossProduct(__vw_{s}.ViewDirection);
+            if (__cn.IsZeroLength()) continue;
+            if (__dimTake_{s}(__cv.Reference, __tf.OfPoint(__ca),
+                    __tf.OfVector(__cn.Normalize()), __want,
+                    ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn)) return;
+            continue;
+        }}
+        GeometryInstance __gi = __go as GeometryInstance;
+        if (__gi != null)
+        {{
+            __dimWalk_{s}(__gi.GetSymbolGeometry(), __tf.Multiply(__gi.Transform), __want,
+                ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn);
+            if (__gr != null) return;
+        }}
+    }}
+}}
+void __dimGeom_{s}(Element __el, XYZ __want, out Reference __gr, out XYZ __gp, out XYZ __gn)
+{{
+    __gr = null; __gp = null; __gn = null;
+    Reference __fr = null; XYZ __fp = null; XYZ __fn = null;
+    Wall __wl = __el as Wall;
+    if (__wl != null)
+    {{
+        try
+        {{
+            IList<Reference> __sf = HostObjectUtils.GetSideFaces(__wl, ShellLayerType.Exterior);
+            if (__sf != null)
+                foreach (Reference __sr in __sf)
+                {{
+                    PlanarFace __spf = __el.GetGeometryObjectFromReference(__sr) as PlanarFace;
+                    if (__spf == null) continue;
+                    if (__dimTake_{s}(__sr, __spf.Origin, __spf.FaceNormal, __want,
+                            ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn)) break;
+                }}
+        }} catch {{ }}
+    }}
+    if (__gr == null)
+    {{
+        Options __gopt = new Options();
+        __gopt.ComputeReferences = true;
+        __gopt.IncludeNonVisibleObjects = true;
+        __gopt.View = __vw_{s};
+        GeometryElement __gge = null;
+        try {{ __gge = __el.get_Geometry(__gopt); }} catch {{ }}
+        __dimWalk_{s}(__gge, Transform.Identity, __want,
+            ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn);
+    }}
+    if (__gr == null && __fr != null) {{ __gr = __fr; __gp = __fp; __gn = __fn; }}
+}}"""
+
+
 def _emit_dimension(op: dict, ver: str, stamp: str,
                     isolation: str = "atomic") -> tuple[str, str, str, str]:
     """create_dimension: doc.Create.NewDimension(view, Line, ReferenceArray[, DimensionType])
     — STABLE across 2021-2026 (no per-version branch; the 4-arg DimensionType
-    overload exists unchanged back to 2019, confirmed against revitapidocs).
+    overload exists unchanged back to 2019, re-confirmed 09.08 against the six
+    reference assemblies through the live Roslyn service, not against docs).
 
     Regenerate BEFORE reference extraction (28.07, live П11-repeat measured
     by the lead AFTER the reference/line fix below landed): the SAME typed
@@ -2933,37 +4033,85 @@ def _emit_dimension(op: dict, ver: str, stamp: str,
     caught-and-ignored.
 
     References (28.07, live E5 measurement, FAS_R23 Revit 2023 — see wave
-    report): ReferenceArray needs GEOMETRIC references (a face/edge), never
-    an ELEMENT reference — ``new Reference(element)`` compiled 6/6 (the gate
-    cannot see this) but refused LIVE: «NewDimension: The references are
-    not geometric references. Parameter name: references». Per ref, RUNTIME
-    (the category is not known at compile time for an element_id ref, and
-    even a same-program ref may not be a wall):
-      * ``as Wall`` succeeds -> ``HostObjectUtils.GetSideFaces(wall,
-        ShellLayerType.Exterior)[0]`` (E5's own recipe: two parallel walls,
-        Exterior+Exterior faces, value came out exactly the AXIS distance —
-        the value DEPENDS on which side is chosen; Exterior+Interior or
-        Interior+Interior would measure a different, also-valid distance.
-        No "the" correct value exists for the compiler to assert — see the
-        postcondition note below);
-      * otherwise (or the wall call fails/returns nothing —
-        ArgumentException is documented for hosts GetSideFaces does not
-        support): the general fallback — ``Element.Geometry(Options
-        {ComputeReferences=true, View=<this op's own view>})``, first
-        PlanarFace carrying a non-null ``.Reference``;
-      * neither found: a typed refusal (refuse_stmt), never a null smuggled
-        into ReferenceArray.
+    report): ReferenceArray needs GEOMETRIC references (a face/edge/curve),
+    never an ELEMENT reference — ``new Reference(element)`` compiled 6/6 (the
+    gate cannot see this) but refused LIVE: «NewDimension: The references are
+    not geometric references. Parameter name: references».  RevitAPI.xml says
+    the same for both overloads: "An array of geometric references to which
+    the dimension is to be bound", ArgumentException "Thrown when references
+    are not geometric references".
 
-    Postcondition (geometry): the MEASURED VALUE is not gated — which faces
-    get chosen (Exterior/Interior, above) changes it, and the compiler has
-    no independent "expected" distance to compare against for an arbitrary
-    live model. The honest postcondition is EXISTENCE (materialize/typed
-    refusal) + References.Size == requested ref count with matching
-    ElementIds (topology, unchanged by this fix — Reference.ElementId
-    reports the OWNING element for a geometric reference exactly as it did
-    for the old element reference, confirmed via RevitAPI.xml) + view
-    binding (topology). The numeric value still lands in the receipt
-    (readback ``value_mm``), un-gated, for the operator/caller to read.
+    WHAT WAS STILL WRONG AFTER THAT FIX (09.08).  The 28.07 repair covered
+    exactly one shape of element — a straight ``Wall``, via
+    ``HostObjectUtils.GetSideFaces``, the one shape E5 measured.  Everything
+    else fell to a generic walk that tested only ``go as Solid`` at the top
+    level, and TWO whole classes of element can never produce a Solid there:
+
+      * a FAMILY INSTANCE (column, beam, door, window, furniture, generic
+        model) stores its geometry as a ``GeometryInstance`` — RevitAPI.xml,
+        type summary: "The most common situation where GeometryInstances are
+        encountered is in Family instances."  The walk skipped it, so the op
+        answered every such request with the typed refusal «у элемента нет
+        геометрической ссылки для размера»;
+      * a DATUM (grid, level, reference plane) and a model line expose a
+        ``Curve``, not a Solid, and only when
+        ``Options.IncludeNonVisibleObjects`` is set — which it was not.  The
+        registry entry for this op advertises "элементов ИЛИ ОСЕЙ" in its own
+        comment, so a grid dimension was a promise the emitter could not keep.
+
+    That is the honest reading of "1 built / 3 blamed": the ONE recipe that
+    was fixed is the one that builds, and the emitter refused the rest.  The
+    fix is not "unwrap the instance" but WHICH unwrap: ``GetInstanceGeometry()``
+    is documented as returning a COPY whose "references ... are not suitable
+    for creating new Revit elements referencing the original element (for
+    example, dimensioning)" — i.e. it produces exactly the class of reference
+    NewDimension throws on, and it would have compiled 6/6 and refused live a
+    third time.  ``GetSymbolGeometry()`` with no transform is the one the API
+    names as suitable; its coordinates are symbol-local, so the point and
+    normal ride back through ``GeometryInstance.Transform``.  See
+    :func:`_dim_geom_helpers_cs` for the walk and for why the face choice is
+    no longer arbitrary.
+
+    Refusal stays typed and op-bound (``refuse_stmt``): a null is never
+    smuggled into ReferenceArray.
+
+    THE MEASURED VALUE IS NOW GATED (09.08) — and this is a reversal of the
+    28.07 note, so the reason matters.  28.07 said no expectation exists
+    because "which faces get chosen changes the value".  That was true when
+    the face was chosen arbitrarily; it stopped being true when the emitter
+    started KNOWING which plane it handed over.  The witness now compares
+    Revit's own reported number against the distance between the planes the
+    references actually name:
+
+      * project every resolved plane's point onto the dimension direction,
+        sort (the sort makes the check independent of the order Revit chose
+        to store References in — RevitAPI.xml only promises that segment N is
+        "wrapped by nth and n+1st references", i.e. an along-the-line order);
+      * consecutive differences ARE the expected segment values;
+      * read back ``Dimension.Value`` for one segment, or every
+        ``DimensionSegment.Value`` when ``NumberOfSegments > 1`` — RevitAPI.xml:
+        Value "will not have a value ... for linear dimensions with more than
+        one segment", which is why a single-segment read alone would have been
+        a check that cannot fail on a 3-ref dimension.
+
+    This is NOT a claim about the user's intent — no compiler can know whether
+    the operator wanted the exterior or the interior face.  It is the claim
+    the axis can carry: THE NUMBER REVIT PRINTED IS THE DISTANCE BETWEEN THE
+    GEOMETRY THIS DIMENSION IS BOUND TO.  It can fail, and the failures it is
+    built for are real: a family-instance transform composed wrongly (symbol
+    coordinates leaking into model space), a reference that re-associated to
+    another subelement on regeneration, or a segment/reference correspondence
+    that is not the documented one.  Any of those used to be a plausible-
+    looking number in the receipt with a green witness.
+
+    NO TOLERANCE IS INVENTED FOR IT, and none is registered: the comparison
+    runs against ``doc.Application.VertexTolerance`` — Revit's own "two points
+    within this distance are considered coincident" — read from the running
+    application at witness time.  There is no number in the emitted C# and no
+    number in the registry to drift.  The margin is not load-bearing either
+    way: both sides are exact double arithmetic over the same geometry (noise
+    ~1e-12 ft), while the defect class it separates (a wrong face, a wrong
+    transform) is off by a wall thickness or a storey.
 
     Line (28.07, same live measurement): line_at is ONE view-space point
     (KIR_DOC_SPEC.md dimension.line_at) — the ANCHOR the line passes
@@ -2972,20 +4120,18 @@ def _emit_dimension(op: dict, ver: str, stamp: str,
     backwards for the ordinary case (two parallel walls running EAST-WEST,
     separated NORTH-SOUTH) — the line must run ACROSS the measured faces
     (a perpendicular to the walls), or the references project onto
-    coincident/degenerate points. Fixed: the direction is now the FIRST
-    resolved reference's PlanarFace.FaceNormal (re-read via
-    ``Element.GetGeometryObjectFromReference`` — confirmed identical API
-    2021..2026 by reflection over RevitAPI.dll), projected into the view
-    plane (component along View.ViewDirection removed) and normalized;
-    falls back to View.RightDirection only when that normal cannot be
-    read (a non-planar/ungeometric first reference, or a normal that
-    projects to ~zero in the view plane — a face edge-on to the view).
+    coincident/degenerate points. It is now the in-view-plane normal of the
+    FIRST resolved reference, which the resolver already computed and
+    already proved non-degenerate — so the old ``View.RightDirection``
+    fallback is GONE, together with the flagged gap that described it: a ref
+    whose normal cannot project into the view plane is no longer silently
+    dimensioned along an unrelated axis, it is not a usable candidate at all.
     Dimension.Curve is documented ALWAYS UNBOUND (Revit API Developer
     Guide, "Dimensions and Constraints"): the drawn extent — and the
     position of Origin ALONG the line — is an emergent property of where
     the actual references project, never of line_at.u; only the line's
-    ANCHOR+DIRECTION are ours to state, never asserted as a postcondition
-    (see above — no gated geometry check remains for this op)."""
+    ANCHOR+DIRECTION are ours to state, and neither is asserted as a
+    postcondition (the VALUE is)."""
     oid = op["id"]
     s = _safe(oid)
     view_res = _annot_view_res(op, s, ver, oid, isolation)
@@ -2995,64 +4141,67 @@ def _emit_dimension(op: dict, ver: str, stamp: str,
     ref_lines = []
     elem_vars = []
     gref_vars = []
+    pt_vars = []
     for i, sel in enumerate(refs):
         rv = f"__rf_{s}_{i}"
         gv = f"__gref_{s}_{i}"
+        pv = f"__gpt_{s}_{i}"
+        nv = f"__gn_{s}_{i}"
         label = f"refs[{i}]"
+        # ВТОРАЯ СТУПЕНЬ СЕЛЕКТОРА: грань НАЗВАНА, а не найдена наугад.
+        #
+        # Ветка стоит ПЕРЕД общей и заменяет её целиком, потому что это два
+        # разных обещания, а не два способа сделать одно. Общая ветка ИЩЕТ
+        # годную геометрическую ссылку и вправе взять первую попавшуюся: у
+        # `NewDimension` без ссылки нет вообще ничего, и «какая-нибудь грань»
+        # лучше отказа. Названная грань — обещание другого рода: программа
+        # сказала КАКАЯ, и «какая-нибудь» здесь была бы ложью в квитанции.
+        # Поэтому здесь мощность множества решает, а не порядок перебора
+        # (см. `faceref.resolve_cs`).
+        if faceref.is_face_sel(sel):
+            el_res = _annot_elem_res(
+                faceref.inner_selector(sel), rv, ver, oid, f"{label}.of",
+                isolation).replace(f"Element {rv} =", f"{rv} =", 1)
+            ref_lines.append(
+                f"{el_res}\n"
+                f"Reference {gv} = null;\n"
+                + faceref.resolve_cs(
+                    sel, s=s, i=i, elem_var=rv, out_var=gv, oid=oid,
+                    label=label, isolation=isolation, view_var=f"__vw_{s}",
+                    refuse_stmt=refuse_stmt, cs_literal=_cs)
+                # ПОДПИСЬ СВЯЗАННОЙ ГРАНИ, снятая ДО коммита. Её читает
+                # свидетель ниже; `catch` не глотает неудачу, а СНИМАЕТ ФЛАГ,
+                # и свидетель на снятом флаге падает. Проглоченное чтение
+                # сделало бы проверку непроваливаемой — то есть хуже, чем её
+                # отсутствие.
+                + f"\ntry {{ __fbWant_{s}.Add({gv}.ConvertToStableRepresentation(doc)); }}"
+                + f"\ncatch {{ __fbOk_{s} = false; }}")
+            elem_vars.append(rv)
+            gref_vars.append(gv)
+            continue
         # assignment form: the post block reads every __rf_<s>_<i> (requested
-        # ids witness), so their declarations hoist to decl (scope contract).
-        # __gref_<s>_<i> is create-local only (never read by post/readback).
+        # ids witness) and every __gpt_<s>_<i> (value witness), so their
+        # declarations hoist to decl (scope contract).  __gref_/__gn_ are
+        # create-local; __gn_<s>_0 is read by the LATER refs of the same
+        # create block, which is the same scope.
         el_res = _annot_elem_res(sel, rv, ver, oid, label, isolation).replace(
             f"Element {rv} =", f"{rv} =", 1)
+        want = "null" if i == 0 else f"__gn_{s}_0"
         ref_lines.append(
             f"{el_res}\n"
             f"Reference {gv} = null;\n"
-            f"Wall {gv}_wall = {rv} as Wall;\n"
-            f"if ({gv}_wall != null)\n{{\n"
-            f"    try\n    {{\n"
-            f"        var {gv}_sf = HostObjectUtils.GetSideFaces({gv}_wall, ShellLayerType.Exterior);\n"
-            f"        if ({gv}_sf != null && {gv}_sf.Count > 0) {gv} = {gv}_sf[0];\n"
-            f"    }} catch {{ }}\n"
-            f"}}\n"
-            f"if ({gv} == null)\n{{\n"
-            f"    Options {gv}_opt = new Options();\n"
-            f"    {gv}_opt.ComputeReferences = true;\n"
-            f"    {gv}_opt.View = __vw_{s};\n"
-            f"    GeometryElement {gv}_ge = {rv}.get_Geometry({gv}_opt);\n"
-            f"    if ({gv}_ge != null)\n"
-            f"        foreach (GeometryObject {gv}_go in {gv}_ge)\n"
-            f"        {{\n"
-            f"            Solid {gv}_sol = {gv}_go as Solid;\n"
-            f"            if ({gv}_sol == null) continue;\n"
-            f"            foreach (Face {gv}_fc in {gv}_sol.Faces)\n"
-            f"            {{\n"
-            f"                PlanarFace {gv}_pf = {gv}_fc as PlanarFace;\n"
-            f"                if ({gv}_pf != null && {gv}_pf.Reference != null)\n"
-            f"                {{ {gv} = {gv}_pf.Reference; break; }}\n"
-            f"            }}\n"
-            f"            if ({gv} != null) break;\n"
-            f"        }}\n"
-            f"}}\n"
+            f"XYZ {nv} = null;\n"
+            f"__dimGeom_{s}({rv}, {want}, out {gv}, out {pv}, out {nv});\n"
             f"if ({gv} == null) {{ {refuse_stmt(oid, _cs(label + ': у элемента нет геометрической ссылки для размера'), isolation)} }}")
         elem_vars.append(rv)
         gref_vars.append(gv)
+        pt_vars.append(pv)
     ref_array_lines = "\n".join(ref_lines)
     ref_appends = "\n".join(
         f"__refs_{s}.Append({gv});" for gv in gref_vars)
-    # Line direction: the first resolved reference's face normal, projected
-    # into the view plane; RightDirection is the fallback (see docstring).
-    dir_lines = (
-        f"XYZ __dimDir_{s} = __vw_{s}.RightDirection;\n"
-        f"try\n{{\n"
-        f"    GeometryObject __ddgo_{s} = {elem_vars[0]}.GetGeometryObjectFromReference({gref_vars[0]});\n"
-        f"    PlanarFace __ddpf_{s} = __ddgo_{s} as PlanarFace;\n"
-        f"    if (__ddpf_{s} != null)\n"
-        f"    {{\n"
-        f"        XYZ __ddn_{s} = __ddpf_{s}.FaceNormal;\n"
-        f"        XYZ __ddInPlane_{s} = __ddn_{s}.Subtract(__vw_{s}.ViewDirection.Multiply(__ddn_{s}.DotProduct(__vw_{s}.ViewDirection)));\n"
-        f"        if (__ddInPlane_{s}.GetLength() > 1e-6) __dimDir_{s} = __ddInPlane_{s}.Normalize();\n"
-        f"    }}\n"
-        f"}} catch {{ }}")
+    # Line direction: the in-view-plane normal the resolver chose for the
+    # FIRST reference (see docstring — no View.RightDirection fallback).
+    dir_lines = f"__dimDir_{s} = __gn_{s}_0;"
     g_dimtype = op.get("dim_type")
     if g_dimtype is not None:
         dt_res = _annot_elem_res(g_dimtype, f"__dtel_{s}", ver, oid, "dim_type",
@@ -3064,8 +4213,24 @@ def _emit_dimension(op: dict, ver: str, stamp: str,
     else:
         dimtype_decl = ""
         new_dim_call = f"__el_{s} = doc.Create.NewDimension(__vw_{s}, __ln_{s}, __refs_{s});"
+    named_faces = [i for i, sel in enumerate(refs) if faceref.is_face_sel(sel)]
     decl = (f"Dimension __el_{s} = null;\nView __vw_{s} = null;\n"
-            + "\n".join(f"Element {v} = null;" for v in elem_vars))
+            + "\n".join(f"Element {v} = null;" for v in elem_vars) + "\n"
+            + "\n".join(f"XYZ {v} = null;" for v in pt_vars) + "\n"
+            + f"XYZ __dimDir_{s} = null;\n"
+            + _dim_geom_helpers_cs(s))
+    if named_faces:
+        # Всё это появляется ТОЛЬКО при названной грани: без неё программа
+        # обязана быть побайтово прежней (закон выключенного флага).
+        # СЛИЯНИЕ 09.08: объявления волны размеров (точки, направление и
+        # помощники геометрии) и объявления волны названных граней стоят
+        # ОДНО ЗА ДРУГИМ, а не вместо друг друга — обе волны дописывали в один
+        # блок `decl`, и любая победившая сторона унесла бы у другой имя,
+        # которое её же POST-блок читает (правило области видимости: имя,
+        # прочитанное свидетелем, обязано быть объявлено в `decl`).
+        decl += (f"\nList<string> __fbWant_{s} = new List<string>();"
+                 f"\nbool __fbOk_{s} = true;\n"
+                 + faceref.walk_helpers_cs(s))
     create = (
         f"// create_dimension {cs_line_comment_fragment(oid)}\n{view_res}\n"
         f"doc.Regenerate();\n"
@@ -3082,20 +4247,15 @@ def _emit_dimension(op: dict, ver: str, stamp: str,
         f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('NewDimension вернул null'), isolation)} }}\n"
         + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
     requested_ids = ", ".join(f"{var}.Id.ToString()" for var in elem_vars)
+    proj_pushes = "\n".join(
+        f"    __proj_{s}.Add({pv}.DotProduct(__dimDir_{s}));" for pv in pt_vars)
     # topology: References bound to exactly the requested element ids
     # (SPEC witness triple — topology_ok; Reference.ElementId reports the
     # OWNING element for a geometric reference exactly as it did for the
-    # retired element reference, confirmed via RevitAPI.xml — unaffected by
-    # the 28.07 reference fix). No gated GEOMETRY obligation remains for
-    # this op (28.07): the measured VALUE depends on which faces got
-    # resolved (Exterior/Interior — see the emitter docstring), the
-    # compiler has no independent "expected" distance for an arbitrary live
-    # model to compare it against, and Dimension.Curve is documented ALWAYS
-    # UNBOUND (Revit API Developer Guide, "Dimensions and Constraints") so
-    # even Origin's position is emergent from where the actual references
-    # project — never of our line_at. The honest postcondition is
-    # EXISTENCE + References topology + view binding; the numeric value
-    # still reaches the caller, un-gated, via readback's ``value_mm``.
+    # retired element reference, confirmed via RevitAPI.xml).  geometry: the
+    # measured value against the planes those references name (09.08 — see
+    # the emitter docstring for why this became derivable and why no
+    # tolerance is registered for it).
     post = [
         WitnessCheck(
             obligation_key="in_view", reader_cs="",
@@ -3118,13 +4278,277 @@ def _emit_dimension(op: dict, ver: str, stamp: str,
                 f"        __post.Add({_cs(oid + ': References do not match requested refs (topology)')});\n"),
             message="References do not match requested refs (topology)",
             style="guard"),
+        WitnessCheck(
+            obligation_key="value",
+            reader_cs=(
+                f"    var __proj_{s} = new List<double>();\n"
+                f"{proj_pushes}\n"
+                f"    __proj_{s}.Sort();\n"
+                f"    var __expect_{s} = new List<double>();\n"
+                f"    for (int __pi = 0; __pi + 1 < __proj_{s}.Count; __pi++)\n"
+                f"        __expect_{s}.Add(__proj_{s}[__pi + 1] - __proj_{s}[__pi]);\n"
+                f"    var __got_{s} = new List<double>(); bool __valRead_{s} = true;\n"
+                f"    try\n"
+                f"    {{\n"
+                f"        if (__el_{s}.NumberOfSegments > 1)\n"
+                f"            foreach (DimensionSegment __sg_{s} in __el_{s}.Segments)\n"
+                f"                __got_{s}.Add(__sg_{s}.Value ?? double.NaN);\n"
+                f"        else __got_{s}.Add(__el_{s}.Value ?? double.NaN);\n"
+                f"    }}\n"
+                f"    catch {{ __valRead_{s} = false; }}\n"
+                f"    double __vtol_{s} = doc.Application.VertexTolerance;\n"),
+            verdict_cs=(
+                f"    bool __valBad_{s} = !__valRead_{s} || __got_{s}.Count != __expect_{s}.Count;\n"
+                f"    if (!__valBad_{s})\n"
+                f"        for (int __vi = 0; __vi < __expect_{s}.Count; __vi++)\n"
+                f"            if (double.IsNaN(__got_{s}[__vi]) ||\n"
+                f"                Math.Abs(__got_{s}[__vi] - __expect_{s}[__vi]) > __vtol_{s})\n"
+                f"                __valBad_{s} = true;\n"
+                f"    if (__valBad_{s})\n"
+                f"        __post.Add({_cs(oid + ': measured value is not the distance between the referenced geometry (geometry)')});\n"),
+            message="measured value is not the distance between the referenced geometry (geometry)",
+            style="guard"),
     ]
+    if named_faces:
+        # ЧТО ЭТА ПРОВЕРКА УТВЕРЖДАЕТ, СЛОВО В СЛОВО: грань, которую резолвер
+        # выбрал ДО коммита, присутствует среди `References` ПОСТРОЕННОГО
+        # размера ПОСЛЕ коммита — сверка по `ConvertToStableRepresentation`,
+        # то есть по подписи самой ГРАНИ, а не её владельца.
+        #
+        # ПОЧЕМУ ЭТОГО НЕ ГОВОРИТ СОСЕДНЯЯ ПРОВЕРКА `references`. Та читает
+        # `Reference.ElementId` — ВЛАДЕЛЬЦА геометрической ссылки. Она
+        # одинаково зелена, к какой бы грани того же элемента размер ни
+        # привязался, и потому о названной грани не говорит НИЧЕГО.
+        #
+        # ПОЧЕМУ ОНА НЕ ВАКУУМНА: эмитируется только при названной грани,
+        # значит `__fbWant` непуст по построению. Провалиться ей есть на чём,
+        # и отказы, ради которых она написана, — настоящие: ссылка,
+        # переассоциировавшаяся на другой подэлемент при регенерации, или
+        # `NewDimension`, связавшийся не с тем, что ему передали.
+        #
+        # ЧЕГО ОНА НЕ ДОКАЗЫВАЕТ, И ЭТО СКАЗАНО ПРЯМО: что выбранная грань —
+        # ТА, КОТОРУЮ ХОТЕЛ АВТОР. Наружная против внутренней компилятору
+        # неизвестна; ось несёт ровно то, что может нести.
+        #
+        # НЕ ПРОВЕРЕНО ЖИВЬЁМ (09.08): равенство подписи ДО и ПОСЛЕ коммита
+        # офлайн не устанавливается — Revit вправе переписать представление
+        # при регенерации. Это ПЕРВАЯ живая проверка этой ветки; см. docs.
+        post.append(WitnessCheck(
+            obligation_key="named_face_binding",
+            reader_cs=(
+                f"    var __fbActual_{s} = new List<string>();\n"
+                f"    bool __fbRead_{s} = __fbOk_{s};\n"
+                f"    try {{ foreach (Reference __fbR in __el_{s}.References) "
+                f"if (__fbR != null) "
+                f"__fbActual_{s}.Add(__fbR.ConvertToStableRepresentation(doc)); }}\n"
+                f"    catch {{ __fbRead_{s} = false; }}\n"),
+            verdict_cs=(
+                f"    if (!__fbRead_{s} || "
+                f"!__fbWant_{s}.All(__fbW => __fbActual_{s}.Contains(__fbW)))\n"
+                f"        __post.Add({_cs(oid + ': named face is not among the built dimension References (topology)')});\n"),
+            message="named face is not among the built dimension References (topology)",
+            style="guard"))
     readback = (
         f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
         f"    var __rb = new Dictionary<string, object>();\n"
         f"    __rb[\"id\"] = __el_{s}.Id.ToString();\n"
         + _stamp_readback(f"__el_{s}") +
         f"    try {{ __rb[\"value_mm\"] = Math.Round(MM(__el_{s}.Value ?? 0.0), 1); }} catch {{ }}\n"
+        f"    try {{ __rb[\"references\"] = __el_{s}.References.Size; }} catch {{ }}\n"
+        f"    __results[{_cs(oid)}] = __rb;\n}}")
+    return decl, create, post, readback
+
+
+def _emit_angular_dimension(op: dict, ver: str, stamp: str,
+                            isolation: str = "atomic") -> tuple[str, str, str, str]:
+    """create_angular_dimension: ``AngularDimension.Create(doc, view, Arc,
+    IList<Reference>, DimensionType)``.
+
+    VERSION AXIS: NONE.  Measured 09.08 against the six reference assemblies
+    through the live Roslyn service (not against docs, and not against
+    ``revit_api_db.json``): the 5-argument overload compiles on 2021, 2022,
+    2023, 2024, 2025 AND 2026 — RevitAPI.xml dates it to 2017.  That is worth
+    stating because the rest of the family does NOT behave this way:
+    ``LinearDimension.Create`` / ``RadialDimension.Create`` /
+    ``ArcLengthDimension.Create`` are 2025-2026 only (CS0103 "the name does
+    not exist" on 2021-2024), and ``NewDiameterDimension`` /
+    ``NewRadialDimension`` / ``NewAngularDimension`` / ``NewModelText`` live on
+    ``FamilyItemFactory`` alone — ``doc.Create.NewDiameterDimension`` is CS1061
+    on all six, only ``doc.FamilyCreate`` has them, i.e. FAMILY EDITOR ONLY and
+    unusable for the project documents this compiler authors.
+
+    THE ARC IS DERIVED, NOT ASKED FOR.  RevitAPI.xml constrains the call:
+    "References should be: at least two, non parallel and RAYS OF THE ARC
+    passed".  So the arc is not decoration — its centre must be the vertex
+    where the two referenced planes meet, and its two endpoints must sit on
+    those planes.  Asking the author for a centre and a radius would invite
+    exactly the silently-wrong outcome this op exists to avoid (an arc that
+    misses the vertex still compiles, and Revit would either refuse or measure
+    something else).  Everything is therefore computed at RUNTIME from the two
+    references the resolver already returns (point + in-view-plane unit
+    normal, see :func:`_dim_geom_helpers_cs`) plus the ONE view-space point the
+    author does give:
+
+      * vertex — the 2x2 solve of the two plane equations in the view's own
+        (Right, Up) basis.  Because both normals are unit and lie in the view
+        plane, the determinant IS ``sin`` of the angle between them, so
+        "parallel references" needs no invented epsilon: it is compared with
+        ``doc.Application.AngleTolerance`` — the API's own "two angle
+        measurements closer than this value are considered identical";
+      * radius — the distance from that vertex to ``at``.  The author's point
+        is the arc, not a hint about it;
+      * WHICH pair of rays — the four ray combinations give four different
+        angles, and ``at`` disambiguates: each ray is the in-plane direction
+        along its own reference, signed toward ``at``.  This is the same law
+        as create_dimension's line_at (one point, no extra parameter) and it
+        means the op cannot silently measure the supplement of what the author
+        pointed at.
+
+    THE VALUE IS GATED, on the same principle as create_dimension (09.08): the
+    sweep angle is known at creation time because we built the arc from the two
+    rays, so ``Dimension.Value`` — radians, Revit's internal angle unit — has
+    an independent expectation to be compared against, with
+    ``Application.AngleTolerance`` read from the running application.  No
+    number is invented and none is registered.  What is NOT proven offline is
+    that Revit reports the sweep of the arc we passed rather than its
+    supplement; if it does not, this witness makes the FIRST live run refuse
+    loudly instead of returning a plausible angle — which is the whole point of
+    gating it.
+
+    Refusals are typed and op-bound (``refuse_stmt``): parallel references, an
+    ``at`` that lands on the vertex, a degenerate arc, and a document with no
+    default angular DimensionType each name themselves."""
+    oid = op["id"]
+    s = _safe(oid)
+    view_res = _annot_view_res(op, s, ver, oid, isolation)
+    refs = op["refs"]
+    u, w = op["at"]
+    at_cs = docspace.emit_view2d_to_xyz_cs(f"__vw_{s}", u, w)
+    ref_lines = []
+    elem_vars = []
+    gref_vars = []
+    for i, sel in enumerate(refs):
+        rv = f"__rf_{s}_{i}"
+        gv = f"__gref_{s}_{i}"
+        pv = f"__gpt_{s}_{i}"
+        nv = f"__gn_{s}_{i}"
+        label = f"refs[{i}]"
+        el_res = _annot_elem_res(sel, rv, ver, oid, label, isolation).replace(
+            f"Element {rv} =", f"{rv} =", 1)
+        # ``want`` stays null for BOTH refs here: create_dimension prefers a
+        # PARALLEL second candidate because it measures a distance; an angle
+        # needs the opposite, and a parallel pair is a typed refusal below.
+        ref_lines.append(
+            f"{el_res}\n"
+            f"Reference {gv} = null;\n"
+            f"__dimGeom_{s}({rv}, null, out {gv}, out {pv}, out {nv});\n"
+            f"if ({gv} == null) {{ {refuse_stmt(oid, _cs(label + ': у элемента нет геометрической ссылки для размера'), isolation)} }}")
+        elem_vars.append(rv)
+        gref_vars.append(gv)
+    g_dimtype = op.get("dim_type")
+    if g_dimtype is not None:
+        dt_res = _annot_elem_res(g_dimtype, f"__dtel_{s}", ver, oid, "dim_type",
+                                 isolation)
+        dimtype_decl = (
+            f"{dt_res}\n"
+            f"DimensionType __dt_{s} = __dtel_{s} as DimensionType;\n"
+            f"if (__dt_{s} == null) {{ {refuse_stmt(oid, _cs('dim_type: элемент не DimensionType'), isolation)} }}")
+    else:
+        dimtype_decl = (
+            f"DimensionType __dt_{s} = doc.GetElement(doc.GetDefaultElementTypeId(\n"
+            f"    ElementTypeGroup.AngularDimensionType)) as DimensionType;\n"
+            f"if (__dt_{s} == null) {{ {refuse_stmt(oid, _cs('dim_type: в документе нет типа углового размера по умолчанию — назовите dim_type явно'), isolation)} }}")
+    decl = (f"AngularDimension __el_{s} = null;\nView __vw_{s} = null;\n"
+            + "\n".join(f"Element {v} = null;" for v in elem_vars) + "\n"
+            + "\n".join(f"XYZ __gpt_{s}_{i} = null;" for i in range(len(refs)))
+            + "\n"
+            + "\n".join(f"XYZ __gn_{s}_{i} = null;" for i in range(len(refs)))
+            + "\n"
+            + f"double __asw_{s} = 0.0;\n"
+            + _dim_geom_helpers_cs(s))
+    create = (
+        f"// create_angular_dimension {cs_line_comment_fragment(oid)}\n{view_res}\n"
+        f"doc.Regenerate();\n"
+        + "\n".join(ref_lines) + "\n"
+        f"XYZ __aR_{s} = __vw_{s}.RightDirection;\n"
+        f"XYZ __aU_{s} = __vw_{s}.UpDirection;\n"
+        f"XYZ __aO_{s} = __vw_{s}.Origin;\n"
+        f"double __aa0_{s} = __gn_{s}_0.DotProduct(__aR_{s});\n"
+        f"double __ab0_{s} = __gn_{s}_0.DotProduct(__aU_{s});\n"
+        f"double __ac0_{s} = __gpt_{s}_0.Subtract(__aO_{s}).DotProduct(__gn_{s}_0);\n"
+        f"double __aa1_{s} = __gn_{s}_1.DotProduct(__aR_{s});\n"
+        f"double __ab1_{s} = __gn_{s}_1.DotProduct(__aU_{s});\n"
+        f"double __ac1_{s} = __gpt_{s}_1.Subtract(__aO_{s}).DotProduct(__gn_{s}_1);\n"
+        f"double __adet_{s} = __aa0_{s} * __ab1_{s} - __aa1_{s} * __ab0_{s};\n"
+        f"if (Math.Abs(__adet_{s}) <= doc.Application.AngleTolerance) "
+        f"{{ {refuse_stmt(oid, _cs('refs: ссылки параллельны — у угла нет вершины'), isolation)} }}\n"
+        f"XYZ __avx_{s} = __aO_{s}\n"
+        f"    .Add(__aR_{s}.Multiply((__ac0_{s} * __ab1_{s} - __ac1_{s} * __ab0_{s}) / __adet_{s}))\n"
+        f"    .Add(__aU_{s}.Multiply((__aa0_{s} * __ac1_{s} - __aa1_{s} * __ac0_{s}) / __adet_{s}));\n"
+        f"XYZ __aat_{s} = {at_cs};\n"
+        f"XYZ __arv_{s} = __aat_{s}.Subtract(__avx_{s});\n"
+        f"if (__arv_{s}.IsZeroLength()) "
+        f"{{ {refuse_stmt(oid, _cs('at: точка совпала с вершиной угла — у дуги размера нулевой радиус'), isolation)} }}\n"
+        f"XYZ __ad0_{s} = __gn_{s}_0.CrossProduct(__vw_{s}.ViewDirection).Normalize();\n"
+        f"if (__ad0_{s}.DotProduct(__arv_{s}) < 0.0) __ad0_{s} = __ad0_{s}.Negate();\n"
+        f"XYZ __ad1_{s} = __gn_{s}_1.CrossProduct(__vw_{s}.ViewDirection).Normalize();\n"
+        f"if (__ad1_{s}.DotProduct(__arv_{s}) < 0.0) __ad1_{s} = __ad1_{s}.Negate();\n"
+        f"XYZ __ay_{s} = __vw_{s}.ViewDirection.CrossProduct(__ad0_{s}).Normalize();\n"
+        f"if (__ay_{s}.DotProduct(__ad1_{s}) < 0.0) __ay_{s} = __ay_{s}.Negate();\n"
+        f"__asw_{s} = Math.Atan2(__ad1_{s}.DotProduct(__ay_{s}), __ad1_{s}.DotProduct(__ad0_{s}));\n"
+        f"Arc __arc_{s};\n"
+        f"try {{ __arc_{s} = Arc.Create(__avx_{s}, __arv_{s}.GetLength(), 0.0, __asw_{s}, __ad0_{s}, __ay_{s}); }}\n"
+        f"catch (Exception __ex_{s}) {{ {refuse_stmt(oid, f'\"at: вырожденная дуга углового размера: \" + __ex_{s}.Message', isolation)} }}\n"
+        f"{dimtype_decl}\n"
+        f"IList<Reference> __arefs_{s} = new List<Reference>();\n"
+        + "\n".join(f"__arefs_{s}.Add({gv});" for gv in gref_vars) + "\n"
+        f"try {{ __el_{s} = AngularDimension.Create(doc, __vw_{s}, __arc_{s}, __arefs_{s}, __dt_{s}); }}\n"
+        f"catch (Exception __ex2_{s}) {{ {refuse_stmt(oid, f'\"AngularDimension.Create: \" + __ex2_{s}.Message', isolation)} }}\n"
+        f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('AngularDimension.Create вернул null'), isolation)} }}\n"
+        + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
+    requested_ids = ", ".join(f"{var}.Id.ToString()" for var in elem_vars)
+    post = [
+        WitnessCheck(
+            obligation_key="in_view", reader_cs="",
+            verdict_cs=(
+                f"    if (__el_{s}.OwnerViewId.ToString() != __vw_{s}.Id.ToString())\n"
+                f"        __post.Add({_cs(oid + ': angular dimension belongs to wrong view (topology)')});\n"),
+            message="angular dimension belongs to wrong view (topology)",
+            style="guard"),
+        WitnessCheck(
+            obligation_key="references",
+            reader_cs=(
+                f"    var __requested_{s} = new List<string>() {{ {requested_ids} }};\n"
+                f"    var __actual_{s} = new List<string>(); bool __refsReadable_{s} = true;\n"
+                f"    try {{ foreach (Reference __rr in __el_{s}.References) "
+                f"if (__rr != null && __rr.ElementId != null) __actual_{s}.Add(__rr.ElementId.ToString()); }}\n"
+                f"    catch {{ __refsReadable_{s} = false; }}\n"),
+            verdict_cs=(
+                f"    if (!__refsReadable_{s} || __actual_{s}.Count != __requested_{s}.Count ||\n"
+                f"        !__actual_{s}.OrderBy(__x => __x, StringComparer.Ordinal).SequenceEqual(\n"
+                f"            __requested_{s}.OrderBy(__x => __x, StringComparer.Ordinal)))\n"
+                f"        __post.Add({_cs(oid + ': References do not match requested refs (topology)')});\n"),
+            message="References do not match requested refs (topology)",
+            style="guard"),
+        WitnessCheck(
+            obligation_key="value",
+            reader_cs=(
+                f"    double __agot_{s} = double.NaN; bool __aRead_{s} = true;\n"
+                f"    try {{ __agot_{s} = __el_{s}.Value ?? double.NaN; }}\n"
+                f"    catch {{ __aRead_{s} = false; }}\n"),
+            verdict_cs=(
+                f"    if (!__aRead_{s} || double.IsNaN(__agot_{s}) ||\n"
+                f"        Math.Abs(__agot_{s} - __asw_{s}) > doc.Application.AngleTolerance)\n"
+                f"        __post.Add({_cs(oid + ': measured angle is not the sweep of the arc built from the references (geometry)')});\n"),
+            message="measured angle is not the sweep of the arc built from the references (geometry)",
+            style="guard"),
+    ]
+    readback = (
+        f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
+        f"    var __rb = new Dictionary<string, object>();\n"
+        f"    __rb[\"id\"] = __el_{s}.Id.ToString();\n"
+        + _stamp_readback(f"__el_{s}") +
+        f"    try {{ __rb[\"value_deg\"] = Math.Round((__el_{s}.Value ?? 0.0) * 180.0 / Math.PI, 3); }} catch {{ }}\n"
         f"    try {{ __rb[\"references\"] = __el_{s}.References.Size; }} catch {{ }}\n"
         f"    __results[{_cs(oid)}] = __rb;\n}}")
     return decl, create, post, readback
@@ -3199,15 +4623,23 @@ def _emit_tag(op: dict, ver: str, stamp: str,
     # readback API itself drifts (see docstring) — branched in PYTHON, one
     # call emitted per version, never a dual try/catch of both members.
     if ver >= "2022":
-        # >=2022: GetTaggedLocalElementIds() exists (2022 also still compiles
-        # the deprecated TaggedLocalElementId property, but the new method is
-        # correct on both 2022 and 2023+ so there is no need to branch here).
+        # >=2022: the multi-target readback exists (2022 also still compiles the
+        # deprecated TaggedLocalElementId property, but the new member is correct
+        # on both 2022 and 2023+ so there is no need to branch here).
+        #
+        # GetTaggedLocalElement*S*, not ...ElementIds, and that is not a style
+        # choice: `GetTaggedLocalElementIds()` returns `ISet<ElementId>`, and on
+        # net48 `ISet<>` lives in `System.dll`, which the DEPLOYED plugin does
+        # not reference — CS0012, measured live on 2026-08-04 (the decompile tag
+        # stage died on it). The sibling member returns `ICollection<Element>`
+        # (mscorlib), exists on the same 2022-2026, and answers the same
+        # question. See `kukai/ir/decompile/tag_extract.py:_TAG_TARGET_2022_CS`.
         bound_expr = (
             f"    try\n    {{\n"
-            f"        foreach (var __tid in __el_{s}.GetTaggedLocalElementIds())\n"
-            f"            if (__tid.ToString() == __tg_{s}.Id.ToString()) {{ __bound_{s} = true; break; }}\n"
+            f"        foreach (Element __tel in __el_{s}.GetTaggedLocalElements())\n"
+            f"            if (__tel != null && __tel.Id.ToString() == __tg_{s}.Id.ToString()) {{ __bound_{s} = true; break; }}\n"
             f"    }} catch {{ }}\n")
-    else:  # <=2021: GetTaggedLocalElementIds does not exist yet
+    else:  # <=2021: the multi-target readback does not exist yet
         bound_expr = (
             f"    try {{ __bound_{s} = __el_{s}.TaggedLocalElementId.ToString() == __tg_{s}.Id.ToString(); }}\n"
             f"    catch {{ }}\n")
@@ -3230,9 +4662,11 @@ def _emit_tag(op: dict, ver: str, stamp: str,
             obligation_key="head_at", reader_cs="",
             verdict_cs=(
                 f"    try\n    {{\n"
-                f"        var __rel_{s} = __el_{s}.TagHeadPosition - __vw_{s}.Origin;\n"
-                f"        double __ou_{s} = MM(__rel_{s}.DotProduct(__vw_{s}.RightDirection));\n"
-                f"        double __ow_{s} = MM(__rel_{s}.DotProduct(__vw_{s}.UpDirection));\n"
+                # ОДИН закон обратного хода на всё семейство (docspace):
+                # байты те же, что были набраны здесь руками.
+                + docspace.emit_xyz_to_view2d_cs(
+                    f"__vw_{s}", f"__el_{s}.TagHeadPosition", f"__rel_{s}",
+                    f"__ou_{s}", f"__ow_{s}", indent=" " * 8) +
                 f"        if (Math.Abs(__ou_{s} - {round(u, 2)}) > {htol} || Math.Abs(__ow_{s} - {round(w, 2)}) > {htol})\n"
                 f"            __post.Add({_cs(oid + ': tag head differs from at (geometry)')});\n"
                 f"    }} catch {{ __post.Add({_cs(oid + ': tag head unreadable (geometry)')}); }}\n"),
@@ -3406,9 +4840,10 @@ def _emit_text(op: dict, ver: str, stamp: str,
         verdict_cs=(
             f"    try\n    {{\n"
             f"        var __loc_{s} = __el_{s}.Coord;\n"
-            f"        var __rel_{s} = __loc_{s} - __vw_{s}.Origin;\n"
-            f"        double __ou_{s} = MM(__rel_{s}.DotProduct(__vw_{s}.RightDirection));\n"
-            f"        double __ow_{s} = MM(__rel_{s}.DotProduct(__vw_{s}.UpDirection));\n"
+            # ОДИН закон обратного хода на всё семейство (docspace).
+            + docspace.emit_xyz_to_view2d_cs(
+                f"__vw_{s}", f"__loc_{s}", f"__rel_{s}",
+                f"__ou_{s}", f"__ow_{s}", indent=" " * 8) +
             f"        if (Math.Abs(__ou_{s} - {round(u, 2)}) > {attol} || Math.Abs(__ow_{s} - {round(w, 2)}) > {attol})\n"
             f"            __post.Add({_cs(oid + ': at смещена относительно заданной точки вида (geometry)')});\n"
             f"    }} catch {{ __post.Add({_cs(oid + ': text position unreadable (geometry)')}); }}\n"),
@@ -3432,6 +4867,222 @@ def _emit_text(op: dict, ver: str, stamp: str,
     return decl, create, post, readback
 
 
+def _emit_filled_region(op: dict, ver: str, stamp: str,
+                        isolation: str = "atomic") -> tuple[str, str, str, str]:
+    """create_filled_region: ``FilledRegion.Create(doc, typeId, viewId,
+    IList<CurveLoop>)`` — 6/6 по эталонным сборкам, без единой развилки версий.
+
+    ДВА ПОДЪЯЗЫКА В ОДНОМ ОПЕ, И ШОВ МЕЖДУ НИМИ — ЕДИНСТВЕННОЕ, ЧТО ЗДЕСЬ
+    НЕТРИВИАЛЬНО. CONTOUR отдаёт канонические рёбра (вся дуговая арифметика уже
+    посчитана в питоне), docspace отдаёт базис вида. Петля собирается ТЕМ ЖЕ
+    ``contour.emit_loop_cs``, но с форматтером точки, который кладёт [u,v] в
+    плоскость вида, — потому что ``FilledRegion.Create`` отвергает петлю, не
+    параллельную эскизной плоскости вида (RevitAPI.xml дословно), а прежний
+    форматтер строит в плоскости XY модели, то есть верен только на планах.
+    Одна формула на прямой ход живёт в ``docspace._view2d_to_xyz_expr``, и
+    обратный ход свидетеля берётся оттуда же — тождественность, а не сходство.
+
+    ТРИ ОТКАЗА ДО ВСЯКОЙ C#, каждый — потому что иначе получился бы молчаливо
+    неверный результат, а не ошибка:
+
+    * ``in_view: ref`` — общий отказ семейства (``_annot_view_res``): ни один
+      оп KIR не создаёт View, значит ``as View`` не скомпилировался бы никогда;
+    * ``at_grid`` внутри контура — адрес от осей даёт МОДЕЛЬНЫЕ координаты, а
+      поле объявлено видовым. На плане с мировым базисом числа совпадают, на
+      разрезе — означают другое место; ровно путаница пространств, которую
+      docspace делает невыразимой для точек, и она не должна протекать через
+      контур;
+    * координата вне рабочего предела — тот же ``check_pt_view2d``, что стоит у
+      ``at`` марки и текста, применённый к вершинам ОПУЩЕННОГО контура (у
+      CONTOUR собственного предела координат нет вовсе).
+
+    Тип: опущенный разрешается документным умолчанием
+    (``ElementTypeGroup.FilledRegionType`` — компилируется 6/6), названный —
+    пулом ``filled_region_types``. Обе ветки проходят
+    ``FilledRegion.IsValidFilledRegionTypeId`` ДО вызова: он дешевле
+    исключения внутри транзакции и называет ошибку точнее.
+    ``IsRegionCreationEnabledInView`` для симметрии НЕ используется — он описан
+    в RevitAPI.xml и отсутствует во всех шести DLL (CS0117, замер 09.08).
+    """
+    from kukai.ir import contour as C
+    oid = op["id"]
+    s = _safe(oid)
+    region = op["__region__"]
+    holes = region["holes"]
+    view_res = _annot_view_res(op, s, ver, oid, isolation)
+    # Адрес от осей — модельная рамка в видовом поле. Отказ до эмиссии.
+    if "at_grid" in repr(op.get("contour")):
+        raise KirRefusal([Diagnostic(
+            code=TYPE_BAD_TYPE, op_id=oid, field_name="contour",
+            got=op.get("contour"),
+            message_ru=(
+                "contour: адрес от осей (at_grid) недопустим у заливки — "
+                "точки контура задаются в ПРОСТРАНСТВЕ ВИДА ([u,v] мм от "
+                "View.Origin вдоль Right/Up), а ось живёт в модели: на плане "
+                "эти числа совпали бы, на разрезе означали бы другое место. "
+                "Дайте литеральные [u,v]"))])
+    # Предел координат — тот же, что у `at` марки/текста (docspace), потому что
+    # это то же самое пространство. У самого CONTOUR предела координат нет.
+    bound_diags: list[Diagnostic] = []
+    for label, edges in ([("contour.outer", region["outer"])]
+                         + [(f"contour.holes[{hi}]", h)
+                            for hi, h in enumerate(holes)]):
+        for p0, _p1, _b in edges:
+            docspace.check_pt_view2d(list(p0), oid, label, bound_diags)
+    if bound_diags:
+        raise KirRefusal(bound_diags[:1])
+    g_type = _gid(op, "type") if isinstance(op.get("type"), dict) \
+        and "__grounded__" in op["type"] else None
+    if g_type and g_type.get("in_emit") == IN_EMIT_DEFAULT:
+        type_res = (
+            f"__frt_{s} = doc.GetElement(doc.GetDefaultElementTypeId("
+            f"ElementTypeGroup.FilledRegionType)) as FilledRegionType;\n"
+            f"if (__frt_{s} == null) {{ {refuse_stmt(oid, _cs('в документе нет типа заливки по умолчанию — назовите type'), isolation)} }}")
+    else:
+        type_res = (
+            f"__frt_{s} = doc.GetElement({_eid(g_type['id'], ver, oid)}) as FilledRegionType;\n"
+            f"if (__frt_{s} == null) {{ {refuse_stmt(oid, _cs('тип заливки не найден (модель изменилась после grounding)'), isolation)} }}")
+    pt_fn = f"__vp_{s}"
+    triples = [C.edge_witness_triples(region["outer"])]
+    triples += [C.edge_witness_triples(h) for h in holes]
+    flat = [t for loop in triples for t in loop]
+    n_edges = len(flat)
+
+    def _arr(name: str, values) -> str:
+        return (f"double[] __{name}_{s} = new double[] {{ "
+                + ", ".join(f"{round(v, 2)}" for v in values) + " };")
+
+    decl = "\n".join([
+        f"FilledRegion __el_{s} = null;",
+        f"View __vw_{s} = null;",
+        f"FilledRegionType __frt_{s} = null;",
+        # Локальная функция вида→мир: её видят и создание, и постусловия
+        # (контракт областей видимости — per_op оборачивает create своей).
+        docspace.emit_view2d_point_fn_cs(f"__vw_{s}", pt_fn),
+        # Авторский контур, вывезенный в C# ОДИН РАЗ: свидетель сверяется с
+        # ним, а не с тем, что сам же передал в вызов.
+        _arr("fu0", [t[0][0] for t in flat]),
+        _arr("fv0", [t[0][1] for t in flat]),
+        _arr("fum", [t[1][0] for t in flat]),
+        _arr("fvm", [t[1][1] for t in flat]),
+        _arr("fu1", [t[2][0] for t in flat]),
+        _arr("fv1", [t[2][1] for t in flat]),
+    ])
+    fmt = (lambda x, y: f"{pt_fn}({round(x, 2)}, {round(y, 2)})")
+    geo = [f"var __loops_{s} = new List<CurveLoop>();",
+           C.emit_loop_cs(region["outer"], f"__ol_{s}", pt=fmt),
+           f"__loops_{s}.Add(__ol_{s});"]
+    for hi, hole in enumerate(holes):
+        geo.append(C.emit_loop_cs(hole, f"__hl_{s}_{hi}", pt=fmt))
+        geo.append(f"__loops_{s}.Add(__hl_{s}_{hi});")
+    create = (
+        f"// create_filled_region {cs_line_comment_fragment(oid)}\n{view_res}\n{type_res}\n"
+        f"if (!FilledRegion.IsValidFilledRegionTypeId(doc, __frt_{s}.Id)) "
+        f"{{ {refuse_stmt(oid, _cs('type: id резолвится не в тип заливки (IsValidFilledRegionTypeId)'), isolation)} }}\n"
+        + "\n".join(geo) + "\n"
+        f"try {{ __el_{s} = FilledRegion.Create(doc, __frt_{s}.Id, __vw_{s}.Id, __loops_{s}); }}\n"
+        f"catch (Exception __ex_{s}) {{ {refuse_stmt(oid, f'\"FilledRegion.Create: \" + __ex_{s}.Message', isolation)} }}\n"
+        f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('FilledRegion.Create вернул null'), isolation)} }}\n"
+        + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
+    btol = tolerance("create_filled_region", "boundary_mm")
+    # Обратный ход — из docspace, тем же законом, что и прямой.
+    inv = (lambda point_cs, rel, u, v:
+           docspace.emit_xyz_to_view2d_cs(f"__vw_{s}", point_cs, rel, u, v,
+                                          indent=" " * 16))
+    boundary_reader = (
+        f"    int __frLoops_{s} = 0; int __frCurves_{s} = 0;\n"
+        f"    bool __frRead_{s} = true; bool __frStray_{s} = false;\n"
+        f"    int[] __frHit_{s} = new int[{n_edges}];\n"
+        f"    try\n    {{\n"
+        f"        foreach (CurveLoop __frCl_{s} in __el_{s}.GetBoundaries())\n"
+        f"        {{\n"
+        f"            __frLoops_{s}++;\n"
+        f"            foreach (Curve __frCv_{s} in __frCl_{s})\n"
+        f"            {{\n"
+        f"                __frCurves_{s}++;\n"
+        + inv(f"__frCv_{s}.GetEndPoint(0)", f"__frRa_{s}", f"__frAu_{s}", f"__frAv_{s}")
+        + inv(f"__frCv_{s}.GetEndPoint(1)", f"__frRb_{s}", f"__frBu_{s}", f"__frBv_{s}")
+        + inv(f"__frCv_{s}.Evaluate(0.5, true)", f"__frRm_{s}", f"__frMu_{s}", f"__frMv_{s}")
+        + f"                bool __frOne_{s} = false;\n"
+        f"                for (int __frK_{s} = 0; __frK_{s} < {n_edges}; __frK_{s}++)\n"
+        f"                {{\n"
+        f"                    bool __frFwd_{s} = Math.Abs(__frAu_{s} - __fu0_{s}[__frK_{s}]) <= {btol}\n"
+        f"                        && Math.Abs(__frAv_{s} - __fv0_{s}[__frK_{s}]) <= {btol}\n"
+        f"                        && Math.Abs(__frBu_{s} - __fu1_{s}[__frK_{s}]) <= {btol}\n"
+        f"                        && Math.Abs(__frBv_{s} - __fv1_{s}[__frK_{s}]) <= {btol};\n"
+        f"                    bool __frRev_{s} = Math.Abs(__frAu_{s} - __fu1_{s}[__frK_{s}]) <= {btol}\n"
+        f"                        && Math.Abs(__frAv_{s} - __fv1_{s}[__frK_{s}]) <= {btol}\n"
+        f"                        && Math.Abs(__frBu_{s} - __fu0_{s}[__frK_{s}]) <= {btol}\n"
+        f"                        && Math.Abs(__frBv_{s} - __fv0_{s}[__frK_{s}]) <= {btol};\n"
+        f"                    if ((__frFwd_{s} || __frRev_{s})\n"
+        f"                        && Math.Abs(__frMu_{s} - __fum_{s}[__frK_{s}]) <= {btol}\n"
+        f"                        && Math.Abs(__frMv_{s} - __fvm_{s}[__frK_{s}]) <= {btol})\n"
+        f"                    {{ __frHit_{s}[__frK_{s}]++; __frOne_{s} = true; break; }}\n"
+        f"                }}\n"
+        f"                if (!__frOne_{s}) __frStray_{s} = true;\n"
+        f"            }}\n"
+        f"        }}\n"
+        f"    }} catch {{ __frRead_{s} = false; }}\n"
+        f"    bool __frExact_{s} = true;\n"
+        f"    for (int __frJ_{s} = 0; __frJ_{s} < {n_edges}; __frJ_{s}++)\n"
+        f"        if (__frHit_{s}[__frJ_{s}] != 1) __frExact_{s} = false;\n")
+    boundary_verdict = (
+        f"    if (!__frRead_{s})\n"
+        f"        __post.Add({_cs(oid + ': граница заливки нечитаема — GetBoundaries бросил (geometry)')});\n"
+        f"    else if (__frLoops_{s} != {1 + len(holes)} || __frCurves_{s} != {n_edges})\n"
+        f"        __post.Add({_cs(oid + ': прочитано ')} + __frLoops_{s} + "
+        f"{_cs(' петель / ')} + __frCurves_{s} + "
+        f"{_cs(f' рёбер вместо {1 + len(holes)}/{n_edges} (geometry)')});\n"
+        f"    else if (__frStray_{s} || !__frExact_{s})\n"
+        f"        __post.Add({_cs(oid + ': граница заливки не совпала с заданным контуром в осях вида (geometry)')});\n")
+    post = [
+        WitnessCheck(
+            obligation_key="in_view", reader_cs="",
+            verdict_cs=(
+                f"    if (__el_{s}.OwnerViewId.ToString() != __vw_{s}.Id.ToString())\n"
+                f"        __post.Add({_cs(oid + ': filled region belongs to wrong view (topology)')});\n"),
+            message="filled region belongs to wrong view (topology)",
+            style="guard"),
+        WitnessCheck(
+            obligation_key="region_type", reader_cs="",
+            verdict_cs=(
+                f"    if (__el_{s}.GetTypeId().ToString() != __frt_{s}.Id.ToString())\n"
+                f"        __post.Add({_cs(oid + ': тип заливки после чтения не тот, что запрошен (semantic)')});\n"),
+            message="тип заливки после чтения не тот, что запрошен (semantic)",
+            style="guard"),
+        WitnessCheck(
+            obligation_key="boundary",
+            reader_cs=boundary_reader,
+            verdict_cs=boundary_verdict,
+            message="граница заливки не совпала с заданным контуром (geometry)",
+            tol=btol, style="else_block"),
+    ]
+    readback = (
+        f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
+        f"    var __rb = new Dictionary<string, object>();\n"
+        f"    __rb[\"id\"] = __el_{s}.Id.ToString();\n"
+        + _stamp_readback(f"__el_{s}", type_level=False) +
+        f"    __rb[\"view_id\"] = __el_{s}.OwnerViewId.ToString();\n"
+        f"    __rb[\"type_id\"] = __el_{s}.GetTypeId().ToString();\n"
+        # ИМЯ типа, а не только id, и это не украшение квитанции. При
+        # опущенном `type` тип выбирает сам документ уже здесь, внутри
+        # исполнения, поэтому витрина выбора (`ground.attach_runtime_choices`)
+        # берёт имя ровно отсюда. Замер 10.08.2026: из восьми опов с
+        # документным умолчанием семь читали `type_name` обратно, а заливка —
+        # единственная — не читала, то есть указатель в её квитанции вёл бы в
+        # никуда. Прибор на часть диапазона опаснее отсутствующего.
+        f"    try {{ var __frTy_{s} = doc.GetElement(__el_{s}.GetTypeId());\n"
+        f"        if (__frTy_{s} != null && __frTy_{s}.Name != null) "
+        f"__rb[\"type_name\"] = __frTy_{s}.Name; }} catch {{ }}\n"
+        # ЗАПИСАНО, А НЕ УТВЕРЖДЕНО: «заливка это или маска» решает ТИП, а
+        # какие типы проекта маскирующие — из программы не видно. Требовать
+        # `IsMasking == false` значило бы отказывать по догадке; квитанция
+        # несёт факт, и первый живой прогон закроет вопрос замером.
+        f"    try {{ __rb[\"is_masking\"] = __el_{s}.IsMasking; }} catch {{ }}\n"
+        f"    __results[{_cs(oid)}] = __rb;\n}}")
+    return decl, create, post, readback
+
+
 # ── wave/struct (2026-07-17): create_beam / create_foundation ───────────────
 # Thin registration wrappers only — all real logic (StructuralType.Beam /
 # StructuralType.Footing / structural-Floor-slab emit) lives in struct_emit.py
@@ -3449,6 +5100,36 @@ def _emit_foundation_struct(op: dict, ver: str, stamp: str,
     return struct_emit.emit_foundation(op, ver, stamp, isolation)
 
 
+def _emit_wall_foundation_struct(op: dict, ver: str, stamp: str,
+                                 isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import struct_emit
+    return struct_emit.emit_wall_foundation(op, ver, stamp, isolation)
+
+
+# wave/framing (2026-08-09): балочная система и ферма. Та же регистрация
+# без логики, что у трёх опов выше — тело живёт в struct_emit.py.
+
+def _emit_beam_system_struct(op: dict, ver: str, stamp: str,
+                             isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import struct_emit
+    return struct_emit.emit_beam_system(op, ver, stamp, isolation)
+
+
+def _emit_truss_struct(op: dict, ver: str, stamp: str,
+                       isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import struct_emit
+    return struct_emit.emit_truss(op, ver, stamp, isolation)
+
+
+# wave/reinforcement (2026-08-10): армирование по области. Та же регистрация
+# без логики — тело живёт в struct_emit.py, как у всех структурных опов.
+
+def _emit_area_reinforcement_struct(op: dict, ver: str, stamp: str,
+                                    isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import struct_emit
+    return struct_emit.emit_area_reinforcement(op, ver, stamp, isolation)
+
+
 # wave/arch (2026-07-29): потолки и ограждения. Логика в arch_emit.py (своя
 # зона волны), здесь — только регистрация, ровно как у волны каркаса выше.
 
@@ -3464,6 +5145,132 @@ def _emit_railing_arch(op: dict, ver: str, stamp: str,
     return arch_emit.emit_railing(op, ver, stamp, isolation)
 
 
+# wave/datums (2026-08-09): цепь осей, выдавленная кровля и размножение марша
+# по этажам. Логика в datum_emit.py (своя зона волны), здесь — только
+# регистрация, ровно как у волн каркаса и архитектуры выше. Импорт отложенный
+# по той же причине: datum_emit импортирует помощники ИЗ этого модуля.
+
+def _emit_multi_segment_grid_datum(op: dict, ver: str, stamp: str,
+                                   isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import datum_emit
+    return datum_emit.emit_multi_segment_grid(op, ver, stamp, isolation)
+
+
+def _emit_extrusion_roof_datum(op: dict, ver: str, stamp: str,
+                               isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import datum_emit
+    return datum_emit.emit_extrusion_roof(op, ver, stamp, isolation)
+
+
+def _emit_multistory_stairs_datum(op: dict, ver: str, stamp: str,
+                                  isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import datum_emit
+    return datum_emit.emit_multistory_stairs(op, ver, stamp, isolation)
+
+
+# wave/mep-electrical (2026-08-09): короб ЭОМ, две заготовки и два гибких
+# участка. Логика в mep_emit.py (своя зона волны), здесь — только регистрация,
+# ровно как у волн каркаса и архитектуры выше. Импорт отложенный по той же
+# причине: mep_emit импортирует помощники ИЗ этого модуля.
+
+def _emit_conduit_mep(op: dict, ver: str, stamp: str,
+                      isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import mep_emit
+    return mep_emit._emit_conduit(op, ver, stamp, isolation)
+
+
+def _emit_pipe_placeholder_mep(op: dict, ver: str, stamp: str,
+                               isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import mep_emit
+    return mep_emit._emit_pipe_placeholder(op, ver, stamp, isolation)
+
+
+def _emit_duct_placeholder_mep(op: dict, ver: str, stamp: str,
+                               isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import mep_emit
+    return mep_emit._emit_duct_placeholder(op, ver, stamp, isolation)
+
+
+def _emit_flex_duct_mep(op: dict, ver: str, stamp: str,
+                        isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import mep_emit
+    return mep_emit._emit_flex_duct(op, ver, stamp, isolation)
+
+
+def _emit_flex_pipe_mep(op: dict, ver: str, stamp: str,
+                        isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import mep_emit
+    return mep_emit._emit_flex_pipe(op, ver, stamp, isolation)
+
+
+# wave/analysis (2026-08-09): три нагрузки КР и путь эвакуации. Логика в
+# analysis_emit.py (своя зона волны), здесь — только регистрация, ровно как у
+# волн каркаса, архитектуры и ЭОМ выше. Импорт отложенный по той же причине:
+# analysis_emit импортирует помощники ИЗ этого модуля.
+
+def _emit_point_load_analysis(op: dict, ver: str, stamp: str,
+                              isolation: str = "atomic") -> tuple[str, str, list, str]:
+    from kukai.ir import analysis_emit
+    return analysis_emit.emit_point_load(op, ver, stamp, isolation)
+
+
+def _emit_line_load_analysis(op: dict, ver: str, stamp: str,
+                             isolation: str = "atomic") -> tuple[str, str, list, str]:
+    from kukai.ir import analysis_emit
+    return analysis_emit.emit_line_load(op, ver, stamp, isolation)
+
+
+def _emit_area_load_analysis(op: dict, ver: str, stamp: str,
+                             isolation: str = "atomic") -> tuple[str, str, list, str]:
+    from kukai.ir import analysis_emit
+    return analysis_emit.emit_area_load(op, ver, stamp, isolation)
+
+
+def _emit_path_of_travel_analysis(op: dict, ver: str, stamp: str,
+                                  isolation: str = "atomic") -> tuple[str, str, list, str]:
+    from kukai.ir import analysis_emit
+    return analysis_emit.emit_path_of_travel(op, ver, stamp, isolation)
+# wave/site (2026-08-09): рельеф, площадка под здание, подобласть. Логика в
+# site_emit.py (своя зона волны), здесь — только регистрация. Импорт
+# отложенный по той же причине, что у волн выше: site_emit импортирует
+# помощники ИЗ этого модуля, и импорт на уровне файла замкнул бы цикл.
+
+def _emit_topography_site(op: dict, ver: str, stamp: str,
+                          isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import site_emit
+    return site_emit.emit_topography(op, ver, stamp, isolation)
+
+
+def _emit_building_pad_site(op: dict, ver: str, stamp: str,
+                            isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import site_emit
+    return site_emit.emit_building_pad(op, ver, stamp, isolation)
+
+
+def _emit_site_subregion_site(op: dict, ver: str, stamp: str,
+                              isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import site_emit
+    return site_emit.emit_site_subregion(op, ver, stamp, isolation)
+
+
+# wave/sweep (2026-08-09): навесные профили — карниз/руст на стене и краевой
+# профиль по периметру плиты. Логика в sweep_emit.py (своя зона волны), здесь
+# — только регистрация. Импорт отложенный по той же причине, что у волн выше:
+# sweep_emit импортирует помощники ИЗ этого модуля, и импорт на уровне файла
+# замкнул бы цикл.
+
+def _emit_wall_sweep(op: dict, ver: str, stamp: str,
+                     isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import sweep_emit
+    return sweep_emit.emit_wall_sweep(op, ver, stamp, isolation)
+
+
+def _emit_slab_edge(op: dict, ver: str, stamp: str,
+                    isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import sweep_emit
+    return sweep_emit.emit_slab_edge(op, ver, stamp, isolation)
+
+
 # wave/shape (2026-07-29): произвольная геометрия мешем. Логика в
 # shape_emit.py (своя зона волны), здесь — только регистрация. Импорт
 # отложенный по той же причине, что у волн выше: shape_emit импортирует
@@ -3473,6 +5280,36 @@ def _emit_directshape_mesh(op: dict, ver: str, stamp: str,
                            isolation: str = "atomic") -> tuple[str, str, str, str]:
     from kukai.ir import shape_emit
     return shape_emit.emit_directshape(op, ver, stamp, isolation)
+
+
+# wave/solid (2026-08-09): ПАРАМЕТРИЧЕСКОЕ тело — та самая «отдельная волна с
+# живым замером», которую пообещала шапка ops_shape.py вместо флажка
+# Target=Solid. Логика в solid_emit.py (своя зона волны), здесь — только
+# регистрация; импорт отложенный по той же причине, что у волн выше.
+
+def _emit_solid_extrusion(op: dict, ver: str, stamp: str,
+                          isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import solid_emit
+    return solid_emit.emit_solid_extrusion(op, ver, stamp, isolation)
+
+
+def _emit_solid_revolve(op: dict, ver: str, stamp: str,
+                        isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import solid_emit
+    return solid_emit.emit_solid_revolve(op, ver, stamp, isolation)
+
+
+# wave/mass (2026-08-10): стена по НАКЛОННОЙ грани концептуальной массы —
+# единственная фабрика главы масс, которую RevitAPI.xml разрешает В ПРОЕКТНОМ
+# документе («document is not a project document» стоит у неё среди условий
+# броска, то есть требуется ровно тот документ, в который KIR и пишет).
+# Логика в mass_emit.py (своя зона волны), здесь — только регистрация; импорт
+# отложенный по той же причине, что у волн выше.
+
+def _emit_face_wall(op: dict, ver: str, stamp: str,
+                    isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import mass_emit
+    return mass_emit.emit_face_wall(op, ver, stamp, isolation)
 
 
 # wave/room (2026-08-03): разделитель помещений. Логика в room_emit.py (своя
@@ -3494,6 +5331,17 @@ def _emit_opening(op: dict, ver: str, stamp: str,
                   isolation: str = "atomic") -> tuple[str, str, str, str]:
     from kukai.ir import opening_emit
     return opening_emit.emit_opening(op, ver, stamp, isolation)
+
+
+# wave/space (2026-08-10): пространство ОВК. Логика в room_emit.py
+# (парный файл своей волны), здесь — только регистрация. Импорт
+# отложенный по той же причине, что у волн выше: room_emit импортирует
+# помощники ИЗ этого модуля.
+
+def _emit_space(op: dict, ver: str, stamp: str,
+                isolation: str = "atomic") -> tuple[str, str, str, str]:
+    from kukai.ir import room_emit
+    return room_emit.emit_space(op, ver, stamp, isolation)
 
 
 def _emit_group(op: dict, ver: str, stamp: str,
@@ -3925,12 +5773,6 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
             f"if (__ct_{s} == null) {{ {refuse_stmt(oid, _cs('тип панели не найден (модель изменилась после grounding)'), isolation)} }}")
     elif by == "name":
         want = sel["value"]
-        not_found_message = (
-            "тип панели «" + want + "» не найден среди "
-            "типоразмеров семейств и типов стен")
-        ambiguous_message = (
-            "тип панели «" + want + "» неоднозначен — "
-            "несколько типов с этим именем; укажите element_id")
         type_res = (
             f"var __cts_{s} = new List<ElementType>();\n"
             f"foreach (Element __cte_{s} in new FilteredElementCollector(doc)"
@@ -3941,8 +5783,11 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
             f".OfClass(typeof(WallType)))\n"
             f"    if (__ctw_{s}.Name == {_cs(want)}) "
             f"__cts_{s}.Add((ElementType)__ctw_{s});\n"
-            f"if (__cts_{s}.Count == 0) {{ {refuse_stmt(oid, _cs(not_found_message), isolation)} }}\n"
-            f"if (__cts_{s}.Count > 1) {{ {refuse_stmt(oid, _cs(ambiguous_message), isolation)} }}\n"
+            f"if (__cts_{s}.Count == 0) {{ {refuse_stmt(oid, _cs('тип панели «' + want + '» не найден среди '
+                              'типоразмеров семейств и типов стен'), isolation)} }}\n"
+            f"if (__cts_{s}.Count > 1) {{ {refuse_stmt(oid, _cs('тип панели «' + want + '» неоднозначен — '
+                              'несколько типов с этим именем; укажите '
+                              'element_id'), isolation)} }}\n"
             f"__ct_{s} = __cts_{s}[0];")
     else:
         raise KirRefusal([Diagnostic(
@@ -3996,24 +5841,6 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"    }}\n"
         f"    catch {{ return false; }}\n"
         f"}};")
-
-    unlock_refusal_message = (
-        '"замок ячейки не снимается для " + '
-        f'__ClassName(__cp_{s}) + " (панель " + '
-        f'__cp_{s}.Id.ToString() + "): " + '
-        f'__ClassName(__cux_{s}) + ": " + '
-        f'(String.IsNullOrEmpty(__cux_{s}.Message) ? '
-        '"(пустое сообщение Revit)" : '
-        f'__cux_{s}.Message)')
-    type_chase_refusal_message = (
-        '"догон типа ячейки не прошёл: " + '
-        f'__ClassName(__ctx_{s}) + ": " + '
-        f'(String.IsNullOrEmpty(__ctx_{s}.Message) ? '
-        '"(пустое сообщение Revit)" : '
-        f'__ctx_{s}.Message) + " | занявший " + '
-        f'__cn_{s}.Id.ToString() + " (" + '
-        f'__ClassName(__cn_{s}) + "), просили тип " '
-        f'+ __ct_{s}.Id.ToString()')
 
     create = (
         f"// set_curtain_panel {cs_line_comment_fragment(oid)}\n"
@@ -4082,7 +5909,13 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"    try {{ __cp_{s}.Pinned = false; }}\n"
         f"    catch (Exception __cux_{s})\n"
         f"    {{\n"
-        f"        {refuse_stmt(oid, unlock_refusal_message, isolation)}\n"
+        f"        {refuse_stmt(oid, '"замок ячейки не снимается для " + '
+                              f'__ClassName(__cp_{s}) + " (панель " + '
+                              f'__cp_{s}.Id.ToString() + "): " + '
+                              f'__ClassName(__cux_{s}) + ": " + '
+                              f'(String.IsNullOrEmpty(__cux_{s}.Message) ? '
+                              '"(пустое сообщение Revit)" : '
+                              f'__cux_{s}.Message)', isolation)}\n"
         f"    }}\n"
         f"}}\n"
         # УЛИКА, А НЕ ПУСТАЯ СТРОКА. Revit бросает из ChangePanelType с
@@ -4160,7 +5993,14 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"        }}\n"
         f"        catch (Exception __ctx_{s})\n"
         f"        {{\n"
-        f"            {refuse_stmt(oid, type_chase_refusal_message, isolation)}\n"
+        f"            {refuse_stmt(oid, '"догон типа ячейки не прошёл: " + '
+                                  f'__ClassName(__ctx_{s}) + ": " + '
+                                  f'(String.IsNullOrEmpty(__ctx_{s}.Message) ? '
+                                  '"(пустое сообщение Revit)" : '
+                                  f'__ctx_{s}.Message) + " | занявший " + '
+                                  f'__cn_{s}.Id.ToString() + " (" + '
+                                  f'__ClassName(__cn_{s}) + "), просили тип " '
+                                  f'+ __ct_{s}.Id.ToString()', isolation)}\n"
         f"        }}\n"
         f"    }}\n"
         f"}}")
@@ -4184,16 +6024,6 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
         f"{{\n"
         + _indent(_stamp_block(f"__cn_{s}", stamp), "    ") + "\n"
         f"}}")
-
-    cell_unreadable_message = _cs(
-        oid + ": ячейка (%d,%d) не читается "
-        "после сборки (semantic)" % (u, v))
-    panel_type_mismatch_message = _cs(
-        oid + ": тип панели в ячейке не "
-        "равен запрошенному (semantic)")
-    cell_host_mismatch_message = _cs(
-        oid + ": ячейка принадлежит "
-        "другому носителю (topology)")
 
     post = [
         WitnessCheck(
@@ -4231,13 +6061,15 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
                 f"    if (__co_{s} == null) __co_{s} = __cq_{s};\n"),
             verdict_cs=(
                 f"    if (__co_{s} == null)\n"
-                f"        __post.Add({cell_unreadable_message});\n"
+                f"        __post.Add({_cs(oid + ': ячейка (%d,%d) не читается '
+                                          'после сборки (semantic)' % (u, v))});\n"
                 f"    else\n"
                 f"    {{\n"
                 f"        ElementId __cet_{s} = __ccEffType{s}(__co_{s});\n"
                 f"        if (__cet_{s} == null || __cet_{s}.ToString() != "
                 f"__ct_{s}.Id.ToString())\n"
-                f"            __post.Add({panel_type_mismatch_message});\n"
+                f"            __post.Add({_cs(oid + ': тип панели в ячейке не '
+                                              'равен запрошенному (semantic)')});\n"
                 f"    }}\n"),
             message="тип панели в ячейке не равен запрошенному (semantic)",
             style="else_block"),
@@ -4257,7 +6089,8 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
                 f"            if (__cfi_{s}.Host == null\n"
                 f"                || __cfi_{s}.Host.Id.ToString() != "
                 f"__ch_{s}.Id.ToString())\n"
-                f"                __post.Add({cell_host_mismatch_message});\n"
+                f"                __post.Add({_cs(oid + ': ячейка принадлежит '
+                                                  'другому носителю (topology)')});\n"
                 f"        }}\n"
                 f"        else\n"
                 f"        {{\n"
@@ -4268,7 +6101,8 @@ def _emit_set_curtain_panel(op: dict, ver: str, stamp: str,
                 # занявшего лежит на оси носителя.
                 f"            bool __chm_{s} = __ccAxis{s}(__co_{s});\n"
                 f"            if (!__chm_{s})\n"
-                f"                __post.Add({cell_host_mismatch_message});\n"
+                f"                __post.Add({_cs(oid + ': ячейка принадлежит '
+                                                  'другому носителю (topology)')});\n"
                 f"        }}\n"
                 f"    }}\n"),
             message="ячейка принадлежит другому носителю (topology)",
@@ -4373,19 +6207,6 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
     px, py, pz = _pt3(op["position_mm"])
     tol = tolerance("create_curtain_grid_line", "position_mm")
     mul_tol = _MULLION_ON_LINE_EVIDENCE_MM
-    stamp_refusal_message = (
-        '"линия разрезки не принимает штамп прогона (" + '
-        f'__gsx_{s_}.Message + ") — созданный, но непомеченный '
-        'элемент сломал бы сверку пересборки"')
-    grid_membership_message = _cs(
-        oid + ": созданная линия не состоит "
-        "в сетке носителя (topology)")
-    direction_mismatch_message = _cs(
-        oid + ": направление линии не равно "
-        "запрошенному (semantic)")
-    position_mismatch_message = _cs(
-        oid + ": линия не проходит через "
-        "запрошенную точку (geometry)")
 
     if host["by"] == "ref":
         host_res = f"__gh_{s_} = (Element)__el_{_safe(host['value'])};"
@@ -4489,7 +6310,9 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
         f"}}\n"
         f"catch (Exception __gsx_{s_})\n"
         f"{{\n"
-        f"    {refuse_stmt(oid, stamp_refusal_message, isolation)}\n"
+        f"    {refuse_stmt(oid, '"линия разрезки не принимает штамп прогона (" + '
+                          f'__gsx_{s_}.Message + ") — созданный, но непомеченный '
+                          'элемент сломал бы сверку пересборки"', isolation)}\n"
         f"}}")
 
     post = [
@@ -4503,7 +6326,8 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
                 f"    __gdel_{s_} = __gDist{s_}(__gr_{s_}, __gp_{s_});\n"),
             verdict_cs=(
                 f"    if (!__gmem_{s_})\n"
-                f"        __post.Add({grid_membership_message});\n"),
+                f"        __post.Add({_cs(oid + ': созданная линия не состоит '
+                                          'в сетке носителя (topology)')});\n"),
             message="созданная линия не состоит в сетке носителя (topology)",
             style="else_block"),
         WitnessCheck(
@@ -4511,7 +6335,8 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
             reader_cs="",
             verdict_cs=(
                 f"    if (__gisu_{s_} != {is_u})\n"
-                f"        __post.Add({direction_mismatch_message});\n"),
+                f"        __post.Add({_cs(oid + ': направление линии не равно '
+                                          'запрошенному (semantic)')});\n"),
             message="направление линии не равно запрошенному (semantic)",
             style="guard"),
         WitnessCheck(
@@ -4521,7 +6346,8 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
                 # -1 — «не измерено»: нечитаемая кривая обязана быть
                 # отказом, а не молчаливым успехом.
                 f"    if (__gdel_{s_} < 0.0 || __gdel_{s_} > {tol})\n"
-                f"        __post.Add({position_mismatch_message});\n"),
+                f"        __post.Add({_cs(oid + ': линия не проходит через '
+                                          'запрошенную точку (geometry)')});\n"),
             message="линия не проходит через запрошенную точку (geometry)",
             tol=tol,
             style="guard"),
@@ -4580,6 +6406,15 @@ def _emit_create_curtain_grid_line(op: dict, ver: str, stamp: str,
     return decl, create, post, readback
 
 
+
+#: Опы, чей результат — ПРОСТРАНСТВЕННЫЙ элемент. ВЫВОДИТСЯ из реестра по
+#: категории результата, а не перечисляется: список имён протух бы на первом
+#: же новом пространственном опе, и протух бы МОЛЧА — программа просто
+#: перестала бы получать регенерацию.
+_SPATIAL_ENCLOSURE_OPS = frozenset(
+    name for name, cats in spec.OP_RESULT_CATEGORIES.items()
+    if set(cats) & set(ops_room.SPATIAL_ENCLOSURE_CATEGORIES))
+
 _EMITTERS = {"create_wall": _emit_wall, "create_pipe": _emit_pipe,
              "create_grid": _emit_grid, "create_level": _emit_level,
              "create_floor": _emit_floor, "create_column": _emit_column,
@@ -4589,21 +6424,68 @@ _EMITTERS = {"create_wall": _emit_wall, "create_pipe": _emit_pipe,
              "create_floor_by_contour": _emit_floor_contour,
              "set_param": _emit_setparam, "delete": _emit_delete,
              "create_duct": _emit_duct, "create_cable_tray": _emit_cable_tray,
+             "create_conduit": _emit_conduit_mep,
+             "create_pipe_placeholder": _emit_pipe_placeholder_mep,
+             "create_duct_placeholder": _emit_duct_placeholder_mep,
+             "create_flex_duct": _emit_flex_duct_mep,
+             "create_flex_pipe": _emit_flex_pipe_mep,
              "create_roof": _emit_roof,
              "route_pipe_system": _emit_route_pipe_system,
              "route_duct_system": _emit_route_duct_system,
              "create_type": _emit_create_type, "load_family": _emit_load_family,
-             "create_dimension": _emit_dimension, "create_tag": _emit_tag, "create_text": _emit_text,
+             "create_dimension": _emit_dimension,
+             "create_angular_dimension": _emit_angular_dimension,
+             "create_tag": _emit_tag, "create_text": _emit_text,
+             "create_filled_region": _emit_filled_region,
              "create_beam": _emit_beam_struct, "create_foundation": _emit_foundation_struct,
+             "create_wall_foundation": _emit_wall_foundation_struct,
+             "create_beam_system": _emit_beam_system_struct,
+             "create_truss": _emit_truss_struct,
+             "create_area_reinforcement": _emit_area_reinforcement_struct,
              "create_group": _emit_group,
              "set_curtain_panel": _emit_set_curtain_panel,
              "create_curtain_grid_line": _emit_create_curtain_grid_line,
              "create_ceiling": _emit_ceiling_arch,
              "create_railing": _emit_railing_arch,
+             "create_topography": _emit_topography_site,
+             "create_building_pad": _emit_building_pad_site,
+             "create_site_subregion": _emit_site_subregion_site,
+             "create_wall_sweep": _emit_wall_sweep,
+             "create_slab_edge": _emit_slab_edge,
+             "create_multi_segment_grid": _emit_multi_segment_grid_datum,
+             "create_extrusion_roof": _emit_extrusion_roof_datum,
+             "create_multistory_stairs": _emit_multistory_stairs_datum,
              "create_directshape": _emit_directshape_mesh,
+             "create_solid_extrusion": _emit_solid_extrusion,
+             "create_solid_revolve": _emit_solid_revolve,
+             "create_face_wall": _emit_face_wall,
              "create_room_separator": _emit_room_separator,
+             "create_space": _emit_space,
              "create_opening": _emit_opening,
+             "create_point_load": _emit_point_load_analysis,
+             "create_line_load": _emit_line_load_analysis,
+             "create_area_load": _emit_area_load_analysis,
+             "create_path_of_travel": _emit_path_of_travel_analysis,
              "move_elements": _emit_move_elements, "change_type": _emit_change_type}
+
+
+def program_hash(grounded_ops: list[dict]) -> str:
+    blob = json.dumps(grounded_ops, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:8]
+
+
+def _program_stamp(grounded_ops: list[dict], stamp_scope: str = "") -> str:
+    """Return the legacy stamp or one exact A5 run-owned stamp.
+
+    The empty default preserves every existing golden byte-for-byte.  A scoped
+    stamp is an internal compiler input, never part of user-authored KIR.
+    """
+
+    if stamp_scope:
+        if not re.fullmatch(r"a5:[0-9a-f]{12}:[0-9a-f]{16}", stamp_scope):
+            raise ValueError("invalid internal A5 stamp scope")
+        return f"kir:{stamp_scope}:{program_hash(grounded_ops)}"
+    return f"kir:{program_hash(grounded_ops)}"
 
 
 def _document_binding_guard(
@@ -4646,6 +6528,7 @@ def _element_identity_guard(
     revit_version: str,
     *,
     rollback: str,
+    symbol_prefix: str = "__kirBinding",
 ) -> str:
     """Emit exact dependency guards inside the write transaction.
 
@@ -4663,6 +6546,8 @@ def _element_identity_guard(
                        for item in expected_identities)):
         raise ValueError(
             "expected_identities must contain ElementIdentityProof values")
+    if not re.fullmatch(r"__[A-Za-z][A-Za-z0-9]*", symbol_prefix):
+        raise ValueError("invalid element identity guard symbol prefix")
     by_id: dict[int, ElementIdentityProof] = {}
     for proof in expected_identities:
         prior = by_id.get(proof.element_id)
@@ -4680,25 +6565,25 @@ def _element_identity_guard(
         proof = by_id[element_id]
         literal = _eid(element_id, revit_version, "$program")
         blocks.extend((
-            f"Element __kirBinding_{index} = null;",
-            f"string __kirBindingUid_{index} = \"\";",
-            f"string __kirBindingVersion_{index} = \"\";",
+            f"Element {symbol_prefix}_{index} = null;",
+            f"string {symbol_prefix}Uid_{index} = \"\";",
+            f"string {symbol_prefix}Version_{index} = \"\";",
             "try",
             "{",
-            f"    __kirBinding_{index} = doc.GetElement({literal});",
-            f"    if (__kirBinding_{index} != null)",
+            f"    {symbol_prefix}_{index} = doc.GetElement({literal});",
+            f"    if ({symbol_prefix}_{index} != null)",
             "    {",
-            f"        __kirBindingUid_{index} = "
-            f"__kirBinding_{index}.UniqueId ?? \"\";",
-            f"        __kirBindingVersion_{index} = "
-            f"__kirBinding_{index}.VersionGuid.ToString(\"N\");",
+            f"        {symbol_prefix}Uid_{index} = "
+            f"{symbol_prefix}_{index}.UniqueId ?? \"\";",
+            f"        {symbol_prefix}Version_{index} = "
+            f"{symbol_prefix}_{index}.VersionGuid.ToString(\"N\");",
             "    }",
             "}",
             "catch { }",
-            f"if (__kirBinding_{index} == null ||",
-            f"    !String.Equals(__kirBindingUid_{index}, "
+            f"if ({symbol_prefix}_{index} == null ||",
+            f"    !String.Equals({symbol_prefix}Uid_{index}, "
             f"{_cs(proof.unique_id)}, StringComparison.Ordinal) ||",
-            f"    !String.Equals(__kirBindingVersion_{index}, "
+            f"    !String.Equals({symbol_prefix}Version_{index}, "
             f"{_cs(proof.version_guid)}, StringComparison.Ordinal))",
             f"{{ {rollback}return __Refuse(\"$program\", "
             f"\"open model binding changed: ElementId {element_id} "
@@ -4725,8 +6610,7 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
                         *, stamp_scope: str = "",
                         expected_document: Mapping[str, str] | None = None,
                         expected_identities: Sequence[
-                            ElementIdentityProof] | None = None,
-                        _program_stamp_value: str | None = None) -> str:
+                            ElementIdentityProof] | None = None) -> str:
     """Dedicated whole-program template for create_stairs: StairsEditScope owns
     its transactions (cannot nest inside the shared program txn — the reason
     for the KIR-L002 sole-op rule). The IFailuresPreprocessor implementation
@@ -4735,13 +6619,16 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
     proven by the 6/6 gate like every other template)."""
     oid = op["id"]
     s = _safe(oid)
-    derived_stamp = _program_stamp([op], stamp_scope)
-    if (_program_stamp_value is not None
-            and _program_stamp_value != derived_stamp):
-        raise ValueError("program stamp disagrees with stairs payload")
-    stamp = _program_stamp_value or derived_stamp
-    x0, y0 = op["p0_mm"][0], op["p0_mm"][1]
-    x1, y1 = op["p1_mm"][0], op["p1_mm"][1]
+    stamp = _program_stamp([op], stamp_scope)
+    # ФОРМА МАРША — РОВНО ОДНА ИЗ ДВУХ (KIR-P007 держит это в плане):
+    # прямой отрезок `p0_mm`/`p1_mm` либо винт `spiral`. Ветка расходится
+    # ровно в ОДНОМ операторе — создании марша — плюс свидетель, который
+    # существует только у винта; весь каркас StairsEditScope/транзакции/
+    # предобработчика отказов общий и не сдвинулся ни на байт.
+    spiral = op.get("spiral")
+    if spiral is None:
+        x0, y0 = op["p0_mm"][0], op["p0_mm"][1]
+        x1, y1 = op["p1_mm"][0], op["p1_mm"][1]
     w = op.get("width_mm")
     width_cs = (f"        try {{ __run_{s}.ActualRunWidth = U({w}); }} catch {{ }}\n"
                 if w is not None else "")
@@ -4771,7 +6658,76 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
     )
     base = _lvl_pin(op, "base_level", f"__base_{s}", ver, oid)
     top = _lvl_pin(op, "top_level", f"__top_{s}", ver, oid)
-    return _with_class_name_helper(
+    if spiral is None:
+        run_cs = (
+            f"        StairsRun __run_{s} = StairsRun.CreateStraightRun(doc, __sid_{s},\n"
+            f"            Line.CreateBound(\n"
+            f"                new XYZ(U({x0}), U({y0}), __base_{s}.Elevation),\n"
+            f"                new XYZ(U({x1}), U({y1}), __base_{s}.Elevation)),\n"
+            f"            StairsRunJustification.Center);\n"
+            f"        if (__run_{s} == null)\n"
+            f"        {{ __t.RollBack(); __ess.Cancel(); return __Refuse({_cs(oid)}, \"CreateStraightRun вернул null\"); }}\n")
+        spiral_post = ""
+        spiral_readback = ""
+    else:
+        # ВСЯ ТРИГОНОМЕТРИЯ — ЗДЕСЬ, НА КОМПИЛЯЦИИ. В C# уезжают готовые
+        # литералы радиан: авторские градусы переводит питон, ровно как у
+        # контуров с дугами. Z центра НЕ авторский — API прямо говорит, что
+        # Z центра И ЕСТЬ базовая отметка нового марша, поэтому туда идёт
+        # `__base.Elevation`, тот же, что у прямого марша.
+        cx, cy = spiral["center_mm"][0], spiral["center_mm"][1]
+        start_rad = math.radians(spiral["start_angle_deg"])
+        included_rad = math.radians(spiral["included_angle_deg"])
+        cw = "true" if spiral["clockwise"] else "false"
+        run_cs = (
+            f"        StairsRun __run_{s} = StairsRun.CreateSpiralRun(doc, __sid_{s},\n"
+            f"            new XYZ(U({cx}), U({cy}), __base_{s}.Elevation),\n"
+            f"            U({spiral['radius_mm']}), {start_rad!r}, {included_rad!r}, {cw},\n"
+            f"            StairsRunJustification.Center);\n"
+            f"        if (__run_{s} == null)\n"
+            f"        {{ __t.RollBack(); __ess.Cancel(); return __Refuse({_cs(oid)}, \"CreateSpiralRun вернул null\"); }}\n")
+        # СВИДЕТЕЛЬ ЧИТАЕТ РЕЗУЛЬТАТ, И ТОЛЬКО ТО, ЗА ЧТО МОЖЕТ ОТВЕЧАТЬ.
+        #
+        # Что проверяется: путь СОЗДАННОГО марша перечитывается
+        # (`GetStairsPath` — есть на всех шести версиях) и обязан содержать
+        # ДУГУ. Проверка не пустая: у прямого марша путь — Line, дуге там
+        # взяться неоткуда, так что «винт запросили, а марш вышел прямой»
+        # эта строка ловит и откатывает.
+        #
+        # ЧЕГО ЗДЕСЬ НАМЕРЕННО НЕТ — ЦЕНТРА, РАДИУСА, РАЗМАХА И НАПРАВЛЕНИЯ.
+        # Отношение между ЗАПРОШЕННЫМИ центром/радиусом и тем, что
+        # `GetStairsPath` возвращает (смещение на полуширину марша,
+        # юстировка, положение линии пути), НЕ ИЗМЕРЕНО ни нами, ни
+        # документацией. Допуск, придуманный ради зелёного свидетеля, —
+        # именно тот дефект, который этот компилятор существует запрещать,
+        # а жёсткая проверка по выдуманному числу откатила бы ВЕРНО
+        # построенную лестницу. Поэтому вместо проверки — ЗАМЕР: центр и
+        # радиус пути уезжают в расписку (ниже), и первый же живой прогон
+        # превращает «не измерено» в число.
+        spiral_post = (
+            f"        try\n"
+            f"        {{\n"
+            f"            bool __spiralArc_{s} = false;\n"
+            f"            foreach (Curve __spc_{s} in __run_{s}.GetStairsPath())\n"
+            f"                if (__spc_{s} is Arc) __spiralArc_{s} = true;\n"
+            f"            if (!__spiralArc_{s})\n"
+            f"                __post.Add({_cs(oid + ': spiral run path has no Arc (geometry)')});\n"
+            f"        }}\n"
+            f"        catch {{ __post.Add({_cs(oid + ': spiral run path unreadable (geometry)')}); }}\n")
+        spiral_readback = (
+            f"    try {{ foreach (ElementId __rid_{s} in __st_{s}.GetStairsRuns())\n"
+            f"          {{\n"
+            f"              var __r_{s} = doc.GetElement(__rid_{s}) as StairsRun;\n"
+            f"              if (__r_{s} == null) continue;\n"
+            f"              foreach (Curve __pc_{s} in __r_{s}.GetStairsPath())\n"
+            f"              {{\n"
+            f"                  var __pa_{s} = __pc_{s} as Arc;\n"
+            f"                  if (__pa_{s} == null) continue;\n"
+            f"                  __rb_{s}[\"path_center_mm\"] = new double[] {{ Math.Round(MM(__pa_{s}.Center.X), 1), Math.Round(MM(__pa_{s}.Center.Y), 1) }};\n"
+            f"                  __rb_{s}[\"path_radius_mm\"] = Math.Round(MM(__pa_{s}.Radius), 1);\n"
+            f"              }}\n"
+            f"          }} }} catch {{ }}\n")
+    return _with_program_helpers(
         f"{_AUTH_PREAMBLE}\n"
         f"// create_stairs {cs_line_comment_fragment(oid)} — sole-op program, StairsEditScope owns transactions\n"
         + pre_doc_guard +
@@ -4800,15 +6756,9 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
         f"        __fho.SetForcedModalHandling(false);\n"
         f"        __fho.SetClearAfterRollback(true);\n"
         f"        __t.SetFailureHandlingOptions(__fho);\n"
-        + txn_doc_guard +
-        txn_identity_guard +
-        f"        StairsRun __run_{s} = StairsRun.CreateStraightRun(doc, __sid_{s},\n"
-        f"            Line.CreateBound(\n"
-        f"                new XYZ(U({x0}), U({y0}), __base_{s}.Elevation),\n"
-        f"                new XYZ(U({x1}), U({y1}), __base_{s}.Elevation)),\n"
-        f"            StairsRunJustification.Center);\n"
-        f"        if (__run_{s} == null)\n"
-        f"        {{ __t.RollBack(); __ess.Cancel(); return __Refuse({_cs(oid)}, \"CreateStraightRun вернул null\"); }}\n"
+        + txn_doc_guard
+        + txn_identity_guard
+        + run_cs
         + width_cs +
         f"        doc.Regenerate();\n"
         f"        __st_{s} = doc.GetElement(__sid_{s}) as Autodesk.Revit.DB.Architecture.Stairs;\n"
@@ -4823,7 +6773,8 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
         f"            __post.Add({_cs(oid + ': top level mismatch (topology)')});\n"
         f"        if (__st_{s}.GetStairsRuns().Count < 1)\n"
         f"            __post.Add({_cs(oid + ': нет маршей (semantic)')});\n"
-        + width_post +
+        + width_post
+        + spiral_post +
         f"        if (__post.Count > 0)\n"
         f"        {{\n"
         f"            __t.RollBack(); __ess.Cancel();\n"
@@ -4854,6 +6805,7 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
         f"    try {{ __rb_{s}[\"risers\"] = __st_{s}.ActualRisersNumber; }} catch {{ }}\n"
         f"    try {{ var __tid = __st_{s}.GetTypeId(); var __ty = doc.GetElement(__tid);\n"
         f"          if (__ty != null) __rb_{s}[\"type_name\"] = __ty.Name; }} catch {{ }}\n"
+        + spiral_readback +
         f"}}\n"
         f"__results[{_cs(oid)}] = __rb_{s};\n"
         f"__results[\"ok\"] = true;\n"
@@ -4880,14 +6832,48 @@ def emit_stairs_program(op: dict, ver: str, intent: str = "",
         f"{{  // pad scope: the fixed wrapper footer closes __KirPad, UserCode, namespace")
 
 
+def _emit_stairs_landing_program(op: dict, ver: str, intent: str = "", *,
+                                 stamp_scope: str = "",
+                                 expected_document=None,
+                                 expected_identities=None) -> str:
+    """Тонкая регистрация без логики — тело в `stairs_landing_emit.py`.
+
+    Импорт ленивый по той же причине, что у struct/datum/solid: тот модуль
+    берёт приватные помощники ОТСЮДА, и модульный импорт замкнул бы граф.
+    """
+    from kukai.ir import stairs_landing_emit
+    return stairs_landing_emit.emit_stairs_landing_program(
+        op, ver, intent, stamp_scope=stamp_scope,
+        expected_document=expected_document,
+        expected_identities=expected_identities)
+
+
+#: ОП-ВЛАДЕЛЕЦ ТРАНЗАКЦИЙ -> ЕГО СОБСТВЕННЫЙ ШАБЛОН ЦЕЛОЙ ПРОГРАММЫ.
+#:
+#: Таблица заведена вместе со вторым таким опом (10.08.2026) и ровно затем,
+#: чтобы факт «у соло-опа свой шаблон» имел ОДИН адрес.  До неё имя
+#: `emit_stairs_program` стояло литералом в ветке, общей для всего множества
+#: `spec.SOLO_OPS`, — то есть площадка молча уехала бы в шаблон марша и
+#: получила бы чужую эмиссию, а не отказ.  Ключи обязаны совпадать с
+#: `spec.SOLO_OPS`; расхождение ловит `tests/test_stairs_landing.py`.
+_SOLO_PROGRAMS = {
+    "create_stairs": emit_stairs_program,
+    "create_stairs_landing": _emit_stairs_landing_program,
+}
+
+
 # Ops whose Wall.Create output can be de-joined (per_op disallow_wall_joins).
 _WALL_OPS = frozenset({"create_wall"})
 
 
 def _op_refs(node) -> set:
-    """Intra-program op ids this (grounded) op depends on: both ref forms —
+    """Intra-program op ids this (grounded) op depends on: all ref forms —
     ``{"__grounded__": {"via": "ref", "ref": id}}`` (ground.py pools) and raw
     ``{"by": "ref", "value": id}`` selectors (host/target_w, never grounded).
+    Element addresses are replaced by literal points during GROUND, so their
+    source op survives only in the compiler-owned ``__address__`` receipt.
+    It remains a runtime prerequisite: under per-op isolation a dependent must
+    not be created at cached coordinates after its authored support refused.
     ``__host_wall__`` (the plan-attached host op ECHO) is skipped: its inner
     refs belong to the host op, not to this one."""
     refs = set()
@@ -4898,6 +6884,15 @@ def _op_refs(node) -> set:
             refs.add(g["ref"])
         if node.get("by") == "ref" and isinstance(node.get("value"), str):
             refs.add(node["value"])
+        addresses = node.get("__address__")
+        if isinstance(addresses, list):
+            for address in addresses:
+                if not isinstance(address, dict):
+                    continue
+                element = address.get("element")
+                if isinstance(element, dict) \
+                        and isinstance(element.get("of"), str):
+                    refs.add(element["of"])
         for key, value in node.items():
             if key == "__host_wall__":
                 continue
@@ -5021,19 +7016,13 @@ def _wrap_create_per_op(op: dict, s: str, create: str,
         f"}}")
 
 
-def _emit_program_core(
-    grounded_ops: list[dict],
-    revit_version: str,
-    intent: str = "",
-    *,
-    isolation: str = "atomic",
-    postconditions: str = "strict",
-    disallow_wall_joins: bool = False,
-    stamp_scope: str = "",
-    expected_document: Mapping[str, str] | None = None,
-    expected_identities: Sequence[ElementIdentityProof] | None = None,
-    _program_stamp_value: str | None = None,
-) -> str:
+def emit_program(grounded_ops: list[dict], revit_version: str, intent: str = "",
+                 *, isolation: str = "atomic", postconditions: str = "strict",
+                 disallow_wall_joins: bool = False,
+                 stamp_scope: str = "",
+                 expected_document: Mapping[str, str] | None = None,
+                 expected_identities: Sequence[
+                     ElementIdentityProof] | None = None) -> str:
     """Emit one authoring program.
 
     ``isolation``:
@@ -5064,31 +7053,31 @@ def _emit_program_core(
     # (`compiler.plan_program`, `spec.SOLO_OPS`), чтобы быть достижимым БЕЗ
     # живого Revit; здесь оно остаётся дословно — эмиттер обязан отказывать
     # сам, а не полагаться на то, что до него дошли через план.
-    if any(op["op"] in spec.SOLO_OPS for op in grounded_ops):
+    solo = [op for op in grounded_ops if op["op"] in spec.SOLO_OPS]
+    if solo:
         if len(grounded_ops) != 1:
+            # ИМЯ ОПА БЕРЁТСЯ ИЗ ПРОГРАММЫ, А НЕ ПИШЕТСЯ ЛИТЕРАЛОМ (10.08.2026).
+            # До появления второго соло-опа текст называл `create_stairs`
+            # безусловно, и площадка получила бы отказ, обвиняющий чужую
+            # операцию, — прибор, врущий ровно на новой половине диапазона.
             raise KirRefusal([Diagnostic(
                 code=PLAN_SOLO_OP,
-                message_ru="create_stairs — единственный оп своей программы "
+                message_ru=f"{solo[0]['op']} — единственный оп своей программы "
                            "(StairsEditScope владеет собственными транзакциями); "
                            "вынесите остальные опы в отдельные программы")])
-        return emit_stairs_program(
+        return _SOLO_PROGRAMS[solo[0]["op"]](
             grounded_ops[0], revit_version, intent, stamp_scope=stamp_scope,
             expected_document=expected_document,
-            expected_identities=expected_identities,
-            _program_stamp_value=_program_stamp_value)
+            expected_identities=expected_identities)
     per_op = isolation == "per_op"
     # A partial commit cannot honour a whole-program rollback, so per_op forces
     # report-mode postconditions (drift surfaced, elements kept).
     report_posts = per_op or postconditions == "report"
-    derived_stamp = _program_stamp(grounded_ops, stamp_scope)
-    if (_program_stamp_value is not None
-            and _program_stamp_value != derived_stamp):
-        raise ValueError("program stamp disagrees with grounded payload")
-    stamp = _program_stamp_value or derived_stamp
+    stamp = _program_stamp(grounded_ops, stamp_scope)
     txn_name = ("KIR: " + (intent or "authoring"))[:80]
     op_ids = {op["id"] for op in grounded_ops}
     decls, creates, posts, readbacks = [], [], [], []
-    walls_since_regen = False
+    writes_since_regen = False
     for op in grounded_ops:
         s = _safe(op["id"])
         d, c, p, r = _EMITTERS[op["op"]](op, revit_version, stamp,
@@ -5098,11 +7087,50 @@ def _emit_program_core(
         # Both render HERE — the one render path, byte-identically.
         p = post_to_string(op["id"], p)
         # v0 rule: build walls first, THEN place rooms into finished enclosures
-        if op["op"] == "create_room" and walls_since_regen:
-            c = "doc.Regenerate();  // finalize wall enclosures before rooms (v0 rule)\n" + c
-            walls_since_regen = False
-        elif op["op"] == "create_wall":
-            walls_since_regen = True
+        # ═══ ПРАВИЛО РЕГЕНЕРАЦИИ ПЕРЕД ПРОСТРАНСТВЕННЫМ ОПОМ ═══
+        #
+        # ЧТО ЗАМЕРЕНО, И ЭТО НЕ ПРО СТЕНЫ. Провенанс правила (a63d5c13) —
+        # факт о Revit: «свежая стена без граней ДО регенерации». То есть
+        # только что созданный элемент не реализован в документе целиком,
+        # пока не позвали `doc.Regenerate()`. `NewRoom`/`NewSpace` разрешают
+        # объемлющую область В МОМЕНТ ВЫЗОВА — значит важно, создавалось ли
+        # ЧТО-НИБУДЬ после последней регенерации, а вовсе не была ли это
+        # стена.
+        #
+        # ПОЧЕМУ НЕ СПИСОК ОГРАНИЧИВАЮЩИХ ОПОВ. Соблазн был: спросить
+        # реестр, чей результат ограничивает комнату. Замер 11.08 по шести
+        # сборкам закрывает эту дорогу — ЕДИНСТВЕННЫЙ BuiltInParameter,
+        # называющий ограничение комнаты, это `WALL_ATTR_ROOM_BOUNDING`
+        # (6/6). У разделителя, перекрытия, потолка и кровли такого
+        # параметра нет вовсе: они ограничивают по своей природе. Спросить
+        # элемент «ограничиваешь ли ты» нечем, поэтому список пришлось бы
+        # вести руками — и он протух бы на первом же новом опе.
+        #
+        # ЧТО БЫЛО СЛОМАНО. Правило вооружал ТОЛЬКО `create_wall`, а
+        # ограничивающих элементов реестр строит восемь родов (замер 11.08:
+        # create_room_separator, create_floor, create_floor_by_contour,
+        # create_ceiling, create_roof, create_extrusion_roof, create_column,
+        # create_building_pad). Программа «разделитель, затем комната в
+        # образованном им контуре» регенерации НЕ получала — проверено на
+        # эмиссии: разделитель на позиции 2645, комната на 5534, регенерации
+        # между ними нет.
+        #
+        # ЦЕНА ОШИБКИ НЕСИММЕТРИЧНА, и правило выбрано по ней: лишняя
+        # регенерация стоит времени, пропущенная — ОТКАТА ВЕРНОЙ ПРОГРАММЫ
+        # (комната прочитает Area == 0 и свидетель уронит всё). Из двух зол
+        # выбрано обратимое, ровно как у слепоты приёмки.
+        #
+        # ЗАКРЫТО ОТ ПРОТУХАНИЯ: обе стороны правила выводятся из реестра, а
+        # не перечисляются. Вооружает — любой оп с `writes_model`, значит
+        # новый пишущий оп попадает в правило сам. Потребляет —
+        # `_SPATIAL_ENCLOSURE_OPS`, и `tests/test_regen_before_spatial.py`
+        # падает, если в реестре появился пространственный оп, которого там
+        # нет.
+        if op["op"] in _SPATIAL_ENCLOSURE_OPS and writes_since_regen:
+            c = "doc.Regenerate();  // realise everything created above before the enclosure is resolved\n" + c
+            writes_since_regen = False
+        elif spec.OPS[op["op"]].writes_model:
+            writes_since_regen = True
         if per_op:
             d = d + f"\nbool __ok_{s} = false;"
             c = _wrap_create_per_op(op, s, c, disallow_wall_joins, op_ids)
@@ -5172,7 +7200,7 @@ def _emit_program_core(
         _indent(identity_guard_raw, "        ") + "\n"
         if identity_guard_raw else ""
     )
-    return _with_class_name_helper(
+    return _with_program_helpers(
         f"{_AUTH_PREAMBLE}\n"
         + op_refuse_decl
         + "\n".join(decls) + "\n"
@@ -5239,61 +7267,3 @@ def _emit_program_core(
         + op_refuse_class +
         f"private static class __KirPad\n"
         f"{{")
-
-
-def emit_program(grounded_ops: list[dict], revit_version: str, intent: str = "",
-                 *, isolation: str = "atomic", postconditions: str = "strict",
-                 disallow_wall_joins: bool = False,
-                 stamp_scope: str = "",
-                 expected_document: Mapping[str, str] | None = None,
-                 expected_identities: Sequence[
-                     ElementIdentityProof] | None = None) -> str:
-    """Compatibility facade for callers that still hold mutable op dicts.
-
-    The compiler production path uses :func:`emit_lowered_program`; this raw
-    entry remains for SDK/tests and converges on the same private byte owner.
-    """
-
-    return _emit_program_core(
-        grounded_ops,
-        revit_version,
-        intent,
-        isolation=isolation,
-        postconditions=postconditions,
-        disallow_wall_joins=disallow_wall_joins,
-        stamp_scope=stamp_scope,
-        expected_document=expected_document,
-        expected_identities=expected_identities,
-    )
-
-
-def emit_lowered_program(lowered: LoweredProgram) -> str:
-    """Emit the exact policy and target bound by ``LoweredProgram``."""
-
-    if not isinstance(lowered, LoweredProgram):
-        raise TypeError("emit_lowered_program requires a LoweredProgram")
-    policy = lowered.policy
-    return _emit_program_core(
-        lowered.grounded.to_ops(),
-        lowered.target_profile.revit_year,
-        lowered.grounded.planned.intent,
-        isolation=policy.isolation.value,
-        postconditions=policy.postconditions.value,
-        disallow_wall_joins=policy.disallow_wall_joins,
-        stamp_scope=policy.stamp_scope,
-        expected_document=(
-            policy.expected_document.compiler_guard()
-            if policy.expected_document is not None else None
-        ),
-        expected_identities=policy.expected_identities,
-        _program_stamp_value=lowered.program_stamp,
-    )
-
-
-def emit_artifact(lowered: LoweredProgram) -> EmittedArtifact:
-    """Return the content-addressed result of typed authoring emission."""
-
-    return EmittedArtifact(
-        lowered=lowered,
-        source=emit_lowered_program(lowered),
-    )

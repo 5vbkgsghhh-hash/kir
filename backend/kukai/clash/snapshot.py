@@ -86,6 +86,15 @@ class Census:
     #: называл виновника, а не только число.
     no_hull_by_category: collections.Counter = field(
         default_factory=collections.Counter)
+    #: ВЫРОЖДЕННЫЕ оболочки: тело нулевого объёма (`hulls.hull_degeneracy`).
+    #: Оболочка нулевого объёма не может доказать клеш — её пары ничего не
+    #: значат, — но и нарушением закона содержания она не является, пока в
+    #: данных нет независимого свидетеля протяжённости. Поэтому счётчик, а не
+    #: отказ: 9.7 % склада (замер 10.08.2026) обязаны быть ВИДНЫ.
+    degenerate_hulls: collections.Counter = field(
+        default_factory=collections.Counter)
+    degenerate_by_category: dict = field(
+        default_factory=lambda: collections.defaultdict(collections.Counter))
     #: Типы, у которых сечения не оказалось: `category -> {type_name}`.
     #: Один битый элемент и целый тип без параметра — разные диагнозы, и
     #: счётчик элементов их не различает.
@@ -192,8 +201,30 @@ class Census:
                                   | set(self.unsupported) | set(self.missing_geometry))
             },
             "reasons": dict(sorted(self.reasons.items())),
+            "degenerate_hulls": self.degeneracy_as_dict(),
             "sections": self.sections_as_dict(),
             "mvp_side_coverage": self.mvp_side_coverage(),
+        }
+
+    def degeneracy_as_dict(self) -> dict:
+        """Оболочки нулевого объёма. Публикуется ВСЕГДА, включая ноль:
+        «вырожденных нет» и «не считали» обязаны выглядеть по-разному."""
+        total = sum(v for k, v in self.degenerate_hulls.items() if k != "ok")
+        hulled = sum(self.hulled.values())
+        return {
+            "total": total,
+            "hulled": hulled,
+            "share": round(total / hulled, 6) if hulled else 0.0,
+            "by_kind": {k: self.degenerate_hulls.get(k, 0)
+                        for k in H.DEGENERACIES if k != "ok"},
+            "by_category": {cat: dict(sorted(v.items()))
+                            for cat, v in sorted(self.degenerate_by_category.items())
+                            if v},
+            "note": ("оболочка нулевого объёма НЕ МОЖЕТ доказать клеш. "
+                     "Нарушением закона содержания она при этом не является: "
+                     "независимого свидетеля протяжённости у этих элементов в "
+                     "данных нет (замер 10.08.2026: 67 108 из 67 108 без "
+                     "свидетеля), поэтому здесь счётчик, а не отказ."),
         }
 
     def mvp_side_coverage(self) -> dict:
@@ -341,6 +372,10 @@ def build_from_elements(elements: Iterable[dict], *, origin: dict,
         if rec is not None:
             census.eligible[cat] += 1
             census.hulled[cat] += 1
+            degen = H.hull_degeneracy(rec.hull)
+            census.degenerate_hulls[degen] += 1
+            if degen != "ok":
+                census.degenerate_by_category[cat][degen] += 1
             records.append(rec)
             continue
         assert ref is not None

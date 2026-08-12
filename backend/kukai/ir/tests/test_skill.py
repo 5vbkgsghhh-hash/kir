@@ -24,9 +24,8 @@
    `tool_doc.NOTES`.
 
 ЧЕГО ЗДЕСЬ НАМЕРЕННО НЕТ: проверок против живой телеметрии
-(`data/telemetry/*.jsonl`). Эти файлы РАСТУТ по мере работы прода, поэтому
-замеренные частоты (210 из 586) — датированный снимок 30.07, а не инвариант;
-тест, привязанный к ним, начал бы падать от чужой работы.
+(`data/telemetry/*.jsonl`). Эти файлы растут по мере работы прода; без явной
+идентичности попыток их строки нельзя превращать в частоту отказов автора.
 """
 from __future__ import annotations
 
@@ -40,6 +39,11 @@ os.environ.setdefault("KIR_REJECTIONS_PATH",
 
 from kukai.ir import macros, skill, spec  # noqa: E402
 from kukai.ir.compiler import MAX_OPS_PER_PROGRAM, compile_program  # noqa: E402
+from kukai.ir.diag import (  # noqa: E402
+    W_POSTCONDITIONS_COMMITTED,
+    X_POSTCONDITIONS,
+)
+from kukai.ir.outcome import RetrySafety  # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
 from kukai.ir.tool_doc import NOTES, build_tool_description  # noqa: E402
 
@@ -89,12 +93,42 @@ class CourseProgramsCompile(unittest.TestCase):
 
     def test_the_programs_in_the_text_are_the_programs_tested(self):
         """Ратчет против расхождения показанного и проверенного: каждая
-        программа обязана присутствовать в тексте курса своим JSON."""
-        text = skill.build_skill_text()
+        программа обязана присутствовать своим JSON там, где её ПОКАЖУТ.
+
+        АДРЕС ПЕРЕПИСАН 09.08, ХРАПОВИК — НЕТ. Литералы разборов уехали из
+        постоянно загружаемого текста в `course("разборы")` (2 496 символов
+        при потолке описания 30 000). Проверка поэтому смотрит ОБА адреса
+        разом: программа, выпавшая из обоих, показана не будет нигде — а
+        именно от этого храповик и сторожит. Пара §6 осталась в курсе, потому
+        что там программы и есть предмет суждения.
+        """
+        shown = (skill.build_skill_text() + "\n"
+                 + skill.build_walkthrough_programs_text())
         for name, program in skill.ALL_PROGRAMS:
             with self.subTest(program=name):
-                self.assertIn(skill._render_program(program), text,
-                              f"{name} не отрендерена в текст")
+                self.assertIn(skill._render_program(program), shown,
+                              f"{name} не отрендерена нигде")
+
+    def test_the_displaced_walkthrough_programs_really_arrive(self):
+        """ВЫТЕСНЕНИЕ — ПЕРЕЕЗД С ПРОВЕРКОЙ, ЧТО НОВЫЙ АДРЕС ЧИТАЕТСЯ.
+
+        Обе стороны шва разом: программы разборов обязаны БЫТЬ в уроке и
+        обязаны ОТСУТСТВОВАТЬ в постоянно загружаемом тексте. Без второй
+        половины «вытеснил» неотличимо от «удалил», а без первой — от
+        «потерял».
+        """
+        from kukai.ir.course import lessons
+
+        text = skill.build_skill_text()
+        home = lessons.lesson(skill.WALKTHROUGH_PROGRAMS_TOPIC)
+        for _title, _steps, programs in skill.WALKTHROUGHS:
+            for label, program in programs:
+                rendered = skill._render_program(program)
+                with self.subTest(program=label):
+                    self.assertIn(rendered, home, "не доехала в урок")
+                    self.assertNotIn(rendered, text, "осталась и в описании")
+        # Дверь названа: урок, до которого нет указателя, тёмный.
+        self.assertIn(f'course("{skill.WALKTHROUGH_PROGRAMS_TOPIC}")', text)
 
     def test_the_tower_is_one_op_not_an_enumeration(self):
         """Число из разбора 1: тот же силуэт — одна операция, а не 160."""
@@ -266,7 +300,7 @@ class AdvisedBoundariesActuallyRefuse(unittest.TestCase):
         self.assertIn("развернётся", out.diagnostics[0].message_ru)
 
     def test_program_op_budget_refuses(self):
-        """Самый частый отказ системы (210 из 586 живых) обязан быть настоящим."""
+        """Объявленный в курсе бюджет обязан быть настоящей границей."""
         walls = [{"op": "create_wall", "id": f"w{i}", "p0_mm": [i * 100, 0],
                   "p1_mm": [i * 100, 5000], "height_mm": 3000, "level": LEVEL}
                  for i in range(MAX_OPS_PER_PROGRAM + 1)]
@@ -301,6 +335,28 @@ class ReadingSideIsDescribedCorrectly(unittest.TestCase):
 
 
 class NumbersMatchTheCode(unittest.TestCase):
+    def test_refusal_playbook_is_contract_driven_not_legacy_frequency(self):
+        self.assertEqual(len(skill.REFUSAL_PLAYBOOK), 6)
+        text = skill.build_skill_text()
+
+        for stale_claim in (
+                "САМЫЙ ЧАСТЫЙ", "210 из 586", "64 из 586",
+                "40 таких", "ЕДИНСТВЕННЫЙ ОТКАЗ",
+                "Остальные отказы KIR retryable",
+                "Остальная программа была верна"):
+            self.assertNotIn(stale_claim, text)
+
+        for required_truth in (
+                "err.retryable", "outcome.retry", "machine-applicable",
+                X_POSTCONDITIONS, W_POSTCONDITIONS_COMMITTED,
+                "KIR-G101/G102", "KIR-G104", "ops_total", "op_refusals"):
+            self.assertIn(required_truth, text)
+        for retry_safety in RetrySafety:
+            self.assertIn(retry_safety.value, text)
+
+        self.assertIn("Для других кодов `candidates`", text)
+        self.assertNotIn("Пустой список кандидатов", text)
+
     def test_every_quoted_limit_equals_its_constant(self):
         text = skill.build_skill_text()
         for value in (macros.MAX_SERIES_OPS, macros.MAX_TRACK_PARAMS,

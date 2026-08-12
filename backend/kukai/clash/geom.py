@@ -8,8 +8,19 @@
 Что здесь точно, а что нет (это не украшение — на этом стоит вердикт):
 
 * `Prism` — выпуклый многогранник: выпуклый полигон подошвы × [z0, z1].
+* `PrismSet` — ОБЪЕДИНЕНИЕ выпуклых призм с общим [z0, z1]. Тело невыпуклое.
 * `Capsule` — полилиния × радиус (объединение сегментов; узлы покрыты).
 * `Aabb` — бокс; частный случай призмы с прямоугольной подошвой.
+
+ПОЧЕМУ `PrismSet` — ОТДЕЛЬНЫЙ ТИП, А НЕ ПРИЗМА С ВОГНУТОЙ ПОДОШВОЙ. SAT —
+теорема о ВЫПУКЛЫХ множествах и только о них. `_project` берёт min/max по
+вершинам, то есть проекцию ВЫПУКЛОЙ ОБОЛОЧКИ подошвы: подай ей вогнутый контур —
+и она вернёт выпуклый ответ МОЛЧА, без ошибки и без флага. Вогнутость поэтому
+обязана быть видна в ТИПЕ, а не спрятана в поле: `PrismSet` носит список
+ВЫПУКЛЫХ кусков, и код, который типа не знает, спотыкается громко. По той же
+причине `PrismSet` НЕ наследует `Prism`: наследование сделало бы
+`isinstance(h, Prism)` истинным и вернуло бы ровно то молчаливое овыпукление,
+ради устранения которого тип и заведён.
 
 Знаковое расстояние `signed_distance` считается ТОЧНО для каждой пары оболочек
 (не для настоящих тел — см. `narrow.verdict_of`). «Точно» здесь проверяемо:
@@ -21,6 +32,20 @@
 Клэмп-по-z из v1 отозван (ревью №12): у наклонного отрезка минимумы по XY и по
 Z достигаются в разных точках, и их независимое сравнение объявляет клеш там,
 где общей точки нет.
+
+ВОЛНА DECOMPOSE (10.08.2026), вторая половина. Зазор пары ВЫПУКЛЫХ подошв
+считался по лучшей разделяющей оси SAT и был НИЖНЕЙ ОЦЕНКОЙ евклидова
+расстояния (контрпример ревью №7: 1.0 против истинного √2). Оценка снизу
+завышает клеш и потому безопасна — ровно пока оболочка ОДНА. У объединения
+кусков она перестаёт быть безопасной по другой причине: `dist(∪Aᵢ, ∪Bⱼ) =
+minᵢⱼ dist(Aᵢ, Bⱼ)` верно как теоретико-множественное равенство, но минимум по
+N·M НИЖНИХ ОЦЕНОК — оценка ТЕМ ХУЖЕ, чем больше кусков, и разбивка подошвы
+обменяла бы ложные перекрытия на ЛОЖНЫЕ НАРУШЕНИЯ ЗАЗОРА. Поэтому вместе с
+разбивкой вводится `_convex_poly_distance` — точное расстояние пары выпуклых
+многоугольников перебором «вершина–ребро», и оно применяется ко ВСЕМ парам
+подошв, а не только к разбитым. Публикуемое расстояние с этой волны ТОЧНО;
+нижней оценкой осталась ровно одна величина — глубина перекрытия ОБЪЕДИНЕНИЙ
+(см. `signed_distance`).
 """
 
 from __future__ import annotations
@@ -92,6 +117,39 @@ class Prism:
 
 
 @dataclass(frozen=True)
+class PrismSet:
+    """ОБЪЕДИНЕНИЕ выпуклых призм с общим [z0, z1]. Подошва — вогнутая область.
+
+    Куски приходят из `clash.decompose`, где доказано, что их объединение РАВНО
+    объявленной области (сверка площадей + независимая проверка центроидов), а
+    не содержит её и не содержится в ней. Здесь это уже предпосылка: каждый
+    кусок обязан быть ВЫПУКЛЫМ, иначе всё, что ниже, врёт молча.
+
+    Общий [z0, z1] — не упрощение, а форма данных: подошва выдавливается одной
+    отметкой на одну высоту. Куску собственный размах по Z взять неоткуда.
+
+    ВЫРОЖДЕННЫЕ КУСКИ (отрезок, точка) не выбрасываются: заметание выпускает их
+    на защемлениях области, а выброшенный кусок УМЕНЬШАЕТ оболочку. Как
+    выпуклые множества они законны, и вся арифметика ниже их держит.
+    """
+    pieces: tuple[tuple[Pt2, ...], ...]
+    z0: float
+    z1: float
+
+    def bounds(self) -> tuple[Pt3, Pt3]:
+        xs = [p[0] for fp in self.pieces for p in fp]
+        ys = [p[1] for fp in self.pieces for p in fp]
+        if not xs:
+            # Пустое тело. Габарит ПУСТОГО множества — вывернутый бокс, и это
+            # не «нет данных», а корректный ответ: пересечься с ним нельзя.
+            return ((math.inf, math.inf, self.z0), (-math.inf, -math.inf, self.z1))
+        return ((min(xs), min(ys), self.z0), (max(xs), max(ys), self.z1))
+
+    def prisms(self) -> list["Prism"]:
+        return [Prism(fp, self.z0, self.z1) for fp in self.pieces]
+
+
+@dataclass(frozen=True)
 class Capsule:
     """Полилиния × радиус. Один сегмент — частый случай; полилиния нужна дугам,
     разложенным на хорды, и наклонным трассам."""
@@ -112,7 +170,31 @@ class Capsule:
         return list(zip(self.path, self.path[1:]))
 
 
-Hull = Aabb | Prism | Capsule
+Hull = Aabb | Prism | PrismSet | Capsule
+
+#: Оболочки, у которых подошва РАСКЛАДЫВАЕТСЯ на выпуклые куски. Единая точка,
+#: где призма, бокс и объединение приводятся к одному виду: любой код, который
+#: перебирает куски вручную, рано или поздно забудет один из трёх типов.
+def footprint_pieces(h: Hull) -> tuple[tuple[Pt2, ...], ...] | None:
+    """Выпуклые подошвы оболочки, либо `None` для капсулы (у неё подошвы нет)."""
+    if isinstance(h, PrismSet):
+        return h.pieces
+    if isinstance(h, Prism):
+        return (h.footprint,)
+    if isinstance(h, Aabb):
+        return (h.as_prism().footprint,)
+    return None
+
+
+def z_span(h: Hull) -> tuple[float, float] | None:
+    """Размах по Z у призменного семейства. `None` — капсула."""
+    if isinstance(h, PrismSet):
+        return (h.z0, h.z1)
+    if isinstance(h, Prism):
+        return (h.z0, h.z1)
+    if isinstance(h, Aabb):
+        return (h.lo[2], h.hi[2])
+    return None
 
 
 def hull_bounds(h: Hull) -> tuple[Pt3, Pt3]:
@@ -244,28 +326,75 @@ def _project(poly: Sequence[Pt2], axis: Pt2) -> tuple[float, float]:
     return min(vals), max(vals)
 
 
-def poly_poly_gap(a: Sequence[Pt2], b: Sequence[Pt2]) -> float:
-    """Зазор двух ВЫПУКЛЫХ полигонов: >0 — расстояние по разделяющей оси,
-    <=0 — глубина проникания (минимальный перенос).
+def _seg_seg_distance_2d(p0: Pt2, p1: Pt2, q0: Pt2, q1: Pt2) -> float:
+    """Расстояние двух отрезков на плоскости. Точно, включая вырожденные."""
+    def pt_seg(p, a, b):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        e = dx * dx + dy * dy
+        if e <= EPS_MM2:
+            return math.hypot(p[0] - a[0], p[1] - a[1])
+        t = _clamp01(((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / e)
+        return math.hypot(p[0] - a[0] - dx * t, p[1] - a[1] - dy * t)
 
-    Для непересекающихся полигонов это НИЖНЯЯ ОЦЕНКА евклидова расстояния (по
-    лучшей разделяющей оси), для пересекающихся — точная глубина по лучшей оси.
-    Нижняя оценка расстояния означает завышение клеша, то есть огрубление в
-    безопасную сторону: лишние находки видно, пропущенных нет.
+    # Собственное пересечение — расстояние ноль, и его не даст ни одна из
+    # четырёх проекций «конец на отрезок».
+    d1x, d1y = p1[0] - p0[0], p1[1] - p0[1]
+    d2x, d2y = q1[0] - q0[0], q1[1] - q0[1]
+    den = d1x * d2y - d1y * d2x
+    if den != 0.0:
+        rx, ry = q0[0] - p0[0], q0[1] - p0[1]
+        t = (rx * d2y - ry * d2x) / den
+        u = (rx * d1y - ry * d1x) / den
+        if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
+            return 0.0
+    return min(pt_seg(p0, q0, q1), pt_seg(p1, q0, q1),
+               pt_seg(q0, p0, p1), pt_seg(q1, p0, p1))
 
-    Ревью №7. Оператор проверил лично: перестановочной нестабильности НЕТ —
-    все циклические повороты одного квадрата дают один ответ. Осталась вторая
-    половина: 1.0 против истинных √5 в контрпримере. Здесь снят ранний выход по
-    первой же разделяющей оси (он делал результат зависящим от ПОРЯДКА осей,
-    а не только от геометрии) — берётся максимум по всем осям, то есть самая
-    тугая из доступных SAT-оценок. Точным расстоянием это не становится, и
-    отчёт называет величину нижней оценкой (`SEPARATION_SEMANTICS`), а не
-    расстоянием.
+
+def _convex_poly_distance(a: Sequence[Pt2], b: Sequence[Pt2]) -> float:
+    """ТОЧНОЕ евклидово расстояние двух НЕПЕРЕСЕКАЮЩИХСЯ выпуклых полигонов.
+
+    Ближайшая пара точек двух непересекающихся выпуклых множеств всегда
+    содержит хотя бы одну ВЕРШИНУ (даже когда ближайшие элементы — две
+    параллельные стороны: вершина одной из них достигает того же минимума).
+    Поэтому перебор «сторона × сторона» замыкает все случаи без приближения.
+
+    Стоимость O(n·m). Здесь это не важно: подошва призмы после разбивки — от
+    трёх до шести вершин, и худшая пара стоит десятки умножений.
+
+    Вызывать ТОЛЬКО когда SAT уже сказал «разделены»: для пересекающихся
+    полигонов перебор по границам вернул бы 0 и потерял бы глубину.
     """
-    if not a or not b:
+    na, nb = len(a), len(b)
+    if na == 0 or nb == 0:
         return math.inf
-    if len(a) == 1 and len(b) == 1:
+    if na == 1 and nb == 1:
         return math.hypot(a[0][0] - b[0][0], a[0][1] - b[0][1])
+    if na == 1:
+        return min(_seg_seg_distance_2d(a[0], a[0], b[j], b[(j + 1) % nb])
+                   for j in range(nb))
+    if nb == 1:
+        return min(_seg_seg_distance_2d(a[i], a[(i + 1) % na], b[0], b[0])
+                   for i in range(na))
+    best = math.inf
+    for i in range(na):
+        ai, aj = a[i], a[(i + 1) % na]
+        for j in range(nb):
+            d = _seg_seg_distance_2d(ai, aj, b[j], b[(j + 1) % nb])
+            if d < best:
+                best = d
+    return best
+
+
+def _poly_sat_gap(a: Sequence[Pt2], b: Sequence[Pt2]) -> float:
+    """SAT-зазор: ЗНАК точен, положительная величина — оценка СНИЗУ.
+
+    Вынесено из `poly_poly_gap` не ради красоты, а ради отсева: у объединения
+    кусков минимум ищется по N·M парам, и точное расстояние (перебор
+    «вершина–ребро») незачем считать у пары, чья дешёвая оценка снизу уже хуже
+    найденного минимума. Отсев ТОЧЕН: уточнение может только поднять величину,
+    поэтому пара, отсеянная по оценке снизу, победить не могла.
+    """
     best = -math.inf
     for axis in (_poly_axes(a) + _poly_axes(b)) or [(1.0, 0.0), (0.0, 1.0)]:
         amin, amax = _project(a, axis)
@@ -274,6 +403,47 @@ def poly_poly_gap(a: Sequence[Pt2], b: Sequence[Pt2]) -> float:
         if gap > best:
             best = gap
     return best
+
+
+def _xy_range(poly: Sequence[Pt2]) -> tuple[float, float, float, float]:
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def poly_poly_gap(a: Sequence[Pt2], b: Sequence[Pt2]) -> float:
+    """Зазор двух ВЫПУКЛЫХ полигонов: >0 — ТОЧНОЕ евклидово расстояние,
+    <=0 — глубина проникания (она же длина наименьшего разводящего переноса).
+
+    Ревью №7 закрыто ЦЕЛИКОМ. Первая половина (перестановочная нестабильность)
+    не воспроизвелась у оператора; вторая — «1.0 против истинных √2» — была
+    настоящей и чинилась только формулой. Здесь она и починена: SAT решает
+    ВОПРОС О ЗНАКЕ (разделены или нет) — на это он и есть теорема, — а величину
+    в разделённом случае даёт точный перебор `_convex_poly_distance`.
+
+    ЗАЧЕМ ЭТО ПОНАДОБИЛОСЬ ИМЕННО СЕЙЧАС. Пока подошва была одна, нижняя
+    оценка была безопасной: она завышает клеш, то есть даёт лишние находки, а
+    не пропуски. У ОБЪЕДИНЕНИЯ подошв расстояние берётся минимумом по парам
+    кусков, и минимум по N·M нижним оценок — оценка тем более рыхлая, чем
+    мельче разбивка. Разбивка без этой правки меняла бы ложные перекрытия на
+    ложные нарушения зазора, то есть переносила бы ошибку, а не убирала.
+
+    В пересекающемся случае величина прежняя и точная: максимум по осям от
+    отрицательных зазоров — это наименьшее перекрытие проекций, то есть длина
+    MTV пары ВЫПУКЛЫХ полигонов.
+    """
+    if not a or not b:
+        return math.inf
+    if len(a) == 1 and len(b) == 1:
+        return math.hypot(a[0][0] - b[0][0], a[0][1] - b[0][1])
+    best = _poly_sat_gap(a, b)
+    if best <= 0.0:
+        return best
+    # Разделены — SAT сказал ЧТО, точный перебор говорит НАСКОЛЬКО.
+    # Точное расстояние никогда не меньше оценки снизу; сравнение оставлено
+    # как страховка от вырожденных подошв, где перебор границ может дать 0.
+    exact = _convex_poly_distance(a, b)
+    return exact if exact >= best else best
 
 
 def _interval_gap(a0: float, a1: float, b0: float, b1: float) -> float:
@@ -310,8 +480,22 @@ def _point_in_prism(pt: Pt3, p: Prism) -> bool:
     for i in range(n):
         ax, ay = fp[i]
         bx, by = fp[(i + 1) % n]
-        cr = (bx - ax) * (pt[1] - ay) - (by - ay) * (pt[0] - ax)
-        if abs(cr) <= EPS_MM:
+        ex, ey = bx - ax, by - ay
+        cr = ex * (pt[1] - ay) - ey * (pt[0] - ax)
+        # Ревью №8, тот же закон на новом месте: `cr` имеет размерность мм², и
+        # сравнивать его с порогом в МИЛЛИМЕТРАХ нельзя ни при каком масштабе.
+        # Расстояние от точки до прямой ребра есть `cr / |ребро|`, поэтому
+        # порог умножается на длину ребра — тогда сравниваются миллиметры с
+        # миллиметрами.
+        #
+        # ЗАМЕР, который это нашёл (10.08.2026, плотная проба содержания по
+        # 1 621 617 точкам корпуса): 893 точки, лежащие НА границе ячейки,
+        # объявлялись снаружи оболочки. У ячейки с ребром 5 500 мм точка в
+        # 1e-9 мм от ребра давала cr ≈ 5.5e-6 > EPS_MM = 1e-6 и признавалась
+        # строго снаружи. До разбивки дефект был почти невидим: внутренних
+        # границ у одной выпуклой подошвы нет, а после — их десятки.
+        L = math.hypot(ex, ey)
+        if abs(cr) <= EPS_MM * (L if L > 1.0 else 1.0):
             continue
         s = 1 if cr > 0 else -1
         if sign == 0:
@@ -440,11 +624,47 @@ def seg_prism_signed_distance(s0: Pt3, s1: Pt3, p: Prism) -> float:
 
 # ────────────────────────────────────────────────────── пары оболочек
 
+def _prism_pair_sd(fa: Sequence[Pt2], fb: Sequence[Pt2],
+                   za: tuple[float, float], zb: tuple[float, float]) -> float:
+    """Знаковое расстояние ОДНОЙ пары выпуклых призм.
+
+    Призма — декартово произведение подошвы на интервал ПО ТЕМ ЖЕ осям,
+    поэтому квадраты расстояний складываются: `hypot` здесь точен, а не
+    приближён. Композиция обязана происходить ВНУТРИ пары кусков и только
+    потом уходить в минимум по парам: `hypot` от минимума по XY одной пары и
+    минимума по Z ДРУГОЙ описывает точку, которой нет ни в одном теле.
+    """
+    gxy = poly_poly_gap(fa, fb)
+    gz = _interval_gap(za[0], za[1], zb[0], zb[1])
+    if gxy > 0 or gz > 0:
+        return math.hypot(max(0.0, gxy), max(0.0, gz))
+    return max(gxy, gz)
+
+
 def signed_distance(a: Hull, b: Hull) -> float:
     """Знаковое расстояние между ДВУМЯ ОБОЛОЧКАМИ (не телами).
 
     Отрицательное — проникание. Функция симметрична по построению: пары
     приводятся к каноническому порядку типов.
+
+    ЧТО ЗНАЧИТ ЧИСЛО У ОБЪЕДИНЕНИЯ (`PrismSet`) — две разные вещи по разные
+    стороны нуля, и путать их нельзя:
+
+    * ЗНАК ТОЧЕН ВСЕГДА. `∪Aᵢ ∩ ∪Bⱼ ≠ ∅` тогда и только тогда, когда
+      пересекается хоть одна пара кусков, поэтому минимум по парам меняет знак
+      ровно там, где меняет его настоящее тело. Ни пропуска, ни лишней находки
+      разбивка не создаёт — она их УБИРАЕТ.
+    * ПОЛОЖИТЕЛЬНАЯ ВЕЛИЧИНА ТОЧНА. `dist(∪Aᵢ, ∪Bⱼ) = minᵢⱼ dist(Aᵢ, Bⱼ)` —
+      равенство множеств, а каждое слагаемое точно с этой волны.
+    * ОТРИЦАТЕЛЬНАЯ ВЕЛИЧИНА — НИЖНЯЯ ОЦЕНКА, и это принципиально. Развести
+      два ОБЪЕДИНЕНИЯ обязан ОДИН перенос, гасящий ВСЕ пересекающиеся пары
+      кусков разом, поэтому |MTV(A,B)| ≥ maxᵢⱼ|MTV(Aᵢ,Bⱼ)| и, вообще говоря,
+      строго больше любой из них. Публикуемая здесь глубина — самая глубокая
+      пара кусков, то есть нижняя оценка требуемого хода. Выдавать её за MTV
+      значило бы подписать сертификат, который не проверяли; поэтому
+      `detect.Finding.separation_is_lower_bound` у таких пар истинен, а
+      разводящий перенос берётся не отсюда, а из `certified_separating_
+      translation`, где он ПРОВЕРЯЕТСЯ переносом.
     """
     ka, kb = type(a).__name__, type(b).__name__
     if (ka, kb) == ("Capsule", "Capsule"):
@@ -454,20 +674,91 @@ def signed_distance(a: Hull, b: Hull) -> float:
                 best = min(best, seg_seg_distance(p0, p1, q0, q1))
         return best - (a.radius + b.radius)
     if ka == "Capsule":
-        pr = b.as_prism() if kb == "Aabb" else b
-        best = min(seg_prism_signed_distance(p0, p1, pr) for p0, p1 in a.segments())
+        best = math.inf
+        segs = a.segments()
+        for pr in _as_prisms(b):
+            # Отсев требует габарита, а у ВЫРОЖДЕННОЙ подошвы (пустой список
+            # вершин) его нет. Тогда отсева просто нет: расстояние считается
+            # как раньше и вернёт `inf` через грани, которых у такой призмы
+            # тоже нет. Молчаливого исключения из перебора не происходит.
+            plo, phi = (pr.bounds() if pr.footprint else (None, None))
+            for p0, p1 in segs:
+                # Тот же точный отсев: габаритный зазор отрезка и куска не
+                # больше настоящего расстояния, поэтому пара, проигравшая по
+                # нему, не могла победить по существу.
+                if best < math.inf and plo is not None:
+                    g = 0.0
+                    for k in range(3):
+                        lo_k, hi_k = min(p0[k], p1[k]), max(p0[k], p1[k])
+                        gk = max(plo[k] - hi_k, lo_k - phi[k])
+                        if gk > 0.0:
+                            g += gk * gk
+                    if g > 0.0 and math.sqrt(g) >= best:
+                        continue
+                d = seg_prism_signed_distance(p0, p1, pr)
+                if d < best:
+                    best = d
         return best - a.radius
     if kb == "Capsule":
         return signed_distance(b, a)
-    pa = a.as_prism() if ka == "Aabb" else a
-    pb = b.as_prism() if kb == "Aabb" else b
-    gxy = poly_poly_gap(pa.footprint, pb.footprint)
-    gz = _interval_gap(pa.z0, pa.z1, pb.z0, pb.z1)
-    if gxy > 0 or gz > 0:
-        # Призма — декартово произведение подошвы на интервал, поэтому
-        # квадраты расстояний складываются: это точно, а не приближение.
-        return math.hypot(max(0.0, gxy), max(0.0, gz))
-    return max(gxy, gz)
+    fa, fb = footprint_pieces(a), footprint_pieces(b)
+    za, zb = z_span(a), z_span(b)
+    if fa is None or fb is None or za is None or zb is None:
+        return math.inf
+    gz = _interval_gap(za[0], za[1], zb[0], zb[1])
+    if len(fa) == 1 and len(fb) == 1:
+        return _prism_pair_sd(fa[0], fb[0], za, zb)
+    # ── ОТСЕВ ПО ОЦЕНКАМ СНИЗУ. Ответ от него не зависит ни на разряд: каждая
+    #    отброшенная пара кусков отброшена величиной, которая НЕ БОЛЬШЕ её
+    #    настоящего расстояния, и уже проигрывает найденному минимуму.
+    #    Замер 11.08.2026 (медиана 19 кусков на разложенную подошву, максимум
+    #    62): без отсева пара оболочек стоила ~1.4 мс против 0.05 мс у выпуклой,
+    #    то есть тридцатикратное подорожание узкой фазы — ради него волну бы и
+    #    завернули. Отсев ТОЧЕН, и это проверено отдельно: 4 000 случайных пар
+    #    объединений против полного перебора всех пар кусков, 0 расхождений.
+    zc = max(0.0, gz)
+    ra = [_xy_range(p) for p in fa]
+    rb = [_xy_range(p) for p in fb]
+    best = math.inf
+    for i, pa in enumerate(fa):
+        ax0, ay0, ax1, ay1 = ra[i]
+        for j, pb in enumerate(fb):
+            bx0, by0, bx1, by1 = rb[j]
+            # (1) габаритный зазор кусков — оценка снизу, три вычитания
+            gx = max(bx0 - ax1, ax0 - bx1)
+            gy = max(by0 - ay1, ay0 - by1)
+            if gx > 0.0 or gy > 0.0:
+                lb = math.hypot(math.hypot(max(0.0, gx), max(0.0, gy)), zc)
+                if lb >= best:
+                    continue
+            elif zc > 0.0 and zc >= best:
+                continue
+            # (2) SAT — оценка снизу потуже, но всё ещё дешёвая
+            sat = _poly_sat_gap(pa, pb)
+            if sat > 0.0:
+                if math.hypot(sat, zc) >= best:
+                    continue
+                # `max` — та же страховка, что в `poly_poly_gap`: у вырожденной
+                # подошвы перебор границ может дать 0 там, где SAT прав.
+                d = math.hypot(max(sat, _convex_poly_distance(pa, pb)), zc)
+            elif gz > 0.0:
+                d = zc
+            else:
+                d = max(sat, gz)
+            if d < best:
+                best = d
+    return best
+
+
+def _as_prisms(h: Hull) -> list[Prism]:
+    """Призменное семейство -> список ВЫПУКЛЫХ призм. Капсула -> пусто."""
+    if isinstance(h, PrismSet):
+        return h.prisms()
+    if isinstance(h, Prism):
+        return [h]
+    if isinstance(h, Aabb):
+        return [h.as_prism()]
+    return []
 
 
 #: Допуск постусловия разведения: перенос обязан выводить пару в `sd >= -SEP_EPS`.
@@ -483,6 +774,10 @@ def translate(h: Hull, v: Sequence[float]) -> Hull:
         return Capsule(tuple(sh(p) for p in h.path), h.radius)
     if isinstance(h, Aabb):
         return Aabb(sh(h.lo), sh(h.hi))
+    if isinstance(h, PrismSet):
+        return PrismSet(
+            tuple(tuple((x + v[0], y + v[1]) for x, y in fp) for fp in h.pieces),
+            h.z0 + v[2], h.z1 + v[2])
     fp = tuple((x + v[0], y + v[1]) for x, y in h.footprint)
     return Prism(fp, h.z0 + v[2], h.z1 + v[2])
 
@@ -506,6 +801,17 @@ def certified_separating_translation(a: Hull, b: Hull
     Порядок: типовой кандидат → проверка → сертифицированный запасной вариант
     по габаритам (он разводит всегда) → проверка → `None` с названной причиной
     (`mtv_unavailable_reason`). Молчаливого `None` не бывает.
+
+    НАСКОЛЬКО ЭТОТ ХОД ДЛИННЕЕ НАИМЕНЬШЕГО — ЗАМЕРЕНО, а не оценено.
+    `clash.resolve.minimal_exit` ищет наименьший перенос бисекцией по
+    направлению (множество `{t : (A+t·d) ∩ B ≠ ∅}` у выпуклых тел есть
+    ОТРЕЗОК, поэтому бисекция корректна). Сверка на 600 настоящих находках
+    `sob62_r23_v5` (10.08.2026): здешний ход длиннее минимального в 5.892 раза
+    по медиане, в 56.667 на p90 и в 112 066.5 раза в худшем случае.
+
+    Это НЕ противоречие с абзацем выше: минимальность здесь и не обещана.
+    Ссылка стоит затем, чтобы альтернативу было ВИДНО из точки, где выбирают
+    вектор, — иначе её выбирают, не зная цены.
     """
     sd = signed_distance(a, b)
     if sd >= 0:
@@ -531,22 +837,43 @@ def mtv_unavailable_reason(a: Hull, b: Hull) -> str | None:
 
 
 def _separation_candidates(a: Hull, b: Hull, sd: float) -> list[Sequence[float] | None]:
+    """Кандидаты в разводящий перенос. КАЖДЫЙ проверяется вызывающим.
+
+    У объединения кандидат берётся по ВСЕМУ телу, а не по куску: перенос,
+    выводящий один кусок, отправляет его в соседний, и пара остаётся в
+    проникании. Поэтому проекции считаются по объединению вершин обоих тел, а
+    набор осей — по граням всех кусков. Для одного выпуклого куска это ровно
+    прежняя формула с прежним ответом, поэтому находки, которых волна не
+    касается, не сдвигаются ни на разряд.
+    """
     ka, kb = type(a).__name__, type(b).__name__
-    if ka in ("Prism", "Aabb") and kb in ("Prism", "Aabb"):
-        pa = a.as_prism() if ka == "Aabb" else a
-        pb = b.as_prism() if kb == "Aabb" else b
+    fa, fb = footprint_pieces(a), footprint_pieces(b)
+    za, zb = z_span(a), z_span(b)
+    if fa is not None and fb is not None and za is not None and zb is not None:
         out: list[Sequence[float] | None] = []
-        up, down = pb.z1 - pa.z0, pa.z1 - pb.z0
+        up, down = zb[1] - za[0], za[1] - zb[0]
         out.append((0.0, 0.0, up if up <= down else -down))
-        axis, depth = _best_axis(pa.footprint, pb.footprint)
+        pts_a = [p for fp in fa for p in fp]
+        pts_b = [p for fp in fb for p in fp]
+        axes: list[Pt2] = []
+        for fp in fa:
+            axes += _poly_axes(fp)
+        for fp in fb:
+            axes += _poly_axes(fp)
+        axis, depth = _best_axis_over(pts_a, pts_b, axes)
         if axis is not None:
             out.append((axis[0] * depth, axis[1] * depth, 0.0))
         return out
-    if ka == "Capsule" and kb in ("Prism", "Aabb"):
-        return [_capsule_prism_push(a, b.as_prism() if kb == "Aabb" else b)]
-    if kb == "Capsule" and ka in ("Prism", "Aabb"):
-        v = _capsule_prism_push(b, a.as_prism() if ka == "Aabb" else a)
-        return [None if v is None else tuple(-c for c in v)]
+    if ka == "Capsule" and fb is not None:
+        # Каждый кусок даёт свой ход; ни один не обещан работающим, поэтому
+        # предлагаются ВСЕ, а решает проверка переносом.
+        return [_capsule_prism_push(a, pr) for pr in _as_prisms(b)]
+    if kb == "Capsule" and fa is not None:
+        out2: list[Sequence[float] | None] = []
+        for pr in _as_prisms(a):
+            v = _capsule_prism_push(b, pr)
+            out2.append(None if v is None else tuple(-c for c in v))
+        return out2
     return [_capsule_capsule_push(a, b)]
 
 
@@ -618,9 +945,17 @@ def _aabb_separation(a: Hull, b: Hull) -> Sequence[float] | None:
     return None if best is None else best[1]
 
 
-def _best_axis(a: Sequence[Pt2], b: Sequence[Pt2]) -> tuple[Pt2 | None, float]:
+def _best_axis_over(a: Sequence[Pt2], b: Sequence[Pt2],
+                    axes: Sequence[Pt2]) -> tuple[Pt2 | None, float]:
+    """Ось наименьшего перекрытия проекций и длина хода вдоль неё.
+
+    Точки и оси разведены по разным параметрам намеренно: у объединения
+    кусков проекция обязана считаться по ВСЕМ вершинам тела, а осями служат
+    нормали граней КАЖДОГО куска. Слепить их в один список нельзя — «ребро»
+    между вершинами разных кусков не является гранью ни одного тела.
+    """
     best_axis, best_gap = None, -math.inf
-    for axis in _poly_axes(a) + _poly_axes(b):
+    for axis in axes:
         amin, amax = _project(a, axis)
         bmin, bmax = _project(b, axis)
         gap = max(bmin - amax, amin - bmax)
@@ -635,6 +970,10 @@ def _best_axis(a: Sequence[Pt2], b: Sequence[Pt2]) -> tuple[Pt2 | None, float]:
     back = amax - bmin
     return (best_axis, out) if out <= back else (
         (-best_axis[0], -best_axis[1]), back)
+
+
+def _best_axis(a: Sequence[Pt2], b: Sequence[Pt2]) -> tuple[Pt2 | None, float]:
+    return _best_axis_over(a, b, _poly_axes(a) + _poly_axes(b))
 
 
 def _capsule_prism_push(cap: Capsule, pr: Prism) -> tuple[float, float, float] | None:
@@ -673,21 +1012,20 @@ def _translate(h: Hull, axis: int, d: float) -> Hull:
         q[axis] += d
         return tuple(q)
 
-    if isinstance(h, Capsule):
-        return Capsule(tuple(shift3(p) for p in h.path), h.radius)
-    if isinstance(h, Aabb):
-        return Aabb(shift3(h.lo), shift3(h.hi))
-    if axis == 2:
-        return Prism(h.footprint, h.z0 + d, h.z1 + d)
-    fp = tuple(((x + d, y) if axis == 0 else (x, y + d)) for x, y in h.footprint)
-    return Prism(fp, h.z0, h.z1)
+    v = [0.0, 0.0, 0.0]
+    v[axis] = d
+    return translate(h, v)
 
 
 def contains_point(h: Hull, pt: Pt3) -> bool:
     """Содержит ли оболочка точку — основа property-теста «оболочка содержит
-    элемент»."""
+    элемент».
+
+    У объединения принадлежность — дизъюнкция по кускам: точка в теле тогда и
+    только тогда, когда она хоть в одном куске. Это и есть определение
+    объединения, а не приближение к нему.
+    """
     if isinstance(h, Capsule):
         return min(seg_seg_distance(p0, p1, pt, pt)
                    for p0, p1 in h.segments()) <= h.radius + 1e-6
-    p = h.as_prism() if isinstance(h, Aabb) else h
-    return _point_in_prism(pt, p)
+    return any(_point_in_prism(pt, p) for p in _as_prisms(h))

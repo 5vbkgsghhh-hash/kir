@@ -150,6 +150,249 @@ def _canonical_object_json(value: Any, field_name: str) -> str | None:
             f"{field_name} must contain only finite JSON values") from exc
 
 
+#: Виды сечения типа. Список ЗАКРЫТ: строка пула либо выходит отсюда ровно с
+#: одним видом, либо не несёт сечения вовсе — «похожего» вида не бывает.
+#:
+#: `plate`         — тело постоянной толщины вокруг своей опорной поверхности
+#:                   (стена вокруг оси, плита вокруг отметки);
+#: `round`         — круглое сечение объявленного ДИАМЕТРА;
+#: `rect`          — прямоугольное сечение (ширина, высота);
+#: `nominal_table` — таблица «номинал -> наружный», прочитанная у типа. Одна
+#:                   строка сама по себе тела не задаёт: тело появляется, когда
+#:                   программа НАЗОВЁТ номинал, а таблица переведёт его в
+#:                   наружный размер.
+SECTION_KINDS = ("plate", "round", "rect", "nominal_table")
+
+#: Максимум строк в таблице номиналов ОДНОГО типа. Сегмент трубы несёт весь
+#: сортамент; потолок держит вес снапшота, а его достижение НАЗЫВАЕТСЯ
+#: (`sizes_truncated`), потому что усечённая таблица и отсутствующая таблица —
+#: разные факты: по первой номинал может не найтись, и это не «нет данных».
+SECTION_MAX_SIZES = 64
+
+
+@dataclass(frozen=True, slots=True)
+class TypeSection:
+    """Геометрия ТИПА: чем именно тело элемента этого типа ограничено.
+
+    ЗАЧЕМ ЭТО ЗДЕСЬ. Замер 09.08 по реестру (`spec.OPS`, 48 операций): ни одна
+    операция создания не несёт толщину стены, перекрытия или сечение колонны —
+    `create_wall` объявляет ось и высоту, `create_cable_tray` только ось. Все
+    эти числа живут в ТИПЕ, а тип разрешается против ЖИВОГО документа ровно на
+    стадии ground. Значит, единственное место, где сечение вообще знаемо, —
+    здесь, и до этой волны строка пула несла только `{id, name}`.
+
+    ЧЕСТНОСТЬ ПОЛЯ `uniform`. Число само по себе не даёт права строить призму:
+    у стены переменного состава по высоте, у наклонной, у стены с выступами
+    призма по одной толщине тело НЕ содержит, то есть допускает ПРОПУСК клеша.
+    Поэтому запись несёт два поля сразу: число и приговор о том, ограничивает
+    ли оно тело. `uniform=False` без `blockers` невозможен — причина обязана
+    быть НАЗВАНА, иначе «тела нет» неотличимо от «не смотрели».
+
+    Единицы — миллиметры, как во всём снапшоте.
+    """
+
+    kind: str
+    source: str
+    thickness_mm: float | None = None
+    diameter_mm: float | None = None
+    width_mm: float | None = None
+    height_mm: float | None = None
+    #: Собственный габарит типоразмера по Z относительно ТОЧКИ ВСТАВКИ, мм.
+    #: Знак значим: у реальной колонны база уходит НИЖЕ своей отметки (замер
+    #: 09.08 на Snowdon: 4 колонны из 114 выходили за оболочку ровно на
+    #: 254.0 мм вниз — это геометрия семейства, а не ошибка программы).
+    local_z_min_mm: float | None = None
+    local_z_max_mm: float | None = None
+    #: Пары `(номинал_мм, наружный_мм)`, отсортированные по номиналу.
+    sizes: tuple[tuple[float, float], ...] = ()
+    sizes_truncated: bool = False
+    uniform: bool = False
+    blockers: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.kind not in SECTION_KINDS:
+            raise OpenModelProfileError(
+                f"type_section.kind must be one of {SECTION_KINDS}")
+        _string(self.source, "type_section.source", nonempty=True)
+        for field_name, value in (
+            ("thickness_mm", self.thickness_mm),
+            ("diameter_mm", self.diameter_mm),
+            ("width_mm", self.width_mm),
+            ("height_mm", self.height_mm),
+        ):
+            if value is None:
+                continue
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or float(value) <= 0.0):
+                raise OpenModelProfileError(
+                    f"type_section.{field_name} must be a positive number")
+        for field_name, value in (("local_z_min_mm", self.local_z_min_mm),
+                                  ("local_z_max_mm", self.local_z_max_mm)):
+            if value is None:
+                continue
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))):
+                raise OpenModelProfileError(
+                    f"type_section.{field_name} must be a finite number")
+        if ((self.local_z_min_mm is None) != (self.local_z_max_mm is None)):
+            raise OpenModelProfileError(
+                "type_section local z bounds must both be present or absent")
+        if (self.local_z_min_mm is not None
+                and float(self.local_z_min_mm) > float(self.local_z_max_mm)):
+            raise OpenModelProfileError(
+                "type_section.local_z_min_mm must not exceed local_z_max_mm")
+        if not isinstance(self.sizes, tuple):
+            raise OpenModelProfileError("type_section.sizes must be a tuple")
+        previous = None
+        for index, pair in enumerate(self.sizes):
+            if (not isinstance(pair, tuple) or len(pair) != 2
+                    or any(isinstance(item, bool)
+                           or not isinstance(item, (int, float))
+                           or not math.isfinite(float(item))
+                           or float(item) <= 0.0 for item in pair)):
+                raise OpenModelProfileError(
+                    f"type_section.sizes[{index}] must be two positive numbers")
+            if previous is not None and float(pair[0]) <= previous:
+                raise OpenModelProfileError(
+                    "type_section.sizes must be sorted by unique nominal")
+            previous = float(pair[0])
+        _strict_bool(self.sizes_truncated, "type_section.sizes_truncated")
+        _strict_bool(self.uniform, "type_section.uniform")
+        blockers = _strings(self.blockers, "type_section.blockers")
+        if blockers != tuple(sorted(blockers)):
+            raise OpenModelProfileError(
+                "type_section.blockers must be sorted")
+        # Закон переписи, перенесённый на одну строку: «не ограничивает» без
+        # причины — то же молчание, от которого весь этот модуль защищает.
+        if self.uniform and blockers:
+            raise OpenModelProfileError(
+                "type_section cannot be uniform and blocked at once")
+        if not self.uniform and not blockers and self.kind != "nominal_table":
+            raise OpenModelProfileError(
+                "non-uniform type_section must name its blockers")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Каноническая строка. Пустые поля ОПУЩЕНЫ, а не занулены: снапшот
+        без сечения обязан остаться байт в байт прежним (см. отпечатки)."""
+        row: dict[str, Any] = {"kind": self.kind, "source": self.source}
+        for key, value in (
+            ("thickness_mm", self.thickness_mm),
+            ("diameter_mm", self.diameter_mm),
+            ("width_mm", self.width_mm),
+            ("height_mm", self.height_mm),
+        ):
+            if value is not None:
+                row[key] = float(value)
+        if self.local_z_min_mm is not None:
+            row["local_z_min_mm"] = float(self.local_z_min_mm)
+            row["local_z_max_mm"] = float(self.local_z_max_mm)
+        if self.sizes:
+            row["sizes"] = [[float(a), float(b)] for a, b in self.sizes]
+        if self.sizes_truncated:
+            row["sizes_truncated"] = True
+        if self.uniform:
+            row["uniform"] = True
+        if self.blockers:
+            row["blockers"] = list(self.blockers)
+        return row
+
+    @classmethod
+    def from_dict(cls, value: Any, *,
+                  field_name: str = "type_section") -> "TypeSection":
+        row = _mapping(value, field_name)
+        raw_sizes = row.get("sizes") or ()
+        if (not isinstance(raw_sizes, Sequence)
+                or isinstance(raw_sizes, (str, bytes, bytearray))):
+            raise OpenModelProfileError(f"{field_name}.sizes must be a list")
+        sizes: list[tuple[float, float]] = []
+        for index, pair in enumerate(raw_sizes):
+            if (not isinstance(pair, Sequence)
+                    or isinstance(pair, (str, bytes, bytearray))
+                    or len(pair) != 2):
+                raise OpenModelProfileError(
+                    f"{field_name}.sizes[{index}] must be a pair")
+            sizes.append((float(pair[0]), float(pair[1])))
+        raw_blockers = row.get("blockers") or ()
+        return cls(
+            kind=_string(row.get("kind"), f"{field_name}.kind", nonempty=True),
+            source=_string(
+                row.get("source"), f"{field_name}.source", nonempty=True),
+            thickness_mm=row.get("thickness_mm"),
+            diameter_mm=row.get("diameter_mm"),
+            width_mm=row.get("width_mm"),
+            height_mm=row.get("height_mm"),
+            local_z_min_mm=row.get("local_z_min_mm"),
+            local_z_max_mm=row.get("local_z_max_mm"),
+            sizes=tuple(sizes),
+            sizes_truncated=_strict_bool(
+                row.get("sizes_truncated", False),
+                f"{field_name}.sizes_truncated"),
+            uniform=_strict_bool(
+                row.get("uniform", False), f"{field_name}.uniform"),
+            blockers=_strings(list(raw_blockers), f"{field_name}.blockers"),
+        )
+
+    def outer_for_nominal_mm(self, nominal_mm: float,
+                             *, tol_mm: float = 0.5) -> float | None:
+        """Номинал -> НАРУЖНЫЙ размер по таблице ТИПА, либо `None`.
+
+        Ни одного коэффициента здесь нет и быть не может: перевод существует
+        ровно потому, что его напечатал сам документ (`PipeSegment.GetSizes`).
+        Номинала, которого в таблице нет, эта функция НЕ приближает — «почти
+        совпал» есть та же выдумка, что и переводной множитель.
+
+        `tol_mm` — допуск на сравнение ДВУХ ЧИСЕЛ В МИЛЛИМЕТРАХ, пришедших
+        разными путями (программа пишет 100.0, документ хранит футы и
+        переводит обратно). 0.5 мм выбран как половина наименьшего шага
+        сортамента, а не как «мало»: соседние номиналы ДУ отстоят минимум на
+        4 мм (ДУ6/ДУ8), то есть спутать два номинала этот допуск не может.
+        """
+        if (isinstance(nominal_mm, bool)
+                or not isinstance(nominal_mm, (int, float))
+                or not math.isfinite(float(nominal_mm))):
+            return None
+        target = float(nominal_mm)
+        for nominal, outer in self.sizes:
+            if abs(nominal - target) <= tol_mm:
+                return outer
+        return None
+
+
+def prune_ground_snapshot(snapshot: Any) -> dict[str, Any]:
+    """Снапшот -> только то, что нужно для ТЕЛА: отметки и сечения типов.
+
+    Живёт здесь, потому что диалект снапшота принадлежит этому модулю, а
+    носить целый снапшот через сессию нельзя: пул `family_symbols` бывает в
+    тысячи строк, и 99% его полей (`unique_id`, `version_guid`, счётчики) на
+    оболочку не влияют вовсе.
+
+    Пустой словарь и ОТСУТСТВИЕ словаря — разные факты, и здесь они разные
+    значения: пустой значит «спросили, сечений нет», отсутствие — «не
+    спрашивали». Читатель обязан их различать.
+    """
+    if not isinstance(snapshot, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for pool, rows in snapshot.items():
+        if not isinstance(pool, str) or not isinstance(rows, list):
+            continue
+        keep: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if pool == "levels":
+                if row.get("elevation_mm") is None:
+                    continue
+                keep.append({"id": row.get("id"), "name": row.get("name"),
+                             "elevation_mm": row["elevation_mm"]})
+            elif isinstance(row.get("section"), Mapping):
+                keep.append({"id": row.get("id"), "name": row.get("name"),
+                             "section": dict(row["section"])})
+        if keep:
+            out[pool] = keep
+    return out
+
+
 def required_grounding_pools() -> tuple[str, ...]:
     """Return the exact pool universe declared by the live OpSpec registry."""
 
@@ -183,6 +426,14 @@ class ModelCatalogEntry:
     params_json: str | None = None
     p0_mm: tuple[float, float] | None = None
     p1_mm: tuple[float, float] | None = None
+    #: Геометрия ТИПА (волна sections). НЕ входит в `binding_digest`: тот
+    #: подписывает ИДЕНТИЧНОСТЬ строки, а сечение — её содержимое. Снапшот,
+    #: снятый до этой волны, обязан дать тот же отпечаток, что и раньше.
+    section: "TypeSection | None" = None
+    #: Отметка уровня в мм — только у строк пула `levels`. Без неё программа,
+    #: объявившая стену на уровне, не имеет НИ ОДНОЙ отметки Z, и тела у неё
+    #: нет по построению, сколько бы толщин ни знал тип.
+    elevation_mm: float | None = None
 
     def __post_init__(self) -> None:
         _element_id(self.element_id, "catalog_entry.element_id")
@@ -214,6 +465,16 @@ class ModelCatalogEntry:
         if (self.p0_mm is None) != (self.p1_mm is None):
             raise OpenModelProfileError(
                 "catalog entry grid endpoints must both be present or absent")
+        if self.section is not None and not isinstance(
+                self.section, TypeSection):
+            raise OpenModelProfileError(
+                "catalog_entry.section must be a typed TypeSection")
+        if self.elevation_mm is not None and (
+                isinstance(self.elevation_mm, bool)
+                or not isinstance(self.elevation_mm, (int, float))
+                or not math.isfinite(float(self.elevation_mm))):
+            raise OpenModelProfileError(
+                "catalog_entry.elevation_mm must be a finite number")
 
     @property
     def identity_exact(self) -> bool:
@@ -266,10 +527,14 @@ class ModelCatalogEntry:
         if self.p0_mm is not None:
             row["p0_mm"] = list(self.p0_mm)
             row["p1_mm"] = list(self.p1_mm or ())
+        if self.section is not None:
+            row["section"] = self.section.to_dict()
+        if self.elevation_mm is not None:
+            row["elevation_mm"] = float(self.elevation_mm)
         return row
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        row = {
             "element_id": self.element_id,
             "name": self.name,
             "unique_id": self.unique_id,
@@ -286,6 +551,15 @@ class ModelCatalogEntry:
             "identity_exact": self.identity_exact,
             "binding_digest": self.binding_digest,
         }
+        # ОТСУТСТВУЮЩЕЕ ОСТАЁТСЯ ОТСУТСТВУЮЩИМ. Остальные поля зануляются
+        # (так было и так остаётся), а эти два ОПУСКАЮТСЯ: `digest` профиля
+        # считается по этому же словарю, и `"section": null` сдвинул бы
+        # отпечаток КАЖДОГО разбора, снятого до этой волны.
+        if self.section is not None:
+            row["section"] = self.section.to_dict()
+        if self.elevation_mm is not None:
+            row["elevation_mm"] = float(self.elevation_mm)
+        return row
 
     @classmethod
     def from_ground_row(
@@ -314,6 +588,11 @@ class ModelCatalogEntry:
                 row.get("params"), f"{field_name}.params"),
             p0_mm=_optional_vec2(row.get("p0_mm"), f"{field_name}.p0_mm"),
             p1_mm=_optional_vec2(row.get("p1_mm"), f"{field_name}.p1_mm"),
+            section=(
+                None if row.get("section") is None
+                else TypeSection.from_dict(
+                    row["section"], field_name=f"{field_name}.section")),
+            elevation_mm=row.get("elevation_mm"),
         )
 
     @classmethod
@@ -1117,6 +1396,218 @@ try
     }
 }
 catch { }
+// ─────────────────────────────────────────────────────────────────────────
+// СЕЧЕНИЕ ТИПА (волна sections, 09.08.2026). ЗАЧЕМ: замер по реестру
+// (`spec.OPS`, 48 операций) — НИ ОДНА операция создания не несёт толщину
+// стены, перекрытия или сечение колонны. Они живут в ТИПЕ, а тип разрешается
+// против живого документа ровно здесь. До этой волны строка пула несла
+// `{id, name}`, и потому `kukai/clash/` не мог построить тело НИ ОДНОМУ
+// заявленному элементу: на двух реальных зданиях — ноль оболочек.
+//
+// ВСЕ ЧЛЕНЫ НИЖЕ СКОМПИЛИРОВАНЫ НА ШЕСТИ ВЕРСИЯХ (:52412, 09.08.2026):
+//   Level.Elevation                              2021-2026 6/6
+//   WallType.Width, WallType.Kind                2021-2026 6/6
+//   HostObjAttributes.GetCompoundStructure       2021-2026 6/6
+//   CompoundStructure.GetWidth                   2021-2026 6/6
+//   CompoundStructure.IsVerticallyHomogeneous()  2021-2026 6/6
+//   CompoundStructure.GetWallSweepsInfo(WallSweepType)  2021-2026 6/6
+//   CompoundStructure.VariableLayerIndex         2021-2026 6/6
+//   CompoundStructure.HasStructuralDeck          2021-2026 6/6
+//   PipeType.RoutingPreferenceManager            2021-2026 6/6
+//   RoutingPreferenceManager.GetNumberOfRules/GetRule   2021-2026 6/6
+//   PipeSegment.GetSizes / MEPSize.Nominal|OuterDiameter 2021-2026 6/6
+//   BuiltInParameter.STRUCTURAL_SECTION_COMMON_*  2021-2026 6/6
+// Версионно-условных чтений здесь поэтому НЕТ: тело снапшота одно на все
+// шесть, и отсутствующий на 2021 член сломал бы весь снапшот целиком.
+//
+// ЧЕГО ЗДЕСЬ НЕТ И ПОЧЕМУ. У ЛОТКА сечения на типе не существует ни в одной
+// из шести версий: `CableTrayType` несёт только `BendMultiplier`,
+// `IsWithFitting`, `ShapeType` (сверено по RevitAPI.xml и компиляцией), а
+// `Autodesk.Revit.DB.Electrical.CableTraySizeSettings` не существует вовсе
+// (CS0234 на всех шести). Ширина и высота лотка — параметры ЭКЗЕМПЛЯРА, и
+// `CableTray.Create(doc, typeId, p0, p1, levelId)` их не принимает. Значит
+// молчание тут честное: тела у лотка нет не потому, что снапшот беден, а
+// потому, что ни операция, ни тип его не выражают.
+Func<Element, BuiltInParameter, double> __ParamMM =
+    (Element __pe, BuiltInParameter __bip) =>
+{
+    try
+    {
+        var __p = __pe.get_Parameter(__bip);
+        if (__p == null || !__p.HasValue
+            || __p.StorageType != StorageType.Double) return 0.0;
+        return __MM(__p.AsDouble());
+    }
+    catch { return 0.0; }
+};
+Func<Element, string, Dictionary<string, object>> __Section =
+    (Element __e, string __cat) =>
+{
+    var __sec = new Dictionary<string, object>();
+    var __blk = new List<string>();
+    // 1. СТЕНА. Толщина есть, но одного числа МАЛО: у наклонной, ступенчатой
+    //    и составной по высоте стены призма по толщине тело НЕ содержит, то
+    //    есть допускает пропуск клеша. Поэтому число едет вместе с приговором.
+    var __wt = __e as WallType;
+    if (__wt != null)
+    {
+        double __ww = 0.0;
+        try { __ww = __MM(__wt.Width); } catch { }
+        if (!(__ww > 0.0)) return null;
+        __sec["kind"] = "plate";
+        __sec["source"] = "WallType.Width";
+        __sec["thickness_mm"] = __ww;
+        try { if (__wt.Kind != WallKind.Basic)
+                  __blk.Add("wall_kind_" + __wt.Kind.ToString()); }
+        catch { __blk.Add("wall_kind_unreadable"); }
+        try
+        {
+            var __cs = __wt.GetCompoundStructure();
+            if (__cs == null) __blk.Add("compound_structure_absent");
+            else
+            {
+                if (!__cs.IsVerticallyHomogeneous())
+                    __blk.Add("vertically_compound");
+                if (__cs.GetWallSweepsInfo(WallSweepType.Sweep).Count > 0)
+                    __blk.Add("wall_sweeps");
+                if (__cs.GetWallSweepsInfo(WallSweepType.Reveal).Count > 0)
+                    __blk.Add("wall_reveals");
+                if (__cs.VariableLayerIndex >= 0) __blk.Add("variable_layer");
+            }
+        }
+        catch { __blk.Add("compound_structure_unreadable"); }
+        if (__blk.Count == 0) __sec["uniform"] = true;
+        else { __blk.Sort(); __sec["blockers"] = __blk.ToArray(); }
+        return __sec;
+    }
+    // 2. ПЛИТА (перекрытие / потолок / кровля) — общий предок
+    //    `HostObjAttributes`. Стена сюда не доходит: она разобрана выше.
+    var __ho = __e as HostObjAttributes;
+    if (__ho != null)
+    {
+        CompoundStructure __cs2 = null;
+        try { __cs2 = __ho.GetCompoundStructure(); } catch { }
+        if (__cs2 == null) return null;
+        double __th = 0.0;
+        try { __th = __MM(__cs2.GetWidth()); } catch { }
+        if (!(__th > 0.0)) return null;
+        __sec["kind"] = "plate";
+        __sec["source"] = "HostObjAttributes.GetCompoundStructure().GetWidth";
+        __sec["thickness_mm"] = __th;
+        try { if (__cs2.VariableLayerIndex >= 0) __blk.Add("variable_layer"); }
+        catch { __blk.Add("variable_layer_unreadable"); }
+        try { if (__cs2.HasStructuralDeck) __blk.Add("structural_deck"); }
+        catch { }
+        if (__blk.Count == 0) __sec["uniform"] = true;
+        else { __blk.Sort(); __sec["blockers"] = __blk.ToArray(); }
+        return __sec;
+    }
+    // 3. ТРУБА: таблица «номинал -> НАРУЖНЫЙ», напечатанная самим документом.
+    //    Ни одного переводного множителя здесь нет и быть не может: у ДУ100
+    //    номинал 100, наружный 114.3, и вывести второе из первого нельзя
+    //    ничем, кроме сортамента. Когда один номинал приходит от нескольких
+    //    сегментов (сталь и медь в одних правилах), берётся БОЛЬШИЙ наружный:
+    //    огрубление вверх законно, выбор одного из двух — нет.
+    var __pt2 = __e as Autodesk.Revit.DB.Plumbing.PipeType;
+    if (__pt2 != null)
+    {
+        var __nominals = new List<double>();
+        var __outers = new Dictionary<double, double>();
+        try
+        {
+            var __rpm = __pt2.RoutingPreferenceManager;
+            int __nr = __rpm == null ? 0 : __rpm.GetNumberOfRules(
+                RoutingPreferenceRuleGroupType.Segments);
+            for (int __i = 0; __i < __nr; __i++)
+            {
+                var __rule = __rpm.GetRule(
+                    RoutingPreferenceRuleGroupType.Segments, __i);
+                if (__rule == null) continue;
+                var __segEl = doc.GetElement(__rule.MEPPartId)
+                    as Autodesk.Revit.DB.Plumbing.PipeSegment;
+                if (__segEl == null) continue;
+                foreach (MEPSize __z in __segEl.GetSizes())
+                {
+                    double __nom = __MM(__z.NominalDiameter);
+                    double __out = __MM(__z.OuterDiameter);
+                    if (!(__nom > 0.0) || !(__out > 0.0)) continue;
+                    double __prev;
+                    if (!__outers.TryGetValue(__nom, out __prev))
+                    { __outers[__nom] = __out; __nominals.Add(__nom); }
+                    else if (__prev < __out) __outers[__nom] = __out;
+                }
+            }
+        }
+        catch { }
+        if (__nominals.Count == 0) return null;
+        __nominals.Sort();
+        var __pairs = new List<object>();
+        bool __trunc = false;
+        foreach (double __nom in __nominals)
+        {
+            if (__pairs.Count >= 64) { __trunc = true; break; }
+            __pairs.Add(new double[] { __nom, __outers[__nom] });
+        }
+        __sec["kind"] = "nominal_table";
+        __sec["source"] =
+            "PipeType.RoutingPreferenceManager+PipeSegment.GetSizes";
+        __sec["sizes"] = __pairs;
+        if (__trunc) __sec["sizes_truncated"] = true;
+        return __sec;
+    }
+    // 4. НЕСУЩИЙ ПРОФИЛЬ у типоразмера семейства. Спрашивается ТОЛЬКО у
+    //    несущих категорий: пул `family_symbols` собирается без сужения и
+    //    насчитывает тысячи строк, а три чтения на каждую окупаются лишь
+    //    там, где ответ бывает.
+    if (__cat == "OST_StructuralColumns" || __cat == "OST_Columns"
+        || __cat == "OST_StructuralFraming"
+        || __cat == "OST_StructuralFoundation")
+    {
+        var __fsy = __e as FamilySymbol;
+        if (__fsy != null)
+        {
+            double __dia = __ParamMM(
+                __fsy, BuiltInParameter.STRUCTURAL_SECTION_COMMON_DIAMETER);
+            double __sw = __ParamMM(
+                __fsy, BuiltInParameter.STRUCTURAL_SECTION_COMMON_WIDTH);
+            double __sh = __ParamMM(
+                __fsy, BuiltInParameter.STRUCTURAL_SECTION_COMMON_HEIGHT);
+            if (__dia > 0.0)
+            {
+                __sec["kind"] = "round";
+                __sec["source"] = "STRUCTURAL_SECTION_COMMON_DIAMETER";
+                __sec["diameter_mm"] = __dia;
+                __sec["uniform"] = true;
+            }
+            else if (__sw > 0.0 && __sh > 0.0)
+            {
+                __sec["kind"] = "rect";
+                __sec["source"] =
+                    "STRUCTURAL_SECTION_COMMON_WIDTH+HEIGHT";
+                __sec["width_mm"] = __sw;
+                __sec["height_mm"] = __sh;
+                __sec["uniform"] = true;
+            }
+            else return null;
+            // СОБСТВЕННЫЙ ГАБАРИТ ТИПОРАЗМЕРА ПО Z. Замер 09.08 на Snowdon:
+            // 4 колонны из 114 выходили за оболочку ровно на 254.0 мм ВНИЗ, и
+            // все четыре — одного типоразмера. База семейства уходит ниже
+            // своей отметки, и знать об этом может только сам типоразмер.
+            try
+            {
+                var __bb = __fsy.get_BoundingBox(null);
+                if (__bb != null)
+                {
+                    __sec["local_z_min_mm"] = __MM(__bb.Min.Z);
+                    __sec["local_z_max_mm"] = __MM(__bb.Max.Z);
+                }
+            }
+            catch { }
+            return __sec;
+        }
+    }
+    return null;
+};
 var __ParamNames = new string[0];
 var __snap = new Dictionary<string, object>();
 Action<string, System.Collections.Generic.IEnumerable<Element>, int> __AddPool =
@@ -1137,6 +1628,7 @@ Action<string, System.Collections.Generic.IEnumerable<Element>, int> __AddPool =
         try { __r["unique_id"] = __e.UniqueId ?? ""; } catch { __r["unique_id"] = ""; }
         try { __r["version_guid"] = __e.VersionGuid.ToString("N"); } catch { __r["version_guid"] = ""; }
         try { __r["class_name"] = __e.ToString() ?? ""; } catch { __r["class_name"] = ""; }
+        string __catName = "";
         try
         {
             var __category = __e.Category;
@@ -1144,10 +1636,27 @@ Action<string, System.Collections.Generic.IEnumerable<Element>, int> __AddPool =
             {
                 int __categoryId;
                 if (Int32.TryParse(__category.Id.ToString(), out __categoryId))
-                    __r["category"] = Enum.GetName(
+                {
+                    __catName = Enum.GetName(
                         typeof(BuiltInCategory), __categoryId)
                         ?? __categoryId.ToString();
+                    __r["category"] = __catName;
+                }
             }
+        }
+        catch { }
+        // Отметка УРОВНЯ. Без неё программа, объявившая стену на уровне, не
+        // имеет ни одной отметки Z, и тела у неё нет по построению — сколько
+        // бы толщин ни знал тип. Ключ появляется только у строк пула levels.
+        var __lvl = __e as Level;
+        if (__lvl != null)
+        {
+            try { __r["elevation_mm"] = __MM(__lvl.Elevation); } catch { }
+        }
+        try
+        {
+            var __secRow = __Section(__e, __catName);
+            if (__secRow != null) __r["section"] = __secRow;
         }
         catch { }
         var __fs = __e as FamilySymbol;
@@ -1219,6 +1728,15 @@ __AddPool("roof_types", new FilteredElementCollector(doc).OfClass(typeof(RoofTyp
 __AddPool("duct_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Mechanical.DuctType)).Cast<Element>(), 1000);
 __AddPool("duct_system_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Mechanical.MechanicalSystemType)).Cast<Element>(), 1000);
 __AddPool("cable_tray_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Electrical.CableTrayType)).Cast<Element>(), 1000);
+// wave/mep-electrical (2026-08-09): пулы короба и двух гибких типов.
+// Собираются ПО КЛАССУ, как pipe/duct/cable-tray выше: ConduitType,
+// FlexDuctType и FlexPipeType — самостоятельные классы ElementType
+// (существование каждого проверено компиляцией на 2021-2026), и фильтр по
+// классу возвращает ровно их. Категорийный фильтр здесь был бы хуже:
+// OST_Conduit несёт и сами короба, и их типы.
+__AddPool("conduit_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Electrical.ConduitType)).Cast<Element>(), 1000);
+__AddPool("flex_duct_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Mechanical.FlexDuctType)).Cast<Element>(), 1000);
+__AddPool("flex_pipe_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Plumbing.FlexPipeType)).Cast<Element>(), 1000);
 // beam_types фильтруется по ТИПУ РАЗМЕЩЕНИЯ, в отличие от остальных пулов
 // символов. Замерено 27.07: все 36 семейств каркаса реального здания —
 // FamilyPlacementType.OneLevelBased (точечные), а create_beam эмитит
@@ -1236,8 +1754,85 @@ __AddPool("foundation_symbols", new FilteredElementCollector(doc).OfClass(typeof
 // У ограждения это единственный способ вообще узнать список типов:
 // ElementTypeGroup.RailingType не существует ни на одной версии (замерено),
 // то есть спросить документ «а какой тип по умолчанию» нельзя в принципе.
+// wave/wall-foundation (2026-08-09): типы ленточного фундамента. По КЛАССУ,
+// как потолок и ограждение: WallFoundationType — самостоятельный класс
+// ElementType (компиляция 2021-2026, 6/6), и WallFoundation.Create не примет
+// ничего другого. В отличие от ограждения, документный тип по умолчанию у
+// него ЕСТЬ: ElementTypeGroup.WallFoundationType компилируется на всех шести.
+__AddPool("wall_foundation_types", new FilteredElementCollector(doc).OfClass(typeof(WallFoundationType)).Cast<Element>(), 1000);
+// wave/analysis (2026-08-09): случаи загружения и три типа нагрузок.
+// ТИПЫ — ПО КЛАССУ, как труба/воздуховод/лоток выше: PointLoadType,
+// LineLoadType и AreaLoadType — самостоятельные классы ElementType
+// (существование каждого проверено компиляцией на 2021-2026), и фильтр по
+// классу возвращает ровно их. Категорийный фильтр здесь был бы хуже:
+// OST_PointLoads несёт и сами нагрузки, и их типы.
+//
+// load_cases — пул ЭКЗЕМПЛЯРОВ (как levels и grids), а не типов: случай
+// загружения это элемент проекта, и заземляться по нему обязаны все три
+// нагрузки. Природы (LoadNature) здесь НЕТ: их вход — операция создания
+// СЛУЧАЯ, которой в этой волне нет, а пул без селектора нарушил бы правило
+// «пул существует ради заземления» (см. ops_analysis.py).
+__AddPool("load_cases", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Structure.LoadCase)).Cast<Element>(), 1000);
+__AddPool("point_load_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Structure.PointLoadType)).Cast<Element>(), 1000);
+__AddPool("line_load_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Structure.LineLoadType)).Cast<Element>(), 1000);
+__AddPool("area_load_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Structure.AreaLoadType)).Cast<Element>(), 1000);
+// wave/framing (2026-08-09): типы ферм. ПО КЛАССУ, как потолок, ограждение и
+// ленточный фундамент: TrussType — самостоятельный класс (компиляция 2021-2026,
+// 6/6), и Truss.Create принимает ТОЛЬКО его id. Категорийный фильтр был бы
+// хуже: OST_Truss держит и сами фермы, и их типы. Отдельного пула балочной
+// системе НЕ ЗАВЕДЕНО — её символ балки это обычный beam_types, тот же пул и
+// тот же фильтр по типу размещения, что у create_beam.
+__AddPool("truss_types", new FilteredElementCollector(doc).OfClass(typeof(FamilySymbol)).OfCategory(BuiltInCategory.OST_Truss).Cast<Element>(), 1000);
+// wave/reinforcement (2026-08-10): три пула армирования по области. ВСЕ ТРИ
+// ПО КЛАССУ, как ферма и ленточный фундамент: AreaReinforcementType,
+// RebarBarType и RebarHookType — самостоятельные классы ElementType
+// (компиляция 2021-2026, 6/6), и AreaReinforcement.Create проверяет КАЖДЫЙ
+// аргумент на свой класс отдельно. Категорийный фильтр здесь был бы хуже:
+// OST_Rebar держит и стержни, и их типы, а OST_AreaRein — и системы, и типы.
+__AddPool("area_reinforcement_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Structure.AreaReinforcementType)).Cast<Element>(), 1000);
+__AddPool("rebar_bar_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Structure.RebarBarType)).Cast<Element>(), 1000);
+__AddPool("rebar_hook_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Structure.RebarHookType)).Cast<Element>(), 1000);
 __AddPool("ceiling_types", new FilteredElementCollector(doc).OfClass(typeof(CeilingType)).Cast<Element>(), 1000);
 __AddPool("railing_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Architecture.RailingType)).Cast<Element>(), 1000);
+// wave/site (2026-08-09): типы площадки под здание и толщи рельефа.
+//
+// ПЛОЩАДКА собирается ПО КЛАССУ, как все остальные: BuildingPadType — тип
+// ElementType, существующий на всех шести версиях (замерено компиляцией).
+//
+// ТОЛЩА — единственный пул этого файла, который НЕ МОЖЕТ назвать свой класс.
+// `ToposolidType` появился только в 2024 (на 2021/2022 это CS0246, на 2023 —
+// CS0122: тип есть, но internal), а это ТЕЛО ОДНО НА ВСЕ ШЕСТЬ ВЕРСИЙ: оно
+// не эмитируется под версию, значит любое упоминание имени не собралось бы
+// на половине флота и утащило бы за собой ВЕСЬ снапшот, то есть все
+// остальные пулы вместе с ним. Поэтому фильтр идёт по ИМЕНИ ТИПА CLR у
+// общего предка HostObjAttributes (BuildingPadType/FloorType/RoofType/
+// WallType/CeilingType/ToposolidType — все его наследники; проверено
+// присваиванием). На 2021-2023 совпадений нет по построению, и пул честно
+// пуст — то есть create_topography(variety=toposolid) там получит KIR-G104
+// «пусто в модели», ровно на тех версиях, где эта операция и так отказывает
+// по оси версий. Категорией это сделать НЕЛЬЗЯ: BuiltInCategory.OST_Toposolid
+// появился в 2023, на ГОД раньше самого класса, то есть имя категории версию
+// не различает.
+__AddPool("building_pad_types", new FilteredElementCollector(doc).OfClass(typeof(BuildingPadType)).Cast<Element>(), 1000);
+// wave/sweep (2026-08-09). ДВА ПУЛА, СОБРАННЫЕ ПО-РАЗНОМУ, И РАЗНИЦА — ЗАМЕР.
+// `SlabEdgeType` — настоящий класс ElementType (компиляция 6/6), поэтому пул
+// краевых профилей идёт ПО КЛАССУ, как wall_foundation_types.
+// А вот класса `WallSweepType`-как-ElementType НЕ СУЩЕСТВУЕТ: `WallSweepType`
+// это ПЕРЕЧИСЛЕНИЕ {Sweep, Reveal} (замерено), и тип профиля живёт обычным
+// ElementType в OST_Cornices (карнизы) либо OST_Reveals (русты). Поэтому
+// единственный возможный сбор — по ДВУМ категориям, одним пулом: разделить их
+// на два пула нельзя, потому что `grounded` в реестре статичен, а тип у
+// операции один параметр.
+__AddPool("wall_sweep_types", new FilteredElementCollector(doc).WherePasses(new ElementMulticategoryFilter(new List<BuiltInCategory> { BuiltInCategory.OST_Cornices, BuiltInCategory.OST_Reveals })).WhereElementIsElementType().Cast<Element>(), 1000);
+__AddPool("slab_edge_types", new FilteredElementCollector(doc).OfClass(typeof(SlabEdgeType)).Cast<Element>(), 1000);
+__AddPool("toposolid_types", new FilteredElementCollector(doc).OfClass(typeof(HostObjAttributes)).Cast<Element>().Where(__tse => { try { return __tse.GetType().Name == "ToposolidType"; } catch { return false; } }), 1000);
+// wave/detail (2026-08-09): типы заливки. ПО КЛАССУ, как все остальные:
+// FilledRegionType — самостоятельный тип ElementType, существующий на всех
+// шести версиях (замерено компиляцией). Категорией это делать НЕЛЬЗЯ:
+// OST_FilledRegion держит и сами заливки (элементы вида), и их типы, то есть
+// категорийный фильтр вернул бы пул, половина которого не является типом и
+// отвергается самим `FilledRegion.IsValidFilledRegionTypeId`.
+__AddPool("filled_region_types", new FilteredElementCollector(doc).OfClass(typeof(FilledRegionType)).Cast<Element>(), 1000);
 var __gridQuery = new FilteredElementCollector(doc).OfClass(typeof(Grid))
     .Cast<Grid>().OrderBy(__x => __Id(__x)).ToList();
 var __grids = new List<object>();
@@ -1277,12 +1872,21 @@ catch { __documentFingerprint["project_uid"] = ""; }
 __snap["__document_fingerprint"] = __documentFingerprint;
 __snap["__profile_schema_version"] = "open-model-profile/1";
 __snap["__profile_required_pools"] = new string[] {
-    "beam_types", "cable_tray_types", "ceiling_types",
+    "area_reinforcement_types",
+    "beam_types", "building_pad_types", "cable_tray_types", "ceiling_types",
     "column_symbols_architectural",
-    "column_symbols_structural", "door_symbols", "duct_system_types",
-    "duct_types", "family_symbols", "floor_types", "foundation_symbols",
-    "grids", "levels", "pipe_types", "piping_system_types", "railing_types",
-    "roof_types", "wall_types", "window_symbols"
+    "rebar_bar_types", "rebar_hook_types",
+    "column_symbols_structural", "conduit_types", "door_symbols",
+    "duct_system_types",
+    "area_load_types",
+    "duct_types", "family_symbols", "filled_region_types",
+    "flex_duct_types", "flex_pipe_types",
+    "floor_types", "foundation_symbols",
+    "grids", "levels", "line_load_types", "load_cases", "pipe_types",
+    "piping_system_types", "point_load_types", "railing_types",
+    "roof_types", "slab_edge_types", "toposolid_types", "truss_types",
+    "wall_foundation_types",
+    "wall_sweep_types", "wall_types", "window_symbols"
 };
 try { __snap["__revit_version"] = doc.Application.VersionNumber ?? ""; }
 catch { __snap["__revit_version"] = ""; }
@@ -1304,7 +1908,11 @@ __all__ = [
     "OpenModelProfile",
     "OpenModelProfileError",
     "PreflightIssueCode",
+    "SECTION_KINDS",
+    "SECTION_MAX_SIZES",
+    "TypeSection",
     "capture_open_model_profile",
     "preflight_programs",
+    "prune_ground_snapshot",
     "required_grounding_pools",
 ]

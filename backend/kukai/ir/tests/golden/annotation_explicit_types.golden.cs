@@ -40,6 +40,202 @@ Dimension __el_D1 = null;
 View __vw_D1 = null;
 Element __rf_D1_0 = null;
 Element __rf_D1_1 = null;
+XYZ __gpt_D1_0 = null;
+XYZ __gpt_D1_1 = null;
+XYZ __dimDir_D1 = null;
+bool __dimTake_D1(Reference __r, XYZ __o, XYZ __n, XYZ __want,
+    ref Reference __gr, ref XYZ __gp, ref XYZ __gn,
+    ref Reference __fr, ref XYZ __fp, ref XYZ __fn)
+{
+    if (__r == null || __o == null || __n == null) return false;
+    XYZ __vd = __vw_D1.ViewDirection;
+    XYZ __ip = __n.Subtract(__vd.Multiply(__n.DotProduct(__vd)));
+    if (__ip.IsZeroLength()) return false;
+    __ip = __ip.Normalize();
+    if (__fr == null) { __fr = __r; __fp = __o; __fn = __ip; }
+    if (__want != null && !__ip.CrossProduct(__want).IsZeroLength()) return false;
+    __gr = __r; __gp = __o; __gn = __ip;
+    return true;
+}
+void __dimWalk_D1(GeometryElement __ge, Transform __tf, XYZ __want,
+    ref Reference __gr, ref XYZ __gp, ref XYZ __gn,
+    ref Reference __fr, ref XYZ __fp, ref XYZ __fn)
+{
+    if (__ge == null) return;
+    foreach (GeometryObject __go in __ge)
+    {
+        Solid __sol = __go as Solid;
+        if (__sol != null)
+        {
+            foreach (Face __fc in __sol.Faces)
+            {
+                PlanarFace __pf = __fc as PlanarFace;
+                if (__pf == null || __pf.Reference == null) continue;
+                if (__dimTake_D1(__pf.Reference, __tf.OfPoint(__pf.Origin),
+                        __tf.OfVector(__pf.FaceNormal), __want,
+                        ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn)) return;
+            }
+            continue;
+        }
+        Curve __cv = __go as Curve;
+        if (__cv != null)
+        {
+            if (__cv.Reference == null) continue;
+            XYZ __ca = null; XYZ __cd = null;
+            Line __cl = __cv as Line;
+            if (__cl != null) { __ca = __cl.Origin; __cd = __cl.Direction; }
+            else if (__cv.IsBound) { __ca = __cv.GetEndPoint(0); __cd = __cv.GetEndPoint(1).Subtract(__ca); }
+            if (__ca == null || __cd == null || __cd.IsZeroLength()) continue;
+            XYZ __cn = __cd.Normalize().CrossProduct(__vw_D1.ViewDirection);
+            if (__cn.IsZeroLength()) continue;
+            if (__dimTake_D1(__cv.Reference, __tf.OfPoint(__ca),
+                    __tf.OfVector(__cn.Normalize()), __want,
+                    ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn)) return;
+            continue;
+        }
+        GeometryInstance __gi = __go as GeometryInstance;
+        if (__gi != null)
+        {
+            __dimWalk_D1(__gi.GetSymbolGeometry(), __tf.Multiply(__gi.Transform), __want,
+                ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn);
+            if (__gr != null) return;
+        }
+    }
+}
+void __dimGeom_D1(Element __el, XYZ __want, out Reference __gr, out XYZ __gp, out XYZ __gn)
+{
+    __gr = null; __gp = null; __gn = null;
+    Reference __fr = null; XYZ __fp = null; XYZ __fn = null;
+    Wall __wl = __el as Wall;
+    if (__wl != null)
+    {
+        try
+        {
+            IList<Reference> __sf = HostObjectUtils.GetSideFaces(__wl, ShellLayerType.Exterior);
+            if (__sf != null)
+                foreach (Reference __sr in __sf)
+                {
+                    PlanarFace __spf = __el.GetGeometryObjectFromReference(__sr) as PlanarFace;
+                    if (__spf == null) continue;
+                    if (__dimTake_D1(__sr, __spf.Origin, __spf.FaceNormal, __want,
+                            ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn)) break;
+                }
+        } catch { }
+    }
+    if (__gr == null)
+    {
+        Options __gopt = new Options();
+        __gopt.ComputeReferences = true;
+        __gopt.IncludeNonVisibleObjects = true;
+        __gopt.View = __vw_D1;
+        GeometryElement __gge = null;
+        try { __gge = __el.get_Geometry(__gopt); } catch { }
+        __dimWalk_D1(__gge, Transform.Identity, __want,
+            ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn);
+    }
+    if (__gr == null && __fr != null) { __gr = __fr; __gp = __fp; __gn = __fn; }
+}
+AngularDimension __el_A1 = null;
+View __vw_A1 = null;
+Element __rf_A1_0 = null;
+Element __rf_A1_1 = null;
+XYZ __gpt_A1_0 = null;
+XYZ __gpt_A1_1 = null;
+XYZ __gn_A1_0 = null;
+XYZ __gn_A1_1 = null;
+double __asw_A1 = 0.0;
+bool __dimTake_A1(Reference __r, XYZ __o, XYZ __n, XYZ __want,
+    ref Reference __gr, ref XYZ __gp, ref XYZ __gn,
+    ref Reference __fr, ref XYZ __fp, ref XYZ __fn)
+{
+    if (__r == null || __o == null || __n == null) return false;
+    XYZ __vd = __vw_A1.ViewDirection;
+    XYZ __ip = __n.Subtract(__vd.Multiply(__n.DotProduct(__vd)));
+    if (__ip.IsZeroLength()) return false;
+    __ip = __ip.Normalize();
+    if (__fr == null) { __fr = __r; __fp = __o; __fn = __ip; }
+    if (__want != null && !__ip.CrossProduct(__want).IsZeroLength()) return false;
+    __gr = __r; __gp = __o; __gn = __ip;
+    return true;
+}
+void __dimWalk_A1(GeometryElement __ge, Transform __tf, XYZ __want,
+    ref Reference __gr, ref XYZ __gp, ref XYZ __gn,
+    ref Reference __fr, ref XYZ __fp, ref XYZ __fn)
+{
+    if (__ge == null) return;
+    foreach (GeometryObject __go in __ge)
+    {
+        Solid __sol = __go as Solid;
+        if (__sol != null)
+        {
+            foreach (Face __fc in __sol.Faces)
+            {
+                PlanarFace __pf = __fc as PlanarFace;
+                if (__pf == null || __pf.Reference == null) continue;
+                if (__dimTake_A1(__pf.Reference, __tf.OfPoint(__pf.Origin),
+                        __tf.OfVector(__pf.FaceNormal), __want,
+                        ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn)) return;
+            }
+            continue;
+        }
+        Curve __cv = __go as Curve;
+        if (__cv != null)
+        {
+            if (__cv.Reference == null) continue;
+            XYZ __ca = null; XYZ __cd = null;
+            Line __cl = __cv as Line;
+            if (__cl != null) { __ca = __cl.Origin; __cd = __cl.Direction; }
+            else if (__cv.IsBound) { __ca = __cv.GetEndPoint(0); __cd = __cv.GetEndPoint(1).Subtract(__ca); }
+            if (__ca == null || __cd == null || __cd.IsZeroLength()) continue;
+            XYZ __cn = __cd.Normalize().CrossProduct(__vw_A1.ViewDirection);
+            if (__cn.IsZeroLength()) continue;
+            if (__dimTake_A1(__cv.Reference, __tf.OfPoint(__ca),
+                    __tf.OfVector(__cn.Normalize()), __want,
+                    ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn)) return;
+            continue;
+        }
+        GeometryInstance __gi = __go as GeometryInstance;
+        if (__gi != null)
+        {
+            __dimWalk_A1(__gi.GetSymbolGeometry(), __tf.Multiply(__gi.Transform), __want,
+                ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn);
+            if (__gr != null) return;
+        }
+    }
+}
+void __dimGeom_A1(Element __el, XYZ __want, out Reference __gr, out XYZ __gp, out XYZ __gn)
+{
+    __gr = null; __gp = null; __gn = null;
+    Reference __fr = null; XYZ __fp = null; XYZ __fn = null;
+    Wall __wl = __el as Wall;
+    if (__wl != null)
+    {
+        try
+        {
+            IList<Reference> __sf = HostObjectUtils.GetSideFaces(__wl, ShellLayerType.Exterior);
+            if (__sf != null)
+                foreach (Reference __sr in __sf)
+                {
+                    PlanarFace __spf = __el.GetGeometryObjectFromReference(__sr) as PlanarFace;
+                    if (__spf == null) continue;
+                    if (__dimTake_A1(__sr, __spf.Origin, __spf.FaceNormal, __want,
+                            ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn)) break;
+                }
+        } catch { }
+    }
+    if (__gr == null)
+    {
+        Options __gopt = new Options();
+        __gopt.ComputeReferences = true;
+        __gopt.IncludeNonVisibleObjects = true;
+        __gopt.View = __vw_A1;
+        GeometryElement __gge = null;
+        try { __gge = __el.get_Geometry(__gopt); } catch { }
+        __dimWalk_A1(__gge, Transform.Identity, __want,
+            ref __gr, ref __gp, ref __gn, ref __fr, ref __fp, ref __fn);
+    }
+    if (__gr == null && __fr != null) { __gr = __fr; __gp = __fp; __gn = __fn; }
+}
 IndependentTag __el_T1 = null; Element __tg_T1 = null;
 View __vw_T1 = null;
 TextNote __el_X1 = null;
@@ -66,7 +262,7 @@ using (Transaction __t = new Transaction(doc, "KIR: аннотации с явн
         if (__lv_W1 == null) { __t.RollBack(); return __Refuse("W1", (__lv_raw_W1 == null ? "уровень не найден (модель изменилась после grounding)" : "id уровня резолвится не в Level, а в " + __ClassName(__lv_raw_W1) + " — причина (дрейф модели или неверный id) не определена рантаймом")); }
         __el_W1 = Wall.Create(doc, Line.CreateBound(P(0, 0, 0), P(6000, 0, 0)), __wt_W1.Id, __lv_W1.Id, U(3000.0), 0.0, false, false);
         if (__el_W1 == null) { __t.RollBack(); return __Refuse("W1", "Wall.Create вернул null"); }
-        try { Parameter __cm = __el_W1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:9f982893:W1"); } catch { }
+        try { Parameter __cm = __el_W1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:b5fb387b:W1"); } catch { }
 
         // create_dimension D1
         __vw_D1 = doc.GetElement(new ElementId(900)) as View;
@@ -74,84 +270,19 @@ using (Transaction __t = new Transaction(doc, "KIR: аннотации с явн
         doc.Regenerate();
         __rf_D1_0 = (Element)__el_W1;
         Reference __gref_D1_0 = null;
-        Wall __gref_D1_0_wall = __rf_D1_0 as Wall;
-        if (__gref_D1_0_wall != null)
-        {
-            try
-            {
-                var __gref_D1_0_sf = HostObjectUtils.GetSideFaces(__gref_D1_0_wall, ShellLayerType.Exterior);
-                if (__gref_D1_0_sf != null && __gref_D1_0_sf.Count > 0) __gref_D1_0 = __gref_D1_0_sf[0];
-            } catch { }
-        }
-        if (__gref_D1_0 == null)
-        {
-            Options __gref_D1_0_opt = new Options();
-            __gref_D1_0_opt.ComputeReferences = true;
-            __gref_D1_0_opt.View = __vw_D1;
-            GeometryElement __gref_D1_0_ge = __rf_D1_0.get_Geometry(__gref_D1_0_opt);
-            if (__gref_D1_0_ge != null)
-                foreach (GeometryObject __gref_D1_0_go in __gref_D1_0_ge)
-                {
-                    Solid __gref_D1_0_sol = __gref_D1_0_go as Solid;
-                    if (__gref_D1_0_sol == null) continue;
-                    foreach (Face __gref_D1_0_fc in __gref_D1_0_sol.Faces)
-                    {
-                        PlanarFace __gref_D1_0_pf = __gref_D1_0_fc as PlanarFace;
-                        if (__gref_D1_0_pf != null && __gref_D1_0_pf.Reference != null)
-                        { __gref_D1_0 = __gref_D1_0_pf.Reference; break; }
-                    }
-                    if (__gref_D1_0 != null) break;
-                }
-        }
+        XYZ __gn_D1_0 = null;
+        __dimGeom_D1(__rf_D1_0, null, out __gref_D1_0, out __gpt_D1_0, out __gn_D1_0);
         if (__gref_D1_0 == null) { __t.RollBack(); return __Refuse("D1", "refs[0]: у элемента нет геометрической ссылки для размера"); }
         __rf_D1_1 = doc.GetElement(new ElementId(12345));
         if (__rf_D1_1 == null) { __t.RollBack(); return __Refuse("D1", "refs[1]: элемент не найден (модель изменилась после grounding)"); }
         Reference __gref_D1_1 = null;
-        Wall __gref_D1_1_wall = __rf_D1_1 as Wall;
-        if (__gref_D1_1_wall != null)
-        {
-            try
-            {
-                var __gref_D1_1_sf = HostObjectUtils.GetSideFaces(__gref_D1_1_wall, ShellLayerType.Exterior);
-                if (__gref_D1_1_sf != null && __gref_D1_1_sf.Count > 0) __gref_D1_1 = __gref_D1_1_sf[0];
-            } catch { }
-        }
-        if (__gref_D1_1 == null)
-        {
-            Options __gref_D1_1_opt = new Options();
-            __gref_D1_1_opt.ComputeReferences = true;
-            __gref_D1_1_opt.View = __vw_D1;
-            GeometryElement __gref_D1_1_ge = __rf_D1_1.get_Geometry(__gref_D1_1_opt);
-            if (__gref_D1_1_ge != null)
-                foreach (GeometryObject __gref_D1_1_go in __gref_D1_1_ge)
-                {
-                    Solid __gref_D1_1_sol = __gref_D1_1_go as Solid;
-                    if (__gref_D1_1_sol == null) continue;
-                    foreach (Face __gref_D1_1_fc in __gref_D1_1_sol.Faces)
-                    {
-                        PlanarFace __gref_D1_1_pf = __gref_D1_1_fc as PlanarFace;
-                        if (__gref_D1_1_pf != null && __gref_D1_1_pf.Reference != null)
-                        { __gref_D1_1 = __gref_D1_1_pf.Reference; break; }
-                    }
-                    if (__gref_D1_1 != null) break;
-                }
-        }
+        XYZ __gn_D1_1 = null;
+        __dimGeom_D1(__rf_D1_1, __gn_D1_0, out __gref_D1_1, out __gpt_D1_1, out __gn_D1_1);
         if (__gref_D1_1 == null) { __t.RollBack(); return __Refuse("D1", "refs[1]: у элемента нет геометрической ссылки для размера"); }
         ReferenceArray __refs_D1 = new ReferenceArray();
         __refs_D1.Append(__gref_D1_0);
         __refs_D1.Append(__gref_D1_1);
-        XYZ __dimDir_D1 = __vw_D1.RightDirection;
-        try
-        {
-            GeometryObject __ddgo_D1 = __rf_D1_0.GetGeometryObjectFromReference(__gref_D1_0);
-            PlanarFace __ddpf_D1 = __ddgo_D1 as PlanarFace;
-            if (__ddpf_D1 != null)
-            {
-                XYZ __ddn_D1 = __ddpf_D1.FaceNormal;
-                XYZ __ddInPlane_D1 = __ddn_D1.Subtract(__vw_D1.ViewDirection.Multiply(__ddn_D1.DotProduct(__vw_D1.ViewDirection)));
-                if (__ddInPlane_D1.GetLength() > 1e-6) __dimDir_D1 = __ddInPlane_D1.Normalize();
-            }
-        } catch { }
+        __dimDir_D1 = __gn_D1_0;
         XYZ __p0_D1 = (__vw_D1.Origin + __vw_D1.RightDirection.Multiply(U(3000.0)) + __vw_D1.UpDirection.Multiply(U(500.0)));
         Line __ln_D1;
         try { __ln_D1 = Line.CreateBound(__p0_D1, __p0_D1.Add(__dimDir_D1.Multiply(U(1000.0)))); }
@@ -163,7 +294,59 @@ using (Transaction __t = new Transaction(doc, "KIR: аннотации с явн
         try { __el_D1 = doc.Create.NewDimension(__vw_D1, __ln_D1, __refs_D1, __dt_D1); }
         catch (Exception __ex2_D1) { __t.RollBack(); return __Refuse("D1", "NewDimension: " + __ex2_D1.Message); }
         if (__el_D1 == null) { __t.RollBack(); return __Refuse("D1", "NewDimension вернул null"); }
-        try { Parameter __cm = __el_D1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:9f982893:D1"); } catch { }
+        try { Parameter __cm = __el_D1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:b5fb387b:D1"); } catch { }
+
+        // create_angular_dimension A1
+        __vw_A1 = doc.GetElement(new ElementId(900)) as View;
+        if (__vw_A1 == null) { __t.RollBack(); return __Refuse("A1", "in_view: вид не найден (модель изменилась после grounding, либо id — не View)"); }
+        doc.Regenerate();
+        __rf_A1_0 = (Element)__el_W1;
+        Reference __gref_A1_0 = null;
+        __dimGeom_A1(__rf_A1_0, null, out __gref_A1_0, out __gpt_A1_0, out __gn_A1_0);
+        if (__gref_A1_0 == null) { __t.RollBack(); return __Refuse("A1", "refs[0]: у элемента нет геометрической ссылки для размера"); }
+        __rf_A1_1 = doc.GetElement(new ElementId(12345));
+        if (__rf_A1_1 == null) { __t.RollBack(); return __Refuse("A1", "refs[1]: элемент не найден (модель изменилась после grounding)"); }
+        Reference __gref_A1_1 = null;
+        __dimGeom_A1(__rf_A1_1, null, out __gref_A1_1, out __gpt_A1_1, out __gn_A1_1);
+        if (__gref_A1_1 == null) { __t.RollBack(); return __Refuse("A1", "refs[1]: у элемента нет геометрической ссылки для размера"); }
+        XYZ __aR_A1 = __vw_A1.RightDirection;
+        XYZ __aU_A1 = __vw_A1.UpDirection;
+        XYZ __aO_A1 = __vw_A1.Origin;
+        double __aa0_A1 = __gn_A1_0.DotProduct(__aR_A1);
+        double __ab0_A1 = __gn_A1_0.DotProduct(__aU_A1);
+        double __ac0_A1 = __gpt_A1_0.Subtract(__aO_A1).DotProduct(__gn_A1_0);
+        double __aa1_A1 = __gn_A1_1.DotProduct(__aR_A1);
+        double __ab1_A1 = __gn_A1_1.DotProduct(__aU_A1);
+        double __ac1_A1 = __gpt_A1_1.Subtract(__aO_A1).DotProduct(__gn_A1_1);
+        double __adet_A1 = __aa0_A1 * __ab1_A1 - __aa1_A1 * __ab0_A1;
+        if (Math.Abs(__adet_A1) <= doc.Application.AngleTolerance) { __t.RollBack(); return __Refuse("A1", "refs: ссылки параллельны — у угла нет вершины"); }
+        XYZ __avx_A1 = __aO_A1
+            .Add(__aR_A1.Multiply((__ac0_A1 * __ab1_A1 - __ac1_A1 * __ab0_A1) / __adet_A1))
+            .Add(__aU_A1.Multiply((__aa0_A1 * __ac1_A1 - __aa1_A1 * __ac0_A1) / __adet_A1));
+        XYZ __aat_A1 = (__vw_A1.Origin + __vw_A1.RightDirection.Multiply(U(1500.0)) + __vw_A1.UpDirection.Multiply(U(1500.0)));
+        XYZ __arv_A1 = __aat_A1.Subtract(__avx_A1);
+        if (__arv_A1.IsZeroLength()) { __t.RollBack(); return __Refuse("A1", "at: точка совпала с вершиной угла — у дуги размера нулевой радиус"); }
+        XYZ __ad0_A1 = __gn_A1_0.CrossProduct(__vw_A1.ViewDirection).Normalize();
+        if (__ad0_A1.DotProduct(__arv_A1) < 0.0) __ad0_A1 = __ad0_A1.Negate();
+        XYZ __ad1_A1 = __gn_A1_1.CrossProduct(__vw_A1.ViewDirection).Normalize();
+        if (__ad1_A1.DotProduct(__arv_A1) < 0.0) __ad1_A1 = __ad1_A1.Negate();
+        XYZ __ay_A1 = __vw_A1.ViewDirection.CrossProduct(__ad0_A1).Normalize();
+        if (__ay_A1.DotProduct(__ad1_A1) < 0.0) __ay_A1 = __ay_A1.Negate();
+        __asw_A1 = Math.Atan2(__ad1_A1.DotProduct(__ay_A1), __ad1_A1.DotProduct(__ad0_A1));
+        Arc __arc_A1;
+        try { __arc_A1 = Arc.Create(__avx_A1, __arv_A1.GetLength(), 0.0, __asw_A1, __ad0_A1, __ay_A1); }
+        catch (Exception __ex_A1) { __t.RollBack(); return __Refuse("A1", "at: вырожденная дуга углового размера: " + __ex_A1.Message); }
+        Element __dtel_A1 = doc.GetElement(new ElementId(6001));
+        if (__dtel_A1 == null) { __t.RollBack(); return __Refuse("A1", "dim_type: элемент не найден (модель изменилась после grounding)"); }
+        DimensionType __dt_A1 = __dtel_A1 as DimensionType;
+        if (__dt_A1 == null) { __t.RollBack(); return __Refuse("A1", "dim_type: элемент не DimensionType"); }
+        IList<Reference> __arefs_A1 = new List<Reference>();
+        __arefs_A1.Add(__gref_A1_0);
+        __arefs_A1.Add(__gref_A1_1);
+        try { __el_A1 = AngularDimension.Create(doc, __vw_A1, __arc_A1, __arefs_A1, __dt_A1); }
+        catch (Exception __ex2_A1) { __t.RollBack(); return __Refuse("A1", "AngularDimension.Create: " + __ex2_A1.Message); }
+        if (__el_A1 == null) { __t.RollBack(); return __Refuse("A1", "AngularDimension.Create вернул null"); }
+        try { Parameter __cm = __el_A1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:b5fb387b:A1"); } catch { }
 
         // create_tag T1
         __vw_T1 = doc.GetElement(new ElementId(900)) as View;
@@ -174,7 +357,7 @@ using (Transaction __t = new Transaction(doc, "KIR: аннотации с явн
         try { __el_T1 = IndependentTag.Create(doc, __ttel_T1.Id, __vw_T1.Id, new Reference(__tg_T1), true, TagOrientation.Horizontal, (__vw_T1.Origin + __vw_T1.RightDirection.Multiply(U(3000.0)) + __vw_T1.UpDirection.Multiply(U(800.0)))); }
         catch (Exception __ex_T1) { __t.RollBack(); return __Refuse("T1", "IndependentTag.Create: " + __ex_T1.Message); }
         if (__el_T1 == null) { __t.RollBack(); return __Refuse("T1", "IndependentTag.Create вернул null"); }
-        try { Parameter __cm = __el_T1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:9f982893:T1"); } catch { }
+        try { Parameter __cm = __el_T1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:b5fb387b:T1"); } catch { }
 
         // create_text X1
         __vw_X1 = doc.GetElement(new ElementId(900)) as View;
@@ -185,7 +368,7 @@ using (Transaction __t = new Transaction(doc, "KIR: аннотации с явн
         try { __el_X1 = TextNote.Create(doc, __vw_X1.Id, (__vw_X1.Origin + __vw_X1.RightDirection.Multiply(U(1000.0)) + __vw_X1.UpDirection.Multiply(U(1000.0))), "См. примечание", __ttel_X1.Id); }
         catch (Exception __ex_X1) { __t.RollBack(); return __Refuse("X1", "TextNote.Create: " + __ex_X1.Message); }
         if (__el_X1 == null) { __t.RollBack(); return __Refuse("X1", "TextNote.Create вернул null"); }
-        try { Parameter __cm = __el_X1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:9f982893:X1"); } catch { }
+        try { Parameter __cm = __el_X1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:b5fb387b:X1"); } catch { }
         __ltel_X1 = (Element)__el_W1;
         try
         {
@@ -238,6 +421,50 @@ using (Transaction __t = new Transaction(doc, "KIR: аннотации с явн
                 !__actual_D1.OrderBy(__x => __x, StringComparer.Ordinal).SequenceEqual(
                     __requested_D1.OrderBy(__x => __x, StringComparer.Ordinal)))
                 __post.Add("D1: References do not match requested refs (topology)");
+            var __proj_D1 = new List<double>();
+            __proj_D1.Add(__gpt_D1_0.DotProduct(__dimDir_D1));
+            __proj_D1.Add(__gpt_D1_1.DotProduct(__dimDir_D1));
+            __proj_D1.Sort();
+            var __expect_D1 = new List<double>();
+            for (int __pi = 0; __pi + 1 < __proj_D1.Count; __pi++)
+                __expect_D1.Add(__proj_D1[__pi + 1] - __proj_D1[__pi]);
+            var __got_D1 = new List<double>(); bool __valRead_D1 = true;
+            try
+            {
+                if (__el_D1.NumberOfSegments > 1)
+                    foreach (DimensionSegment __sg_D1 in __el_D1.Segments)
+                        __got_D1.Add(__sg_D1.Value ?? double.NaN);
+                else __got_D1.Add(__el_D1.Value ?? double.NaN);
+            }
+            catch { __valRead_D1 = false; }
+            double __vtol_D1 = doc.Application.VertexTolerance;
+            bool __valBad_D1 = !__valRead_D1 || __got_D1.Count != __expect_D1.Count;
+            if (!__valBad_D1)
+                for (int __vi = 0; __vi < __expect_D1.Count; __vi++)
+                    if (double.IsNaN(__got_D1[__vi]) ||
+                        Math.Abs(__got_D1[__vi] - __expect_D1[__vi]) > __vtol_D1)
+                        __valBad_D1 = true;
+            if (__valBad_D1)
+                __post.Add("D1: measured value is not the distance between the referenced geometry (geometry)");
+        }
+        // post A1
+        {
+            if (__el_A1.OwnerViewId.ToString() != __vw_A1.Id.ToString())
+                __post.Add("A1: angular dimension belongs to wrong view (topology)");
+            var __requested_A1 = new List<string>() { __rf_A1_0.Id.ToString(), __rf_A1_1.Id.ToString() };
+            var __actual_A1 = new List<string>(); bool __refsReadable_A1 = true;
+            try { foreach (Reference __rr in __el_A1.References) if (__rr != null && __rr.ElementId != null) __actual_A1.Add(__rr.ElementId.ToString()); }
+            catch { __refsReadable_A1 = false; }
+            if (!__refsReadable_A1 || __actual_A1.Count != __requested_A1.Count ||
+                !__actual_A1.OrderBy(__x => __x, StringComparer.Ordinal).SequenceEqual(
+                    __requested_A1.OrderBy(__x => __x, StringComparer.Ordinal)))
+                __post.Add("A1: References do not match requested refs (topology)");
+            double __agot_A1 = double.NaN; bool __aRead_A1 = true;
+            try { __agot_A1 = __el_A1.Value ?? double.NaN; }
+            catch { __aRead_A1 = false; }
+            if (!__aRead_A1 || double.IsNaN(__agot_A1) ||
+                Math.Abs(__agot_A1 - __asw_A1) > doc.Application.AngleTolerance)
+                __post.Add("A1: measured angle is not the sweep of the arc built from the references (geometry)");
         }
         // post T1
         {
@@ -246,8 +473,8 @@ using (Transaction __t = new Transaction(doc, "KIR: аннотации с явн
             bool __bound_T1 = false;
             try
             {
-                foreach (var __tid in __el_T1.GetTaggedLocalElementIds())
-                    if (__tid.ToString() == __tg_T1.Id.ToString()) { __bound_T1 = true; break; }
+                foreach (Element __tel in __el_T1.GetTaggedLocalElements())
+                    if (__tel != null && __tel.Id.ToString() == __tg_T1.Id.ToString()) { __bound_T1 = true; break; }
             } catch { }
             if (!__bound_T1)
                 __post.Add("T1: марка не связана с target (semantic, VIEW-BINDING LAW: target не виден в in_view?)");
@@ -343,6 +570,16 @@ using (Transaction __t = new Transaction(doc, "KIR: аннотации с явн
     try { __rb["value_mm"] = Math.Round(MM(__el_D1.Value ?? 0.0), 1); } catch { }
     try { __rb["references"] = __el_D1.References.Size; } catch { }
     __results["D1"] = __rb;
+}
+
+// witness A1
+{
+    var __rb = new Dictionary<string, object>();
+    __rb["id"] = __el_A1.Id.ToString();
+    try { var __stampParam = __el_A1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__stampParam != null) __rb["stamp"] = __stampParam.AsString(); } catch { }
+    try { __rb["value_deg"] = Math.Round((__el_A1.Value ?? 0.0) * 180.0 / Math.PI, 3); } catch { }
+    try { __rb["references"] = __el_A1.References.Size; } catch { }
+    __results["A1"] = __rb;
 }
 
 // witness T1

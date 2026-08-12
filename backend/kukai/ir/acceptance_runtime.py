@@ -4,7 +4,7 @@
 acceptance session so that the handler cannot accidentally reorder the
 correctness loop:
 
-    grounded program -> pre-read -> fsynced registration -> write -> post-read
+    typed plan -> pre-read -> fsynced registration -> write -> post-read
     -> code-computed verdict -> fsynced terminal evidence
 
 Every write routed through the regular serving body enters this state machine,
@@ -21,8 +21,10 @@ from kukai.ir.acceptance import (
     Expectation,
     derive_expectation,
     expectation_categories,
+    symbol_rows_from_snapshot,
 )
 from kukai.ir.acceptance_evidence import (
+    ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
     AcceptanceEvidence,
     AcceptanceReason,
     AcceptanceRegistration,
@@ -51,7 +53,7 @@ from kukai.ir.acceptance_journal import (
 )
 from kukai.ir.bridge_result import extract_error
 from kukai.ir.contracts import DocumentFingerprint, ElementIdentityProof
-from kukai.ir.midend import GroundedProgram, PlannedProgram
+from kukai.ir.midend import PlannedProgram
 from kukai.ir.outcome import AcceptanceState, ProgramOutcome, WitnessState
 
 
@@ -252,7 +254,7 @@ class AcceptanceSession:
         # UniqueIds or pre-existing parameter values would widen private model
         # state into the conversation for no correctness benefit.
         payload = {
-            "schema_version": evidence.schema_version,
+            "schema_version": ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
             "run_id": self.registration.run_id,
             "state": evidence.state.value,
             "reason": evidence.reason.value,
@@ -271,8 +273,6 @@ class AcceptanceSession:
                 if evidence.mutation_verdict is not None else None
             ),
         }
-        if self.registration.ground_digest is not None:
-            payload["ground_digest"] = self.registration.ground_digest
         payload["journal"] = {
             "schema_version": ACCEPTANCE_JOURNAL_SCHEMA_VERSION,
             "durable": self.journal.state.finalized,
@@ -285,7 +285,7 @@ class AcceptanceSession:
     def registration_wire(self) -> dict[str, Any]:
         """Small proof that the predicate was durable before execution."""
 
-        payload = {
+        return {
             "schema_version": ACCEPTANCE_JOURNAL_SCHEMA_VERSION,
             "state": "prepared",
             "run_id": self.registration.run_id,
@@ -298,13 +298,10 @@ class AcceptanceSession:
             "journal_checksum": self.journal.state.checksum,
             "durable": True,
         }
-        if self.registration.ground_digest is not None:
-            payload["ground_digest"] = self.registration.ground_digest
-        return payload
 
 
 async def prepare_acceptance(
-    planned: PlannedProgram | GroundedProgram,
+    planned: PlannedProgram,
     snapshot: Mapping[str, Any],
     document: DocumentFingerprint,
     reader: AcceptanceReader,
@@ -315,13 +312,8 @@ async def prepare_acceptance(
 ) -> AcceptanceSession:
     """Pre-read and fsync the predicate before returning write authority."""
 
-    ground_digest = None
-    if isinstance(planned, GroundedProgram):
-        ground_digest = planned.ground_digest
-        planned = planned.planned
     if not isinstance(planned, PlannedProgram):
-        raise TypeError(
-            "acceptance preparation requires PlannedProgram or GroundedProgram")
+        raise TypeError("acceptance preparation requires PlannedProgram")
     if planned.family.value != "write":
         raise ValueError("independent mutation acceptance requires a write plan")
     if not isinstance(snapshot, Mapping):
@@ -336,9 +328,13 @@ async def prepare_acceptance(
             "хранилище доказательств KIR не настроено — транзакция не запускалась",
             f"set {ACCEPTANCE_EVIDENCE_DIR_ENV} to a private writable directory",
         )
+    # Оба справочника — ДАННЫЕ О МОДЕЛИ из того же снимка, который уже
+    # заземлил программу, и оба читаются ДО эффекта: предикат
+    # пред-регистрируется по построению, а не оправдывается после.
     expectation = derive_expectation(
         planned,
         level_names_by_id=_level_names_by_id(snapshot),
+        family_symbols=symbol_rows_from_snapshot(snapshot),
     )
     mutation_expectation = derive_mutation_expectation(planned)
     run_id = new_acceptance_run_id()
@@ -378,7 +374,6 @@ async def prepare_acceptance(
         categories=expectation_categories(expectation),
         before=before,
         mutation_before=mutation_before,
-        ground_digest=ground_digest,
     )
     try:
         journal = AcceptanceJournal.create(root, registration)

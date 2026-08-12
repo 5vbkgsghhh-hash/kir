@@ -181,12 +181,10 @@ def test_a_program_envelope_is_accepted_as_well_as_a_bare_list() -> None:
 # 3. ЗАГОЛОВОК НЕ СИЛЬНЕЕ ТЕЛА
 # ═════════════════════════════════════════════════════════════════════════
 
-def test_a_passing_headline_never_hides_the_unevaluated_rules() -> None:
-    """ДЕФЕКТ: `Verdict.PASS` печатался словом ПРИГОДЕН и точка, при том что
-    тело вердикта тут же перечисляло правила, которые НЕ ОЦЕНИВАЛИСЬ вовсе.
-
-    Модель читает заголовок как «готово» и уходит. Закон: заголовок обязан
-    быть НЕ СИЛЬНЕЕ тела.
+def test_a_not_evaluated_verdict_never_hides_rule_coverage() -> None:
+    """Интеграционный носитель: на реальной KIR-программе часть правил
+    оценена, а обязательные предусловия для других не доказаны. Итог
+    честно `NOT_EVALUATED`, но он не имеет права скрыть знаменатель покрытия.
     """
     verdict = dc.check_ops(kir_ops(), building_id="проба")
     coverage = verdict.report.coverage
@@ -195,12 +193,35 @@ def test_a_passing_headline_never_hides_the_unevaluated_rules() -> None:
     assert evaluated < total, (
         "материал перестал быть материалом: на этой программе оценены ВСЕ "
         "правила, и заголовку нечего скрывать — тест потерял предмет")
+    # Обязательные предусловия отказывают fail-closed: этот носитель честно
+    # NOT_EVALUATED и всё равно обязан назвать покрытие в первой строке.
+    assert verdict.verdict is dc.Verdict.NOT_EVALUATED
 
     head = dc.render_verdict(verdict).splitlines()[0]
     assert str(evaluated) in head and str(total) in head, head
     assert "НЕ ОЦЕНЕН" in head.upper(), head
-    # Слово «ПРИГОДЕН» само по себе остаётся, но уже не как всё утверждение.
+    # Исторически здесь был голый «ПРИГОДЕН»; ни этот старый
+    # исход, ни голый «НЕ ОЦЕНЕНО» не имеют права скрыть покрытие.
     assert head.strip() != "═══ ВЕРДИКТ О ЗАМЫСЛЕ: ПРИГОДЕН ═══"
+
+
+@pytest.mark.parametrize(("evaluated", "total"), [
+    (0, 20),
+    (10, 20),
+    (20, 20),
+])
+def test_a_not_evaluated_headline_names_its_rule_coverage(
+    evaluated: int, total: int,
+) -> None:
+    assert dc.verdict_headline_text(
+        dc.Verdict.NOT_EVALUATED, evaluated=evaluated, total=total,
+    ) == f"ИТОГ НЕ ОЦЕНЕН; ОЦЕНЕНО {evaluated} ПРАВИЛ ИЗ {total}"
+
+
+def test_a_partial_pass_headline_names_its_rule_coverage() -> None:
+    assert dc.verdict_headline_text(
+        dc.Verdict.PASS, evaluated=10, total=20,
+    ) == "ПРИГОДЕН ПО 10 ПРАВИЛАМ ИЗ 20, ОСТАЛЬНОЕ НЕ ОЦЕНЕНО"
 
 
 def test_the_headline_of_a_full_pass_stays_short() -> None:

@@ -510,5 +510,91 @@ def _tempdir():
         shutil.rmtree(path, ignore_errors=True)
 
 
+class CanonicalJsonAgreement(unittest.TestCase):
+    """The eight ``_canonical_json`` of this package must mean one thing.
+
+    REFUTING TEST — both assertions fail on the code before 10.08.2026, where
+    ``lift_cache._canonical_json`` omitted ``allow_nan=False`` and therefore
+    emitted the non-JSON literals ``NaN`` / ``Infinity`` while the other seven
+    raised.  Measured that day: on twelve finite probe shapes all eight agreed
+    byte for byte, so this is the whole of the divergence, not a sample of it.
+    """
+
+    _MODULES = (
+        "kukai.ir.midend",
+        "kukai.ir.decompile.journal",
+        "kukai.ir.decompile.lift_cache",
+        "kukai.ir.decompile.geometry_acceptance",
+        "kukai.ir.decompile.passport",
+        "kukai.ir.decompile.merkle",
+        "kukai.ir.acceptance_live",
+        "kukai.ir.acceptance_mutation",
+    )
+
+    def _impls(self):
+        import importlib
+
+        out = {}
+        for name in self._MODULES:
+            fn = getattr(importlib.import_module(name), "_canonical_json", None)
+            self.assertIsNotNone(fn, f"{name} lost its _canonical_json")
+            out[name] = fn
+        return out
+
+    def test_every_canon_refuses_non_finite_numbers(self) -> None:
+        for probe in ({"v": float("nan")}, {"v": float("inf")},
+                      {"v": float("-inf")}):
+            for name, fn in self._impls().items():
+                with self.subTest(module=name, probe=repr(probe)):
+                    with self.assertRaises(Exception):
+                        fn(probe)
+
+    def test_every_canon_agrees_on_finite_payloads(self) -> None:
+        probes = (
+            {"b": 1, "a": 2},
+            {"name": "Кухня"},
+            {"x": 1.0, "y": 1},
+            {"z": -0.0},
+            {"p": (1, 2, 3)},
+            {"a": {}, "b": [], "c": None},
+            {"n": 2 ** 53 + 1},
+            {"ключ": "значение"},
+            {"s": "a\tb\nc"},
+        )
+        impls = self._impls()
+        for probe in probes:
+            with self.subTest(probe=repr(probe)):
+                outs = {fn(probe) for fn in impls.values()}
+                self.assertEqual(
+                    len(outs), 1,
+                    f"the canons disagree on a finite payload: {outs}")
+
+
+class NonFiniteMakesTheLiftEntryUncacheable(unittest.TestCase):
+    """A NaN must force a MISS, never an exception out of key derivation.
+
+    REFUTING TEST for the SHAPE of the fix, not only its presence: the naive
+    repair (let ``allow_nan=False`` raise) would turn a document that keys
+    fine today into a crashed run.  ``lift_cache``'s own law — stated in
+    ``_lift_source_hash`` and ``_index_hash`` — is that it may cost a
+    recompute and must never give a wrong answer, so both call sites answer
+    with a distinct miss-forcing key instead.
+    """
+
+    def test_index_with_a_non_finite_value_keys_to_a_miss(self) -> None:
+        from kukai.ir.decompile.lift_cache import _index_hash
+
+        clean = _index_hash({"rows": [{"x": 1.0}]})
+        dirty = _index_hash({"rows": [{"x": float("nan")}]})
+        self.assertTrue(dirty.startswith("nonfinite:"), dirty)
+        self.assertNotEqual(clean, dirty)
+
+    def test_a_non_finite_index_does_not_kill_key_derivation(self) -> None:
+        from kukai.ir.decompile.lift_cache import _index_hash
+
+        # The point of the whole exercise: this call must RETURN.
+        self.assertIsInstance(_index_hash({"x": float("inf")}), str)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -136,6 +136,19 @@ class Refusal(str, Enum):
     UNKNOWN_OP = "unknown_op"
     #: После замыкания исполнять нечего.
     NOTHING_TO_BUILD = "nothing_to_build"
+    #: Подпись НАРИСОВАННОГО панелью не совпала с подписью ПОКАЗАННОГО
+    #: сервером. Со сцены-склейки это два РАЗНЫХ вычисления, и расхождение
+    #: означает здание, которого инженер не видел. Победитель здесь НЕ
+    #: выбирается: взять серверную версию значит построить непоказанное,
+    #: взять панельную — довериться тому, чего мы не считали.
+    SHOWN_MISMATCH = "shown_mismatch"
+    #: Панель смотрит на ХВОСТ журнала, а не на здание. Отправить хвост как
+    #: здание нельзя, даже если подписи сошлись: сошлись бы на хвосте.
+    PARTIAL_SCENE = "partial_scene"
+    #: Сервер этой сессии не показывал сцены вовсе — подписывать нечего.
+    #: Отдельно от `SHOWN_MISMATCH` намеренно: «не совпало» и «не показывали»
+    #: лечатся разным, и первое ещё требует объяснения, а второе нет.
+    NOTHING_SHOWN = "nothing_shown"
 
 
 _REFUSAL_RU: dict[Refusal, str] = {
@@ -155,6 +168,15 @@ _REFUSAL_RU: dict[Refusal, str] = {
         "в показанной программе есть операция, отсутствующая в реестре: её "
         "зависимости неизвестны, и замыкание выделения недоказуемо"),
     Refusal.NOTHING_TO_BUILD: "после замыкания исполнять нечего",
+    Refusal.SHOWN_MISMATCH: (
+        "то, что нарисовала панель, и то, что показал сервер, — разные вещи. "
+        "Переносить нельзя НИ ОДНУ из версий: серверная не была на экране, "
+        "панельную мы не считали. Перезагрузите сцену целиком"),
+    Refusal.PARTIAL_SCENE: (
+        "на экране ХВОСТ журнала, а не здание: часть программ в эту сцену не "
+        "попала. Отправить хвост как здание нельзя — запросите сцену целиком"),
+    Refusal.NOTHING_SHOWN: (
+        "сервер не показывал этой сессии ни одной сцены: подписывать нечего"),
 }
 
 
@@ -266,9 +288,23 @@ def refs_of(op: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
                 out.append((param.name, value["value"]))
         elif param.kind == _REF_LIST_KIND and isinstance(value, (list, tuple)):
             for index, item in enumerate(value):
-                if (isinstance(item, Mapping) and item.get("by") == "ref"
+                if not isinstance(item, Mapping):
+                    continue
+                if (item.get("by") == "ref"
                         and isinstance(item.get("value"), str)):
                     out.append((f"{param.name}[{index}]", item["value"]))
+                    continue
+                # Вторая ступень селектора (`{"by": "face", "of": ...}`,
+                # `kukai/ir/faceref.py`): ссылка лежит на уровень глубже.
+                # Пропустить её здесь — значит замкнуть выделение БЕЗ
+                # производящего опа и выдать наружу программу с висячим ref;
+                # замыкание, теряющее ребро, хуже отсутствующего, потому что
+                # выглядит выполненным.
+                inner = item.get("of")
+                if (item.get("by") == "face" and isinstance(inner, Mapping)
+                        and inner.get("by") == "ref"
+                        and isinstance(inner.get("value"), str)):
+                    out.append((f"{param.name}[{index}].of", inner["value"]))
     return tuple(out)
 
 
@@ -516,3 +552,96 @@ def _census_of(context: Sequence[Mapping[str, Any]],
         return ({"unavailable": True,
                  "ru": "перепись посчитать не удалось — считайте, что "
                        "показанного покрытия НЕТ"}, [])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# КНОПКА ВЬЮЕРА: перенос ПОКАЗАННОЙ СЦЕНЫ, а не показанного кадра
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ГРАНИЦА ПРОДУКТА, А НЕ ОПТИМИЗАЦИЯ. Кнопка «отправить в Revit» — единственное
+# место, где виртуальное становится настоящим, и она подписывает ТО, ЧТО
+# ЧЕЛОВЕК ВИДЕЛ. Пока сцена приезжала целиком, «показанное» и «переносимое»
+# совпадали по построению. Со склейкой из базы и хвостов это два РАЗНЫХ
+# вычисления — серверное и панельное, — и любое их расхождение есть здание,
+# которого инженер не видел, построенное с его согласия.
+#
+# ТРИ ПРАВИЛА, И НИ ОДНО НЕ ВЫВОДИТСЯ ИЗ ДРУГИХ:
+#
+#   1. подпись считается ОТ НАРИСОВАННОГО. Панель складывает её из своих
+#      склеенных буферов — из тех же чисел, что кормят рисовальщик, — а не
+#      повторяет то, что прислал сервер. Иначе подписывалось бы намерение;
+#   2. расхождение — ОТКАЗ, а не выбор победителя. Обе версии запрещены:
+#      серверная не была на экране, панельную мы не считали;
+#   3. `partial` доезжает до кнопки. Инженер, смотрящий на хвост, не должен
+#      иметь возможности отправить его как здание — даже если подписи сошлись,
+#      сошлись бы они на хвосте.
+#
+# ЧЕГО ЗДЕСЬ НЕТ. Выделения куска (`selection`) на этом пути пока нет: сцена
+# переносится целиком. Замыкание по зависимостям поэтому не нужно — в пачке
+# уже всё, на что она ссылается. Появится выделение — вернётся и `closure`,
+# который для кадров уже написан выше.
+
+SCENE_DECISION_SCHEMA = "kir-transfer-scene/1"
+
+
+def authorize_scene(key: tuple[str, str], *, shown_digest: str,
+                    partial: bool = False) -> Decision:
+    """Разрешить перенос ПОКАЗАННОЙ СЦЕНЫ. Никогда не поднимает исключений."""
+    try:
+        return _authorize_scene(key, shown_digest=shown_digest,
+                                partial=partial)
+    except Exception:  # noqa: BLE001 — кнопка не имеет права ронять сессию
+        logger.exception("kir transfer authorize_scene failed")
+        return _refuse(Refusal.NOT_SHOWN, requested=shown_digest,
+                       extra_ru="решение не собралось — переносить нечего")
+
+
+def _authorize_scene(key: tuple[str, str], *, shown_digest: str,
+                     partial: bool) -> Decision:
+    from kukai.live import journal as _journal
+    from kukai.live import showroom as _showroom
+
+    if not enabled():
+        return _refuse(Refusal.DISABLED, requested=shown_digest)
+
+    # ХВОСТ ПРОВЕРЯЕТСЯ ПЕРВЫМ. Он делает бессмысленным всё остальное: подпись
+    # хвоста сойдётся сама с собой и ничего этим не докажет.
+    if partial:
+        return _refuse(Refusal.PARTIAL_SCENE, requested=shown_digest)
+
+    current = _showroom.scene_digest(key)
+    if not current:
+        return _refuse(Refusal.NOTHING_SHOWN, requested=shown_digest)
+    if not shown_digest or shown_digest != current:
+        # РАСХОЖДЕНИЕ НАЗЫВАЕТСЯ ОБЕИМИ ПОДПИСЯМИ. Отказ, не говорящий, что с
+        # чем не сошлось, неотличим от поломки.
+        return _refuse(
+            Refusal.SHOWN_MISMATCH, requested=shown_digest,
+            current_digest=current,
+            diverged=(f"панель: {shown_digest or '(пусто)'}",
+                      f"сервер: {current}"))
+
+    session = _journal.get(key)
+    if session is None or not session.records:
+        return _refuse(Refusal.NOTHING_TO_BUILD, requested=shown_digest)
+
+    pack = [[dict(op) for op in record.ops] for record in session.records]
+    if not any(pack):
+        return _refuse(Refusal.NOTHING_TO_BUILD, requested=shown_digest)
+
+    context = [dict(op) for op in session.datums]
+    census, lines = _census_of(context, pack, "")
+    return Decision(
+        status=Status.READY,
+        requested_digest=shown_digest,
+        # РАВЕНСТВО ПОДПИСЕЙ И ЕСТЬ «что видел, то и построится». Разные
+        # значения здесь означали бы, что мы переносим не показанное.
+        transfer_digest=shown_digest,
+        current_digest=current,
+        programs=len(pack),
+        ops=sum(len(program) for program in pack),
+        census=census,
+        census_lines=tuple(lines),
+        over_budget=_over_budget(pack),
+        preflight=_preflight(pack),
+    )

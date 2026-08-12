@@ -92,14 +92,59 @@ def reject_model3d_in_annotation(v: Any, oid, field: str, diags: list) -> bool:
 # ── view-space → XYZ materialization, emitted as C# (the runtime basis is only
 #    known after ground; §эмиттер of KIR_DOC_SPEC.md) ──────────────────────────
 
+def _view2d_to_xyz_expr(view_var: str, u_cs: str, v_cs: str) -> str:
+    """ЕДИНСТВЕННОЕ место, где записана прямая формула вида→мир.
+
+    Заведено 09.08.2026, когда у семейства появился ВТОРОЙ потребитель формулы
+    (заливка, у которой через вид едет не одна точка, а целый контур). Пока
+    потребитель был один, «одна формула» держалась тем, что её негде было
+    переписать; со вторым это стало авторской дисциплиной — то же самое, что
+    случилось у CONTOUR с телом ребра (см. ``contour._edge_curve_cs``), где два
+    расхождения из трёх были бы невидимы. ``u_cs``/``v_cs`` — C#-ВЫРАЖЕНИЯ, а не
+    числа, потому что у контура координата приходит параметром локальной
+    функции, а не литералом.
+    """
+    return (f"({view_var}.Origin "
+            f"+ {view_var}.RightDirection.Multiply({u_cs}) "
+            f"+ {view_var}.UpDirection.Multiply({v_cs}))")
+
+
 def emit_view2d_to_xyz_cs(view_var: str, u: float, w: float) -> str:
     """C# expression placing a view-space [u,v] mm point into 3D via the view's
     own basis (Origin + u*RightDirection + v*UpDirection). This is the invention
     materialized: the 2D sheet coordinate becomes a world point ONLY through the
     resolved view's transform, never by hardcoding a Z."""
-    return (f"({view_var}.Origin "
-            f"+ {view_var}.RightDirection.Multiply(U({round(u, 2)})) "
-            f"+ {view_var}.UpDirection.Multiply(U({round(w, 2)})))")
+    return _view2d_to_xyz_expr(
+        view_var, f"U({round(u, 2)})", f"U({round(w, 2)})")
+
+
+def emit_view2d_point_fn_cs(view_var: str, fn_name: str,
+                            u_param: str = "__u", v_param: str = "__v") -> str:
+    """Локальная C#-функция ``fn_name(u, v) -> XYZ`` — та же прямая формула.
+
+    Нужна там, где точек МНОГО и они не литералы: контур заливки лежит в
+    плоскости вида целиком, и разворачивать выражение по каждой вершине значило
+    бы размножить формулу по эмиссии. Объявляется в ``decl`` (контракт областей
+    видимости: ``per_op`` оборачивает create в свою область), поэтому её видят
+    и блок создания, и блок постусловий.
+    """
+    return (f"XYZ {fn_name}(double {u_param}, double {v_param}) => "
+            f"{_view2d_to_xyz_expr(view_var, f'U({u_param})', f'U({v_param})')};")
+
+
+def emit_xyz_to_view2d_cs(view_var: str, point_cs: str, rel_var: str,
+                          u_var: str, v_var: str, indent: str = "") -> str:
+    """ОБРАТНАЯ формула, и она обязана быть ТОЖДЕСТВЕННОЙ прямой, а не похожей.
+
+    ``rel = P - Origin; u = MM(rel·Right); v = MM(rel·Up)`` — ровно обращение
+    ``Origin + u*Right + v*Up`` в ортонормированном базисе вида. Закон записан
+    в инварианте KIR «An inverse must be identical, not similar»; до 09.08 он
+    держался тем, что обе стороны были набраны руками в двух эмиттерах — марки
+    и текста, — и сюда они переехали БАЙТ В БАЙТ (эталоны не двинулись).
+    """
+    return (f"{indent}var {rel_var} = {point_cs} - {view_var}.Origin;\n"
+            f"{indent}double {u_var} = MM({rel_var}.DotProduct({view_var}.RightDirection));\n"
+            f"{indent}double {v_var} = MM({rel_var}.DotProduct({view_var}.UpDirection));\n")
 
 
 def view_scale_to_model_mm(sheet_mm: float, view_scale: int) -> float:

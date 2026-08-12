@@ -13,20 +13,44 @@
 """
 from __future__ import annotations
 
-import asyncio
 import json
+import time as _real_time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest import mock
 
+from kukai.ir.decompile import extract as _extract
 from kukai.ir.decompile import pipeline as pipe
 from kukai.ir.decompile.extract import _timing_totals
 from kukai.ir.decompile.tests.test_pipeline import FakePipelineBridge, _run
 
-#: Задержка, которую тест вставляет в мост.  Заметно больше любой настоящей
-#: работы подделки (микросекунды), чтобы вывод не зависел от нагрузки коробки.
+#: Шаг виртуальных часов внутри каждого постраничного вызова моста.
 SLOW_MS = 400.0
+
+
+class _Clock:
+    """Часы, которые идут только внутри поддельного вызова моста."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _ClockShim:
+    """Подмена `time` только в namespace extract; loop.time не затронут."""
+
+    def __init__(self, clock: _Clock) -> None:
+        self._clock = clock
+
+    def monotonic(self) -> float:
+        return self._clock.now
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_real_time, name)
 
 
 class _SlowBridge(FakePipelineBridge):
@@ -37,15 +61,16 @@ class _SlowBridge(FakePipelineBridge):
     появиться в ``bridge_ms`` извлечения и НИГДЕ БОЛЬШЕ.
     """
 
-    def __init__(self, *, delay_s: float, **kwargs: Any) -> None:
+    def __init__(self, *, delay_s: float, clock: _Clock, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.delay_s = delay_s
+        self.clock = clock
         self.slow_calls = 0
 
     async def __call__(self, code: str, *, timeout_ms: int) -> dict[str, Any]:
         if "long __After = " in code:
             self.slow_calls += 1
-            await asyncio.sleep(self.delay_s)
+            self.clock.advance(self.delay_s)
         return await super().__call__(code, timeout_ms=timeout_ms)
 
 
@@ -103,39 +128,39 @@ class TimingIsRecordedTests(unittest.TestCase):
         которому нельзя верить, в волне про прибор.
 
         Вместо этого задержка берётся заведомо БОЛЬШЕ настоящей работы
-        подделки (~430 мс на fsync), и проверяются две границы внутри одного
+        подделки; виртуальные часы идут только в мосте. Проверяются две границы:
         прогона: мост обязан ВМЕСТИТЬ вставленное время, а наша сторона
         обязана в него НЕ ВЛЕЗТЬ.
         """
 
+        clock = _Clock()
         with TemporaryDirectory() as tmp:
-            slow = _SlowBridge(delay_s=SLOW_MS / 1000.0)
-            self.assertTrue(_decompile(tmp, slow).ok)
+            slow = _SlowBridge(delay_s=SLOW_MS / 1000.0, clock=clock)
+            with mock.patch.object(_extract, "time", _ClockShim(clock)):
+                self.assertTrue(_decompile(tmp, slow).ok)
             timing = json.loads(
                 (Path(tmp) / "run.json").read_bytes())["timing"]
 
         extract = timing["extract"]
-        pages = extract["pages"]
         self.assertGreater(slow.slow_calls, 0, "задержка не сработала")
-        injected = SLOW_MS * pages
+        injected = SLOW_MS * slow.slow_calls
 
         # 1. Ведро моста ВМЕСТИЛО вставленное время.  Красное, если замер
         #    моста закрыть раньше, чем вернулся ответ.
-        self.assertGreaterEqual(
-            extract["bridge_ms"], injected * 0.9,
-            f"вставлено {injected:.0f} мс задержки, а bridge_ms = "
-            f"{extract['bridge_ms']:.0f} мс — время утекло мимо ведра моста")
+        self.assertAlmostEqual(
+            extract["bridge_ms"], injected, places=2,
+            msg=(f"вставлено {injected:.0f} мс, а bridge_ms = "
+                 f"{extract['bridge_ms']:.3f} мс — время утекло мимо ведра моста"))
 
         # 2. Наша сторона в него НЕ ВЛЕЗЛА.  Красное, если parse_ms или
         #    write_ms начать считать от отметки ДО вызова моста, — именно эта
         #    перестановка границ и делает разбивку враньём.
-        self.assertLess(
-            extract["our_ms"], injected * 0.5,
-            f"our_ms = {extract['our_ms']:.0f} мс при вставленных "
-            f"{injected:.0f} мс сна в МОСТУ — ведра перепутаны")
+        self.assertEqual(
+            extract["our_ms"], 0.0,
+            f"our_ms = {extract['our_ms']:.3f} мс при неподвижных часах вне моста")
 
         # 3. Доля моста при медленном мосте — подавляющая.
-        self.assertGreater(extract["bridge_ms_share"], 0.6)
+        self.assertAlmostEqual(extract["bridge_ms_share"], 1.0, places=6)
 
     def test_breakdown_is_per_category_and_survives_resume(self) -> None:
         """Разбивка живёт в чекпойнте — резюм её не обнуляет."""

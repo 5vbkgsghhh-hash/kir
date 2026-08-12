@@ -28,10 +28,69 @@ from kukai.ir.tests.test_pbt import gen_program                    # noqa: E402
 N_PBT = 25
 SEED = 62026
 
+SIZED_CABLE_TRAY_GATE_NAME = "auth_cable_tray_sized"
+SIZED_CABLE_TRAY_GATE_MARKERS = (
+    "RBS_CABLETRAY_WIDTH_PARAM",
+    "RBS_CABLETRAY_HEIGHT_PARAM",
+)
+
+
+def register_sized_cable_tray_gate(programs: dict[str, dict]) -> None:
+    """Put the sectioned cable-tray emitter branch in the live gate corpus."""
+    if SIZED_CABLE_TRAY_GATE_NAME in programs:
+        raise RuntimeError(f"duplicate gate program: {SIZED_CABLE_TRAY_GATE_NAME}")
+    programs[SIZED_CABLE_TRAY_GATE_NAME] = {
+        "ir_version": "1.0",
+        "intent": "кабельный лоток 300x100",
+        "ops": [{
+            "op": "create_cable_tray",
+            "id": "CT2",
+            "p0_mm": [0, 5000, 3000],
+            "p1_mm": [6000, 5000, 3000],
+            "level": {"by": "element_id", "value": 42},
+            "width_mm": 300,
+            "height_mm": 100,
+        }],
+    }
+
+
+def sized_cable_tray_branch_reached(csharp: str) -> bool:
+    """True only when the emitted body contains both section operands."""
+    return all(marker in csharp for marker in SIZED_CABLE_TRAY_GATE_MARKERS)
+
 #: Представительные id для тел боковых стадий. Эмитированный C# инвариантен к
 #: ЧИСЛУ id по форме, поэтому двух хватает; важно лишь, что они настоящие
 #: числовые id, а не заглушки, — числовой разбор внутри тела реален.
 GATE_SIDE_STAGE_IDS = ["19227219", "456"]
+
+#: Программа -> САМАЯ РАННЯЯ версия Revit, на которой она вообще строится.
+#: Ниже неё `KIR-E003` — это ПРАВИЛЬНЫЙ ответ, а не «известная дыра»: операция
+#: честно сказала, что на этой версии её в API нет. Ворота обязаны отличать
+#: это от сломанной эмиссии, иначе зелёный требовал бы молча построить
+#: что-нибудь другое — ровно тот Гудхарт, ради борьбы с которым отказ и
+#: заведён.
+#:
+#: ДАННЫМИ, А НЕ УСЛОВИЕМ (09.08.2026). До этого дня здесь стоял список имён
+#: и жёсткое `ver == "2021"`, то есть выразить можно было ровно одну границу.
+#: Волна площадки принесла вторую: класса `Toposolid` нет до 2024, значит
+#: `site_topography_toposolid` отказывает на ТРЁХ версиях, и старая форма
+#: записала бы два из трёх правильных отказов в провалы ворот. Граница —
+#: свойство операции, поэтому она и стоит числом рядом с программой.
+E003_EXPECTED_BELOW: dict[str, str] = {
+    # 2022: holes у перекрытия/плиты фундамента — путь Floor.Create(loops).
+    "auth_floor_holes": "2022",
+    "auth_contour_l": "2022",
+    "struct_foundation_slab_holes_2021": "2022",
+    "struct_foundation_slab": "2022",
+    # 2022: Ceiling.Create; legacy doc.Create.NewCeiling не существует ни на
+    # одной из шести версий (замерено), то есть сворачивать некуда.
+    "arch_ceiling": "2022",
+    "arch_ceiling_contour": "2022",
+    # 2024: класса Toposolid нет раньше (CS0246 на 2021/2022/2023 — замерено
+    # компиляцией 09.08). Поверхность рельефа (site_topography_surface) сюда
+    # НЕ входит: она строится 6/6, и это разные элементы разных категорий.
+    "site_topography_toposolid": "2024",
+}
 
 #: Стадии, чей C# едет в Revit, но которых НЕТ в реестре конвейера. Tier G
 #: теперь является live-стадией ``geometry`` и берётся из того же реестра, так
@@ -158,7 +217,20 @@ async def main() -> int:
         print("FATAL: compile service :52412 unavailable")
         return 2
 
-    programs: dict[str, dict] = dict(PROGRAMS)
+    # `__ver__` — ПИН ЭТАЛОНА, А НЕ ПОЛЕ ПРОГРАММЫ, и снимать его обязаны оба
+    # читателя `PROGRAMS`. Волна нагрузок завела этот ключ (эталон нагрузок
+    # снимается на 2023, потому что свободная нагрузка живёт только на
+    # 2021-2023) и научила снимать его `test_golden`, но не эти ворота, хотя
+    # правку в них та же волна вносила — исключение E003 для 2024+ ниже. Итог:
+    # ворота подавали ключ в конверт и получали KIR-P003 «неизвестное поле» на
+    # ВСЕХ ШЕСТИ версиях, то есть исключение, написанное волной, не срабатывало
+    # ни разу — программа падала раньше, чем доходила до него.
+    # ЭТО НЕ АРИФМЕТИКА СЛИЯНИЯ, А НАСТОЯЩИЙ ДЕФЕКТ ВЕТКИ, и он показывает,
+    # что ворота на ней до конца не доводили: снятый ключ даёт ровно то, что
+    # волна и задумала — сборку на 2021-2023 и KIR-E003 на 2024-2026.
+    programs: dict[str, dict] = {
+        name: {k: v for k, v in prog.items() if k != "__ver__"}
+        for name, prog in PROGRAMS.items()}
     rng = random.Random(SEED)
     for i in range(N_PBT):
         programs[f"pbt_{i:02d}"] = gen_program(rng)
@@ -177,11 +249,30 @@ async def main() -> int:
     # actually compiles on all six versions (the two-table-lockstep guard
     # test_authoring.QueryTypes.test_all_sixteen_pools_compile_offline
     # proves offline; this is the same proof through the live gate).
+    # ЧАНКОВАНИЕ ДОБАВЛЕНО ПРИ СЛИЯНИИ 09.08, и ошибка была ровно та, от
+    # которой предупреждает блок `all_kinds_` двадцатью строками выше: пулов
+    # стало БОЛЬШЕ ДВАДЦАТИ, и одна программа на все пулы уткнулась в
+    # MAX_OPS_PER_PROGRAM — ворота отдали KIR-L001 на всех шести версиях.
+    #
+    # ЧЬЯ ЭТО ОШИБКА — ЗАМЕРЕНО ПО ВЕТКАМ, А НЕ ПРЕДПОЛОЖЕНО (число берётся из
+    # собственного замка каждой ветки, `assertEqual(len(pools), N)`):
+    # общее основание — 19 пулов (19 опов, предел не перейдён, ворота зелены);
+    # волна каркаса — 20 (ровно предел, ещё проходит);
+    # волна нагрузок — 23, то есть ПРЕДЕЛ БЫЛ ПЕРЕЙДЁН УЖЕ У НЕЁ, на своей
+    # ветке, до всякого слияния; слитое дерево — 24.
+    # Значит это НЕ арифметика слияния: ворота на ветке нагрузок падали и там,
+    # ровно как и из-за `__ver__` выше. Две независимые поломки одних ворот в
+    # одной ветке — признак того, что ворота на ней не запускались до конца.
+    # Чанкуем, а не срезаем: `[:20]` тихо оставил бы последние пулы вне живых
+    # ворот, то есть купил бы зелёный цвет ценой покрытия.
     _qt_pools = spec.OPS["query_types"].params[0].choices
-    programs["query_types_all_pools"] = {"ir_version": "1.0",
-        "intent": "какие типы существуют в каждом закрытом пуле",
-        "ops": [{"op": "query_types", "id": f"t{j}", "pool": p}
-                for j, p in enumerate(_qt_pools)]}
+    _qt_ops = [{"op": "query_types", "id": f"t{j}", "pool": p}
+               for j, p in enumerate(_qt_pools)]
+    for offset in range(0, len(_qt_ops), 20):
+        programs[f"query_types_all_pools_{offset // 20:02d}"] = {
+            "ir_version": "1.0",
+            "intent": "какие типы существуют в каждом закрытом пуле",
+            "ops": _qt_ops[offset:offset + 20]}
     # authoring family — grounded via the COMMITTED shared fixture (fixtures.py,
     # same snapshot unit tests and goldens use; a private harness copy is how
     # the 2026-07-16 checkpoint became non-reproducible from HEAD)
@@ -198,6 +289,7 @@ async def main() -> int:
         {"op": "create_grid", "id": "G1", "p0_mm": [0, -1000],
          "p1_mm": [0, 9000], "name": "А"},
     ], intent="стены+труба+ось")
+    register_sized_cable_tray_gate(programs)
     programs["auth_stack"] = {"ir_version": "1.0", "intent": "стек 5 этажей",
         "ops": [{"op": "stack", "id": "sec", "levels": 5, "h_mm": 3000,
                  "floor": [
@@ -215,6 +307,44 @@ async def main() -> int:
                  "base_level": {"by": "element_id", "value": 42},
                  "top_level": {"by": "element_id", "value": 43},
                  "width_mm": 1200}]}
+    # 09.08: ВТОРАЯ форма марша того же опа — винтовая
+    # (StairsRun.CreateSpiralRun). Ветка, которой ворота не строят, ими не
+    # проверена вовсе; ось версий у винта та же (метод есть и одинаков в
+    # 2021-2026 по эталонным сборкам), поэтому ожидание — шесть OK, без
+    # единого исключения в EXPECTED-списках.
+    programs["auth_stairs_spiral"] = {"ir_version": "1.0",
+        "intent": "винтовая лестница",
+        "ops": [{"op": "create_stairs", "id": "S1",
+                 "spiral": {"center_mm": [3000.0, 3000.0], "radius_mm": 1500.0,
+                            "start_angle_deg": 0.0,
+                            "included_angle_deg": 270.0, "clockwise": False},
+                 "base_level": {"by": "element_id", "value": 42},
+                 "top_level": {"by": "element_id", "value": 43},
+                 "width_mm": 1200}]}
+    # ВОЛНА ЛЕСТНИЦ (10.08.2026): площадка по эскизу — ВТОРОЙ оп со своим
+    # шаблоном целой программы. Две строки, а не одна, потому что ветки
+    # эмиссии у контура РАЗНЫЕ: прямоугольник печатает шесть `Line.CreateBound`
+    # (`bulge == 0`), а многоугольник с дугой уводит в `Arc.Create` по трём
+    # литеральным точкам, и ветка, которой ворота не строят, ими не проверена
+    # вовсе — тот же довод, которым 09.08 заведён винтовой марш выше.
+    programs["auth_stairs_landing"] = {"ir_version": "1.0",
+        "intent": "промежуточная площадка лестницы",
+        "ops": [{"op": "create_stairs_landing", "id": "LG1",
+                 "stairs": {"by": "element_id", "value": 4242},
+                 "contour": {"outer": {"shape": "rect",
+                                       "origin": [5000.0, 0.0],
+                                       "size_mm": [2400.0, 1200.0]}},
+                 "elevation_mm": 1500.0}]}
+    programs["auth_stairs_landing_arc"] = {"ir_version": "1.0",
+        "intent": "площадка со скруглённой гранью",
+        "ops": [{"op": "create_stairs_landing", "id": "LG1",
+                 "stairs": {"by": "element_id", "value": 4242},
+                 "contour": {"outer": {
+                     "shape": "poly",
+                     "points_mm": [[5000.0, 0.0], [7400.0, 0.0],
+                                   [7400.0, 1200.0], [5000.0, 1200.0]],
+                     "arcs": [{"edge": 1, "bulge": 0.3}]}},
+                 "elevation_mm": 1500.0}]}
     # feat/native-groups: a native Revit group (create_group). Members are
     # PRE-GROUNDED authoring ops (the component-library bridge shape); the group
     # op grounds through with no snapshot dependency (grounded=()), and the two
@@ -383,6 +513,46 @@ async def main() -> int:
              "host": {"by": "element_id", "value": 8145901},
              "direction": "u", "position_mm": [4000.0, 120.0, 900.0]},
         ]}
+    # RELATE, АДРЕС (волна 09.08). Ворота обязаны гонять ОБА семейства узлов
+    # на всех шести версиях, и вот зачем именно ворота: адрес разрешается на
+    # компиляции в ЛИТЕРАЛ, поэтому дефект в резолвере выглядит не как
+    # ошибка компиляции, а как ПРАВИЛЬНО СОБИРАЮЩИЙСЯ C# с неверным числом.
+    # Единственное, что здесь доказывают ворота, — что путь «адрес -> число ->
+    # эмиссия» доходит до конца на 2021-2026; ЧТО за число выведено, держат
+    # тесты (`test_relate.py`, побайтовая сверка с ручным вариантом).
+    #
+    # Программа сложена цепочкой намеренно: колонны адресованы ОТ ОСЕЙ, балка
+    # — ОТ КОЛОНН, вторая стена — ОТ КОНЦА первой. Ни одной координаты балки
+    # и стыка в тексте нет, и в этом весь смысл замера.
+    programs["auth_address_grid_and_element"] = {"ir_version": "1.0",
+        "intent": "адрес: колонны от осей, балка по верху колонн, стык стен",
+        "ops": [
+            {"op": "create_column", "id": "AC1", "xy": {"at_grid": ["1", "А"]},
+             "level": {"by": "element_id", "value": 42},
+             "top_level": {"by": "element_id", "value": 43},
+             "symbol": {"by": "element_id", "value": 500}},
+            {"op": "create_column", "id": "AC2",
+             "xy": {"at_grid": [{"grid": "2", "offset_mm": 200,
+                                 "toward": "1"}, "А"]},
+             "level": {"by": "element_id", "value": 42},
+             "top_level": {"by": "element_id", "value": 43},
+             "symbol": {"by": "element_id", "value": 500}},
+            {"op": "create_beam", "id": "AB1",
+             "p0_mm": {"at_element": {"by": "ref", "value": "AC1"},
+                       "point": "center", "z": "top"},
+             "p1_mm": {"at_element": {"by": "ref", "value": "AC2"},
+                       "point": "center", "z": "top"},
+             "level": {"by": "element_id", "value": 43},
+             "symbol": {"by": "element_id", "value": 1100}},
+            {"op": "create_wall", "id": "AW1", "p0_mm": [0, 0],
+             "p1_mm": [6000, 0], "height_mm": 3000,
+             "level": {"by": "element_id", "value": 42}},
+            {"op": "create_wall", "id": "AW2",
+             "p0_mm": {"at_element": {"by": "ref", "value": "AW1"},
+                       "point": "end"},
+             "p1_mm": [6000, 4500], "height_mm": 3000,
+             "level": {"by": "element_id", "value": 42}},
+        ]}
     # wave/shape: произвольная геометрия мешем. Меш порождается МАТЕМАТИКОЙ
     # прямо здесь (витая башня), а не приносится списком литералов: гейт
     # должен гонять ту же форму, которой пользуются живьём, и оставаться
@@ -417,6 +587,74 @@ async def main() -> int:
         "ops": [{"op": "create_directshape", "id": "D1",
                  "mesh": {"vertices_mm": _ds_verts, "triangles": _ds_tris},
                  "category": "mass", "name": "витая башня"}]}
+    # wave/solid (09.08): параметрическое тело. ТРИ программы, потому что у
+    # эмиссии три необязательные ветки, и ворота обязаны собрать каждую:
+    # отметка основания включает преобразование контура, дуга в профиле —
+    # ветку Arc.Create, полный оборот меняет ожидаемую площадь торцов на ноль.
+    # Ворота, собравшие одну ветку из трёх, — это «прибор на часть диапазона».
+    programs["auth_solid_extrusion_plain"] = {
+        "ir_version": "1.0", "intent": "выдавленное тело",
+        "ops": [{"op": "create_solid_extrusion", "id": "SE1",
+                 "profile": {"outer": {"shape": "rect", "origin": [0, 0],
+                                       "size_mm": [4000, 3000]}},
+                 "height_mm": 2500, "category": "generic_model",
+                 "name": "призма"}]}
+    programs["auth_solid_extrusion_arc_holes"] = {
+        "ir_version": "1.0", "intent": "выдавливание с дугой, проёмами и отметкой",
+        "ops": [{"op": "create_solid_extrusion", "id": "SE2",
+                 "profile": {
+                     "outer": {"shape": "poly",
+                               "points_mm": [[0, 0], [6000, 0], [6000, 4000],
+                                             [0, 4000]],
+                               "arcs": [{"edge": 1, "bulge": 0.4}]},
+                     "holes": [{"shape": "rect", "origin": [1000, 1000],
+                                "size_mm": [1200, 1200]},
+                               {"shape": "rect", "origin": [3000, 1500],
+                                "size_mm": [900, 900]}]},
+                 "height_mm": 1800, "base_z_mm": 3300, "category": "mass",
+                 "name": "плита с проёмами"}]}
+    # wave/mass (10.08): стена по наклонной грани массы. ДВЕ программы,
+    # потому что у разрешения носителя ДВЕ ветки, и ворота обязаны собрать
+    # обе: масса, которая УЖЕ СТОИТ (`element_id` — главный сценарий), и
+    # масса, размещённая этой же программой (`ref` на place_family). Ворота,
+    # собравшие одну ветку из двух, — это «прибор на часть диапазона».
+    programs["auth_face_wall_existing_mass"] = {
+        "ir_version": "1.0", "intent": "стена по скату существующей массы",
+        "ops": [{"op": "create_face_wall", "id": "FW1",
+                 "host": {"by": "element_id", "value": 900001},
+                 "face_normal": [0.6, 0.0, 0.8],
+                 "location_line": "core_exterior",
+                 "type": {"by": "name", "value": "Кирпич 250"}}]}
+    programs["auth_face_wall_placed_mass"] = {
+        "ir_version": "1.0", "intent": "стена по скату размещённой массы",
+        "ops": [{"op": "place_family", "id": "M1",
+                 "symbol": {"by": "family_type", "category": "OST_Furniture",
+                            "family_name": "Стол офисный",
+                            "type_name": "Стол 1200"},
+                 "xyz": [1000, 2000, 0],
+                 "level": {"by": "name", "value": "Этаж 1"}},
+                {"op": "create_face_wall", "id": "FW2",
+                 "host": {"by": "ref", "value": "M1"},
+                 "face_normal": [0.0, -0.5, 0.5],
+                 "location_line": "wall_centerline",
+                 "type": {"by": "name", "value": "ЖБ 200"}}]}
+    programs["auth_solid_revolves"] = {
+        "ir_version": "1.0", "intent": "тело вращения: сектор и полный оборот",
+        "ops": [{"op": "create_solid_revolve", "id": "SR1",
+                 "profile": {"outer": {"shape": "rect", "origin": [1000, 0],
+                                       "size_mm": [800, 2400]}},
+                 "axis_xy_mm": [5000, 4000], "sweep_deg": 270,
+                 "category": "generic_model", "name": "сектор кольца"},
+                {"op": "create_solid_revolve", "id": "SR2",
+                 "profile": {
+                     "outer": {"shape": "poly",
+                               "points_mm": [[600, 0], [2000, 0], [2000, 500],
+                                             [1200, 500], [1200, 3000],
+                                             [600, 3000]]},
+                     "holes": [{"shape": "rect", "origin": [800, 1000],
+                                "size_mm": [300, 800]}]},
+                 "axis_xy_mm": [20000, 0], "sweep_deg": 360, "base_z_mm": -1500,
+                 "category": "site", "name": "колонна вращения"}]}
     programs["auth_floor_holes"] = {"ir_version": "1.0", "intent": "плита с проёмом",
         "ops": [{"op": "create_floor", "id": "F1",
                  "outline": [[0, 0], [8000, 0], [8000, 6000], [0, 6000]],
@@ -438,6 +676,15 @@ async def main() -> int:
              "refs": [{"by": "ref", "value": "W1"},
                       {"by": "element_id", "value": 12345}],
              "line_at": [3000, 500]},
+            # 09.08: угловой размер въезжает в тот же корпус, а не в свой —
+            # он делит с линейным весь резольвер ссылок, и разводить их по
+            # разным программам значило бы проверять одну поверхность дважды,
+            # а вторую (dim_type по умолчанию из документа) — ни разу.
+            {"op": "create_angular_dimension", "id": "ANG1",
+             "in_view": {"by": "element_id", "value": 900},
+             "refs": [{"by": "ref", "value": "W1"},
+                      {"by": "element_id", "value": 12345}],
+             "at": [1500, 1500]},
             {"op": "create_tag", "id": "TAG1",
              "in_view": {"by": "element_id", "value": 900},
              "target": {"by": "ref", "value": "W1"}, "at": [3000, 800]},
@@ -564,6 +811,122 @@ async def main() -> int:
             {"op": "create_beam", "id": "B1", "p0_mm": [0, 0, 3000],
              "p1_mm": [6000, 0, 3000], "level": {"by": "element_id", "value": 42}},
         ]}
+    # wave/wall-foundation (2026-08-09): struct_wall_foundation уже приехал
+    # выше из test_golden.PROGRAMS и несёт обе ветви носителя. Здесь — то,
+    # чего эталон дать не может: ЦЕПОЧКА из нескольких стен со своими лентами
+    # в одной транзакции (у каждой опы своя переменная носителя и свой
+    # свидетель — именно так ловится столкновение имён между соседями,
+    # невидимое на программе из одного опа).
+    programs["struct_wall_foundation_chain"] = {"ir_version": "1.0",
+        "intent": "ленты под тремя стенами одной программой",
+        "ops": [
+            {"op": "create_wall", "id": "W1", "p0_mm": [0, 0], "p1_mm": [9000, 0],
+             "level": {"by": "element_id", "value": 42}},
+            {"op": "create_wall", "id": "W2", "p0_mm": [9000, 0], "p1_mm": [9000, 6000],
+             "level": {"by": "element_id", "value": 42}},
+            {"op": "create_wall_foundation", "id": "WF1",
+             "wall": {"by": "ref", "value": "W1"},
+             "type": {"by": "name", "value": "Ленточный 600x300"}},
+            {"op": "create_wall_foundation", "id": "WF2",
+             "wall": {"by": "ref", "value": "W2"}},
+            {"op": "create_wall_foundation", "id": "WF3",
+             "wall": {"by": "element_id", "value": 8145901},
+             "type": {"by": "name", "value": "Ленточный 900x400"}},
+        ]}
+    # wave/framing (2026-08-09): балочная система и ферма. Оси версий у обеих
+    # НЕТ (все четыре перегрузки BeamSystem.Create и единственная подпись
+    # Truss.Create компилируются 6/6), поэтому ворота здесь стерегут не
+    # развилку по версиям, а то, чего эталон дать не может: ДУГОВОЙ профиль
+    # (питоновская развилка по bulge внутри одной эмиссии) и НЕСКОЛЬКО
+    # операций одной волны в одной транзакции — именно так ловится
+    # столкновение имён между соседями, невидимое на программе из одного опа.
+    programs["struct_beam_system_arc_profile"] = {"ir_version": "1.0",
+        "intent": "балочная система по дуговому эскизу",
+        "ops": [{"op": "create_beam_system", "id": "BS1",
+                 "profile": {"outer": {"shape": "poly",
+                                       "points_mm": [[0, 0], [9000, 0],
+                                                     [9000, 6000], [0, 6000]],
+                                       "arcs": [{"edge": 1, "radius_mm": 8000}]}},
+                 "direction_edge": 0,
+                 "level": {"by": "name", "value": "Этаж 1"},
+                 "symbol": {"by": "name", "value": "Балка 200x400"}}]}
+    programs["struct_framing_bay"] = {"ir_version": "1.0",
+        "intent": "пролёт: две балочные системы, две фермы и балка",
+        "ops": [
+            {"op": "create_beam_system", "id": "BS1",
+             "profile": {"outer": {"shape": "rect", "origin": [0, 0],
+                                   "size_mm": [12000, 6000]}},
+             "level": {"by": "element_id", "value": 42}},
+            {"op": "create_beam_system", "id": "BS2",
+             "profile": {"outer": {"shape": "l", "origin": [0, 7000],
+                                   "size_mm": [12000, 8000],
+                                   "cut_mm": [4000, 3000], "corner": "ne"}},
+             "level": {"by": "element_id", "value": 42}},
+            {"op": "create_truss", "id": "TR1", "p0_mm": [0, 16000],
+             "p1_mm": [12000, 16000], "level": {"by": "element_id", "value": 42},
+             "type": {"by": "name", "value": "Ферма стропильная 12м"}},
+            {"op": "create_truss", "id": "TR2", "p0_mm": [0, 19000],
+             "p1_mm": [12000, 19000], "level": {"by": "element_id", "value": 42}},
+            {"op": "create_beam", "id": "B1", "p0_mm": [0, 22000, 3000],
+             "p1_mm": [12000, 22000, 3000], "level": {"by": "element_id", "value": 42}},
+        ]}
+    # wave/reinforcement (2026-08-10): армирование по области. Оси версий у
+    # него НЕТ (обе перегрузки AreaReinforcement.Create компилируются 6/6),
+    # поэтому ворота стерегут не развилку по версиям, а ровно то, чего
+    # программа из одного опа дать не может: ОБЕ формы носителя (ref на плиту
+    # этой же программы и element_id на уже стоящую), ОБЕ ветки типа
+    # (документное умолчание и by:name), обе ветки крюка (пропуск = без
+    # крюков и by:name) и НЕСКОЛЬКО таких опов в одной транзакции — так
+    # ловится столкновение имён между соседями.
+    programs["struct_area_reinforcement_slabs"] = {"ir_version": "1.0",
+        "intent": "армирование двух плит одной программой",
+        "ops": [
+            {"op": "create_floor", "id": "SL1",
+             "outline": [[0, 0], [9000, 0], [9000, 6000], [0, 6000]],
+             "level": {"by": "element_id", "value": 42}, "structural": True},
+            {"op": "create_area_reinforcement", "id": "AR1",
+             "host": {"by": "ref", "value": "SL1"},
+             "direction_deg": 0.0,
+             "bar_type": {"by": "name", "value": "Ø12 A500C"}},
+            {"op": "create_area_reinforcement", "id": "AR2",
+             "host": {"by": "element_id", "value": 8145901},
+             "direction_deg": 90.0,
+             "type": {"by": "name", "value": "Армирование по области 2"},
+             "bar_type": {"by": "element_id", "value": 1902},
+             "hook_type": {"by": "name", "value": "Крюк 90"}},
+        ]}
+    rnga_reinf = random.Random(SEED + 7)
+    for i in range(4):
+        # УГОЛ — СЛУЧАЙНЫЙ И ВНЕ 0..360 ТОЖЕ. Направление периодично, границ у
+        # него в реестре нет намеренно, и эмиссия обязана печатать конечные
+        # cos/sin при любом входе: угол 725° и -30° — законные программы.
+        programs[f"struct_area_reinforcement_pbt_{i}"] = {"ir_version": "1.0",
+            "intent": "армирование по области pbt",
+            "ops": [{"op": "create_area_reinforcement", "id": "AR1",
+                     "host": {"by": "element_id",
+                              "value": rnga_reinf.randint(1000, 9_000_000)},
+                     "direction_deg": rnga_reinf.uniform(-720.0, 720.0),
+                     "bar_type": {"by": "element_id", "value": 1902}}]}
+    rnga_framing = random.Random(SEED + 5)
+    for i in range(6):
+        x0 = rnga_framing.randint(-50000, 50000)
+        if rnga_framing.random() < 0.5:
+            w = rnga_framing.randint(2000, 20000)
+            h = rnga_framing.randint(2000, 20000)
+            programs[f"struct_beam_system_pbt_{i}"] = {"ir_version": "1.0",
+                "intent": "балочная система pbt",
+                "ops": [{"op": "create_beam_system", "id": "BS1",
+                         "profile": {"outer": {"shape": "rect",
+                                               "origin": [x0, x0],
+                                               "size_mm": [w, h]}},
+                         "level": {"by": "element_id", "value": 42}}]}
+        else:
+            programs[f"struct_truss_pbt_{i}"] = {"ir_version": "1.0",
+                "intent": "ферма pbt",
+                "ops": [{"op": "create_truss", "id": "TR1",
+                         "p0_mm": [x0, x0],
+                         "p1_mm": [x0 + rnga_framing.randint(3000, 30000), x0],
+                         "level": {"by": "element_id", "value": 42}}]}
     rnga_struct = random.Random(SEED + 3)
     for i in range(8):
         x0 = rnga_struct.randint(-50000, 50000)
@@ -625,12 +988,18 @@ async def main() -> int:
         # dict is the mechanism for the NEXT one, not a resting place for
         # old bugs already closed.
     }
+    #: Программы, чьи опы честно ОТКАЗЫВАЮТ на 2024-2026 (см. ниже). Имена,
+    #: а не признак «в программе есть нагрузка»: список должен быть
+    #: перечитываемым глазом, ровно как соседний перечень потолков.
+    ANALYSIS_LOAD_PROGRAMS = frozenset({"analysis_loads"})
+
     checks = 0
     known_gaps = 0
     failures = 0
+    sized_cable_tray_branch_checks = 0
 
     async def _gate_row(name: str, prog: dict, snapshot, isolation: str) -> list[str]:
-        nonlocal checks, known_gaps, failures
+        nonlocal checks, known_gaps, failures, sized_cable_tray_branch_checks
         row: list[str] = []
         for ver in spec.REVIT_VERSIONS:
             checks += 1
@@ -646,10 +1015,18 @@ async def main() -> int:
             # зелёные ворота требовали бы от опа молча построить что-нибудь
             # другое — ровно тот Гудхарт, ради борьбы с которым отказ и
             # заведён.
-            if not out.ok and name in ("auth_floor_holes", "auth_contour_l",
-                                       "struct_foundation_slab_holes_2021",
-                                       "struct_foundation_slab",
-                                       "arch_ceiling") and ver == "2021" \
+            if ver < E003_EXPECTED_BELOW.get(name, "2021") \
+                    and not out.ok \
+                    and any(d.code == "KIR-E003" for d in out.diagnostics):
+                row.append(f"{ver}:E003-EXPECTED")
+                continue
+            # wave/analysis (09.08): та же мысль, но ось версий смотрит В
+            # ДРУГУЮ СТОРОНУ. Свободная (нехостированная) нагрузка ЕСТЬ на
+            # 2021-2023 и убрана Autodesk из API в 2024 (замер: перегрузки без
+            # `ElementId hostElemId` дают CS1503/CS1501 на всех трёх новых
+            # версиях). Отказ на 2024-2026 — правильный ответ операции, а не
+            # поломка эмиссии, и ворота обязаны это различать.
+            if not out.ok and name in ANALYSIS_LOAD_PROGRAMS and ver >= "2024" \
                     and any(d.code == "KIR-E003" for d in out.diagnostics):
                 row.append(f"{ver}:E003-EXPECTED")
                 continue
@@ -663,6 +1040,14 @@ async def main() -> int:
                 failures += 1
                 row.append(f"{ver}:REFUSED")
                 continue
+            if name == SIZED_CABLE_TRAY_GATE_NAME:
+                if not sized_cable_tray_branch_reached(out.csharp):
+                    print(f"FAIL {name}@{ver} [{isolation}]: sized cable-tray "
+                          "emitter branch was not reached")
+                    failures += 1
+                    row.append(f"{ver}:BRANCH?")
+                    continue
+                sized_cable_tray_branch_checks += 1
             wrapped = wrap_user_code(out.csharp)
             res = await client.check(wrapped, ver)
             if res is None:
@@ -703,6 +1088,13 @@ async def main() -> int:
                 name, prog, snapshot, "per_op")
             print(f"{name + '_per_op':24s} {' '.join(per_op_row)}")
 
+    expected_sized_tray_checks = len(spec.REVIT_VERSIONS) * 2
+    if sized_cable_tray_branch_checks != expected_sized_tray_checks:
+        print("FAIL sized cable-tray gate coverage: "
+              f"{sized_cable_tray_branch_checks}/"
+              f"{expected_sized_tray_checks} branch emissions")
+        failures += 1
+
     # Expected-refusal gate: valuable invariants proven in CI, not left to be
     # accidental failures. (coordinator return, 2026-07-16)
     expected_refusals = {
@@ -712,6 +1104,36 @@ async def main() -> int:
         # compatibility is now a typed-IR responsibility, so the invalid
         # non-referenceable view input must stop at KIR-T001 before grounding
         # or emission (also pinned in test_result_semantics.py).
+        # Волна ЭОМ 09.08. Совпадающие точки гибкой трассы — отказ НА
+        # КОМПИЛЯЦИИ, а не на свидетеле: Autodesk пишет, что Revit такие
+        # точки ВЫБРАСЫВАЕТ, то есть построил бы трассу с другим числом
+        # точек. Свидетель поймал бы это следствие, но диагноз назвал бы
+        # «геометрия не сошлась»; причина видна раньше, и ворота держат
+        # именно её.
+        "auth_flex_duplicate_point_refused": (
+            {"ir_version": "1.0", "intent": "гибкая труба с совпадающими точками",
+             "ops": [{"op": "create_flex_pipe", "id": "FPX",
+                      "path": [[0, 0, 3000], [0, 0, 3000], [1000, 0, 3000]],
+                      "level": {"by": "element_id", "value": 42}}]},
+            GROUND_SNAPSHOT, "KIR-T002"),
+        # RELATE, адрес от элемента (09.08). Верх колонны БЕЗ `top_level` в
+        # программе не определён: высота приезжает из типоразмера, которого
+        # программа не знает. Отказ обязан быть ОФЛАЙНОВЫМ и типизированным —
+        # молча взятый «низ + что-нибудь» поставил бы балку на отметку,
+        # которую свидетель принял бы (он сверяет с тем же числом).
+        "auth_address_element_unbound_top_refused": (
+            {"ir_version": "1.0", "intent": "балка по верху неприкреплённой колонны",
+             "ops": [
+                 {"op": "create_column", "id": "UC1", "xy": [0, 0],
+                  "level": {"by": "element_id", "value": 42},
+                  "symbol": {"by": "element_id", "value": 500}},
+                 {"op": "create_beam", "id": "UB1",
+                  "p0_mm": {"at_element": {"by": "ref", "value": "UC1"},
+                            "point": "center", "z": "top"},
+                  "p1_mm": [4000, 0, 3300],
+                  "level": {"by": "element_id", "value": 42},
+                  "symbol": {"by": "element_id", "value": 1100}}]},
+            GROUND_SNAPSHOT, "KIR-G115"),
         "auth_in_view_ref_refused": (
             _prog([_wall(), {"op": "create_tag", "id": "TAG1",
                              "in_view": {"by": "ref", "value": "W1"},
@@ -924,6 +1346,7 @@ async def main() -> int:
           f"+ {write_program_count} write programs (per_op), "
           f"x {len(spec.REVIT_VERSIONS)} versions each "
           f"+ {len(expected_refusals)} expected-refusal check(s), "
+          f"{sized_cable_tray_branch_checks} sized-tray branch emission(s), "
           f"{checks} live compile checks, "
           f"{known_gaps} known per_op gap(s) tracked separately, "
           f"{failures} failures")

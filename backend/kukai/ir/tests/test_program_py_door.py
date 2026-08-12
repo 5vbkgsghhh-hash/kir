@@ -165,9 +165,10 @@ class TheDoorOpens(_DoorHarness):
         result = self._call_executing({"program_py": ELLIPSE_SCRIPT})
         self.assertTrue(result["ok"], result)
         # весь путь, а не только шлюз: свидетель и НЕЗАВИСИМАЯ приёмка
-        self.assertEqual(result["witness"],
-                         {"geometry_ok": True, "semantic_ok": True,
-                          "topology_ok": True})
+        # Тройка — поимённо: см. ту же правку в `test_v11_regressions`.
+        for axis in ("geometry_ok", "semantic_ok", "topology_ok"):
+            self.assertIs(result["witness"][axis], True, axis)
+        self.assertIn("unwitnessed_axes", result["witness"])
         self.assertEqual(result["outcome"]["execution"], "committed")
         self.assertEqual(result["outcome"]["acceptance"], "accepted")
 

@@ -64,7 +64,10 @@ from kukai.ir.decompile.tests.test_geom_extract import (  # noqa: E402
     _translated,
 )
 
-_LOT31_TREE = Path("/home/claude/lot31_full/_tree_cache.pkl")
+_LOT31_TREE = Path(os.environ.get(
+    "KIR_LOT31_TREE",
+    Path.home() / "lot31_full" / "_tree_cache.pkl",
+))
 _DATUM_OPS = {"create_level", "create_grid"}
 
 

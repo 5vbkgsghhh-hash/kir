@@ -9,6 +9,12 @@ Its recovery was to repeat the identical selector in every op: 128 beams, 256
 selectors, all the same two values. That is output tokens, latency and drift on
 the one thing that never varies across a lattice.
 
+Since the required-selector plan boundary, the same malformed program stops
+earlier with KIR-P005 on ``level``.  The historical observation above still
+explains why envelope defaults exist; it no longer names the current stage of
+the refusal.  Grounding must not run for a program whose required selector is
+absent.
+
 The scope is deliberately narrow. Only selectors default (see DEFAULTABLE); a
 default that moved geometry would put the shape somewhere other than the op that
 draws it, and an op saying what it does is the property KIR is built on.
@@ -48,9 +54,11 @@ def test_one_envelope_selector_covers_every_op():
 
 
 def test_without_it_the_same_program_is_the_refusal_we_measured():
+    """The historical omission now refuses at the plan boundary, not ground."""
     out = _compile({"ir_version": "1.0", "ops": [_beam(i) for i in range(12)]})
     assert not out.ok
-    assert all(c.startswith("KIR-G") for c in _codes(out)), _codes(out)
+    assert set(_codes(out)) == {"KIR-P005"}, _codes(out)
+    assert {d.field_name for d in out.diagnostics} == {"level"}
 
 
 def test_an_op_that_names_its_own_value_keeps_it():

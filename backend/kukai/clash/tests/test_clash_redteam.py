@@ -372,3 +372,111 @@ def test_a_normal_overlap_is_not_called_a_duplicate():
     rep = D.detect(S.build_from_elements([a, b], origin={"run_dir": "t"}),
                    pair_filter=D.any_physical_pair_filter)
     assert rep["findings"][0]["pair_kind"] == "interference"
+
+
+# ── ГАБАРИТ НЕ ДОКАЗЫВАЕТ СОВПАДЕНИЯ (09.08): совет удалял живой элемент ────
+
+def _pipe_el(eid: str, p0, p1, r=200.0, cat="OST_PipeCurves") -> dict:
+    xs, ys, zs = (p0[0], p1[0]), (p0[1], p1[1]), (p0[2], p1[2])
+    return {"element_id": eid, "category": cat,
+            "p0_mm": list(p0), "p1_mm": list(p1),
+            "section_radius_mm": r, "section_round": True,
+            "bbox_min_mm": [min(xs) - r, min(ys) - r, min(zs) - r],
+            "bbox_max_mm": [max(xs) + r, max(ys) + r, max(zs) + r]}
+
+
+def _floor_el(eid: str, loop, z0=0.0, z1=200.0) -> tuple[dict, dict]:
+    xs = [p[0] for p in loop]
+    ys = [p[1] for p in loop]
+    return ({"element_id": eid, "category": "OST_Floors",
+             "bbox_min_mm": [min(xs), min(ys), z0],
+             "bbox_max_mm": [max(xs), max(ys), z1]},
+            {"profile_available": True,
+             "exterior_loop": [list(p) for p in loop], "holes": []})
+
+
+def test_two_diagonals_of_a_square_are_not_a_duplicate():
+    """Два РАЗНЫХ элемента с одним габаритом. Воспроизведено 09.08:
+
+        Capsule((0,0,0)→(4000,4000,0), r=200)  bounds ((-200,-200,-200),(4200,4200,200))
+        Capsule((4000,0,0)→(0,4000,0), r=200)  bounds ((-200,-200,-200),(4200,4200,200))
+        pair_kind: coincident_duplicate
+
+    Габарит у диагоналей квадрата ОДИН, а тела разные, и совет обзора при
+    этом читался «чинится удалением одного из них» с серьёзностью «критично».
+    Выполнить его — удалить настоящую трубу.
+
+    Ось у этих оболочек ЕСТЬ (`hull_source: axis_section`), то есть выдумывать
+    ничего не надо: две капсулы с разными осями — не дубликат.
+    """
+    snap = S.build_from_elements(
+        [_pipe_el("1", (0, 0, 0), (4000, 4000, 0)),
+         _pipe_el("2", (4000, 0, 0), (0, 4000, 0))],
+        origin={"run_dir": "t"})
+    a, b = snap.records
+    assert a.bounds() == b.bounds(), "воспроизведение: габариты обязаны совпасть"
+    assert D.pair_kind_of(a, b) == "interference"
+    rep = D.detect(snap, pair_filter=D.any_physical_pair_filter)
+    f = rep["findings"][0]
+    assert f["pair_kind"] == "interference", f
+    assert rep["pair_kind_counts"].get("coincident_duplicate", 0) == 0
+
+
+def test_two_halves_of_a_square_floor_are_not_a_duplicate():
+    """То же самое подошвой, а не осью: два треугольных перекрытия — половинки
+    одного квадрата. Габарит общий, подошвы разные, соприкасаются по диагонали.
+    Призма несёт подошву, значит доказательство есть и здесь."""
+    t1 = [(0, 0), (4000, 0), (4000, 4000)]
+    t2 = [(0, 0), (0, 4000), (4000, 4000)]
+    e1, p1 = _floor_el("1", t1)
+    e2, p2 = _floor_el("2", t2)
+    snap = S.build_from_elements([e1, e2], origin={"run_dir": "t"},
+                                 profiles={"1": p1, "2": p2})
+    a, b = snap.records
+    assert a.bounds() == b.bounds()
+    assert D.pair_kind_of(a, b) == "interference"
+
+
+def test_the_same_pipe_twice_is_still_a_duplicate():
+    """Не регрессия в обратную сторону: одна ось, один радиус — дубликат,
+    и обход оси в другую сторону тела не меняет."""
+    snap = S.build_from_elements(
+        [_pipe_el("1", (0, 0, 0), (5000, 0, 0), r=100.0),
+         _pipe_el("2", (0, 0, 0), (5000, 0, 0), r=100.0),
+         _pipe_el("3", (5000, 0, 0), (0, 0, 0), r=100.0)],
+        origin={"run_dir": "t"})
+    rep = D.detect(snap, pair_filter=D.any_physical_pair_filter)
+    assert rep["pair_kind_counts"]["coincident_duplicate"] == 3, rep["findings"]
+
+
+def test_a_capsule_against_a_bare_box_stays_a_suspicion():
+    """Тройственный ответ `hulls_coincide` не смеет схлопнуться в двоичный.
+
+    У трубы 1 сечение прочитано — оболочка капсула; у трубы 2 сечения нет —
+    оболочка габаритный бокс, ровно тот же. Это НЕ доказательство совпадения
+    (`None`, а не `False`), поэтому находка остаётся дубликатом-подозрением;
+    и это НЕ доказательство различия, поэтому терять её нельзя.
+    """
+    a = _pipe_el("1", (0, 0, 0), (5000, 0, 0), r=100.0)
+    b = {"element_id": "2", "category": "OST_PipeCurves",
+         "bbox_min_mm": a["bbox_min_mm"], "bbox_max_mm": a["bbox_max_mm"]}
+    snap = S.build_from_elements([a, b], origin={"run_dir": "t"})
+    ra, rb = snap.records
+    assert (ra.hull_source, rb.hull_source) == ("axis_section", "bbox")
+    assert D.hulls_coincide(ra, rb) is None
+    rep = D.detect(snap, pair_filter=D.any_physical_pair_filter)
+    f = rep["findings"][0]
+    assert f["pair_kind"] == "coincident_duplicate"
+    assert f["hull_grade"] == "coarse"
+    assert D.duplicate_claim_is_proven(f) is False
+
+
+def test_a_thicker_pipe_on_the_same_axis_is_not_a_duplicate():
+    """Радиус — часть тела: та же ось, другое сечение — разные трубы. Габариты
+    у них разные, так что это ещё и проверка, что ворота габарита на месте."""
+    snap = S.build_from_elements(
+        [_pipe_el("1", (0, 0, 0), (5000, 0, 0), r=100.0),
+         _pipe_el("2", (0, 0, 0), (5000, 0, 0), r=150.0)],
+        origin={"run_dir": "t"})
+    a, b = snap.records
+    assert D.pair_kind_of(a, b) == "interference"

@@ -55,16 +55,87 @@ def test_a_coarse_pair_never_gets_the_top_severity():
             assert row["severity"] in ("средняя", "низкая"), row
 
 
-def test_duplicates_are_critical_and_say_how_to_fix():
+def test_a_proven_duplicate_is_critical_and_says_how_to_fix():
+    """Совпали ОСИ и сечения — совпадение доказано геометрией, и совет
+    «удалить одну» законен."""
+    els = [{"element_id": "1", "category": "OST_PipeCurves",
+            "p0_mm": [0, 0, 0], "p1_mm": [5000, 0, 0],
+            "section_radius_mm": 100.0, "section_round": True,
+            "bbox_min_mm": [-100, -100, -100], "bbox_max_mm": [5100, 100, 100]},
+           {"element_id": "2", "category": "OST_PipeCurves",
+            "p0_mm": [0, 0, 0], "p1_mm": [5000, 0, 0],
+            "section_radius_mm": 100.0, "section_round": True,
+            "bbox_min_mm": [-100, -100, -100], "bbox_max_mm": [5100, 100, 100]}]
+    v = R.build_review(_rep(els))
+    row = v["top_findings"][0]
+    assert row["pair_kind"] == "coincident_duplicate"
+    assert row["severity"] == "критично"
+    assert "удалением" in row["text"]
+    assert v["summary"]["duplicates"] == 1
+
+
+def test_a_bbox_only_duplicate_never_tells_you_to_delete():
+    """Стене ось запрещена (ревью №2), оболочка — габаритный бокс. Совпавшие
+    боксы остаются лучшей догадкой о дубликате, но ДОКАЗАТЕЛЬСТВА совпадения
+    тел у нас нет: две диагонали квадрата дают ровно такой же бокс. Значит
+    строка не смеет содержать разрушительного указания.
+    """
     els = [{"element_id": "1", "category": "OST_Walls",
             "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [5000, 200, 3000]},
            {"element_id": "2", "category": "OST_Walls",
             "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [5000, 200, 3000]}]
     v = R.build_review(_rep(els))
     row = v["top_findings"][0]
-    assert row["severity"] == "критично"
-    assert "удалением" in row["text"]
+    assert row["pair_kind"] == "coincident_duplicate"
+    assert row["severity"] == "критично", "находка не пропала и не подешевела"
     assert v["summary"]["duplicates"] == 1
+    assert "удал" not in row["text"].lower(), row["text"]
+    assert "габарит" in row["text"].lower(), row["text"]
+    assert "сверить" in row["text"].lower(), row["text"]
+
+
+def test_the_summary_hint_does_not_promise_deletion_for_every_duplicate():
+    """Тот же закон на уровне сводки: «дубликаты — чинится удалением» стояло
+    над счётчиком, в который попадают и недоказанные пары."""
+    els = [{"element_id": "1", "category": "OST_Walls",
+            "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [5000, 200, 3000]},
+           {"element_id": "2", "category": "OST_Walls",
+            "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [5000, 200, 3000]}]
+    hint = R.build_review(_rep(els))["summary"]["duplicates_hint"]
+    assert "габарит" in hint.lower() and "сверить" in hint.lower(), hint
+
+
+def test_no_row_ever_orders_a_deletion_without_the_proof():
+    """Закон, а не пример: разрушительное указание допустимо ТОЛЬКО там, где
+    детектор доказал совпадение тел. Сцена нарочно смешанная — доказанные
+    дубликаты, недоказанные, диагонали и обычные пересечения разом."""
+    def pipe(eid, p0, p1, r=100.0):
+        xs, ys, zs = (p0[0], p1[0]), (p0[1], p1[1]), (p0[2], p1[2])
+        return {"element_id": eid, "category": "OST_PipeCurves",
+                "p0_mm": list(p0), "p1_mm": list(p1),
+                "section_radius_mm": r, "section_round": True,
+                "bbox_min_mm": [min(xs) - r, min(ys) - r, min(zs) - r],
+                "bbox_max_mm": [max(xs) + r, max(ys) + r, max(zs) + r]}
+
+    els = [pipe("1", (0, 0, 0), (5000, 0, 0)),          # доказанный дубликат…
+           pipe("2", (0, 0, 0), (5000, 0, 0)),          # …вторая половина пары
+           pipe("3", (0, 8000, 0), (4000, 12000, 0), 200.0),   # диагонали
+           pipe("4", (4000, 8000, 0), (0, 12000, 0), 200.0),
+           {"element_id": "5", "category": "OST_Walls",
+            "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [5000, 200, 3000]},
+           {"element_id": "6", "category": "OST_Walls",   # дубликат по боксу
+            "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [5000, 200, 3000]},
+           {"element_id": "7", "category": "OST_Walls",   # обычное пересечение
+            "bbox_min_mm": [100, 0, 0], "bbox_max_mm": [5000, 200, 3000]}]
+    rep = _rep(els)
+    by_id = {f["finding_id"]: f for f in rep["findings"]}
+    v = R.build_review(rep)
+    assert len(v["top_findings"]) == len(by_id) > 5, "сцена обеднела"
+    for row in v["top_findings"]:
+        if "удал" in row["text"].lower():
+            assert D.duplicate_claim_is_proven(by_id[row["finding_id"]]), row
+    assert any("удалением" in r["text"] for r in v["top_findings"]), (
+        "доказанный дубликат перестал говорить, что с ним делать")
 
 
 def test_every_row_carries_both_element_ids_for_the_frontend():

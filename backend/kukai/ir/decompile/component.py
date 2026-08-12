@@ -358,6 +358,40 @@ class ComponentLibrary:
             op.definition.leaf_count * op.occurrence_count
             for op in self.place_ops)
 
+    @property
+    def fidelity_summary(self) -> dict[str, int]:
+        """Discovered vs EXECUTABLE, in one place the caller can read.
+
+        Discovery and authorization are separate stages here by design, and
+        the gap between them is not a rounding error.  Measured 2026-08-11
+        over the stored corpus (one run per `doc_name`, 10 runs, 368 313
+        folded leaves): 595 components and 2 482 instances cover 49 641
+        leaves (13.48%) and save 35 292 (9.58%), but only **316 of 595
+        (53.11%)** carry a fidelity proof, and the executable saving is
+        27 714 of 35 292 = 78.53% of the analytical one.  The split is
+        bimodal, so no single intuition is safe: Snowdon Plumbing 220/221 and
+        the facade 11/11, against the tower 32/145 and `демо` 22/70; and 4 of
+        the 10 runs yield no components at all.
+
+        Before `prove_execution_fidelity` runs, `proven` is 0 by construction
+        -- an unproven op must never read as executable.  This follows the law
+        `ground.py` states for a named default: a choice the caller cannot see
+        is `.FirstOrDefault()` with a better reputation.
+        """
+
+        proven = [op for op in self.place_ops if op.fidelity_proven]
+        return {
+            "components": len(self.place_ops),
+            "proven": len(proven),
+            "instances": sum(
+                op.occurrence_count for op in self.place_ops),
+            "covered_leaves": self.total_instanced_leaves,
+            "saved_leaves": sum(
+                op.savings_leaves for op in self.place_ops),
+            "proven_saved_leaves": sum(op.savings_leaves for op in proven),
+            "singleton_leaves": len(self.singletons_leaves),
+        }
+
 
 def _place_op_reconstructs(
     place_op: "PlaceGroupOp", ordered_occs: Sequence[Occurrence],
@@ -436,11 +470,31 @@ def build_library(
 ) -> ComponentLibrary:
     """Turn a building's maximal repeated subtrees into components + instances.
 
-    Chooses disjoint, non-dominated maximal repeats (like ``takeoff_dag`` /
-    wave-1 dedup): each occurrence path is claimed by at most one component, and
-    a repeat nested inside another is skipped.  Leaves outside every component
-    become singletons.  Every original leaf is thus accounted exactly once
-    (property C7).
+    Chooses DISJOINT maximal repeats: each occurrence path is claimed by at
+    most one component, and a repeat nested inside another is skipped.  Leaves
+    outside every component become singletons, so every original leaf is
+    accounted exactly once (property C7).
+
+    NON-DOMINATION IS NOT DONE HERE, and saying it was is what this paragraph
+    corrects (2026-08-11).  ``dedup_report`` defaults to
+    ``include_dominated=False`` and drops those entries at the source, so every
+    entry reaching this function already carries ``dominated=False`` and the
+    local filter below can never fire -- measured 0 of 460 repeats over 7 real
+    buildings, with 0 dominated entries ever delivered.  The argument is now
+    passed EXPLICITLY so the dependency is stated at the call site instead of
+    inherited from someone else's default, and a dominated entry arriving here
+    is a typed refusal rather than a silent skip: it would mean the upstream
+    contract changed, and skipping it quietly would change WHICH repeats become
+    components with nobody told.
+
+    A second measured limit, so an unexercised branch is not mistaken for a
+    guarantee: the fail-closed reconstruction gate
+    (``_place_op_reconstructs``) has never rejected anything on real data
+    either -- 0 of those same 460 -- because merkle's translation-invariant
+    hash already guarantees what the gate re-derives.  It is kept as an
+    independent cross-check that would catch a hash collision or a
+    canonicalization drift between the two modules, and it must be quoted as
+    exactly that and nothing more.
     """
 
     if not (hasattr(index, "occurrences") and hasattr(index, "by_path")
@@ -448,7 +502,8 @@ def build_library(
         raise ComponentSchemaError("build_library needs a MerkleIndex")
 
     repeats = dedup_report(
-        [index], min_occurrences=min_occurrences, min_leaves=min_leaves)
+        [index], min_occurrences=min_occurrences, min_leaves=min_leaves,
+        include_dominated=False)
 
     claimed_paths: list[tuple[int, ...]] = []
 
@@ -462,7 +517,11 @@ def build_library(
 
     for entry in repeats:
         if entry.dominated:
-            continue
+            raise ComponentSchemaError(
+                "dedup_report delivered a dominated repeat "
+                f"({entry.hash[:12]}) although include_dominated=False was "
+                "requested: the upstream contract changed, and silently "
+                "skipping it would change which repeats become components")
         occs = index.occurrences_of(entry.hash)
         paths = [occ.path for occ in occs]
         if any(_covered(path) for path in paths):

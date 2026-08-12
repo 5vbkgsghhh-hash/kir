@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import functools
 import logging
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -53,8 +55,15 @@ from kukai.ir.open_model import (
     OpenModelProfileError,
     open_model_preflight_enabled as _open_model_preflight_enabled,
     preflight_programs as _preflight_open_model,
+    prune_ground_snapshot,
 )
-from kukai.ir.diag import W_POSTCONDITIONS_COMMITTED
+from kukai.ir.diag import (
+    CERT_UNCERTIFIABLE,
+    CERT_UNPROVEN,
+    CERT_VACUOUS,
+    Diagnostic,
+    W_POSTCONDITIONS_COMMITTED,
+)
 from kukai.ir.outcome import (
     AcceptanceState,
     ExecutionState,
@@ -151,8 +160,17 @@ def inject_revit_ir_schema(tools: list) -> None:
     """Append the tool def (idempotent). Schema generated from the registry."""
     if any(t.get("function", {}).get("name") == "revit_ir" for t in tools):
         return
-    from kukai.ir.schema_gen import program_schema
+    from kukai.ir.schema_transport import program_schema_for_tool
     from kukai.ir.tool_doc import build_tool_description, program_py_schema
+    # ДЕДУПЛИКАЦИЯ СХЕМЫ. `program_schema()` выписывает селектор дословно на
+    # каждый селекторный параметр каждого опа, и на 41 опе это 42 390 токенов
+    # ПОСТАВЩИЦКОГО счёта за ход (замер 09.08 на живом openrouter). Вынос
+    # повторов в `$defs` даёт 11 751 — те же операции, ни одна не спрятана.
+    # Форму выбирает `schema_transport` по ЗАМЕРУ транспорта и всегда называет
+    # причину; генератор при этом остаётся плоским (один источник правды о
+    # языке, `schema_dedup` — чистый пост-проход над его результатом).
+    program, schema_note = program_schema_for_tool()
+    logger.debug("revit_ir tool: %s", schema_note)
     tools.append({
         "type": "function",
         "function": {
@@ -186,7 +204,7 @@ def inject_revit_ir_schema(tools: list) -> None:
                     "порождает). Оба сразу или ни одного — типизированный "
                     "отказ."),
                 "properties": {
-                    "program": program_schema(),
+                    "program": program,
                     "program_py": program_py_schema(),
                 },
             },
@@ -286,6 +304,17 @@ async def _run_declarative(llm_client, bridge_callback, code: str, op: str,
 # result -> ok:false + KIR-X* diagnostic bound to op_id where known; the raw
 # Revit message survives only inside `detail`, never as the only signal.
 
+#: Коды, чей ОТКАТ ДОКАЗАН формой отказа, а не предположением.
+#:
+#: Стояли литеральным кортежем внутри `_handle_revit_ir_inner`, и разделение
+#: X003 на два кода (дрейф / отказ рантайма) прошло бы мимо него молча: X009
+#: выпал бы из «откачено» и стал бы `unconfirmed`, то есть разделение кода
+#: ОСЛАБИЛО БЫ знание об эффекте. Оба кода приходят из `refuse_stmt`, а он по
+#: контракту рендерит RollBack+return (atomic) или throw (per_op) ДО коммита —
+#: значит отката они доказывают поровну. Константа стоит здесь, чтобы этот
+#: довод можно было проверить тестом, а не перечитыванием.
+_ROLLBACK_PROVEN_CODES = ("KIR-X003", "KIR-X004", "KIR-X009")
+
 _X_PATTERNS = (
     ("KIR-X001", ("curve length is too small", "shortcurvetolerance")),
     ("KIR-X002", ("loops intersect", "curve loops")),
@@ -308,10 +337,15 @@ def _translate_runtime(err: dict) -> dict:
         # «NewElbowFitting: failed to insert elbow» — ложь: ничего не исчезало,
         # а пользователя отправляли искать дрейф модели (обе строки пойманы
         # живьём 27.07). Настоящий случай узнаётся по подписи, которую пишут
-        # сами null-guard'ы; всё остальное честно называется рантайм-отказом,
-        # а причина уже лежит в `detail`.
-        code = "KIR-X003"
+        # сами null-guard'ы.
+        #
+        # 09.08.2026: подпись теперь выбирает КОД, а не только текст. Пока оба
+        # мира ехали под X003, различал их РОВНО `detail`, а `detail` в корпус
+        # свидетелей не писался — и 38 живых строк X003 остались без причины
+        # навсегда. Один код на два мира — это дефект таксономии, и починка
+        # текста его не лечит: читатель корпуса видит код, а не прозу.
         drift = "после grounding" in raw
+        code = "KIR-X003" if drift else "KIR-X009"
         msg = ("элемент/тип исчез между grounding и исполнением — откат"
                if drift else
                "оп отказан в рантайме Revit — причина в detail; транзакция откатена")
@@ -351,26 +385,120 @@ def _postcondition_violations(payload: Any) -> list[str]:
     return [str(item) for item in raw if str(item).strip()]
 
 
-def _witness_for_success(family: str, payload: Any) -> dict:
+def _axes_from_violations(violations: Sequence[str]) -> dict:
+    """Разложить нарушения постусловий по ТРЁМ ОСЯМ (SPEC §11.4).
+
+    Разметка живёт В САМОЙ СТРОКЕ нарушения — `(geometry)` либо `(topology)`,
+    а всё, что не помечено ни тем ни другим, семантика. Правило было выписано
+    ДОСЛОВНО дважды (`_witness_for_success` и `_derive_witness`); две копии
+    одного правила расходятся молча и порознь не падают, поэтому копия одна.
+
+    `False` значит «эта ось нарушена», `True` — «среди нарушений её нет».
+    Что ось вообще ПРОВЕРЯЛАСЬ, эта функция не утверждает: об этом отдельно
+    судит `_unwitnessed_axes`, и путать эти два вопроса — весь смысл находки.
+    """
+    return {
+        "geometry_ok": not any("(geometry)" in item for item in violations),
+        "topology_ok": not any("(topology)" in item for item in violations),
+        "semantic_ok": not any(
+            "(geometry)" not in item and "(topology)" not in item
+            for item in violations),
+    }
+
+
+def _unwitnessed_axes(op_names: Sequence[str]):
+    """Оси, зелёный по которым НИКТО НЕ ОБЕЩАЛ ПРОВЕРЯТЬ.
+
+    Тройка осей на успехе зелена целиком, и обоснование у неё одно:
+    внутритранзакционный гейт доказал ВСЕ постусловия до Commit. Довод верен
+    ровно настолько, насколько постусловия по оси вообще ОБЪЯВЛЕНЫ, а про это
+    он не говорит ничего. Замер по `translation_cert.REFINEMENT` (таблица
+    полная — все 64 пишущих опа): обязательств по геометрии нет у 11 опов, по
+    топологии у 15, по семантике у 25. Для них `geometry_ok=True` — форма, а
+    не измерение, и потребитель отличить одно от другого не мог.
+
+    ОТВЕТ ТРИСТЕЙТОМ, тем же законом, что `hulls_coincide` и `Judged.proven`:
+    `{}` — каждый оп программы объявил обязательства по всем трём осям;
+    непустой словарь — ось -> ОПЫ, которые по ней не объявили ничего;
+    `None` — судить нечем (пустая программа, оп вне таблицы, таблица не
+    поднялась). `None` — это НЕ «всё хорошо».
+
+    ОСЬ НАЗЫВАЕТ ВИНОВНИКА, И ЭТО ПРАВКА ПО САМОРЕВЬЮ 10.08. Сначала здесь
+    возвращался СПИСОК осей, и на смешанной программе он врал по-крупному:
+    `create_wall` (объявляет все три) вместе с `set_param` (не объявляет ни
+    одной) давал `["geometry","semantic","topology"]` — ровно то же, что даёт
+    ОДИН `set_param`. Читатель не мог отличить «не проверено ничего» от «одна
+    операция из двух ничего не обещала», хотя лечатся они разным. Сигнал,
+    который не различает эти два случая, — тот же дефект, против которого
+    заведено само поле. Имена опов режутся по десять, как `violations`.
+
+    ПОЛЕ ДОБАВОЧНОЕ, ТРИ БУЛЕВА НЕ ТРОНУТЫ. Переопределить их значило бы
+    сменить смысл под уже написанным потребителем и превратить сегодняшний
+    зелёный в красный; новое поле потребитель вправе не читать, но прочитав —
+    увидит правду. Отказов эта функция не порождает ни одного.
+
+    ЧТО ЗДЕСЬ НЕ РЕШЕНО И РЕШАЕТСЯ НЕ ЗДЕСЬ. У обязательств шесть родов, а
+    осей три. `geometry`/`topology`/`semantic` ложатся один в один, а
+    `materialize` (есть у всех 64) — про то, что элемент вообще возник, и ни
+    одной из трёх осей не покрывает. Спорны два: `parameter` (9 штук, «param
+    == значение после коммита») и `identity` (4 штуки, «Name == name»); оба
+    похожи на семантику, но названы иначе. Считать ли их семантикой — вопрос
+    к владельцу таблицы, а не к этому файлу, поэтому здесь принято СТРОГОЕ
+    прочтение: ось засчитана объявленной, только если обязательство названо
+    её собственным именем. Строгое прочтение ошибается в сторону «сказать,
+    что не мерили», а не наоборот, и ни одной записи не отказывает. Ослабить
+    его — одна строка, но не молча: тогда `set_param`, `create_pipe`,
+    `create_duct`, `create_cable_tray`, `create_type`, `create_grid`,
+    `create_level`, `create_room` и `create_room_separator` перестанут
+    показывать семантику как необъявленную.
+    """
+    if not op_names:
+        return None
+    try:
+        from kukai.ir.translation_cert import _ensure_table
+        table = _ensure_table()
+    except Exception:  # noqa: BLE001 — таблица чужая; её молчание не наш зелёный
+        return None
+    missing: dict[str, list[str]] = {}
+    for name in op_names:
+        refinement = table.get(name)
+        if refinement is None:
+            # Оп вне таблицы обязательств — сказать про его оси нечего, и
+            # выдавать это за «все объявлены» нельзя.
+            return None
+        declared = {obligation.kind for obligation in refinement.obligations}
+        for axis in ({"geometry", "topology", "semantic"} - declared):
+            names = missing.setdefault(axis, [])
+            if name not in names:
+                names.append(name)
+    return {axis: sorted(names)[:10]
+            for axis, names in sorted(missing.items())}
+
+
+def _witness_for_success(family: str, payload: Any,
+                         op_names: Sequence[str] = ()) -> dict:
     """Свидетельство для закоммиченной программы — с учётом нарушений.
 
     Успех транзакции (``ok=True``) — факт: запись состоялась.  Но если
     постусловия нарушены и лишь «зарепорчены», тройка осей обязана это
     показать, иначе потребитель прочитает результат как чистый.
+
+    ``unwitnessed_axes`` отвечает на ВТОРОЙ вопрос, которого тройка не знала:
+    не «нарушена ли ось», а «бралась ли она вообще проверять». См.
+    `_unwitnessed_axes`.
     """
     if family == "query":
         return {"read_only": True}
     vio = _postcondition_violations(payload)
+    unwitnessed = _unwitnessed_axes(op_names)
     if not vio:
-        return {"geometry_ok": True, "semantic_ok": True, "topology_ok": True}
+        return {"geometry_ok": True, "semantic_ok": True, "topology_ok": True,
+                "unwitnessed_axes": unwitnessed}
     return {
-        "geometry_ok": not any("(geometry)" in item for item in vio),
-        "topology_ok": not any("(topology)" in item for item in vio),
-        "semantic_ok": not any(
-            "(geometry)" not in item and "(topology)" not in item
-            for item in vio),
+        **_axes_from_violations(vio),
         "committed": True,
         "violations": vio[:10],
+        "unwitnessed_axes": unwitnessed,
     }
 
 
@@ -385,12 +513,8 @@ def _derive_witness(ok: bool, family: str, diag: Optional[dict]) -> dict:
     w = {"geometry_ok": True, "semantic_ok": True, "topology_ok": True,
          "committed": False}
     if diag and diag.get("code") == "KIR-X004":
-        v = " ".join(diag.get("violations", []))
-        vio = diag.get("violations", [])
-        w["geometry_ok"] = not any("(geometry)" in x for x in vio)
-        w["topology_ok"] = not any("(topology)" in x for x in vio)
-        w["semantic_ok"] = not any(
-            "(geometry)" not in x and "(topology)" not in x for x in vio)
+        # Та же раскладка по осям, что и на успехе, — ОДНОЙ функцией.
+        w.update(_axes_from_violations(diag.get("violations", [])))
     else:
         w["geometry_ok"] = w["semantic_ok"] = w["topology_ok"] = None
     return w
@@ -495,6 +619,23 @@ _KIR_A_TO_ERRCODE = {
     "KIR-A006": ErrCode.KIR_RUNTIME_REFUSED,
     "KIR-A007": ErrCode.KIR_UNCONFIRMED,
     "KIR-A008": ErrCode.KIR_UNCONFIRMED,
+}
+
+# СЕРТИФИКАТ ПЕРЕВОДА (`KIR-R*`, kukai/ir/translation_cert.py).
+#
+# ПРЕДУСЛОВИЕ, А НЕ ИСПОЛНЕНИЕ. Отказ выносится МЕЖДУ компиляцией и первым
+# обращением к мосту: транзакции не было, снимка приёмки не было, модель не
+# трогали. Это ровно семантика `KIR_PRECONDITION_UNMET` — «мир (в данном
+# случае — наша собственная эмиссия) не в том состоянии, которое запись
+# предполагала», — и НЕ `KIR_PROGRAM_REFUSED`: программу автора чинить
+# бессмысленно, свидетеля пишет эмиттер, и та же программа завтра пройдёт без
+# единой правки, как только починят нас.
+_KIR_R_TO_ERRCODE = {
+    CERT_UNPROVEN: ErrCode.KIR_PRECONDITION_UNMET,
+    CERT_VACUOUS: ErrCode.KIR_PRECONDITION_UNMET,
+    # R003 в отказ не превращается (прибор молчит ⇒ пропускаем), но код
+    # обязан быть классифицируем: он ездит в квитанции успеха.
+    CERT_UNCERTIFIABLE: ErrCode.KIR_PRECONDITION_UNMET,
 }
 
 # ПЕСОЧНИЦА ИСХОДНОГО ЯЗЫКА (`KIR-B*`, kukai/ir/sandbox.py).
@@ -713,6 +854,10 @@ def _classify_refusal(res: dict) -> tuple[ErrCode, Optional[dict]]:
     if kir_code.startswith("KIR-A"):
         return _KIR_A_TO_ERRCODE.get(
             kir_code, ErrCode.KIR_RUNTIME_REFUSED), lead
+    if kir_code.startswith("KIR-R"):
+        # Сертификат перевода: эффекта нет по построению (см. таблицу).
+        return _KIR_R_TO_ERRCODE.get(
+            kir_code, ErrCode.KIR_PRECONDITION_UNMET), lead
     if kir_code.startswith("KIR-B"):
         # Песочница исходного языка: ничего не исполнялось (см. таблицу).
         # Умолчание — «отказ программы», а не «наш дефект»: неизвестный
@@ -878,6 +1023,256 @@ def _acceptance_diagnostic(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# СЕРТИФИКАТ ПЕРЕВОДА В ЖИВОМ ПУТИ — ПОСЛЕ КОМПИЛЯЦИИ, ДО ПЕРВОГО ЭФФЕКТА
+#
+# ЗАЧЕМ ВООБЩЕ. Зелёная запись этой системы стоит на четырёх ногах: коммит
+# подтверждён, внутренний свидетель компилятора удовлетворён, независимое
+# перечитывание приняло предзарегистрированный предикат, терминальная улика
+# долговечна. Вторая нога держится на том, что свидетель СПОСОБЕН упасть.
+# Мутация 09.08.2026 показала, что это не следовало ни из чего: подменённый
+# вердикт `if (false) __post.Add("never")` оставлял `certify_op(...).proven ==
+# True`, то есть «постусловия не нарушены» было бы истинно тождественно.
+# Программа с таким свидетелем обязана не писать ВООБЩЕ: её зелёный ничего не
+# значил бы, а `ok:true` без независимого подтверждения — запрещённое
+# состояние.
+#
+# ПОЧЕМУ ИМЕННО ЗДЕСЬ, А НЕ В `compile_program`.
+#   * Это ЕДИНСТВЕННАЯ точка, где план становится эффектом, и через неё
+#     проходят все три двери (чат, админский bulk, питоновский скрипт) — тот
+#     же довод, по которому здесь стоят врезка живого плана и
+#     предполётная проверка открытой модели. Врезка в компилятор
+#     заставила бы платить сухой гейт (1212 компиляций ×6 версий) и
+#     офлайновые разборы, где эффекта нет вовсе.
+#   * Здесь ещё НИЧЕГО не произошло: ground-снимок — чтение, транзакции нет,
+#     подготовленного события журнала нет. Отказ отсюда стоит ноль эффектов.
+#   * Сертифицируется РОВНО та операция, что ушла в C# (`out.grounded_ops` —
+#     заземлённый вид нижения, из которого эмиттер и собрал `out.csharp`), а
+#     не соседняя.
+#
+# ЗАМЕР СТОИМОСТИ (09.08.2026, этот бокс, python3.12, медиана 5 прогонов):
+# корпус из 32 заземлённых программ — p50 7.1 мс на программу, максимум
+# 34.6 мс, ≈4 мс на операцию; самая крупная программа, какую вообще допускает
+# компилятор (299 опов, потолок MAX_BULK_OPS), — 1206 мс при 74 мс на всю
+# компиляцию. Против живой записи в Revit в десятки секунд это 3–5% на
+# предельном чанке и доли процента на чатовой программе. КЭША НЕТ И ОН НЕ
+# НУЖЕН, и это тоже замер, а не мнение: на той же 299-опной программе 1199
+# фрагментов свидетелей дали 1199 различных дайджестов — кэш на дайджест
+# эмитированного текста имел бы РОВНО НОЛЬ попаданий (в каждом свидетеле стоят
+# id операции и её координаты). Кэш, который никогда не срабатывает, — ещё
+# один тёмный путь, а не оптимизация.
+#
+# ОТСУТСТВУЮЩЕЕ ОСТАЛОСЬ ОТСУТСТВУЮЩИМ, И ЭТО ЗАМЕР, А НЕ ОБЕЩАНИЕ (09.08.2026):
+# дайджест ВСЕЙ эмиссии — 188 нижений (32 программы корпуса × до 6 версий
+# Revit), в каждом `plan_digest`, sha256 эмитированной C# и sha256 квитанции
+# `CompileOutput.as_dict()` — при снятом флаге совпал до и после этой врезки:
+#   b50da8a10ddbe82079102d3780fabe1161535dc483f158a0c46c3eefd9722e54
+# (замерено на дереве ДО и на дереве ПОСЛЕ одним и тем же скриптом; поле
+# `grounded_ops` в квитанцию не входит именно поэтому).
+# ═════════════════════════════════════════════════════════════════════════════
+
+#: Сколько диагностик сертификата едет в квитанцию (как у компилятора).
+_CERT_DIAGNOSTIC_LIMIT = 8
+
+
+def _certificate_diagnostics(certificate: Any,
+                             grounded_ops: Sequence[dict]) -> list[dict]:
+    """Разрывы сертификата → типизированные диагностики, ПРИВЯЗАННЫЕ К ОПУ.
+
+    Сертификат называет операцию по ИМЕНИ (`create_wall`), а ремонт
+    адресуется её ИДЕНТИФИКАТОРОМ в программе. Порядок `ProgramCertificate.ops`
+    совпадает с порядком заземлённых операций (`certify_program` идёт по ним
+    подряд), поэтому индекс восстанавливает и `op_id`, и `op_index`.
+    """
+
+    out: list[dict] = []
+    for index, op_cert in enumerate(getattr(certificate, "ops", ())):
+        source = grounded_ops[index] if index < len(grounded_ops) else {}
+        op_id = source.get("id") if isinstance(source, dict) else None
+        for finding in op_cert.vacuous:
+            out.append(Diagnostic(
+                code=CERT_VACUOUS,
+                op_index=index,
+                op_id=op_id,
+                field_name=finding.obligation_key,
+                got=finding.kind,
+                message_ru=finding.describe(),
+            ).as_dict())
+        for verdict in op_cert.clauses:
+            if not verdict.required or verdict.discharged:
+                continue
+            out.append(Diagnostic(
+                code=CERT_UNPROVEN,
+                op_index=index,
+                op_id=op_id,
+                field_name=verdict.kind,
+                got=verdict.reason,
+                message_ru=(
+                    f"{op_cert.op}: обязательство не разряжено "
+                    f"[{verdict.kind}] {verdict.clause} ({verdict.reason})"),
+            ).as_dict())
+    return out
+
+
+def _certify_translation(out: Any, revit_version: str) -> dict:
+    """Квитанция сертификата перевода для одной скомпилированной программы.
+
+    Возвращает словарь ВСЕГДА (никогда не бросает): сертификатор — прибор, и
+    сломанный прибор не имеет права заворачивать верную запись.
+
+    ``status``:
+      * ``proven``          — каждое обязательство разряжено живым свидетелем;
+      * ``vacuous``         — свидетель есть и доказуемо мёртв (НАХОДКА);
+      * ``unproven``        — обязательство без свидетеля (НАХОДКА);
+      * ``uncertifiable``   — реестр обогнал таблицу обязательств: ПРИБОР
+        МОЛЧИТ, и это не находка;
+      * ``instrument_failed`` — сертификатор сам упал: тоже не находка.
+
+    ОТКАЗЫВАЮТ ТОЛЬКО ДВА ПЕРВЫХ КЛАССА И ТОЛЬКО В РЕЖИМЕ ``refuse``. Разница
+    между «прибор нашёл дефект» и «прибора не хватило» — это ровно та разница,
+    на которой месяцами откатывались исправные помещения: приёмка ломалась на
+    кириллице, то есть ЗАВОРАЧИВАЛА ВЕРНОЕ по своей внутренней бухгалтерии.
+    Молчание прибора обязано быть НАЗВАНО в квитанции и пропущено, а не выдано
+    за находку.
+    """
+
+    from kukai.ir import translation_cert as _cert
+
+    mode = _cert.certificate_mode()
+    grounded = list(getattr(out, "grounded_ops", ()) or ())
+    receipt: dict[str, Any] = {
+        "mode": mode,
+        "revit_version": revit_version,
+        "ops": len(grounded),
+    }
+    started = time.perf_counter()
+    try:
+        if not grounded:
+            # Пишущая программа без заземлённого вида — не находка, а
+            # отсутствие материала для суждения (так выглядят пути, не
+            # проходящие через authoring-ветку компилятора).
+            receipt["status"] = "uncertifiable"
+            receipt["detail"] = "нет заземлённого вида нижения"
+        else:
+            certificate = _cert.certify_program(grounded, revit_version)
+            vacuous = bool(certificate.vacuous)
+            if certificate.proven:
+                receipt["status"] = "proven"
+            else:
+                receipt["status"] = "vacuous" if vacuous else "unproven"
+                # ИТОГ ЕДЕТ РЯДОМ С УСЕЧЁННЫМ СПИСКОМ. Резать по восьми и
+                # молчать об этом значит утверждать «вот все диагностики»
+                # там, где их было двадцать: читатель видит полный на вид
+                # список и не имеет ни одного повода усомниться. Та же
+                # форма, что у остальной серии — величина утверждается в
+                # одном месте и читается в другом, — и то же лекарство, что
+                # у чека коллизий: назвать ЧИСЛО, а не показать хвост.
+                _diagnostics = _certificate_diagnostics(certificate, grounded)
+                receipt["diagnostics"] = _diagnostics[:_CERT_DIAGNOSTIC_LIMIT]
+                receipt["diagnostics_total"] = len(_diagnostics)
+            partial = sorted({
+                key for op_cert in certificate.ops
+                for key in op_cert.vacuity_partial})
+            if partial:
+                # «Прочитано целиком» и «прочитано кусками» — разные факты,
+                # и второе не смеет читаться как доказательство чистоты.
+                receipt["vacuity_partial"] = partial[:_CERT_DIAGNOSTIC_LIMIT]
+                # И ЗДЕСЬ ОСОБЕННО. Комментарий строкой выше говорит, что
+                # «прочитано кусками» не смеет читаться как доказательство
+                # чистоты, — а список, несущий этот факт, обрезался молча.
+                receipt["vacuity_partial_total"] = len(partial)
+    except _cert.CertificateSchemaError as exc:
+        receipt["status"] = "uncertifiable"
+        receipt["detail"] = str(exc)[:300]
+    except Exception as exc:  # noqa: BLE001 — прибор не может ломать запись
+        logger.debug("translation certificate failed", exc_info=True)
+        receipt["status"] = "instrument_failed"
+        receipt["detail"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+    receipt["duration_ms"] = round(
+        (time.perf_counter() - started) * 1000.0, 3)
+    receipt["refused"] = bool(
+        mode == _cert.CERT_MODE_REFUSE
+        and receipt["status"] in ("vacuous", "unproven"))
+    return receipt
+
+
+def _record_pre_effect(
+    stage: str,
+    diagnostics: Any,
+    ops: Any,
+    *,
+    query_id: str = "",
+    turn_id: str = "",
+    action_id: str = "",
+    query_fingerprint: str = "",
+    source_kind: str = "unknown",
+    revit_version: str = "2026",
+) -> None:
+    """Record a typed refusal that happened before the first Revit effect.
+
+    These rows belong to the rejection corpus, not the witness corpus: no
+    write reached Revit.  Telemetry remains fail-open and can never change
+    the refusal it describes.
+    """
+    try:
+        from kukai.ir import coverage_feed
+
+        typed: list[Diagnostic] = []
+        for item in diagnostics or ():
+            if isinstance(item, Diagnostic):
+                typed.append(item)
+            elif isinstance(item, dict) and item.get("code"):
+                typed.append(Diagnostic(**{
+                    key: value for key, value in item.items()
+                    if key in Diagnostic.__dataclass_fields__
+                }))
+        if not typed:
+            return
+        coverage_feed.record_rejections(
+            typed,
+            list(ops or ()),
+            query_id=query_id,
+            revit_version=revit_version,
+            stage=stage,
+            turn_id=turn_id,
+            action_id=action_id,
+            query_fingerprint=query_fingerprint,
+            source_kind=source_kind,
+        )
+    except Exception:  # noqa: BLE001 — telemetry cannot break a refusal
+        logger.debug("pre-effect rejection telemetry failed", exc_info=True)
+
+
+def _certificate_refusal(receipt: dict) -> dict:
+    """Отказ ДО ЭФФЕКТА по непроведённому сертификату.
+
+    ``handoff`` намеренно ``None``. Увести эту запись на свободный C# значит
+    выполнить её вообще без свидетеля — усилить ровно тот дефект, из-за
+    которого отказали (тот же довод стоит у отказа подготовки приёмки).
+    """
+
+    message = (
+        "внутренний свидетель программы не доказан: "
+        + ("свидетель есть и доказуемо не может сработать"
+           if receipt.get("status") == "vacuous"
+           else "у обещанного постусловия нет свидетеля")
+        + " — запись не запускалась")
+    diagnostics = receipt.get("diagnostics") or [Diagnostic(
+        code=(CERT_VACUOUS if receipt.get("status") == "vacuous"
+              else CERT_UNPROVEN),
+        message_ru=message).as_dict()]
+    return _with_outcome({
+        "ok": False,
+        "kir": True,
+        "refused": True,
+        "stage": "translation_certificate",
+        "diagnostics": diagnostics,
+        "message_ru": message,
+        "handoff": None,
+        "certificate": receipt,
+    }, program_not_started())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ШЛЮЗ ИСХОДНОГО ЯЗЫКА — питон становится операциями РОВНО ЗДЕСЬ
 #
 # Модель пишет либо программу операциями (`program`), либо скрипт, который её
@@ -910,16 +1305,28 @@ _SCRIPT_FIELD = "program_py"
 #: узнать об этом обязаны мы, а не читатель квитанции через полгода.
 #: Экраны песочницы (адрес объекта в выходе, запрет random/time/os) ловят
 #: только то, что оставляет след; сверка прогонок ловит всё, что меняет ВЫХОД.
-_AUTHOR_SANDBOX_POLICY = None       # ленивая инициализация: см. _sandbox_policy
+_AUTHOR_SANDBOX_POLICY: dict = {}   # ленивая инициализация: см. _sandbox_policy
 
 
 def _sandbox_policy():
-    """Политика песочницы. Ленивая, чтобы импорт serving не тянул песочницу."""
-    global _AUTHOR_SANDBOX_POLICY
-    if _AUTHOR_SANDBOX_POLICY is None:
-        from kukai.ir.sandbox import SandboxPolicy
-        _AUTHOR_SANDBOX_POLICY = SandboxPolicy(replay_check=True)
-    return _AUTHOR_SANDBOX_POLICY
+    """Политика песочницы. Ленивая, чтобы импорт serving не тянул песочницу.
+
+    БЕЛЫЙ СПИСОК ИМПОРТОВ ЧИТАЕТСЯ ЖИВЬЁМ, НА КАЖДЫЙ ХОД. До 09.08 здесь стоял
+    один кэшированный объект, и положение операторского тумблера фиксировалось
+    первым же запросом после старта службы — то есть «включил флаг» означало бы
+    «перезапусти четыре воркера», а «выключил» не означало бы вообще ничего.
+    Тумблер, действующий не сразу, читается как несогласие со службой; то же
+    правило держит `checker.flags.checker_v2_enabled`.
+
+    Кэш остался, но КЛЮЧОМ СЛУЖИТ САМ СПИСОК: `SandboxPolicy` — frozen
+    dataclass, и два его положения живут рядом без всякого противоречия."""
+    from kukai.ir.sandbox import SandboxPolicy, allowed_imports_for_env
+    allowed = allowed_imports_for_env()
+    policy = _AUTHOR_SANDBOX_POLICY.get(allowed)
+    if policy is None:
+        policy = SandboxPolicy(replay_check=True, allowed_imports=allowed)
+        _AUTHOR_SANDBOX_POLICY[allowed] = policy
+    return policy
 
 
 @dataclass(frozen=True)
@@ -934,6 +1341,10 @@ class _AuthoredInput:
     refusal: Optional[dict] = None
     from_script: bool = False
     author_digest: str = ""
+    #: Подпись СРЕДЫ, в которой исполнился скрипт (см. `sandbox.environment_signature`).
+    #: Едет рядом с `author_digest` всюду, где тот едет: подпись исходника без
+    #: подписи среды удостоверяет ровно половину.
+    env_digest: str = ""
     receipt: Optional[dict] = None
 
 
@@ -958,8 +1369,18 @@ def _authorship_receipt(result: Any, *, source_bytes: int) -> dict:
     `stdout` здесь не украшение. Образцы формы (`tower_numpy.py`) печатают
     ЧИСЛОМ расхождение ломаной с кривой, которую они приближают; отрезать этот
     канал значит вернуть «сказал синус, построил ломаную, промолчал» — ровно
-    тот молчаливо-неверный ответ, против которого стоит весь дом."""
+    тот молчаливо-неверный ответ, против которого стоит весь дом.
+
+    `environment` — ВТОРАЯ ПОЛОВИНА ПОДПИСИ, и она здесь целиком, а не одним
+    дайджестом. `author_digest` говорит, ЧЕМ написана программа; `environment`
+    — НА ЧЁМ она посчитана (интерпретатор и версии всего, что скрипт мог
+    импортировать). Без него две квитанции одного скрипта, разошедшиеся из-за
+    обновления библиотеки, читаются как один и тот же ход с разным исходом —
+    «одно здание, две подписи» на слое, который до 09.08 не подписывался
+    вовсе. Аудитор смотрит в квитанцию, поэтому блок лежит в квитанции; в
+    фиксируемый на диск корпус (`witness_feed`) уезжает его дайджест."""
     isolation = dict(getattr(result, "isolation", None) or {})
+    environment = dict(getattr(result, "environment", None) or {})
     receipt = {
         "language": "python",
         "author_digest": getattr(result, "author_digest", "") or "",
@@ -972,6 +1393,11 @@ def _authorship_receipt(result: Any, *, source_bytes: int) -> dict:
                       if key in isolation},
         "replay_checked": bool(isolation.get("replay_checked")),
     }
+    if environment:
+        # Пусто ровно тогда, когда ребёнок не запускался (пустой или слишком
+        # большой исходник): подписывать нечего, и пустой блок сказал бы
+        # «среда неизвестна» вместо «скрипт не исполнялся».
+        receipt["environment"] = environment
     digest = getattr(result, "program_digest", "") or ""
     if digest:
         receipt["program_digest"] = digest
@@ -1080,11 +1506,73 @@ async def _stamp_building_verdict(result: Any, watch: tuple[Any, int]) -> Any:
         key, before = watch
         if _building.programs_seen(key) <= before:
             return result
-        block = await asyncio.to_thread(_building.judge, key)
+        # ГРАНИЦА ХОДА — ТА ЖЕ ОТМЕТКА, ЧТО И ДОЗОР, и она едет ОБЕИМ дверям.
+        # В чате это дороже, чем на админской: здесь квитанцию читает МОДЕЛЬ,
+        # и «45 споров», из которых 45 стояли до неё, она либо примется чинить
+        # (правя чужую геометрию), либо доложит как поломку здания.
+        block = await asyncio.to_thread(
+            functools.partial(_building.judge, key, since_seq=before))
         if block:
             result.setdefault("building", block)
     except Exception:  # noqa: BLE001 — вердикт не может ломать ход, где Revit
         logger.debug("KIR building verdict stamping failed", exc_info=True)
+    return result
+
+
+async def _stamp_building_clash(result: Any, watch: tuple[Any, int]) -> Any:
+    """АУДИТ КОЛЛИЗИЙ НА АДМИНСКОЙ ДВЕРИ — там, где собираются целые здания.
+
+    ЧТО ЭТО ЧИНИТ. Продукт — «инженер жмёт ОТПРАВИТЬ В REVIT, и здание
+    компилируется целиком»; эта кнопка идёт в `handle_revit_ir_bulk`. Замер:
+    `_stamp_building_verdict` вызывается ровно двумя строками, обе на пути
+    `bulk=False`. То есть ЕДИНСТВЕННЫЙ маршрут, которым строятся целые
+    здания, — тот самый, которого проверка на коллизии не видела никогда.
+
+    ПОЧЕМУ ЭТО ОТДЕЛЬНАЯ ФУНКЦИЯ, А НЕ ВЫЗОВ ВЕРДИКТА. Исключение админской
+    двери из ВЕРДИКТА остаётся в силе и обосновано (`live/verdict.py`: автор
+    здесь — материализатор, а не модель, и учить некого). Клеш этого довода
+    не наследует: вердикт — обратная связь МОДЕЛИ, клеш — АУДИТ ЗДАНИЯ, а
+    пересборка со взаимно проникающей геометрией сломана независимо от того,
+    учат ли кого-нибудь. Поэтому здесь зовётся `verdict.clash_only`, который
+    вердикта не строит вовсе.
+
+    КЛЮЧ `building` НЕ ТРОГАЕТСЯ. Блок едет под своим именем `clash`: на
+    чат-двери находки лежат ВНУТРИ `building`, и если бы админская дверь
+    клала их туда же, ключ `building` появился бы там, где вердикта нет, —
+    читатель прочёл бы «здание судили».
+
+    ФЛАГ ВЫКЛЮЧЕН ⇒ НИ ОДНОГО НОВОГО БАЙТА. `clash_only` возвращает `None`
+    при выключенном `KUKAI_IR_CLASH` (это единственный путь наружу у
+    `bundle_clash_report`), а `None` до `setdefault` не доходит.
+
+    ТОЛЬКО ЕСЛИ ЖУРНАЛ ВЫРОС — тем же дозором, что и вердикт: читающий ход
+    зданию не принадлежит.
+
+    В ПОТОКЕ, А НЕ В ЦИКЛЕ: проверка считает питоном под GIL (замер 10.08 —
+    0.5 с на здание в 31 971 операцию), и держать на ней цикл событий значило
+    бы подвесить чужие ходы на чужом здании.
+    """
+    try:
+        if not isinstance(result, dict):
+            return result
+        from kukai.live import verdict as _building
+
+        key, before = watch
+        if _building.programs_seen(key) <= before:
+            return result
+        # ГРАНИЦА ХОДА — ТА ЖЕ ОТМЕТКА, ЧТО И ДОЗОР. `before` уже снят до
+        # тела и означает «сколько программ здание имело ДО этого хода»;
+        # записи с `seq >= before` объявил именно он. Второго учёта «что
+        # нового» не заводится — он разъехался бы с дозором за неделю.
+        block = await asyncio.to_thread(
+            functools.partial(_building.clash_only, key, since_seq=before))
+        if block:
+            result.setdefault("clash", block)
+    except Exception:  # noqa: BLE001 — АУДИТ НЕ МОЖЕТ СТОИТЬ ХОДА, ГДЕ REVIT
+        # УЖЕ ПИШЕТ. Тот же абсолютный fail-open, что у вердикта и у самого
+        # `clash_bundle`: ложный отказ верной постройке стоит здесь дороже
+        # пропущенной находки, и это записано контрактом обоих модулей.
+        logger.debug("KIR bulk clash stamping failed", exc_info=True)
     return result
 
 
@@ -1136,7 +1624,7 @@ async def _authored_input(args: Any) -> _AuthoredInput:
     if not result.ok:
         return _AuthoredInput(
             args=args, from_script=True, author_digest=result.author_digest,
-            receipt=receipt,
+            env_digest=result.env_digest, receipt=receipt,
             refusal=_script_refusal_result(result.refusal, receipt))
 
     # Конверт, выставленный скриптом (`intent`/`defaults`/`allow_destructive`/
@@ -1145,11 +1633,291 @@ async def _authored_input(args: Any) -> _AuthoredInput:
     program = {**(result.envelope or {}), "ops": result.ops}
     return _AuthoredInput(
         args={"program": program}, from_script=True,
-        author_digest=result.author_digest, receipt=receipt)
+        author_digest=result.author_digest, env_digest=result.env_digest,
+        receipt=receipt)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ИСПОЛНИТЕЛЬ ПЛАНА СТРОИТЕЛЬСТВА — ШАГ 2
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# ЧТО ЭТО ЗАКРЫВАЕТ. До этой волны здание нельзя было написать одним скриптом
+# ВООБЩЕ: скрипт с `phase()` собирался в песочнице исправно, а на компиляторе
+# получал сразу два отказа — KIR-P003 («неизвестное поле конверта 'phases'») и
+# KIR-L002 («create_stairs — единственный оп своей программы»). Разметка была
+# сделана и НЕДОСТИЖИМА, поэтому `phase` намеренно не стоял в `POINTER`:
+# реклама половины пути стоит модели раунда так же, как реклама несуществующего
+# имени. Здесь ставится вторая половина, и имя выходит в указатель вместе с ней.
+#
+# ЧТО ИМЕННО СНИМАЕТСЯ С МОДЕЛИ. Ровно три вещи, каждая — измеренный отказ
+# (корпус `kir_rejections.jsonl`, 1469 строк = 349 ПОПЫТОК авторства, 105 из
+# них — граница программы):
+#   * ГДЕ РЕЗАТЬ. Бюджет и соло-оп меряет фаза, а не скрипт (`course.phase()`);
+#   * ЧТО УЖЕ ПОСТРОЕНО. Ссылка на элемент прошлой фазы подставляется САМА,
+#     настоящим ElementId из квитанции той фазы, — вместо перепечатывания id
+#     из прошлого хода руками;
+#   * СКОЛЬКО ХОДОВ. Здание из N фаз — ОДИН ход модели, а не N.
+#
+# ЧЕГО ЗДЕСЬ НЕТ. Второй двери в Revit не заводится: каждое звено идёт через то
+# же самое тело `_handle_revit_ir_inner`, что и любая одиночная программа, — со
+# своим планированием, заземлением, свидетелем в транзакции, независимой
+# приёмкой и журналом. Бюджет не поднят ни на единицу. Ссылка `by=ref` границу
+# по-прежнему не пересекает — пересекает подставленный `element_id`.
+#
+# ЧЕКПОЙНТ — ЭТО ОБЕЩАНИЕ, И ОНО ВЫПОЛНЯЕТСЯ БУКВАЛЬНО. Фаза атомарна; провал
+# фазы K НЕ откатывает фазы 0..K-1 — они закоммичены и остаются. Поэтому
+# квитанция обязана сказать, С КАКОЙ фазы продолжать: план, повторённый
+# целиком, построил бы уже построенное второй раз. Ровно за этим ниже стоит
+# `resume_from`, и ровно поэтому `retryable` у такого отказа — ЛОЖЬ.
+
+PLAN_SCHEMA = "kir-plan/1"
+
+
+def _plan_payload(result: Any) -> dict:
+    """Квитанция моста, адресованная по id опов, — или пусто.
+
+    Тот же путь, которым её читает `_result_contract_diagnostic`: `result` тела
+    несёт ответ моста целиком, а внутри него полезное лежит под ключом
+    `result`. Своего разбора здесь не заводится.
+    """
+    if not isinstance(result, dict):
+        return {}
+    raw = result.get("result")
+    if not isinstance(raw, dict):
+        return {}
+    inner = raw.get("result", raw)
+    return inner if isinstance(inner, dict) else {}
+
+
+def _plan_step(link: Any, result: Any) -> dict:
+    """Одна строка отчёта о фазе. Числа машинные, ничего не толкуется."""
+    outcome = result.get("outcome") if isinstance(result, dict) else None
+    return {
+        "index": link.index,
+        "name": link.name,
+        "ops": len(link.program.get("ops") or ()),
+        "ok": bool(isinstance(result, dict) and result.get("ok")),
+        # «Закоммичено» берётся у типизированного исхода, а не у `ok`: запись
+        # может быть закоммичена и НЕ принята (нарушенное постусловие в режиме
+        # report), и для вопроса «строить ли эту фазу заново» решает первое.
+        "committed": bool(isinstance(outcome, dict)
+                          and outcome.get("execution") == "committed"),
+    }
+
+
+def _plan_receipt(result: Any, steps: list[dict], total: int) -> Any:
+    """Приклеить блок `plan` и СКАЗАТЬ, с какой фазы продолжать.
+
+    Возвращается квитанция ТОЙ фазы, на которой план кончился (последней, если
+    прошли все), — целиком, со всеми её полями. Это не экономия: `witness`,
+    `outcome`, `acceptance` и `certificate` описывают ОДНУ транзакцию, и
+    сложить их по нескольким значило бы выдумать исход, которого не было ни у
+    одной. Что относится к плану целиком, лежит в `plan` и только там.
+    """
+    if not isinstance(result, dict):
+        return result
+    built = [s for s in steps if s["committed"]]
+    # ГДЕ ПЛАН ВСТАЛ — ЭТО `ok`, А НЕ `committed`, И ЭТО ДВА РАЗНЫХ ПОНЯТИЯ
+    # «ГОТОВО». `_run_plan` останавливается по `ok`; указатель прежде
+    # считался по `committed`, и ничто не заставляло их совпасть. Замер
+    # 11.08: фаза, которая ЗАПИСАЛА и НЕ БЫЛА ПРИНЯТА (постусловие нарушено
+    # в режиме `report`), давала `resume_from` на СЛЕДУЮЩУЮ — то есть
+    # квитанция велела перепрыгнуть через фазу, остановившую план, и имя в
+    # той же строке принадлежало предыдущей: «фаза №2 b», где `b` — фаза 1.
+    stopped = next((s for s in steps if not s["ok"]), None)
+    block = {
+        "schema": PLAN_SCHEMA,
+        "phases": total,
+        "committed": len(built),
+        # «НЕ ЗАПУСКАЛАСЬ» — СВОЁ ЧИСЛО. Фазы, до которых план не дошёл, в
+        # `steps` отсутствуют, и читателю приходилось вычитать самому; а
+        # «упала» и «не запускалась» весь этот марафон были разными фактами.
+        "never_started": max(0, total - len(steps)),
+        "steps": steps,
+    }
+    resume = None
+    if stopped is not None:
+        block["stopped_at"] = stopped["index"]
+        if stopped["committed"]:
+            # ЕДИНСТВЕННЫЙ СЛУЧАЙ, ГДЕ УКАЗАТЕЛЬ БЫЛ БЫ ЛОЖЬЮ В ЛЮБУЮ
+            # СТОРОНУ: повторить фазу — продублировать построенное, пропустить
+            # — оставить нарушенное постусловие в здании и промолчать. Здесь
+            # нужно РЕШЕНИЕ автора, и квитанция обязана его потребовать, а не
+            # подставить число.
+            block["needs_decision"] = stopped["index"]
+        else:
+            resume = stopped["index"]
+    elif len(steps) < total:
+        # Все дошедшие фазы приняты, но план кончился раньше таблицы.
+        resume = len(steps)
+    if resume is not None:
+        block["resume_from"] = resume
+    result["plan"] = block
+    # ДИАПАЗОН ПОСТРОЕННОГО НАЗЫВАЕТСЯ ЧИСЛОМ ПОСТРОЕННЫХ, А НЕ АРИФМЕТИКОЙ
+    # НАД УКАЗАТЕЛЕМ. Прежде здесь стояло `0..{resume - 1}`, и при отказе
+    # НУЛЕВОЙ фазы квитанция печатала «фазы 0..-1 уже в модели» —
+    # утверждение о диапазоне, которого не бывает.
+    kept = (f"фазы 0..{len(built) - 1} уже в модели" if built
+            else "в модель ещё ничего не легло")
+    tail = (f": построено фаз {len(built)} из {total}"
+            + (f", не запускалось {block['never_started']}"
+               if block["never_started"] else "")
+            + f". ПОСТРОЕННОЕ ОСТАЁТСЯ — фаза атомарна, план нет. ПОВТОРЯТЬ "
+              f"ПЛАН ЦЕЛИКОМ НЕЛЬЗЯ: {kept}, и второй прогон построит их "
+              f"второй раз.")
+    if stopped is None and resume is None:
+        head = (f"ПЛАН ПОСТРОЕН ЦЕЛИКОМ: {total} фаз, "
+                f"{sum(s['ops'] for s in steps)} операций, каждая фаза — своя "
+                f"транзакция")
+    elif stopped is not None and stopped["committed"]:
+        # НИ ПОВТОРИТЬ, НИ ПРОПУСТИТЬ. Указатель здесь был бы ложью в любую
+        # сторону, поэтому его нет, а есть названный вопрос к автору.
+        head = (f"ФАЗА №{stopped['index']} «{stopped['name']}» ЗАПИСАЛА В "
+                f"МОДЕЛЬ И НЕ БЫЛА ПРИНЯТА{tail} ЭТУ ФАЗУ НЕЛЬЗЯ НИ "
+                f"ПОВТОРИТЬ (продублирует построенное), НИ ПРОПУСТИТЬ "
+                f"(нарушенное постусловие останется в здании). НУЖНО РЕШЕНИЕ: "
+                f"посмотри, что фаза построила, и либо доведи её правкой "
+                f"модели, либо удали построенное ею и пришли план С НЕЁ.")
+    else:
+        at = stopped if stopped is not None else None
+        index = at["index"] if at is not None else resume
+        name = f" «{at['name']}»" if at is not None else ""
+        head = (f"ПЛАН ВСТАЛ НА ФАЗЕ №{index}{name}{tail} СЛЕДУЮЩИЙ ХОД: "
+                f"почини фазу №{index} и пришли план С НЕЁ.")
+    result["message_ru"] = f"{head}\n{result.get('message_ru') or ''}".strip()
+    if built and not result.get("ok"):
+        # Повтор плана целиком продублировал бы построенное. Общий конверт
+        # считает исправленную программу KIR повторяемой; здесь тот же строгий
+        # случай, что и у закоммиченной записи, и «строить снова» решает не
+        # исход последнего звена, а факт, что предыдущие уже в модели.
+        result["handoff"] = None
+        _stamp_refusal(result)
+        err = result.get("err")
+        if isinstance(err, dict):
+            err["retryable"] = False
+    return result
+
+
+def max_plan_phases() -> int:
+    """Потолок ЧИСЛА ФАЗ плана — ВЫВЕДЕН из вместимости журнала сессии.
+
+    ЧТО ЭТО ЗАКРЫВАЕТ (замер 11.08.2026): `MAX_OPS_PER_PROGRAM = 20` меряет
+    ОДНО звено и меряет верно, а числа звеньев не мерил никто. Поэтому план
+    обходил авторский бюджет умножением: `split_phases` принимал 10 000 фаз
+    по 20 опов — 200 000 операций за 236 мс, без единого отказа.
+
+    ОТКУДА ЧИСЛО. Каждая пишущая фаза становится ОДНОЙ программой журнала
+    (`plan_stream.publish` зовётся в общем теле на каждой фазе), а журнал
+    вытесняет самые старые. План длиннее журнала ВЫТЕСНЯЕТ СОБСТВЕННОЕ
+    НАЧАЛО, ещё не достроившись, и всё, что читает журнал, читает здание без
+    начала: вердикт судит хвост, пачка коллизий теряет базу, у вьюера
+    расходится `base_digest`. Это и есть граница разумного, и она не назначена.
+
+    СПРАШИВАЕТСЯ, А НЕ КОПИРУЕТСЯ. Число живёт у журнала и настраивается его
+    переменной; копия здесь разошлась бы с оригиналом на первой же правке —
+    ровно тот класс дефекта, который эта серия закрывала всю неделю.
+
+    ЧЕГО ПОТОЛОК НЕ ОБЕЩАЕТ: что вытеснения не будет. Сессия, объявившая
+    программы ДО плана, уже съела часть вместимости, поэтому условие
+    НЕОБХОДИМОЕ, а не достаточное; правду постфактум говорит
+    `programs_evicted`, и он остаётся на месте.
+    """
+    from kukai.live import journal as _live_journal
+
+    return _live_journal._max_programs()
+
+
+async def _run_plan(program: Any, llm_client, bridge_callback, *,
+                    query_id: str, authored: "_AuthoredInput",
+                    turn_id: str = "", action_id: str = "",
+                    query_fingerprint: str = "",
+                    source_kind: str = "unknown") -> dict:
+    """Провести план по фазам: одна фаза — одна программа — одна транзакция.
+
+    ПОРЯДОК ОБЯЗАТЕЛЕН И ОН ЖЕ АВТОРСКИЙ. Фазы идут в том порядке, в каком их
+    написал скрипт; сортировать их «по зависимостям» здесь нечем и незачем —
+    порядок УЖЕ проверен на закрытии каждой фазы (`course._refuse_use_before_
+    produce`: производитель обязан стоять раньше потребителя), а вторая
+    сортировка означала бы, что автор не знает, в каком порядке строится его
+    здание.
+
+    ОСТАНОВКА НА ПЕРВОЙ НЕУДАЧЕ. Продолжать после провалившейся фазы нельзя:
+    следующая может ссылаться на её результат, и «подставить нечего» — это в
+    лучшем случае отказ, а в худшем построенная не на том элементе стена.
+    """
+    from kukai.ir import compiler as _compiler
+    from kukai.ir.diag import KirRefusal as _KirRefusal
+
+    # ПОТОЛОК ЧИСЛА ФАЗ — ДО ЕДИНОЙ ЗАПИСИ. Отказ после первой построенной
+    # фазы означал бы половину здания в модели и отказ вдогонку; здесь ещё
+    # ничего не начиналось, и `program_not_started()` — правда, а не надежда.
+    _phases = program.get("phases") if isinstance(program, dict) else None
+    _count = len(_phases) if isinstance(_phases, list) else 0
+    if _count > max_plan_phases():
+        return _with_outcome(
+            {"ok": False, "kir": True, "refused": True, "stage": "plan",
+             "diagnostics": [],
+             "message_ru": (
+                 f"ПЛАН ИЗ {_count} ФАЗ НЕ ПРИНЯТ: это больше вместимости "
+                 f"журнала сессии ({max_plan_phases()} программ). Каждая "
+                 f"пишущая фаза — одна программа журнала, поэтому такой план "
+                 f"вытеснил бы СОБСТВЕННОЕ НАЧАЛО, ещё не достроившись: "
+                 f"вердикт судил бы хвост здания, пачка коллизий потеряла бы "
+                 f"базу, живой вид потребовал бы пересинхронизации посреди "
+                 f"стройки. Бюджет ОДНОЙ фазы (20 операций) при этом не "
+                 f"меняется — режь здание на планы покороче и веди их "
+                 f"последовательно."),
+             "handoff": None},
+            program_not_started())
+    try:
+        links = _compiler.split_phases(program)
+    except _KirRefusal as refusal:
+        return _with_outcome(
+            {"ok": False, "kir": True, "refused": True, "stage": "plan",
+             "diagnostics": [d.as_dict() for d in refusal.diagnostics],
+             "message_ru": "\n".join(d.message_ru for d in refusal.diagnostics),
+             "handoff": None},
+            program_not_started())
+
+    products: dict[str, int] = {}
+    steps: list[dict] = []
+    result: Any = None
+    for link in links:
+        try:
+            body = _compiler.substitute_phase_results(link.program, products)
+        except _KirRefusal as refusal:
+            result = _with_outcome(
+                {"ok": False, "kir": True, "refused": True, "stage": "plan",
+                 "diagnostics": [d.as_dict() for d in refusal.diagnostics],
+                 "message_ru": "\n".join(d.message_ru
+                                         for d in refusal.diagnostics),
+                 "handoff": None},
+                program_not_started())
+            steps.append({**_plan_step(link, result), "ok": False})
+            break
+        result = await _handle_revit_ir_inner(
+            {"program": body}, llm_client, bridge_callback,
+            query_id=query_id, bulk=False,
+            turn_id=turn_id, action_id=action_id,
+            query_fingerprint=query_fingerprint,
+            source_kind=source_kind,
+            authored_in_python=authored.from_script,
+            author_digest=authored.author_digest,
+            env_digest=authored.env_digest)
+        step = _plan_step(link, result)
+        steps.append(step)
+        if not step["ok"]:
+            break
+        products.update(_compiler.phase_products(
+            body.get("ops") or (), _plan_payload(result)))
+    return _plan_receipt(result, steps, len(links))
 
 
 async def handle_revit_ir(args: Any, llm_client, bridge_callback,
-                          query_id: str = "") -> dict:
+                          query_id: str = "", *,
+                          turn_id: str = "", action_id: str = "",
+                          query_fingerprint: str = "",
+                          source_kind: str = "unknown") -> dict:
     """ЧАТ-ДВЕРЬ — публичный вход инструмента. Тонкая обёртка над телом:
     ЕДИНСТВЕННОЕ место, где отказ получает машиночитаемый блок `err`.
 
@@ -1174,20 +1942,45 @@ async def handle_revit_ir(args: Any, llm_client, bridge_callback,
         return _stamp_refusal(_stamp_authorship(authored.refusal, authored))
     # Отметка снимается ДО тела: врезка журнала стоит внутри него, и «вырос ли
     # журнал» — единственный честный ответ на «добавил ли этот ход зданию».
+    # У плана она обязана обнимать ВСЕ фазы: здание судят пачкой, и вердикт
+    # после каждой фазы порознь говорил бы о недостроенном доме.
     watch = _building_watch()
+    # ПЛАН ИЛИ ПРОГРАММА — РЕШАЕТ КОНВЕРТ, А НЕ ФЛАГ ВХОДА. Таблицу `phases`
+    # кладёт `course.take_ops()`, когда автор нарисовал хоть одну границу; её
+    # отсутствие оставляет путь БАЙТ В БАЙТ прежним, и это условие, а не вкус
+    # (`test_phases`: «отсутствие остаётся отсутствием»).
+    program = authored.args.get("program") if isinstance(
+        authored.args, dict) else None
+    if isinstance(program, dict) and program.get("phases") is not None:
+        return _stamp_refusal(_stamp_authorship(
+            await _stamp_building_verdict(
+                await _run_plan(program, llm_client, bridge_callback,
+                                query_id=query_id, authored=authored,
+                                turn_id=turn_id, action_id=action_id,
+                                query_fingerprint=query_fingerprint,
+                                source_kind=source_kind),
+                watch),
+            authored))
     return _stamp_refusal(_stamp_authorship(
         await _stamp_building_verdict(
             await _handle_revit_ir_inner(
                 authored.args, llm_client, bridge_callback,
                 query_id=query_id, bulk=False,
+                turn_id=turn_id, action_id=action_id,
+                query_fingerprint=query_fingerprint,
+                source_kind=source_kind,
                 authored_in_python=authored.from_script,
-                author_digest=authored.author_digest),
+                author_digest=authored.author_digest,
+                env_digest=authored.env_digest),
             watch),
         authored))
 
 
 async def handle_revit_ir_bulk(args: Any, llm_client, bridge_callback,
-                               query_id: str = "") -> dict:
+                               query_id: str = "", *,
+                               turn_id: str = "", action_id: str = "",
+                               query_fingerprint: str = "",
+                               source_kind: str = "unknown") -> dict:
     """ВНУТРЕННЯЯ ДВЕРЬ — тот же прод-путь, но бюджет чанка материализатора.
 
     ЗАЧЕМ. Разбор образца Snowdon Towers дал 6 343 элемента и чанки по 250
@@ -1219,20 +2012,37 @@ async def handle_revit_ir_bulk(args: Any, llm_client, bridge_callback,
     authored = await _authored_input(args)
     if authored.refusal is not None:
         return _stamp_refusal(_stamp_authorship(authored.refusal, authored))
+    # Отметка снимается ДО тела — ровно тем же дозором, что у чат-двери:
+    # врезка журнала стоит внутри тела, и «вырос ли журнал» есть единственный
+    # честный ответ на «добавил ли этот ход зданию». ВЕРДИКТА здесь нет и не
+    # будет (автор — материализатор, читателя у квитанции нет), а АУДИТ
+    # КОЛЛИЗИЙ есть: это разные вещи, и разведены они в `live/verdict.py`.
+    watch = _building_watch()
     return _stamp_refusal(_stamp_authorship(
-        await _handle_revit_ir_inner(
-            authored.args, llm_client, bridge_callback,
-            query_id=query_id, bulk=True,
-            authored_in_python=authored.from_script,
-            author_digest=authored.author_digest),
+        await _stamp_building_clash(
+            await _handle_revit_ir_inner(
+                authored.args, llm_client, bridge_callback,
+                query_id=query_id, bulk=True,
+                turn_id=turn_id, action_id=action_id,
+                query_fingerprint=query_fingerprint,
+                source_kind=source_kind,
+                authored_in_python=authored.from_script,
+                author_digest=authored.author_digest,
+                env_digest=authored.env_digest),
+            watch),
         authored))
 
 
 async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                                  query_id: str = "", *,
                                  bulk: bool = False,
+                                 turn_id: str = "",
+                                 action_id: str = "",
+                                 query_fingerprint: str = "",
+                                 source_kind: str = "unknown",
                                  authored_in_python: bool = False,
-                                 author_digest: str = "") -> dict:
+                                 author_digest: str = "",
+                                 env_digest: str = "") -> dict:
     """The tool handler. NEVER raises; every outcome is a typed dict.
 
     ``bulk`` is set by the CALLING DOOR, never by anything inside ``args``:
@@ -1250,6 +2060,9 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         if program is None and isinstance(args, dict) and "ops" in args:
             program = args                    # tolerate un-nested programs
         from kukai.ir.compiler import compile_program, plan_program
+        # Импорт ленивый: сертификат тянет за собой таблицу эмиттеров, а
+        # `kukai/llm/client.py` импортирует этот модуль на старте процесса.
+        from kukai.ir.translation_cert import certificate_enabled
 
         # ЕДИНИЦА АВТОРСТВА РЕШАЕТ, КАКОЙ БЮДЖЕТ ЕЁ МЕРЯЕТ.
         #
@@ -1396,6 +2209,20 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 else:
                     return _typed_error(
                         "ground", "не удалось получить снапшот модели для ground-стадии")
+                # ГЕОМЕТРИЯ ТИПОВ — В ЖУРНАЛ СЕССИИ. Толщина стены и сечение
+                # колонны живут в ТИПЕ и знаемы ровно здесь, на живом
+                # документе; читателю (вердикт о здании, проверка коллизий)
+                # они нужны позже и на ПАЧКЕ. Уходит только очищенная часть
+                # (`prune_ground_snapshot`), и уход — синхронный, без ожиданий,
+                # с проглатыванием любой ошибки: экран не может стоить стройки.
+                try:
+                    from kukai.live import plan_stream as _plan_stream
+                    _plan_stream.remember_sections(
+                        device_id=_turn_device_id(),
+                        sections=prune_ground_snapshot(snapshot))
+                except Exception:  # noqa: BLE001
+                    logger.debug("live plan sections failed (fail-open)",
+                                 exc_info=True)
             except Exception:  # noqa: BLE001
                 logger.debug("KIR snapshot fetch failed", exc_info=True)
                 return _typed_error(
@@ -1430,6 +2257,10 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                     compile_input,
                     revit_version=revit_version,
                     query_id=query_id,
+                    turn_id=turn_id,
+                    action_id=action_id,
+                    query_fingerprint=query_fingerprint,
+                    source_kind=source_kind,
                     snapshot=snapshot,
                     expected_document=expected_document,
                     expected_identities=identity_proofs,
@@ -1440,6 +2271,10 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 revit_version=revit_version,
                 query_id=query_id,
                 snapshot=snapshot,
+                turn_id=turn_id,
+                action_id=action_id,
+                query_fingerprint=query_fingerprint,
+                source_kind=source_kind,
                 # Только предмакросный бюджет. Изоляция остаётся "atomic",
                 # постусловия — строгими: скрипт не покупает права на
                 # частично закоммиченную программу.
@@ -1469,6 +2304,56 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         family = out.planned.family.value
         timeout = _WRITE_TIMEOUT_MS if family == "write" else _QUERY_TIMEOUT_MS
 
+        # СЕРТИФИКАТ ПЕРЕВОДА — ЕДИНСТВЕННАЯ ВРЕЗКА, И ОНА ЗДЕСЬ.
+        #
+        # Компиляция позади (свидетели эмитированы), первого эффекта ещё нет:
+        # ни транзакции, ни подготовленного события журнала, ни второго
+        # обращения к мосту. Программа, чей свидетель доказуемо не может
+        # сработать, не имеет права дойти до записи — её зелёный не значил бы
+        # ничего. Обоснование места, стоимости и режимов — в блоке над
+        # `_certify_translation`; ЧТО делает провал (отказ или запись в
+        # квитанцию) решает режим флага, а не эта строка.
+        #
+        # Только ПИШУЩИЕ: у запроса нет ни свидетеля, ни обязательств, и
+        # `REFINEMENT` про него ничего не знает по построению.
+        #
+        # ПОЧЕМУ ДО ПОВТОРНОГО НИЖЕНИЯ (`guarded_out`), А НЕ ПОСЛЕ. Повторная
+        # компиляция под точную идентичность добавляет ОДИН программный
+        # охранник (`_element_identity_guard`, authoring.py:4943) и не трогает
+        # ни одного свидетеля: сертификат перевыпускает вердикты из
+        # `_EMITTERS[op](op, ver, stamp)`, а туда доказательства идентичности
+        # не передаются вовсе. Значит сертификат первого нижения действителен
+        # и для второго — а сертифицировать раньше значит не платить ни
+        # чтением приёмки, ни подготовленным событием журнала за программу,
+        # которая всё равно не пойдёт.
+        #
+        # ЗДЕСЬ СТОЯЛ ВТОРОЙ ДОВОД, И ОН БЫЛ ССЫЛКОЙ НА МЁРТВОЕ УСЛОВИЕ:
+        # «равенство `plan_digest` двух нижений проверяется ниже по этому телу
+        # как условие продолжения». Проверка ниже существовала, но сработать
+        # не могла — пруфы идентичности в отпечаток не входят вовсе (см.
+        # комментарий на её месте), — и 07.08 снята. Довод выше в ней не
+        # нуждался: он опирается на то, что в `_EMITTERS` доказательства
+        # идентичности не передаются, и это по-прежнему так.
+        #
+        # Флаг снят ⇒ сюда не заходим вовсе: ни вызова, ни поля в квитанции,
+        # ни лишней миллисекунды.
+        certificate_receipt = None
+        if family == "write" and certificate_enabled():
+            certificate_receipt = _certify_translation(out, revit_version)
+            if certificate_receipt["refused"]:
+                _record_pre_effect(
+                    "translation_certificate",
+                    certificate_receipt.get("diagnostics"),
+                    getattr(out, "grounded_ops", ()) or (),
+                    query_id=query_id,
+                    turn_id=turn_id,
+                    action_id=action_id,
+                    query_fingerprint=query_fingerprint,
+                    source_kind=source_kind,
+                    revit_version=revit_version,
+                )
+                return _certificate_refusal(certificate_receipt)
+
         # Independent acceptance belongs to every write that enters this
         # serving body.  In particular, the admin bulk door is reachable
         # directly from /admin/kir/run; it is not automatically enclosed by
@@ -1488,7 +2373,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 assert snapshot is not None
                 assert document_fingerprint is not None
                 acceptance_session = await prepare_acceptance(
-                    out.grounded,
+                    out.planned,
                     snapshot,
                     document_fingerprint,
                     _acceptance_reader,
@@ -1496,6 +2381,17 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                     timeout_ms=_SNAPSHOT_TIMEOUT_MS,
                 )
             except AcceptanceRuntimeError as exc:
+                _record_pre_effect(
+                    "acceptance_prepare",
+                    [exc.diagnostic()],
+                    getattr(out, "grounded_ops", ()) or (),
+                    query_id=query_id,
+                    turn_id=turn_id,
+                    action_id=action_id,
+                    query_fingerprint=query_fingerprint,
+                    source_kind=source_kind,
+                    revit_version=revit_version,
+                )
                 return _with_outcome({
                     "ok": False,
                     "kir": True,
@@ -1528,12 +2424,35 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                         combined[key] for key in sorted(combined)))
                     if contradictory is None else None
                 )
-                if (guarded_out is None or not guarded_out.ok
-                        or guarded_out.planned.plan_digest
-                        != out.planned.plan_digest
-                        or guarded_out.grounded is None
-                        or guarded_out.grounded.ground_digest
-                        != acceptance_session.registration.ground_digest):
+                # ЧТО ЗДЕСЬ ПРОВЕРЯЕТСЯ — ДВЕ ВЕЩИ, И ОБЕ НАЗВАНЫ.
+                # `guarded_out is None` — два РАЗНЫХ пруфа на один
+                # `element_id` (`contradictory`): вызывающий и сессия
+                # разошлись в том, какой элемент считают целью, и склеить их
+                # нельзя. `not guarded_out.ok` — перелоуэринг с гардами
+                # UniqueId+VersionGuid не скомпилировался.
+                #
+                # ТРЕТЬЕЙ ПРОВЕРКИ БОЛЬШЕ НЕТ, И ЭТО ПРАВКА, А НЕ ПРОПУСК.
+                # Стояло `guarded_out.planned.plan_digest !=
+                # out.planned.plan_digest`, и оно НЕ МОГЛО СРАБОТАТЬ НИ РАЗУ.
+                # `plan_digest` — sha256 от `Planned._unsigned_evidence`
+                # (midend), который связывает schema, ir_version, family,
+                # intent, allow_destructive, bulk, source_op_count, program_id
+                # и ops — и НИ ОДНОГО пруфа идентичности. Оба компилирования
+                # идут от одного и того же `compile_input`, а
+                # `expected_identities` доезжает только до
+                # `authoring.emit_program`, то есть меняет `csharp` и больше
+                # ничего: `planned` собран до того, как пруфы вообще прочтены.
+                # Значит стороны сравнения равны ВСЕГДА, когда первое
+                # компилирование удалось. Условие читалось защитой, не будучи
+                # ею, — а такая строка хуже отсутствующей: она занимает место
+                # настоящей.
+                #
+                # Настоящая разница двух сборок живёт в `csharp`, и судить её
+                # мог бы отпечаток ПО ЭМИССИИ. Его сегодня нет; заводить его
+                # здесь, на пути отказа, значило бы поставить новый замок в
+                # месте, где он ещё ни разу не проверялся живьём. Пробел
+                # назван словом, а не закрыт видимостью.
+                if guarded_out is None or not guarded_out.ok:
                     outcome = program_not_started()
                     registration = acceptance_session.registration_wire()
                     detail = {
@@ -1553,18 +2472,30 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                     except AcceptanceJournalError as journal_exc:
                         registration["journal_finalized"] = False
                         registration["journal_error"] = str(journal_exc)
+                    identity_diagnostic = {
+                        "code": "KIR-A009",
+                        "message_ru": (
+                            "точную идентичность целей не удалось "
+                            "встроить в транзакцию — запись не запускалась"),
+                    }
+                    _record_pre_effect(
+                        "acceptance_identity_bind",
+                        [identity_diagnostic],
+                        getattr(out, "grounded_ops", ()) or (),
+                        query_id=query_id,
+                        turn_id=turn_id,
+                        action_id=action_id,
+                        query_fingerprint=query_fingerprint,
+                        source_kind=source_kind,
+                        revit_version=revit_version,
+                    )
                     return _with_outcome({
                         "ok": False,
                         "kir": True,
                         "refused": True,
                         "stage": "acceptance_identity_bind",
-                        "diagnostics": [{
-                            "code": "KIR-A009",
-                            "message_ru": (
-                                "точную идентичность целей не удалось "
-                                "встроить в транзакцию — запись не запускалась"),
-                            "detail": detail,
-                        }],
+                        "diagnostics": [{**identity_diagnostic,
+                                         "detail": detail}],
                         "message_ru": (
                             "точную идентичность целей не удалось встроить "
                             "в транзакцию — запись не запускалась"),
@@ -1617,7 +2548,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
             # error does not; claiming `true` there turns uncertainty into a
             # false safety guarantee.
             rolled_back = (True if family == "write"
-                           and diag["code"] in ("KIR-X003", "KIR-X004")
+                           and diag["code"] in _ROLLBACK_PROVEN_CODES
                            else None)
             if rolled_back:
                 outcome = write_rolled_back(
@@ -1651,9 +2582,16 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 revit_version=revit_version,
                 ok=False, witness=_derive_witness(False, family, diag),
                 duration_ms=_dur_ms, diag_code=diag["code"],
+                diag_op_id=diag.get("op_id"),
+                # Личность отказа целиком: код называет КЛАСС, а поле и текст —
+                # сам отказ. Всё это диагностика уже несла, а корпус выбрасывал.
+                diag_field=diag.get("field_name"),
+                diag_message=diag.get("message_ru"),
+                diag_detail=diag.get("detail"),
                 violations=diag.get("violations"),
                 outcome=outcome.to_dict(),
                 author_digest=author_digest,
+                env_digest=env_digest,
                 acceptance_evidence=acceptance_registration)
             # Доклад на экран и об ОТКАЗЕ тоже. Первая версия рапортовала
             # только об успехе — и живой ход 29.07 это сразу поймал: программа
@@ -1734,8 +2672,13 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 revit_version=revit_version,
                 ok=False, witness=_derive_witness(False, family, contract_diag),
                 duration_ms=_dur_ms, diag_code=contract_diag["code"],
+                diag_op_id=contract_diag.get("op_id"),
+                diag_field=contract_diag.get("field_name"),
+                diag_message=contract_diag.get("message_ru"),
+                diag_detail=contract_diag.get("detail"),
                 outcome=outcome.to_dict(),
                 author_digest=author_digest,
+                env_digest=env_digest,
                 result_payload=(payload if commit_confirmed else None),
                 acceptance_evidence=acceptance_wire)
             diagnostics = [contract_diag]
@@ -1757,7 +2700,14 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         # Режим ``report`` коммитит, сложив нарушения в результат.  Читаем их:
         # молчаливый «успех» поверх нарушенного постусловия — ложь (§3.6).
         _violations = _postcondition_violations(_payload)
-        _witness = _witness_for_success(family, _payload)
+        # ИМЕНА ОПОВ — ЕДИНСТВЕННЫЙ ВХОД, ПО КОТОРОМУ ВИДНО, ЧТО ОБЕЩАЛИ
+        # ПРОВЕРЯТЬ. Читаются защитно: сорваться здесь значило бы обрушить
+        # УЖЕ СОСТОЯВШУЮСЯ запись, а честность свидетельства такой цены не
+        # стоит — при любой неожиданности `_unwitnessed_axes` вернёт `None`.
+        _planned = getattr(out, "planned", None)
+        _op_names = tuple(
+            op.op_name for op in (getattr(_planned, "ops", ()) or ()))
+        _witness = _witness_for_success(family, _payload, _op_names)
         _outcome = (
             query_accepted()
             if family == "query"
@@ -1808,6 +2758,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
             result_payload=_payload if isinstance(_payload, dict) else None,
             outcome=_outcome.to_dict(),
             author_digest=author_digest,
+            env_digest=env_digest,
             acceptance_evidence=_acceptance_wire)
         # The turn's end-of-turn review reads what was actually built, so only
         # a program that reached this point — compiled, executed, witnessed —
@@ -1851,9 +2802,21 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         # молча взяло 1 тип двери из 62 в живом документе. Отчёт машинный,
         # примечание человеческое; второе пусто, когда выбирать было не из чего.
         if out.grounding_report:
-            from kukai.ir.ground import describe_choices_ru
-            out_result["grounding_report"] = out.grounding_report
-            _defaults_note = describe_choices_ru(out.grounding_report)
+            from kukai.ir.ground import (attach_runtime_choices,
+                                         describe_choices_ru)
+            # ЗДЕСЬ И ТОЛЬКО ЗДЕСЬ ИМЯ ТИПА, ВЫБРАННОГО ДОКУМЕНТОМ, СУЩЕСТВУЕТ.
+            # `create_wall` без `type` спрашивает тип у самого документа внутри
+            # эмиссии (`GetDefaultElementTypeId`), поэтому на стадии заземления
+            # квитанция несёт только правило и указатель. Живой ход 10.08.2026
+            # вернул `chosen: {id: null, name: null}` при построенной стене
+            # «111_Кирпич 380» — правило названо, результат неизвестен, а это
+            # ровно «выбор, которого вызывающий не видит». Соединяем с
+            # readback'ом построенного элемента: до этой точки контракт
+            # результата уже потребовал `ok:true`, то есть транзакция
+            # закоммичена и прочитанное имя описывает существующий элемент.
+            _report = attach_runtime_choices(out.grounding_report, _payload)
+            out_result["grounding_report"] = _report
+            _defaults_note = describe_choices_ru(_report)
             if _defaults_note:
                 out_result["defaults_note_ru"] = _defaults_note
         diagnostics = []
@@ -1884,6 +2847,14 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
             out_result["diagnostics"] = diagnostics
         if _acceptance_wire is not None:
             out_result["acceptance"] = _acceptance_wire
+        # КВИТАНЦИЯ ОБЯЗАНА НЕСТИ, ЧТО ИМЕННО СЛУЧИЛОСЬ. Отказ по сертификату
+        # уносит её сам (`_certificate_refusal`); здесь — вторая половина
+        # правила: `ok:true` называет прибор, который сделал этот зелёный
+        # осмысленным, и его режим. Записанная, но пропущенная находка
+        # (`mode: record`) видна прямо в успехе — иначе наблюдательный режим
+        # был бы тишиной, а тишина неотличима от чистоты.
+        if certificate_receipt is not None:
+            out_result["certificate"] = certificate_receipt
         return out_result
     except Exception:  # noqa: BLE001 — absolute fail-open (never break the turn)
         logger.exception("revit_ir handler internal error")
@@ -2181,6 +3152,97 @@ def source_catalogue_snapshot(out_dir: str) -> dict | None:
         return None
 
 
+#: Именованное значение `base_doc_stamp`, означающее «предыдущая ревизия того
+#: же здания по журналу». Именно ЗНАЧЕНИЕ, а не умолчание: база, выбранная
+#: молча, это `.FirstOrDefault()` с хорошей репутацией, а выбор дельта-базы
+#: ошибиться может дороже, чем выбор типа двери.
+JOURNAL_BASE_TOKEN = "@journal"
+
+
+def _resolve_base_from_journal(
+    out_dir: str, doc_stamp: str,
+) -> tuple[str | None, dict | None]:
+    """`@journal` → штамп предыдущей ревизии этого здания, либо ОТКАЗ.
+
+    Отвечает на вопрос, которого системе не хватало: разборы одного здания
+    лежат в соседних каталогах, но до журнала ничто не связывало их между
+    собой, и `base_doc_stamp` брался из памяти оператора. Здесь он берётся из
+    записанного факта — и разрешённое имя ОБЯЗАНО уехать в ответ, потому что
+    выбор, которого спрашивающий не видит, проверить нельзя.
+
+    Каждый отказ типизован и не откатывается к полной пересборке: попросили
+    дельту от предыдущей ревизии — молчаливое «построю всё здание» было бы
+    ответом на другой вопрос.
+    """
+
+    import json as _json
+    import os as _os
+
+    from kukai.ir.decompile.journal import journal_enabled
+
+    if not journal_enabled():
+        return None, {
+            "ok": False, "refused": True, "error": "journal_disabled",
+            "message_ru": (
+                "base_doc_stamp='@journal', но журнал здания выключен — "
+                "включи KUKAI_IR_JOURNAL"),
+        }
+    passport_path = _os.path.join(out_dir, "passport.json")
+    try:
+        with open(passport_path, "r", encoding="utf-8") as handle:
+            doc_name = str(_json.load(handle).get("doc_name") or "")
+    except (OSError, ValueError, AttributeError):
+        doc_name = ""
+    if not doc_name:
+        return None, {
+            "ok": False, "refused": True, "error": "journal_no_doc_name",
+            "message_ru": (
+                "в разборе нет passport.json с именем документа — journal не "
+                "знает, к какому зданию относится этот прогон"),
+        }
+    from kukai.ir.decompile.journal import JournalError
+    from kukai.ir.decompile.journal_store import load_log, log_path, \
+        previous_stamp
+    path = log_path(_os.path.dirname(out_dir), doc_name)
+    try:
+        log = load_log(path)
+    except (JournalError, KeyError, TypeError, ValueError) as exc:
+        # Битый журнал — отказ, а не «истории нет»: перепутать эти два
+        # значит подсунуть базу, выбранную сломанным прибором.
+        return None, {
+            "ok": False, "refused": True, "error": "journal_unreadable",
+            "message_ru": "журнал здания не читается — база не разрешена",
+            "detail": f"{type(exc).__name__}: {exc}"[:400],
+            "doc_name": doc_name,
+        }
+    if log is None:
+        return None, {
+            "ok": False, "refused": True, "error": "journal_absent",
+            "message_ru": (
+                "у этого здания ещё нет журнала — предыдущей ревизии не "
+                "существует; назови base_doc_stamp явно"),
+            "doc_name": doc_name,
+        }
+    stamp, reason = previous_stamp(log, doc_stamp)
+    if reason == "not_in_journal":
+        return None, {
+            "ok": False, "refused": True, "error": "journal_no_revision",
+            "message_ru": (
+                "этого разбора нет в журнале здания — он снят до включения "
+                "журнала либо относится к другому документу"),
+            "doc_name": doc_name,
+        }
+    if reason == "is_base_revision":
+        return None, {
+            "ok": False, "refused": True, "error": "journal_no_previous",
+            "message_ru": (
+                "это первая ревизия здания в журнале — предыдущей нет, "
+                "пересобирать дельтой не от чего"),
+            "doc_name": doc_name,
+        }
+    return stamp, None
+
+
 async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
                                query_id: str = "") -> dict:
     """Admin rebuild driver (thin).  NEVER raises; typed dict only.
@@ -2215,6 +3277,29 @@ async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
         if not isinstance(allow_partial, bool):
             return _typed_error(
                 "args", "allow_partial должен быть JSON boolean")
+        base_doc_stamp = args.get("base_doc_stamp")
+        if base_doc_stamp is not None and (
+                not isinstance(base_doc_stamp, str) or not base_doc_stamp):
+            return _typed_error(
+                "args", "base_doc_stamp должен быть непустой строкой")
+        current_doc_stamp = args.get("current_doc_stamp")
+        if current_doc_stamp is not None and (
+                not isinstance(current_doc_stamp, str)
+                or not current_doc_stamp):
+            return _typed_error(
+                "args", "current_doc_stamp должен быть непустой строкой")
+        allow_conflicts = args.get("allow_conflicts", False)
+        if not isinstance(allow_conflicts, bool):
+            return _typed_error(
+                "args", "allow_conflicts должен быть JSON boolean")
+        if current_doc_stamp is not None and base_doc_stamp is None:
+            # Страж сравнивает документ С БАЗОЙ. Без базы сравнивать не с чем,
+            # и принять аргумент, ничего им не сделав, значило бы ответить
+            # «проверено» на непроверенное.
+            return _typed_error(
+                "args",
+                "current_doc_stamp без base_doc_stamp бессмыслен — страж "
+                "сравнивает документ с базой дельты")
 
         out_dir = _decompile_out_dir(doc_stamp)
         import json as _json
@@ -2246,6 +3331,187 @@ async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
 
         from kukai.ir.decompile.fold import iter_l1_leaves
         leaves = list(iter_l1_leaves(tree))
+
+        # ── пересборка ДЕЛЬТОЙ, а не всем зданием ───────────────────────────
+        # До этой волны единственный живой вход пересборки брал ВСЕ листья
+        # `tree.json` и заново материализовал здание целиком — даже когда
+        # рядом лежал прошлый разбор того же здания и правка была в один
+        # этаж. Слой `rebuild` умел посчитать дельту с 27.07, но его не звал
+        # никто; здесь у него появляется вызывающий.
+        #
+        # Три отказа вместо тихой полной пересборки — потому что дельта,
+        # применённая не к своему A, это молчаливо неверный результат:
+        #   * база названа, а флаг выключен — карваут не смеет включаться сам;
+        #   * базы нет на диске — «нечего сравнивать» это не «различий нет»;
+        #   * дельта не переводит state(A) в state(B) — `DeltaApplyError`.
+        # Ни один из них НЕ откатывается к полной пересборке молча: оператор
+        # просил дельту и обязан узнать, что её не будет.
+        delta_report: dict | None = None
+        if base_doc_stamp is not None:
+            from kukai.ir.decompile.rebuild import rebuild_enabled
+            if not rebuild_enabled():
+                return {
+                    "ok": False, "refused": True,
+                    "error": "rebuild_delta_disabled",
+                    "message_ru": (
+                        "base_doc_stamp задан, но дельта-пересборка выключена "
+                        "— включи KUKAI_IR_REBUILD"),
+                }
+            # `@journal` — база НЕ названа оператором, а взята из записанной
+            # истории здания. Разрешается ДО всех проверок базы, чтобы
+            # дальше путь был ровно тем же, что и у явно названной базы:
+            # ветка «дельта от журнала» не имеет права быть слабее.
+            base_source = "named"
+            if base_doc_stamp == JOURNAL_BASE_TOKEN:
+                resolved, refusal = _resolve_base_from_journal(
+                    out_dir, doc_stamp)
+                if refusal is not None:
+                    return refusal
+                base_doc_stamp = resolved
+                base_source = "journal"
+            base_dir = _decompile_out_dir(base_doc_stamp)
+            base_tree_path = _os.path.join(base_dir, "tree.json")
+            if not _os.path.isfile(base_tree_path):
+                return {
+                    "ok": False, "error": "no_base_decompile",
+                    "message_ru": (
+                        "нет разбора для base_doc_stamp — дельту не от чего "
+                        "считать"),
+                    "base_doc_stamp": base_doc_stamp,
+                }
+            from kukai.ir.decompile.rebuild import RebuildError
+            from kukai.ir.decompile.rebuild_plan import (
+                delta_rebuild_plan, plan_report,
+            )
+            with open(base_tree_path, "r", encoding="utf-8") as handle:
+                base_tree = _json.load(handle)
+            try:
+                plan = delta_rebuild_plan(
+                    base_tree, tree,
+                    label_a=base_doc_stamp, label_b=doc_stamp)
+            except (RebuildError, KeyError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False, "refused": True,
+                    "error": "delta_not_applicable",
+                    "message_ru": (
+                        "дельта не переводит состояние базы в состояние цели "
+                        "— пересборка от этой базы отказана"),
+                    "detail": f"{type(exc).__name__}: {exc}"[:400],
+                    "base_doc_stamp": base_doc_stamp,
+                }
+            wanted = plan.materialize_source_ids
+            leaves = [
+                leaf for leaf in leaves
+                if leaf["source_element_id"] in wanted]
+            delta_report = plan_report(plan)
+            delta_report["base_doc_stamp"] = base_doc_stamp
+            # Выбор, сделанный компилятором, обязан быть ПРЕДЪЯВЛЕН, а не
+            # просто сделан (тот же закон, что у именованного умолчания в
+            # ground.py): по ответу должно быть видно, назвали базу или её
+            # достали из журнала, и какую именно достали.
+            delta_report["base_source"] = base_source
+            # Снятие старых элементов дельта НАЗЫВАЕТ, но не исполняет: у
+            # ранее построенной копии нет карты «лист A → ElementId», и
+            # выдумывать её здесь значило бы удалять вслепую. Список едет в
+            # отчёт именно поэтому — умолчать о нём было бы обещанием, что
+            # здание сойдётся, тогда как сойдётся только добавленное.
+            delta_report["retire_not_executed"] = True
+            # Единственное, чего компилятор проверить НЕ может: что в целевом
+            # документе действительно стоит состояние базы. Теорема доказана
+            # про state(A), а что документ и есть A — это заявление оператора,
+            # сделанное самим фактом `base_doc_stamp`. Молчать об этом нельзя:
+            # дельта на чужой документ построит ровно разницу и промолчит о
+            # том, что здания под ней нет.
+            delta_report["precondition_ru"] = (
+                "дельта верна, только если в документе уже стоит здание "
+                f"{base_doc_stamp}; проверить это офлайн компилятор не может")
+
+            # ── страж: не сотрёт ли дельта чужую работу ────────────────────
+            # Единственное место, где живая пересборка может дать МОЛЧАЛИВО
+            # неверный исход: оператор правил документ после того, как с него
+            # сняли базу. Дельта построит ровно разницу A→B и промолчит о
+            # том, что под ней уже не A. Свежий разбор того же документа
+            # превращает `precondition_ru` из обещания в измерение.
+            if current_doc_stamp is not None:
+                from kukai.ir.decompile.merge3 import merge_enabled
+                if not merge_enabled():
+                    return {
+                        "ok": False, "refused": True,
+                        "error": "merge_guard_disabled",
+                        "message_ru": (
+                            "current_doc_stamp задан, но страж слияния "
+                            "выключен — включи KUKAI_IR_MERGE3"),
+                    }
+                # `@journal` тут НЕ поддержан намеренно: головой журнала почти
+                # всегда является сама цель, и страж сравнил бы цель с собой,
+                # получив «конфликтов нет». Ложное «проверено» хуже честного
+                # «не проверено», поэтому свежий разбор документа называется
+                # явно — как и любой другой разбор.
+                if current_doc_stamp in (doc_stamp, JOURNAL_BASE_TOKEN):
+                    return _typed_error(
+                        "args",
+                        "current_doc_stamp обязан называть СВЕЖИЙ разбор "
+                        "документа, а не цель пересборки: сравнение цели с "
+                        "собой всегда даёт «конфликтов нет»")
+                current_tree_path = _os.path.join(
+                    _decompile_out_dir(current_doc_stamp), "tree.json")
+                if not _os.path.isfile(current_tree_path):
+                    return {
+                        "ok": False, "error": "no_current_decompile",
+                        "message_ru": (
+                            "нет разбора для current_doc_stamp — состояние "
+                            "документа не с чем сравнить"),
+                        "current_doc_stamp": current_doc_stamp,
+                    }
+                from kukai.ir.decompile.merge_guard import (
+                    VERDICT_CONFIRMED, guard_report,
+                )
+                with open(current_tree_path, "r", encoding="utf-8") as handle:
+                    current_tree = _json.load(handle)
+                guard = guard_report(
+                    base_tree, current_tree, tree,
+                    base_label=base_doc_stamp,
+                    current_label=current_doc_stamp,
+                    target_label=doc_stamp)
+                delta_report["merge_guard"] = guard
+                if not guard.get("ok"):
+                    return {
+                        "ok": False, "refused": True,
+                        "error": "merge_guard_failed",
+                        "message_ru": (
+                            "страж слияния не смог сравнить документ с базой "
+                            "— пересборка отказана, а не проведена вслепую"),
+                        "merge_guard": guard,
+                    }
+                if guard["verdict"] == VERDICT_CONFIRMED:
+                    # То, ради чего страж и заведён: условие ПРОВЕРЕНО.
+                    delta_report["precondition_ru"] = (
+                        f"в документе стоит здание {base_doc_stamp} — "
+                        f"проверено свежим разбором {current_doc_stamp}")
+                    delta_report["precondition_verified"] = True
+                else:
+                    # Разошлось — и это тоже ИЗМЕРЕНИЕ, а не прежнее незнание:
+                    # сказано, на сколько ушёл документ и спорит ли он с
+                    # дельтой. Условие базы при этом НЕ выполнено, и врать о
+                    # нём словом «проверено» нельзя.
+                    delta_report["precondition_verified"] = False
+                    delta_report["precondition_ru"] = (
+                        f"в документе НЕ здание {base_doc_stamp}: свежий "
+                        f"разбор {current_doc_stamp} ушёл от базы на "
+                        f"{guard['auto_merged']} правок, спорных с дельтой — "
+                        f"{guard['conflicts_total']}")
+                if guard["verdict"] != VERDICT_CONFIRMED \
+                        and guard["conflicts_total"] and not allow_conflicts:
+                    # Отказ, а не предупреждение: конфликт — это две правки
+                    # одного и того же, и наша сотрёт чужую. Молча пережить
+                    # такое имеет право только тот, кто явно согласился.
+                    return {
+                        "ok": False, "refused": True,
+                        "error": "merge_conflicts",
+                        "message_ru": guard["message_ru"],
+                        "merge_guard": guard,
+                    }
+
         raw_offset = args.get("offset_mm")
         offset_mm = None
         if raw_offset is not None:
@@ -2369,6 +3635,16 @@ async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
         # тогда, когда оператор явно разрешил карваут, и тогда, когда чтение
         # было полным (False, а не отсутствие ключа: «не помечено» и «не
         # измерялось» — разные вещи).
+        # Дельта — не деталь внутри чанков, а первое, что обязан увидеть
+        # спрашивающий «сколько стоит эта пересборка». Отсутствие ключа и
+        # `null` — разные вещи: ключ есть всегда, значение null значит
+        # «пересобирали здание целиком».
+        summary["delta"] = delta_report
+        if delta_report is not None:
+            summary["message_delta_ru"] = (
+                f"дельта от {delta_report['base_doc_stamp']}: "
+                f"{delta_report['delta_leaves']} листьев вместо "
+                f"{delta_report['full_leaves']}")
         summary["is_partial_read"] = bool(partial_read["is_partial_read"])
         summary["worksets_closed"] = partial_read["worksets_closed"]
         if partial_read["is_partial_read"]:
@@ -2433,7 +3709,34 @@ _last_idempotence: dict[str, Any] = {}
 
 
 def last_idempotence_metric() -> Optional[dict[str, Any]]:
-    """Dashboard hook: the last A5 run's exact% and date (or None)."""
+    """Сводка ПОСЛЕДНЕГО прогона A5 В ЭТОМ ПРОЦЕССЕ, либо `None`.
+
+    ПОТРЕБИТЕЛЯ НЕТ, и это сказано здесь, а не подразумевается. Прежде тут
+    стояло «Dashboard hook», то есть докстринг описывал живую проводку,
+    которой в дереве не существует ни одной строкой (замер 11.08.2026: ноль
+    вызывающих). Инструмент, чьё имя и описание обещают подключение, легче
+    всего принять за работающий — и именно поэтому обещание убрано, а не
+    подкреплено выдуманным потребителем.
+
+    ЧТО ПРИ ЭТОМ РАБОТАЕТ, И ПОЭТОМУ НИЧЕГО НЕ УДАЛЕНО:
+
+    * прогоны БЫЛИ. `idempotence.json` лежит рядом с восемью разборами,
+      свежайший `sob62_fas_r23_v18` от 29.07.2026 — 44 ключа, `raw_exact_pct`
+      85.808. Архивная записка `NOTES_A5.md` утверждает обратное («живой
+      прогон НЕ запускался»), но она СТАРШЕ прогонов;
+    * `_last_idempotence` несёт СВОЙСТВО КОРРЕКТНОСТИ, а не только значение:
+      прогон с провалившейся уборкой обязан оставить его ПУСТЫМ, и это
+      держится тестом. Удалить словарь значит снять требование.
+
+    ДЫРА, КОТОРУЮ ОБЯЗАН ЗАКРЫТЬ ТОТ, КТО БУДЕТ ПОДКЛЮЧАТЬ. Словарь живёт в
+    памяти процесса, а данные — на диске (`idempotence.json`). После
+    перезапуска здесь `None` при восьми состоявшихся прогонах, то есть `None`
+    означает СРАЗУ ДВА разных факта: «в этом процессе прогонов не было» и
+    «прогонов не было никогда». Развести их — значит читать артефакт, а для
+    этого нужен `doc_stamp`: разборов восемь, а аргументов у функции нет.
+    Дописывать подпись под несуществующего потребителя здесь отказано: это
+    была бы догадка о том, чего он попросит.
+    """
     return dict(_last_idempotence) if _last_idempotence else None
 
 

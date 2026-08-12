@@ -58,13 +58,35 @@ _EXTRA_SOURCE_PATHS = (
 
 
 def _canonical_json(value: Any) -> str:
-    """Deterministic JSON text: sorted keys, compact, unicode preserved."""
+    """Deterministic JSON text: sorted keys, compact, unicode preserved.
+
+    ``allow_nan=False`` is load-bearing and was missing until 10.08.2026.
+    Seven other modules in this package define their own ``_canonical_json``
+    (``midend``, ``journal``, ``geometry_acceptance``, ``passport``,
+    ``merkle``, ``acceptance_live``, ``acceptance_mutation``); measured the
+    same day, all eight agree BYTE FOR BYTE on every finite payload and parted
+    company on exactly two — ``NaN`` and ``Infinity``.  The other seven refuse
+    them; this one accepted and emitted ``{"v":NaN}``, which is not JSON:
+    RFC 8259 has no such literal, so the text could not be read back by any
+    strict parser, and a value every other canon of this package calls a
+    refusal was silently keyed here as data.
+
+    The hole has never been observed to open — 0 non-finite floats in 857 650
+    records across 12 stored buildings — but it is NOT closed by construction,
+    which is why this is a fix rather than a comment: ``L0Element.params`` is
+    read by ``schema._mapping``, which checks that the KEYS are strings and
+    nothing at all about the values, and those values come from Revit.
+
+    Callers must treat the refusal as *uncacheable*, never as fatal — see
+    ``_index_hash`` and ``lift_cache_key``.
+    """
 
     return json.dumps(
         value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
 
 
@@ -116,7 +138,14 @@ def _index_hash(index: Any) -> str:
         except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
             logger.debug("index to_dict() not serializable: %s", exc)
     if isinstance(index, Mapping):
-        return _sha256_text(_canonical_json(_json_safe(index)))
+        try:
+            return _sha256_text(_canonical_json(_json_safe(index)))
+        except ValueError as exc:
+            # A non-finite number somewhere in the index.  Same answer as an
+            # unknown shape below: force a miss rather than key on text no
+            # strict parser could read back.
+            logger.debug("index is not canonical JSON: %s", exc)
+            return "nonfinite:" + _sha256_text(repr(index))
     # Unknown shape: refuse to pretend we can key it — return a value that
     # forces a miss rather than a possibly-wrong hit.
     return "opaque:" + _sha256_text(repr(index))
@@ -132,6 +161,24 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _document_hash(document: L0Document) -> str:
+    """Content hash of the document, or a miss-forcing key if it is not JSON.
+
+    ``L0Element.params`` is the one numeric surface the L0 schema does NOT
+    validate for finiteness (``schema._mapping`` checks the keys and nothing
+    else), so a Revit-supplied ``NaN`` can reach here.  Р-3 says a cache may
+    cost a recompute and must never give a wrong answer, so an uncanonicalisable
+    document gets a key distinct from every real hash instead of an exception
+    that would kill a run which works today.
+    """
+
+    try:
+        return _sha256_text(_canonical_json(document.to_dict()))
+    except ValueError as exc:
+        logger.debug("document is not canonical JSON: %s", exc)
+        return "nonfinite:" + _sha256_text(repr(document.to_dict()))
+
+
 def lift_cache_key(
     document: L0Document,
     profile_index: Any = None,
@@ -140,6 +187,7 @@ def lift_cache_key(
     curtain_index: Any = None,
     annotation_index: Any = None,
     tag_index: Any = None,
+    dimension_index: Any = None,
     mep_system_index: Any = None,
 ) -> str:
     """Return the content-address for one detailed-lift request.
@@ -155,7 +203,7 @@ def lift_cache_key(
         "wrapper": LIFT_CACHE_WRAPPER_VERSION,
         "code": _lift_source_hash(),
         "change_stamp": document.change_stamp,
-        "document": _sha256_text(_canonical_json(document.to_dict())),
+        "document": _document_hash(document),
         "profile_index": _index_hash(profile_index),
         "family_placement_index": _index_hash(family_placement_index),
         "wall_curve_index": _index_hash(wall_curve_index),
@@ -176,6 +224,10 @@ def lift_cache_key(
         # не работает. Байт-хэш кода закрывает смену КОДА, но не смену
         # ВХОДА, и именно вход здесь меняется.
         "tag_index": _index_hash(tag_index),
+        # И индекс РАЗМЕРОВ: с ним размер становится опом со ссылками на
+        # измеряемые узлы, без него остаётся атомом source_contract_gap.
+        # Запись, посчитанная без индекса, — ДРУГОЙ ответ на тот же документ.
+        "dimension_index": _index_hash(dimension_index),
         # И индекс принадлежности системе: с ним у трубы появляется
         # system_type, без него его нет — другой ответ на тот же документ.
         "mep_system_index": _index_hash(mep_system_index),
@@ -266,6 +318,7 @@ def cached_lift_document_detailed(
     curtain_index: Any = None,
     annotation_index: Any = None,
     tag_index: Any = None,
+    dimension_index: Any = None,
     mep_system_index: Any = None,
     enabled: bool = False,
     cache_dir: Optional[str | os.PathLike[str]] = None,
@@ -288,14 +341,24 @@ def cached_lift_document_detailed(
 
     if not enabled:
         return lift_document_detailed(
-            document, profile_index, family_placement_index, wall_curve_index,
-            curtain_index, annotation_index, tag_index, mep_system_index
+            document, profile_index, family_placement_index,
+            wall_curve_index=wall_curve_index,
+            curtain_index=curtain_index,
+            annotation_index=annotation_index,
+            tag_index=tag_index,
+            dimension_index=dimension_index,
+            mep_system_index=mep_system_index,
         )
 
     directory = Path(cache_dir) if cache_dir is not None else None
     key = lift_cache_key(
-        document, profile_index, family_placement_index, wall_curve_index,
-        curtain_index, annotation_index, tag_index, mep_system_index)
+        document, profile_index, family_placement_index,
+        wall_curve_index=wall_curve_index,
+        curtain_index=curtain_index,
+        annotation_index=annotation_index,
+        tag_index=tag_index,
+        dimension_index=dimension_index,
+        mep_system_index=mep_system_index)
 
     if directory is not None:
         payload = _read_entry(directory, key)
@@ -307,8 +370,13 @@ def cached_lift_document_detailed(
                 logger.debug("lift cache entry unusable for %s: %s", key, exc)
 
     result = lift_document_detailed(
-        document, profile_index, family_placement_index, wall_curve_index,
-        curtain_index, annotation_index, tag_index, mep_system_index
+        document, profile_index, family_placement_index,
+        wall_curve_index=wall_curve_index,
+        curtain_index=curtain_index,
+        annotation_index=annotation_index,
+        tag_index=tag_index,
+        dimension_index=dimension_index,
+        mep_system_index=mep_system_index,
     )
 
     if directory is not None:

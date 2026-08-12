@@ -165,7 +165,14 @@ foreach (var __room in new FilteredElementCollector(doc)
 {
     var __roomRow = new Dictionary<string, object>();
     __roomRow["id"] = __room.Id.ToString();
-    __roomRow["name"] = __room.Name ?? "";
+    Parameter __roomName = __room.get_Parameter(BuiltInParameter.ROOM_NAME);
+    Parameter __roomNumber = __room.get_Parameter(BuiltInParameter.ROOM_NUMBER);
+    if (__roomName == null || __roomNumber == null)
+        throw new InvalidOperationException(
+            "Room " + __room.Id.ToString() +
+            " has no ROOM_NAME/ROOM_NUMBER parameter");
+    __roomRow["name"] = __roomName.AsString() ?? "";
+    __roomRow["number"] = __roomNumber.AsString() ?? "";
     __roomRow["level_id"] = null;
     __roomRow["level_name"] = null;
     try

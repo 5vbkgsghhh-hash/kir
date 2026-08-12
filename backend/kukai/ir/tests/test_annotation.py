@@ -12,13 +12,17 @@ ops_annotation.py module docstring and each emitter's docstring):
     exists yet — a Fable-level registry_base.py change).
   - create_dimension's line direction (28.07, live E5 measurement — see
     DimensionLineOrientation): RUNTIME-derived from the FIRST resolved
-    reference's PlanarFace.FaceNormal, projected into the view plane — the
-    line runs ACROSS the measured faces, not along a fixed view axis, so it
-    generalizes to walls running either way in plan. Falls back to
-    View.RightDirection only when a face normal cannot be read (a
-    non-planar/ungeometric first reference, or a degenerate in-plane
-    projection) — the FLAGGED case is now only that narrower fallback, not
-    the general rule.
+    reference's plane normal, projected into the view plane — the line runs
+    ACROSS the measured faces, not along a fixed view axis, so it generalizes
+    to walls running either way in plan. CLOSED 09.08: the old
+    View.RightDirection fallback is gone, because a candidate whose normal
+    cannot project into the view plane is no longer a usable candidate at all
+    — the gap it described cannot be reached.
+  - create_dimension is offline-proven only (compiles 6/6, both isolations).
+    A LIVE Revit run is still required for the 09.08 reference classes:
+    family instances (GetSymbolGeometry + instance transform) and datums
+    (Curve references under IncludeNonVisibleObjects) have never been placed
+    by a real Revit — only the straight-wall recipe has (28.07, 3000.0 mm).
   - create_text's font HEIGHT is NOT a param (TextNoteType-owned, shared by
     every instance of that type — there is no per-instance height API);
     width_mm (TextNote.Width, the one per-instance sheet-space size Revit
@@ -43,6 +47,7 @@ os.environ.setdefault("KIR_REJECTIONS_PATH",
 from kukai.ir.authoring_validation import (  # noqa: E402
     _TEXT_CONTENT_MAX_CHARS,
 )
+from kukai.ir import spec  # noqa: E402
 from kukai.ir.compiler import compile_program  # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT as SNAPSHOT  # noqa: E402
 
@@ -370,9 +375,14 @@ class DimensionLineOrientation(unittest.TestCase):
     ``Element.GetGeometryObjectFromReference``, confirmed identical API
     2021..2026 by reflection), projected into the view plane — i.e. the
     line runs ACROSS the measured faces, whichever way they happen to face
-    in plan — falling back to View.RightDirection only when that normal
-    cannot be read. The ANCHOR point (line_at, u/w) is unchanged; only the
+    in plan. The ANCHOR point (line_at, u/w) is unchanged; only the
     direction generalizes.
+
+    09.08: the View.RightDirection fallback is GONE. The direction is the
+    in-view-plane normal the resolver ALREADY proved non-degenerate for the
+    first reference (a candidate whose normal cannot project into the view
+    plane is not a usable candidate at all), so there is nothing left to
+    fall back from — see DimensionReferenceClasses below.
     """
 
     def test_element_reference_construction_is_gone(self):
@@ -413,7 +423,7 @@ class DimensionLineOrientation(unittest.TestCase):
         self.assertIn(
             "у элемента нет геометрической ссылки для размера", out.csharp)
 
-    def test_line_direction_derived_from_first_face_normal_with_fallback(self):
+    def test_line_direction_is_the_first_reference_plane_normal(self):
         out = compile_program(_prog([_wall(), _dim(line_at=[3000, 500])]),
                               snapshot=SNAPSHOT)
         self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics][:3])
@@ -421,8 +431,12 @@ class DimensionLineOrientation(unittest.TestCase):
         self.assertIn("GetGeometryObjectFromReference(", cs)
         self.assertIn(".FaceNormal", cs)
         self.assertIn(".Normalize()", cs)
-        # still the documented fallback when no normal is readable
-        self.assertIn("RightDirection", cs)
+        # 09.08 falsifying pin: the direction is the resolver's own normal
+        # for ref 0, not a view axis. Pre-09.08 the emission opened with
+        # ``XYZ __dimDir_D1 = __vw_D1.RightDirection;`` and only overwrote it
+        # when a normal happened to be readable — this assertion FAILS there.
+        self.assertIn("__dimDir_D1 = __gn_D1_0;", cs)
+        self.assertNotIn("__dimDir_D1 = __vw_D1.RightDirection", cs)
 
     def test_line_anchor_still_through_line_at(self):
         """The ANCHOR point is unchanged — only the direction generalizes."""
@@ -447,15 +461,20 @@ class DimensionLineOrientation(unittest.TestCase):
         same-program element, not just walls — the geometry-fallback path
         needs it equally) was never covered. Falsifying pin: pre-fix, no
         Regenerate() call sits between the wall's creation and this op's
-        first GetSideFaces call."""
+        first reference extraction.
+
+        09.08: the extraction moved from an unrolled GetSideFaces call into
+        the ``__dimGeom_<s>`` resolver, so the boundary this test measures is
+        the CALL SITE, not the helper's definition (which now lives in decl,
+        ahead of everything by construction)."""
         out = compile_program(_prog([_wall(), _dim()]), snapshot=SNAPSHOT)
         self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics][:3])
         cs = out.csharp
         i_wall_create = cs.rfind("Wall.Create", 0, cs.find("create_dimension"))
-        i_get_side_faces = cs.find("GetSideFaces")
+        i_resolve = cs.find("__dimGeom_D1(__rf_D1_0")
         self.assertGreater(i_wall_create, -1)
-        self.assertGreater(i_get_side_faces, -1)
-        between = cs[i_wall_create:i_get_side_faces]
+        self.assertGreater(i_resolve, -1)
+        between = cs[i_wall_create:i_resolve]
         self.assertIn("doc.Regenerate();", between)
 
     def test_regenerate_before_reference_extraction_per_op(self):
@@ -471,10 +490,10 @@ class DimensionLineOrientation(unittest.TestCase):
         self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics][:3])
         cs = out.csharp
         i_wall_create = cs.rfind("Wall.Create", 0, cs.find("create_dimension"))
-        i_get_side_faces = cs.find("GetSideFaces")
+        i_resolve = cs.find("__dimGeom_D1(__rf_D1_0")
         self.assertGreater(i_wall_create, -1)
-        self.assertGreater(i_get_side_faces, -1)
-        between = cs[i_wall_create:i_get_side_faces]
+        self.assertGreater(i_resolve, -1)
+        between = cs[i_wall_create:i_resolve]
         self.assertIn("doc.Regenerate();", between)
 
     def test_regenerate_is_not_wrapped_in_catch(self):
@@ -489,6 +508,291 @@ class DimensionLineOrientation(unittest.TestCase):
         segment = cs[idx:idx + 400]
         self.assertIn("doc.Regenerate();", segment)
         self.assertNotIn("try { doc.Regenerate()", segment)
+
+
+class DimensionReferenceClasses(unittest.TestCase):
+    """09.08 — WHAT WAS STILL WRONG after 28.07 fixed the element reference.
+
+    28.07 taught the emitter one recipe (a straight ``Wall`` via
+    ``HostObjectUtils.GetSideFaces``) — the one shape the live E5 experiment
+    measured — and left a generic walk that tested only ``go as Solid`` at the
+    TOP LEVEL of the geometry. Two whole classes of element can never produce
+    a Solid there, so both answered with the typed refusal «у элемента нет
+    геометрической ссылки для размера» no matter what:
+
+      * FAMILY INSTANCES (column, beam, door, window, furniture, generic
+        model) — RevitAPI.xml, GeometryInstance type summary: "The most common
+        situation where GeometryInstances are encountered is in Family
+        instances." Revit stores ONE copy of the symbol geometry and
+        transforms it per instance;
+      * DATUMS (grid, level, reference plane) and model lines — a ``Curve``,
+        not a Solid, and only visible at all with
+        ``Options.IncludeNonVisibleObjects``. The registry entry for this op
+        advertises "элементов ИЛИ ОСЕЙ" in its own comment, so a grid
+        dimension was a promise the emitter could not keep.
+
+    The trap inside the repair, and why this test names it explicitly: the
+    OBVIOUS unwrap is ``GetInstanceGeometry()``, and RevitAPI.xml says of it
+    (and of ``GetSymbolGeometry(Transform)``) verbatim: "because it returns a
+    copy the references found in the geometry objects contained in this
+    element are not suitable for creating new Revit elements referencing the
+    original element (for example, dimensioning). Only the geometry returned
+    by GetSymbolGeometry() with no transform can be used for that purpose."
+    That is the SAME class of defect 28.07 fixed — a reference NewDimension
+    throws on — and it compiles 6/6, so only a live run or this pin catches
+    it. ``GetSymbolGeometry()`` returns symbol-LOCAL coordinates, so the
+    reference comes from one accessor and the position from
+    ``GeometryInstance.Transform``; taking both from the same call is wrong
+    either way round."""
+
+    def _cs(self):
+        out = compile_program(_prog([_wall(), _dim()]), snapshot=SNAPSHOT)
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics][:3])
+        return out.csharp
+
+    def test_reference_handed_to_newdimension_is_geometric(self):
+        """The ReferenceArray is fed ONLY from the resolver's ``out``
+        parameter, never from an element. Falsifying pin: any return to
+        ``new Reference(<element>)`` — the pre-28.07 shape — fails here."""
+        cs = self._cs()
+        self.assertIn("__refs_D1.Append(__gref_D1_0);", cs)
+        self.assertIn("__refs_D1.Append(__gref_D1_1);", cs)
+        self.assertIn("__dimGeom_D1(__rf_D1_0, null, out __gref_D1_0,", cs)
+        # the only source of __gref_* is the resolver, and the resolver only
+        # ever assigns a Reference it read OFF geometry (face/curve/side face)
+        self.assertNotIn("new Reference(__rf_D1_0)", cs)
+        self.assertNotIn("new Reference(__rf_D1_1)", cs)
+        self.assertNotIn("__gref_D1_0 = new Reference(", cs)
+
+    def test_family_instances_use_symbol_geometry_not_instance_geometry(self):
+        cs = self._cs()
+        self.assertIn("as GeometryInstance", cs)
+        self.assertIn("__gi.GetSymbolGeometry()", cs)
+        # the documented-unsuitable accessors must never appear
+        self.assertNotIn("GetInstanceGeometry(", cs)
+        self.assertNotIn("GetSymbolGeometry(Transform", cs)
+
+    def test_symbol_geometry_is_placed_back_by_the_instance_transform(self):
+        """Symbol geometry is in the symbol's local space; the point and the
+        normal that the VALUE witness compares against must be in MODEL space,
+        so they ride through GeometryInstance.Transform (composed, so nested
+        families compose too)."""
+        cs = self._cs()
+        self.assertIn("__tf.Multiply(__gi.Transform)", cs)
+        self.assertIn("__tf.OfPoint(__pf.Origin)", cs)
+        self.assertIn("__tf.OfVector(__pf.FaceNormal)", cs)
+
+    def test_datums_and_model_lines_resolve_through_curve_references(self):
+        """Grids/levels/reference planes expose a Curve, and only when
+        IncludeNonVisibleObjects is set. Falsifying pin: pre-09.08 the walk
+        had no Curve branch and no such option, so `create_dimension` on the
+        grids its own registry entry advertises always refused."""
+        cs = self._cs()
+        self.assertIn(".IncludeNonVisibleObjects = true", cs)
+        self.assertIn("__go as Curve", cs)
+        self.assertIn("__cv.Reference", cs)
+        # the datum's measured plane is the vertical plane through the line
+        self.assertIn("CrossProduct(__vw_D1.ViewDirection)", cs)
+
+    def test_face_choice_is_not_arbitrary(self):
+        """Solid.Faces has no documented order, so "the first planar face of
+        A against the first planar face of B" is a number with no meaning.
+        Ref 0 fixes the measurement normal and later refs PREFER a candidate
+        parallel to it — using Revit's own IsZeroLength, so no threshold is
+        invented in this emitter."""
+        cs = self._cs()
+        self.assertIn("__dimGeom_D1(__rf_D1_0, null,", cs)
+        self.assertIn("__dimGeom_D1(__rf_D1_1, __gn_D1_0,", cs)
+        self.assertIn("__ip.CrossProduct(__want).IsZeroLength()", cs)
+        self.assertIn("__ip.IsZeroLength()", cs)
+
+
+class DimensionValueIsGated(unittest.TestCase):
+    """09.08 — the measured value stopped being receipt-only.
+
+    28.07's note said no expectation existed because "which faces get chosen
+    changes the value". True while the face was arbitrary; false once the
+    resolver knows which PLANE it handed over. The witness re-derives the
+    number from those planes and compares against Revit's own report.
+
+    What is signed is narrow ON PURPOSE: NOT "the operator's intended
+    distance" (exterior vs interior face is unknowable to a compiler) but
+    "the number Revit printed is the distance between the geometry this
+    dimension is bound to". Failures it exists for: a family-instance
+    transform composed wrongly, a reference that re-associated on
+    regeneration, a segment/reference correspondence other than the
+    documented one — each of which used to be a plausible number in the
+    receipt under a green witness."""
+
+    def _cs(self, refs=None):
+        ops = [_wall(), _dim()] if refs is None else [
+            _wall(),
+            {"op": "create_dimension", "id": "D1", "in_view": IN_VIEW,
+             "refs": refs, "line_at": [3000, 500]}]
+        out = compile_program(_prog(ops), snapshot=SNAPSHOT)
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics][:3])
+        return out.csharp
+
+    def test_the_witness_reads_the_result_not_the_call(self):
+        cs = self._cs()
+        self.assertIn("__el_D1.Value ?? double.NaN", cs)
+        self.assertIn("__el_D1.NumberOfSegments > 1", cs)
+        self.assertIn("__el_D1.Segments", cs)
+        self.assertIn("__sg_D1.Value ?? double.NaN", cs)
+
+    def test_the_expectation_is_derived_from_the_resolved_planes(self):
+        cs = self._cs()
+        self.assertIn("__proj_D1.Add(__gpt_D1_0.DotProduct(__dimDir_D1));", cs)
+        self.assertIn("__proj_D1.Add(__gpt_D1_1.DotProduct(__dimDir_D1));", cs)
+        self.assertIn("__proj_D1.Sort();", cs)
+        self.assertIn("__expect_D1.Add(__proj_D1[__pi + 1] - __proj_D1[__pi]);",
+                      cs)
+
+    def test_multi_segment_dimension_gates_every_segment(self):
+        """RevitAPI.xml: Dimension.Value "will not have a value ... for linear
+        dimensions with more than one segment", and Segments map to references
+        "in order" — so a 3-ref dimension needs 2 expectations, not one.
+        Falsifying pin: a single-value read would leave a 3-ref dimension
+        gated by a check that cannot fail."""
+        cs = self._cs(refs=[{"by": "element_id", "value": 1},
+                            {"by": "element_id", "value": 2},
+                            {"by": "element_id", "value": 3}])
+        self.assertEqual(3, cs.count("__proj_D1.Add(__gpt_D1_"))
+        self.assertIn("__got_D1.Count != __expect_D1.Count", cs)
+
+    def test_no_tolerance_number_is_invented_or_registered(self):
+        """The comparison runs against Revit's own coincidence tolerance,
+        read from the running application — so there is no literal in the C#
+        and no entry in the registry to drift out of sync."""
+        cs = self._cs()
+        self.assertIn("double __vtol_D1 = doc.Application.VertexTolerance;", cs)
+        self.assertIn("> __vtol_D1", cs)
+        self.assertEqual({}, spec.OPS["create_dimension"].tolerances)
+
+    def test_the_verdict_signs_the_geometry_axis(self):
+        cs = self._cs()
+        self.assertIn(
+            "D1: measured value is not the distance between the referenced "
+            "geometry (geometry)", cs)
+
+
+class AngularDimensionFamily(unittest.TestCase):
+    """09.08 — the dimension family the census had never examined, VERIFIED
+    per version against the six reference assemblies through the live Roslyn
+    service (localhost:52412), never against docs and never against
+    ``backend/data/revit_api_db.json``:
+
+      AngularDimension.Create(doc, view, Arc, IList<Reference>, DimensionType)
+                                              2021 2022 2023 2024 2025 2026
+      LinearDimension.Create(doc,view,Line,IList<Reference>)   —  —  —  — X X
+      RadialDimension.Create(doc,view,Reference,bool)          —  —  —  — X X
+      ArcLengthDimension.Create(doc,view,Arc,Reference,IList)  —  —  —  — X X
+      doc.Create.NewDiameterDimension                          —  —  —  —  — —
+      doc.FamilyCreate.NewDiameterDimension                    X  X  X  X  X X
+
+    Three of those readings decided what got built, and each is a measurement,
+    not a judgement:
+
+    * AngularDimension is NOT 2025+ — it is 2017-era and compiles on all six,
+      so it needs no version refusal at all and is shipped here;
+    * NewDiameterDimension (and NewRadialDimension / NewAngularDimension /
+      NewModelText) is CS1061 on ``doc.Create`` on every version and compiles
+      only on ``doc.FamilyCreate`` — it lives on ``FamilyItemFactory``, i.e.
+      the FAMILY EDITOR. KIR authors project documents, so there is no version
+      on which a project-side diameter dimension exists. A typed version
+      refusal would be the wrong shape of honesty here: the axis is not the
+      Revit version, it is the document kind;
+    * LinearDimension.Create is 2025+ and does exactly what
+      ``doc.Create.NewDimension`` already does on all six — shipping it would
+      add a version axis and no capability."""
+
+    def _ang(self, oid="A1", **kw):
+        op = {"op": "create_angular_dimension", "id": oid, "in_view": IN_VIEW,
+              "refs": [{"by": "ref", "value": "W1"},
+                       {"by": "element_id", "value": 12345}],
+              "at": [1500, 1500]}
+        op.update(kw)
+        return op
+
+    def _cs(self, ver="2021", **kw):
+        out = compile_program(_prog([_wall(), self._ang(**kw)]),
+                              revit_version=ver, snapshot=SNAPSHOT)
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics][:3])
+        return out.csharp
+
+    def test_no_version_branch_because_the_api_has_none(self):
+        """Same emission on the oldest and the newest shipped version, up to
+        the ElementId literal form the whole compiler already branches on."""
+        old = self._cs("2021")
+        new = self._cs("2026")
+        self.assertIn("AngularDimension.Create(doc, __vw_A1, __arc_A1,", old)
+        self.assertIn("AngularDimension.Create(doc, __vw_A1, __arc_A1,", new)
+
+    def test_the_arc_is_derived_from_the_two_references(self):
+        """The API demands the references be "rays of the arc passed", so the
+        arc cannot be an author-supplied decoration: vertex = the 2x2 solve of
+        the two reference planes in the view basis, radius = distance to `at`,
+        rays signed toward `at`."""
+        cs = self._cs()
+        self.assertIn("double __adet_A1 = __aa0_A1 * __ab1_A1 - "
+                      "__aa1_A1 * __ab0_A1;", cs)
+        self.assertIn("XYZ __avx_A1 = __aO_A1", cs)
+        self.assertIn("if (__ad0_A1.DotProduct(__arv_A1) < 0.0) "
+                      "__ad0_A1 = __ad0_A1.Negate();", cs)
+        self.assertIn("Arc.Create(__avx_A1, __arv_A1.GetLength(), 0.0, "
+                      "__asw_A1, __ad0_A1, __ay_A1)", cs)
+
+    def test_parallel_references_are_a_typed_refusal_with_a_derived_bound(self):
+        """Both normals are unit and lie in the view plane, so the determinant
+        IS sin of the angle between them — the parallelism test is Revit's own
+        AngleTolerance, not an epsilon someone picked."""
+        cs = self._cs()
+        self.assertIn("Math.Abs(__adet_A1) <= doc.Application.AngleTolerance",
+                      cs)
+        self.assertIn("refs: ссылки параллельны — у угла нет вершины", cs)
+
+    def test_the_angle_is_gated_against_the_arc_we_built(self):
+        cs = self._cs()
+        self.assertIn("__agot_A1 = __el_A1.Value ?? double.NaN;", cs)
+        self.assertIn("Math.Abs(__agot_A1 - __asw_A1) > "
+                      "doc.Application.AngleTolerance", cs)
+        self.assertIn(
+            "A1: measured angle is not the sweep of the arc built from the "
+            "references (geometry)", cs)
+        self.assertEqual(
+            {}, spec.OPS["create_angular_dimension"].tolerances)
+
+    def test_default_dimension_type_is_asked_of_the_document(self):
+        cs = self._cs()
+        self.assertIn("ElementTypeGroup.AngularDimensionType", cs)
+        self.assertIn("в документе нет типа углового размера по умолчанию", cs)
+        explicit = self._cs(dim_type={"by": "element_id", "value": 6001})
+        self.assertNotIn("ElementTypeGroup.AngularDimensionType", explicit)
+
+    def test_exactly_two_refs(self):
+        """Derived from the construction, not chosen: the vertex is the
+        intersection of TWO planes."""
+        three = compile_program(_prog([_wall(), self._ang(refs=[
+            {"by": "element_id", "value": 1},
+            {"by": "element_id", "value": 2},
+            {"by": "element_id", "value": 3}])]), snapshot=SNAPSHOT)
+        self.assertFalse(three.ok)
+        self.assertIn("KIR-T001", [d.code for d in three.diagnostics])
+        one = compile_program(_prog([_wall(), self._ang(
+            refs=[{"by": "element_id", "value": 1}])]), snapshot=SNAPSHOT)
+        self.assertFalse(one.ok)
+
+    def test_the_reference_resolver_is_shared_with_create_dimension(self):
+        """Not a second copy: the same helper set, so the GeometryInstance /
+        datum-curve classes the linear op learned on 09.08 are available here
+        by construction rather than by remembering to port them."""
+        cs = self._cs()
+        self.assertIn("void __dimGeom_A1(", cs)
+        self.assertIn("__gi.GetSymbolGeometry()", cs)
+        self.assertIn(".IncludeNonVisibleObjects = true", cs)
+        # an ANGLE wants non-parallel refs, so the parallel-preference the
+        # linear op passes for ref 1 must NOT be passed here
+        self.assertIn("__dimGeom_A1(__rf_A1_1, null,", cs)
 
 
 class CommitGateInvariants(unittest.TestCase):
@@ -675,21 +979,28 @@ class TagVersionAxis(unittest.TestCase):
         self.assertIn("IndependentTag.Create(doc, __ttel_T1.Id, __vw_T1.Id,", cs)
 
     def test_bound_witness_api_drifts_2021_vs_2023(self):
-        """TaggedLocalElementId (property) exists <=2021; GetTaggedLocalElementIds
-        exists >=2022 and TaggedLocalElementId is REMOVED (not just
+        """TaggedLocalElementId (property) exists <=2021; the multi-target
+        readback exists >=2022 and TaggedLocalElementId is REMOVED (not just
         deprecated) on >=2023 — the emitter must never emit both in one body
-        (a runtime try/catch of a non-existent member does not compile)."""
+        (a runtime try/catch of a non-existent member does not compile).
+
+        The >=2022 member is ``GetTaggedLocalElements`` and NOT
+        ``GetTaggedLocalElementIds``: the latter returns ``ISet<ElementId>``,
+        and ``ISet<>`` on net48 lives in ``System.dll``, which the DEPLOYED
+        plugin does not reference (CS0012, measured live 2026-08-04).
+        """
         # NOTE: "TaggedLocalElementId" is a literal substring of
-        # "GetTaggedLocalElementIds" — check the PROPERTY-access shape
+        # "GetTaggedLocalElements" — check the PROPERTY-access shape
         # (".TaggedLocalElementId", no parens) so the two don't false-positive
         # against each other.
         out21 = compile_program(_prog([_wall(), _tag()]), revit_version="2021",
                                 snapshot=SNAPSHOT)
         self.assertIn(".TaggedLocalElementId.ToString()", out21.csharp)
-        self.assertNotIn("GetTaggedLocalElementIds", out21.csharp)
+        self.assertNotIn("GetTaggedLocalElements", out21.csharp)
         out23 = compile_program(_prog([_wall(), _tag()]), revit_version="2023",
                                 snapshot=SNAPSHOT)
-        self.assertIn("GetTaggedLocalElementIds()", out23.csharp)
+        self.assertIn("GetTaggedLocalElements()", out23.csharp)
+        self.assertNotIn("GetTaggedLocalElementIds", out23.csharp)
         self.assertNotIn(".TaggedLocalElementId.ToString()", out23.csharp)
 
 
@@ -757,6 +1068,10 @@ ANNOTATION_PROGRAMS = {
              "refs": [{"by": "ref", "value": "W1"},
                       {"by": "element_id", "value": 12345}],
              "line_at": [3000, 500]},
+            {"op": "create_angular_dimension", "id": "A1", "in_view": IN_VIEW,
+             "refs": [{"by": "ref", "value": "W1"},
+                      {"by": "element_id", "value": 12345}],
+             "at": [1500, 1500]},
             {"op": "create_tag", "id": "T1", "in_view": IN_VIEW,
              "target": {"by": "ref", "value": "W1"}, "at": [3000, 800]},
             {"op": "create_text", "id": "X1", "in_view": IN_VIEW,
@@ -774,6 +1089,11 @@ ANNOTATION_PROGRAMS = {
              "refs": [{"by": "ref", "value": "W1"},
                       {"by": "element_id", "value": 12345}],
              "line_at": [3000, 500],
+             "dim_type": {"by": "element_id", "value": 6001}},
+            {"op": "create_angular_dimension", "id": "A1", "in_view": IN_VIEW,
+             "refs": [{"by": "ref", "value": "W1"},
+                      {"by": "element_id", "value": 12345}],
+             "at": [1500, 1500],
              "dim_type": {"by": "element_id", "value": 6001}},
             {"op": "create_tag", "id": "T1", "in_view": IN_VIEW,
              "target": {"by": "ref", "value": "W1"}, "at": [3000, 800],

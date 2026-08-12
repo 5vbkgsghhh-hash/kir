@@ -1,4 +1,52 @@
-"""Typed honesty: ``Verified[T]`` unconstructible without a proof (wave 7).
+"""Typed honesty: ``Verified[T]`` guarded against ACCIDENTAL construction.
+
+WITHDRAWN 2026-08-11, WITH THE MEASUREMENT THAT WITHDREW IT.  This module used
+to open with "``Verified[T]`` unconstructible without a proof" and to state an
+"Invariant UNFORGEABLE: there is no path to a ``Verified[T]`` that bypasses a
+verifier -- tested adversarially".  That promise is not one Python can keep,
+and it took two lines from outside the module to break.  Every attack below was
+EXECUTED on 2026-08-11 from a process whose only privilege was the right to
+import this file:
+
+  * ``Proof(..., _token=verified._MINT_KEY)``                      -> SUCCEEDS
+  * ``... _token=vars(verified)["_MINT_KEY"]``                     -> SUCCEEDS
+  * ``... _token=prove_round_trip.__globals__["_MINT_KEY"]``       -> SUCCEEDS
+  * ``object.__new__(Proof)`` + ``object.__setattr__``             -> SUCCEEDS
+  * ``Verified(value=..., proof=<forged>, subject_hash=...)``      -> SUCCEEDS
+
+Moving the sentinel into a CLOSURE is the repair that looks obvious, and it was
+measured on an identical toy guard rather than assumed:
+``Guard.__init__.__closure__[i].cell_contents`` hands the secret over, and
+``object.__new__(Guard)`` skips ``__init__`` entirely.  That second line is the
+general result: **no placement of a sentinel can matter, because a constructor
+guard can be bypassed without calling the constructor.**  A closure would have
+been a delay, not a fix.
+
+The suite did not catch this because it tried the neighbouring doors: V1
+constructs ``Proof`` with NO token and ``Verified`` with the string
+``"not a proof"``.  Both are refused, so the tests proved the lock rejects a
+WRONG key -- never that the key is out of reach, which is what the claim
+actually said.  A check signing an axis it did not read, on the one axis this
+module exists for.
+
+WHAT IS TRUE, and it is stated as the whole of it.  Three properties survive,
+and not one of them depends on secrecy:
+
+1. **Accidental construction is refused, loudly.**  A caller who writes
+   ``Proof(...)`` instead of routing through a ``prove_*`` verifier gets a
+   typed ``ForgeryError``, not a silent claim.  This is the guard's real and
+   only security value, and ``PROTECTION`` below says so in code.
+2. **A proof is bound to its subject.**  ``ProofMismatchError`` stops a
+   LEGITIMATE proof from being replayed onto another building.  That is about
+   misapplication, not forgery, so an attacker was never its subject.
+3. **A verifier RUNS its check.**  Each ``prove_*`` calls a real offline
+   assertion and mints nothing when it raises, so a proof obtained honestly
+   does mean the check passed.
+
+Against a hostile process that may import this module there is no defence here
+and there cannot be one in this language; deployment-level isolation is the
+only place that question can be answered.  Do not re-add the word
+"unforgeable".
 
 The existing honesty contract carries verdicts as VALUES — ``EquivalenceClaim``
 has a ``state`` field anyone can set to ``VERIFIED`` without having verified
@@ -10,9 +58,9 @@ translation certificate of wave 2).
 
 Mechanics (a Python analog of a witness / phantom type, enforced at runtime):
 
-* ``Proof.__init__`` requires a module-private capability sentinel; external
-  code cannot obtain it, so ``Proof(...)`` from outside raises ``ForgeryError``
-  — only this module mints proofs.
+* ``Proof.__init__`` requires a module-level capability sentinel, so an
+  ACCIDENTAL ``Proof(...)`` raises ``ForgeryError``.  The sentinel is private
+  by convention only; see the measured bypasses at the top of this file.
 * Each ``prove_*`` verifier RUNS the real check (e.g. ``assert_round_trip``);
   if it does not raise, it mints a ``Proof``; otherwise the check's exception
   propagates and NO proof is produced — there is no "claim without running".
@@ -20,13 +68,24 @@ Mechanics (a Python analog of a witness / phantom type, enforced at runtime):
   subject of the value, so a proof for building X cannot be re-glued onto
   building Y (a replay forgery) — ``ProofMismatchError``.
 
-Invariant UNFORGEABLE: there is no path to a ``Verified[T]`` that bypasses a
-verifier — tested adversarially.
-
 Discipline (forks in TYPED_HONESTY_SPEC.md): inert, additive, opt-in
-(``verified_enabled()`` default OFF; the honesty module is untouched);
-serialization does NOT carry trust — ``from_dict`` re-proves rather than
-believing a stored "verified" flag (Р7).  Frozen L0 untouched.
+(``verified_enabled()`` default OFF; the honesty module is untouched); frozen
+L0 untouched.
+
+SERIALIZATION CARRIES NO TRUST, and that clause used to describe half a
+contract.  It promised "``from_dict`` re-proves rather than believing a stored
+'verified' flag (Р7)", and ``test_verified.py``'s header repeats it as V7.
+Measured 2026-08-11: there is NO ``from_dict`` anywhere in this module, while
+``Verified.to_dict`` stamped ``"verified": True`` into the payload.  The
+forgeable direction shipped and the re-proving direction never existed.
+
+It could not have existed as written: ``to_dict`` carries ``subject_hash`` and
+evidence STRINGS, never the library and tree a ``prove_*`` verifier needs, so
+re-proving from the payload alone is impossible by construction.  So the flag
+goes rather than a reader arriving -- a boolean nothing downstream can
+re-derive is worse crossing a process boundary than no boolean at all.  The
+payload now says ``"trust": "not_carried"`` and keeps the evidence, so a reader
+must re-run a verifier with the real subject in hand to trust anything.
 """
 from __future__ import annotations
 
@@ -72,18 +131,37 @@ def verified_enabled() -> bool:
 # Sealed capability token — the heart of unforgeability
 # ---------------------------------------------------------------------------
 
-# A unique, module-private sentinel.  It is NOT exported and cannot be obtained
-# from outside this module, so only code here can pass the "mint" gate.
+# A unique, module-level sentinel.  It is not exported, and that is the whole
+# of its strength: "private" here is a naming convention, not a capability.
+# Measured bypasses are listed in KNOWN_BYPASSES below.
 _MINT_KEY = object()
+
+#: What this guard actually protects against.  Named in code, not in prose, so
+#: a future reader is stopped by a constant rather than by a paragraph.
+PROTECTION = "accidental_construction_only"
+
+#: CLOSED list of measured ways to obtain a Proof without a verifier
+#: (2026-08-11, executed from outside the module).  It is closed on purpose:
+#: a sixth entry must force a decision about PROTECTION rather than quietly
+#: widen an unstated claim.
+KNOWN_BYPASSES = (
+    "module_attribute",          # verified._MINT_KEY
+    "module_vars",               # vars(verified)["_MINT_KEY"]
+    "function_globals",          # prove_round_trip.__globals__["_MINT_KEY"]
+    "object_new",                # object.__new__(Proof) -- skips __init__
+    "closure_cell_contents",     # would defeat the "move it to a closure" fix
+)
 
 
 @dataclass(frozen=True, slots=True)
 class Proof:
-    """An unforgeable witness that a specific offline check passed.
+    """A witness that a specific offline check passed.
 
     Construct ONLY via a ``prove_*`` verifier in this module; a direct
-    ``Proof(...)`` from outside (without the private mint key) raises
-    ``ForgeryError``.
+    ``Proof(...)`` without the mint key raises ``ForgeryError``.  That guard
+    stops an ACCIDENT, not an adversary -- see ``PROTECTION`` and
+    ``KNOWN_BYPASSES``.  The word "unforgeable" was withdrawn on 2026-08-11
+    after five bypasses were executed from outside this module.
     """
 
     kind: str
@@ -118,13 +196,16 @@ def _mint(kind: str, subject_hash: str, evidence: tuple[str, ...]) -> Proof:
 
 @dataclass(frozen=True, slots=True)
 class Verified(Generic[T]):
-    """A value carrying an unforgeable proof that it was verified.
+    """A value carrying the proof that it was verified.
 
     ``subject_hash`` names the artifact the value is a verdict ABOUT (a tree
     hash, a transition hash, ...).  The constructor requires a ``Proof`` whose
     ``subject_hash`` equals it; otherwise the wrapper cannot exist — a proof for
-    one subject cannot verify a verdict about another (replay forgery).  A
-    ``Verified`` thus exists IFF a real check passed for THIS subject.
+    one subject cannot verify a verdict about another.  That binding is real
+    and does not rest on secrecy: it stops a LEGITIMATE proof from being
+    replayed onto another building.  It does NOT make the wrapper unforgeable,
+    and the "exists IFF a real check passed" reading it used to carry was
+    withdrawn with the measurement at the top of this file.
     """
 
     value: T
@@ -150,8 +231,12 @@ class Verified(Generic[T]):
         value_dict = (
             self.value.to_dict() if hasattr(self.value, "to_dict")
             else self.value)
+        # NO boolean trust flag.  Nothing downstream can re-derive it (there
+        # is no from_dict, and the payload does not carry the subject a
+        # verifier would need), so shipping `"verified": true` would send a
+        # forgeable claim across a process boundary with nothing behind it.
         return {"value": value_dict, "subject_hash": self.subject_hash,
-                "proof": self.proof.to_dict(), "verified": True}
+                "proof": self.proof.to_dict(), "trust": "not_carried"}
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +366,8 @@ def verify_equivalence(claim: Any, proof: Proof) -> "Verified[Any]":
 
 
 __all__ = [
+    "KNOWN_BYPASSES",
+    "PROTECTION",
     "ForgeryError",
     "HonestyTypeError",
     "Proof",

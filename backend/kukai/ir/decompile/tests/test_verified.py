@@ -11,7 +11,8 @@ Numbering matches TYPED_HONESTY_SPEC §5:
   V4 subject-bound (proof for X + verdict about Y -> ProofMismatchError)
   V5 every verifier honest (correct -> proof; broken -> raises)
   V6 Verified cannot carry FAILED
-  V7 serialization does not carry trust (from_dict re-proves)
+  V7 serialization does not carry trust (no boolean flag is emitted;
+     re-proving needs the subject, which the payload cannot carry)
   V8 determinism (same subject -> same subject_hash; cross-process)
   V9 flag default OFF
 """
@@ -184,7 +185,11 @@ class SerializationTrust(unittest.TestCase):
         # The dict records verified:true for audit, but its proof dict cannot be
         # turned back into a Proof (no mint key) — trust does not survive
         # serialization.
-        self.assertTrue(payload["verified"])
+        # V7 CORRECTED 2026-08-11: the payload carries no boolean trust
+        # flag, because no from_dict exists to re-derive one and the
+        # payload does not carry the subject a verifier would need.
+        self.assertNotIn("verified", payload)
+        self.assertEqual(payload["trust"], "not_carried")
         with self.assertRaises(ForgeryError):
             Proof(**{k: v for k, v in payload["proof"].items()})
 

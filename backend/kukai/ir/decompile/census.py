@@ -32,13 +32,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
 
-from .census_contract import NO_CATEGORY_KEY
 from .schema import CategoryState, L0Document
 
 
 # Ключ переписи для элемента без категории. Не «прочее» и не пустая строка:
 # отсутствие категории — это факт о документе (виды, листы, служебные
 # элементы), и он обязан быть счётным, а не растворяться.
+NO_CATEGORY_KEY = "no_category"
+
 # Сколько строк «не читалось» печатается поимённо; остальное сворачивается в
 # остаток с сохранением ОБОИХ чисел (сколько категорий и сколько элементов) —
 # усечённый хвост, о размере которого не сказано, был бы тем же умолчанием,

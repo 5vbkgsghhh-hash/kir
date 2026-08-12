@@ -15,14 +15,14 @@ SPEC 12.9), kind escape value -> typed Diagnostic list, never an exception.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
-from kukai.ir import relate, spec
-from kukai.ir.compile_output import CompileOutput
+from kukai.ir import faceref, relate, spec
 from kukai.ir.contracts import ElementIdentityProof
 from kukai.ir.diag import (
     Diagnostic, KirRefusal,
@@ -30,14 +30,13 @@ from kukai.ir.diag import (
     PARSE_MISSING_FIELD, PARSE_DUP_ID, PARSE_EXCLUSIVE_FIELDS,
     GROUND_UNSUPPORTED_KIND, GROUND_BAD_SELECTOR,
     GROUND_MODEL_BINDING, TYPE_BAD_TYPE, TYPE_BAD_ENUM, TYPE_BOUNDS, PLAN_LIMIT,
-    PLAN_SOLO_OP,
+    PLAN_PHASE_SHAPE, PLAN_SOLO_OP,
 )
 from kukai.ir.emit_utils import (ELEMENT_ID_MAX, cs_identifier_fragment,
                                  cs_line_comment_fragment, cs_string_literal)
-from kukai.ir.hosted_geometry import hosted_offset_check
-from kukai.ir.lowering import lower_program
 from kukai.ir.midend import (
     FieldOrigin,
+    GroundedProgram,
     OperationFamily,
     OpProvenance,
     PlanEncodingError,
@@ -74,6 +73,32 @@ MAX_VALIDATED_OPS = 320     # post-expansion ceiling (macros.MAX_EXPANDED_OPS + 
 BUDGET_AUTHORED = "authored"
 BUDGET_INTERNAL_BULK = "internal_bulk"
 
+def _incident_log_ref(value: Any) -> str:
+    """Return a bounded digest of caller-controlled correlation input."""
+    if not isinstance(value, str) or not value:
+        return "-"
+    digest = hashlib.sha256(
+        value.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    return f"sha256:{digest[:16]}"
+
+
+def _incident_revit_version_ref(value: Any) -> str:
+    """Expose only canonical system-owned target tokens; hash every caller value."""
+    if isinstance(value, str) and value in spec.REVIT_VERSIONS:
+        return value
+    return _incident_log_ref(value)
+
+
+def _incident_input_type(value: Any) -> str:
+    """Describe the public input shape without trusting a custom class name."""
+    if isinstance(value, PlannedProgram):
+        return "PlannedProgram"
+    value_type = type(value)
+    if value_type in (dict, list, tuple, str, int, float, bool, type(None)):
+        return value_type.__name__
+    return "other"
+
 
 def pre_macro_budget(*, bulk: bool) -> tuple[str, int]:
     """Имя и величина предмакросного бюджета — ОДНА точка истины.
@@ -82,6 +107,59 @@ def pre_macro_budget(*, bulk: bool) -> tuple[str, int]:
     назвать один бюджет, а померить другой."""
     return ((BUDGET_INTERNAL_BULK, MAX_BULK_OPS) if bulk
             else (BUDGET_AUTHORED, MAX_OPS_PER_PROGRAM))
+
+
+@dataclass
+class CompileOutput:
+    ok: bool
+    csharp: Optional[str] = None                 # emitted Execute-body (doc in scope)
+    diagnostics: list[Diagnostic] = field(default_factory=list)
+    per_version: dict[str, str] = field(default_factory=dict)
+    # Immutable typed mid-end accepted by this compilation.  C# is merely one
+    # lowering of this exact plan; acceptance/evidence bind to plan_digest.
+    planned: Optional[PlannedProgram] = None
+    # Immutable model-dependent child of ``planned``.  Legacy consumers keep
+    # receiving detached ``grounded_ops`` below; this object is the evidence
+    # authority for exact ground OUTPUT and cannot be changed through either
+    # compatibility view.  It is not a ContextSnapshot identity/revision
+    # witness; the current ground input has no such authoritative contract.
+    grounded: Optional[GroundedProgram] = None
+    # Any-Query invariant (SPEC §14): when the refusal is out-of-coverage rather
+    # than malformed, handoff names the tail route so the caller falls through
+    # to the recipe/wiki path instead of erroring at the user.
+    handoff: Optional[dict] = None
+    # КВИТАНЦИЯ НАЗВАННОГО УМОЛЧАНИЯ: выборы, которые сделал КОМПИЛЯТОР, а не
+    # автор программы. Выбор, которого вызывающий не видит, неотличим от
+    # `.FirstOrDefault()` — а именно им плечо C# молча взяло 1 тип двери из 62
+    # (замер 02.08.2026). Эхо авторского селектора сюда не попадает: там
+    # решение принял автор, и отчитываться не о чем.
+    grounding_report: list[dict] = field(default_factory=list)
+    # ЗАЗЕМЛЁННЫЙ ВИД НИЖЕНИЯ — ровно те словари, из которых эмиттер собрал
+    # `csharp`, и ничего кроме. Нужен ОДНОМУ потребителю: сертификату перевода
+    # (`translation_cert.certify_program`), который проверяет свидетелей
+    # СТАТИЧЕСКИ и потому обязан смотреть на ту же операцию, что ушла в C#, —
+    # иначе он сертифицировал бы соседнюю программу.
+    #
+    # ЭТО НЕ ПЛАН. Приёмка и все доказательства висят на `planned.plan_digest`;
+    # здесь — отсоединённый вид нижения, который никто не имеет права
+    # предъявлять как замысел (та же оговорка стоит у `normed` внутри
+    # `compile_program`). В `as_dict()` НЕ входит: от появления этого поля
+    # квитанция не меняет ни одного байта.
+    grounded_ops: list[dict] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        d = {"ok": self.ok, "csharp": self.csharp,
+             "diagnostics": [x.as_dict() for x in self.diagnostics]}
+        if self.planned is not None:
+            d["plan_digest"] = self.planned.plan_digest
+        if (self.ok and self.grounded is not None
+                and self.grounded.planned.family is ProgramFamily.WRITE):
+            d["ground_digest"] = self.grounded.ground_digest
+        if self.handoff:
+            d["handoff"] = self.handoff
+        if self.grounding_report:
+            d["grounding_report"] = self.grounding_report
+        return d
 
 
 # ── C# helpers emitted once per program (7.3-safe, read-only) ────────────────
@@ -401,6 +479,43 @@ def _apply_defaults(defaults: Any, ops: list, diags: list[Diagnostic]) -> list:
     return _apply_defaults_with_trace(defaults, ops, diags)[0]
 
 
+def hosted_offset_check(hosted: dict, wall: dict, host_id: str,
+                        idx: int | None, diags: list) -> bool:
+    """«дверь за краем стены» — ОДИН судья, ДВЕ площадки вызова.
+
+    Закон читает ЧИСЛА концов стены. Пока концы были литералами, он целиком
+    жил на плане. С RELATE конец стены может приехать из снапшота — и тогда
+    числа появляются только после ground. Прибор, замолчавший на этой части
+    диапазона, был бы опаснее отсутствующего: дверь за краем адресованной
+    стены уехала бы в транзакцию, где отказ стоит круглого рейса.
+
+    Поэтому реализация одна, а вызывают её двое: `_parse_and_check_internal`
+    (литеральные концы) и `ground.ground` (концы, разрешённые от осей).
+    Побочный эффект тот же самый — `__host_wall__` для эмиттера.
+    """
+    import math as _math
+    arc = wall.get("arc")
+    if isinstance(arc, dict):
+        length = abs(float(arc["radius_mm"]) * (
+            float(arc["end_angle_rad"]) - float(arc["start_angle_rad"])))
+    else:
+        length = _math.hypot(wall["p1_mm"][0] - wall["p0_mm"][0],
+                             wall["p1_mm"][1] - wall["p0_mm"][1])
+    offset = hosted.get("offset_mm", 0)
+    if offset > length:
+        diags.append(Diagnostic(
+            code="KIR-T002", op_index=idx, op_id=hosted["id"],
+            field_name="offset_mm", expected=f"0..{length:.0f}", got=offset,
+            message_ru=(f"offset {offset}мм за пределами стены "
+                        f"«{host_id}» ({length:.0f}мм)")))
+        return False
+    host_shape = {"p0_mm": wall["p0_mm"], "p1_mm": wall["p1_mm"]}
+    if isinstance(arc, dict):
+        host_shape["arc"] = arc
+    hosted["__host_wall__"] = host_shape
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class _OpPlanTrace:
     source_index: int
@@ -433,9 +548,24 @@ def _parse_and_check_internal(
         known_top.add("program_id")
     for k in program:
         if k not in known_top:
+            # ПЛАН — НЕ ПРОГРАММА, И ОТКАЗ ОБЯЗАН СКАЗАТЬ ИМЕННО ЭТО.
+            # `phases` — законная часть конверта, которую собирает `course.
+            # phase()`; незаконно здесь другое — отдать план функции, которая
+            # исполняет ОДНУ транзакцию. Это последний рубеж: живая дверь режет
+            # план на пачку (`split_phases`) ВЫШЕ этого места, и сюда план
+            # доезжает только у того, кто резать не стал. Общее «неизвестное
+            # поле» посылало бы такого читателя убирать поле, то есть терять
+            # чекпойнты, — самая дорогая из возможных починок.
+            message = (
+                "программа с планом фаз (`phases`) не исполняется как ОДНА "
+                "программа: фаза — это отдельная транзакция и отдельный "
+                "чекпойнт, а здесь их одна на всё. Тихо склеить фазы значило "
+                "бы объявить чекпойнт, которого нет. Режь план на пачку — "
+                "`compiler.split_phases(program)` — и веди звенья по одному"
+                if k == "phases" else f"неизвестное поле конверта '{k}'")
             diags.append(Diagnostic(code=PARSE_UNKNOWN_FIELD, field_name=k,
                                     candidates=sorted(known_top),
-                                    message_ru=f"неизвестное поле конверта '{k}'"))
+                                    message_ru=message))
     if "intent" in program:
         intent = program.get("intent")
         if not isinstance(intent, str):
@@ -589,9 +719,52 @@ def _parse_and_check_internal(
                 if value.get("by") == "ref":
                     refs.append((p.name, value.get("value"), p))
             elif p.kind == "refs_w" and isinstance(value, list):
-                refs.extend((f"{p.name}[{j}]", item.get("value"), p)
-                            for j, item in enumerate(value)
-                            if isinstance(item, dict) and item.get("by") == "ref")
+                for j, item in enumerate(value):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("by") == "ref":
+                        refs.append((f"{p.name}[{j}]", item.get("value"), p))
+                        continue
+                    # ВТОРАЯ СТУПЕНЬ СЕЛЕКТОРА (`{"by": "face", "of": ...}`).
+                    #
+                    # РЕБРО ГРАФА БЕРЁТСЯ ИЗНУТРИ, И ЭТО ОБЯЗАТЕЛЬНО, А НЕ
+                    # АККУРАТНО. Обход ниже — не родовой: он смотрит ровно на
+                    # ВЕРХНИЙ уровень элемента списка. Ссылка, уехавшая на
+                    # уровень глубже (в `of`), стала бы для него невидимой — и
+                    # тогда KIR-L003 («ref не указывает на более ранний оп») и
+                    # KIR-L004 (род результата) перестали бы срабатывать МОЛЧА,
+                    # а эмиттер сослался бы на переменную C# без гарантии, что
+                    # производящий оп стоит раньше. Именно поэтому вторая
+                    # ступень несёт ЦЕЛЫЙ селектор, а не голый id опа: ребро
+                    # остаётся выразимым в тех же терминах, и учить об этом
+                    # надо ровно одно место — вот это.
+                    inner = item.get("of")
+                    if (item.get("by") == faceref.BY_FACE
+                            and isinstance(inner, dict)
+                            and inner.get("by") == "ref"):
+                        refs.append((f"{p.name}[{j}].of", inner.get("value"), p))
+        # RELATE, АДРЕС ОТ ЭЛЕМЕНТА: ссылка живёт ВНУТРИ значения точечного
+        # параметра, то есть ровно на том уровне глубже, о котором предупреждает
+        # блок выше. Ребро берётся здесь, и берётся ОТДЕЛЬНЫМ списком, а не
+        # подмешиванием в `refs`: проверка рода (KIR-L004) спрашивает
+        # `param_spec.ref_kinds`, а у рода `pt_xy`/`pt_xyz` он ПУСТ по
+        # построению (точка не принимает ссылок), — значит общая ветка отказала
+        # бы КАЖДОМУ верному адресу. Род здесь и не при чём: адрес не передаёт
+        # ссылку в C#, он ЧИТАЕТ числа адресуемого опа на компиляции, и
+        # единственное требование к цели — стоять ВЫШЕ. Какие операции вообще
+        # адресуемы, решает `relate.ELEMENT_GEOMETRY` на стадии ground: этот
+        # список — про порядок, а не про геометрию.
+        for key, ref in relate.element_address_refs(n):
+            if ref not in created:
+                diags.append(Diagnostic(
+                    code="KIR-L003", op_index=idx, op_id=n["id"],
+                    field_name=f"{key}.at_element", got=ref,
+                    candidates=sorted(created),
+                    message_ru=(
+                        f"адрес от элемента: «{ref}» не указывает на более "
+                        f"ранний оп этой программы. Адрес читает числа, "
+                        f"которые автор уже написал, поэтому адресуемый оп "
+                        f"обязан стоять ВЫШЕ адресующего")))
         for key, ref, param_spec in refs:
             if ref not in created:
                 diags.append(Diagnostic(
@@ -611,6 +784,144 @@ def _parse_and_check_internal(
                                 "совместимого типизированного рода")))
         if ospec.result.referenceable:
             created[n["id"]] = ospec
+        # CONTOUR: прямая ломаная ЛИБО типизированный эскиз — ровно одно.
+        #
+        # У операции, которая умеет и то и другое, форма задана ДВАЖДЫ, и
+        # «оба сразу» ровно так же неоднозначны, как «ни одного»: в первом
+        # случае непонятно, какое из двух описаний истинно, во втором строить
+        # нечего. Оба обязаны быть типизированным отказом, а не догадкой —
+        # тот же закон и тот же код KIR-P007, что у place_family ниже.
+        #
+        # Заменить `outline` на `contour` было нельзя: обратный ход
+        # (decompile/materialize.py) эмитирует именно прямые точки, и замена
+        # разомкнула бы круг. Отсюда параллельное поле, отсюда и это правило.
+        #
+        # ПРАВИЛО ЧИТАЕТСЯ ИЗ РЕЕСТРА, А НЕ ИЗ СПИСКА ИМЁН ОПОВ: пара — это
+        # параметр рода `pts` и параметр рода `region` у одной операции.
+        # Следующая операция, которой достанется эскиз, получит проверку
+        # вместе с полем, а не отдельным коммитом «мы забыли».
+        #
+        # ПОЛОВИНА ПРАВИЛА, КОТОРУЮ ПЛАН СКАЗАТЬ НЕ ВПРАВЕ (09.08.2026,
+        # волна проёма). «Оба сразу» неоднозначны ВСЕГДА и отказывают здесь.
+        # «Ни одного» — нет: у операции с развилкой `variety` (закрытое
+        # множество перегрузок Revit; имя дискриминатора — соглашение
+        # реестра, NAMING NOTE в `ops_struct.py`) обязательность формы
+        # УСЛОВНА ПО РОДУ, а план родов не разбирает. У create_opening род
+        # `wall_rect` формы не имеет вовсе — он задаётся двумя углами, — и
+        # общий отказ «форма не задана» обвинял бы верную программу. Нижняя
+        # половина взаимной обязательности живёт поэтому в ветке рода
+        # (`opening_emit._emit_host_face`, типизированный KIR-P005,
+        # называющий ОБА входа), ровно тем же швом, которым `create_railing`
+        # и `create_foundation` держат свои условно обязательные поля.
+        outline_p = next((p.name for p in ospec.params if p.kind == "pts"), None)
+        region_p = next((p.name for p in ospec.params if p.kind == "region"), None)
+        variety_dispatched = any(p.name == "variety" for p in ospec.params)
+        if outline_p and region_p:
+            # Поле, о котором уже сказано конкретнее (кривой контур, битый
+            # регион), здесь не пересказывается вторым, более общим голосом.
+            named = {d.field_name for d in diags if d.op_id == n["id"]}
+            has_outline, has_region = outline_p in n, region_p in n
+            if not (named & {outline_p, region_p}):
+                if has_outline and has_region:
+                    diags.append(Diagnostic(
+                        code=PARSE_EXCLUSIVE_FIELDS, op_index=idx,
+                        op_id=n["id"], field_name=region_p,
+                        expected=f"{outline_p} ЛИБО {region_p}",
+                        got=f"и {outline_p}, и {region_p}",
+                        message_ru=(
+                            f"{n['op']}: форма задана дважды — {outline_p} "
+                            f"(прямая ломаная) и {region_p} (эскиз CONTOUR). "
+                            f"Нужно ровно одно из двух: какое из описаний "
+                            f"истинно, компилятор угадывать не станет")))
+                elif not has_outline and not has_region and not variety_dispatched:
+                    diags.append(Diagnostic(
+                        code=PARSE_EXCLUSIVE_FIELDS, op_index=idx,
+                        op_id=n["id"], field_name=outline_p,
+                        expected=f"{outline_p} ЛИБО {region_p}", got=None,
+                        message_ru=(
+                            f"{n['op']}: форма не задана — нужен либо "
+                            f"{outline_p} (ломаная из 3..64 точек), либо "
+                            f"{region_p} (эскиз CONTOUR: rect/l/poly, дуги, "
+                            f"отверстия)")))
+            if has_region:
+                # Отверстия у региона СВОИ (region.holes). Принять рядом с
+                # ним ещё и плоский `holes` значило бы взять одно описание
+                # проёмов и молча выбросить другое.
+                for p in ospec.params:
+                    if p.kind == "pts_list" and p.name in n:
+                        diags.append(Diagnostic(
+                            code=PARSE_EXCLUSIVE_FIELDS, op_index=idx,
+                            op_id=n["id"], field_name=p.name,
+                            expected=f"{p.name} ЛИБО {region_p}",
+                            got=f"и {p.name}, и {region_p}",
+                            message_ru=(
+                                f"{n['op']}: {p.name} несовместим с "
+                                f"{region_p} — у эскиза отверстия свои "
+                                f"({region_p}.holes), и держать два описания "
+                                f"проёмов сразу значит потерять одно из них")))
+        # ВИНТОВОЙ МАРШ: прямые концы ЛИБО винт — ровно одно.
+        #
+        # Тот же закон и тот же код KIR-P007, что у CONTOUR выше и у
+        # place_family ниже, и по той же причине: у операции, умеющей обе
+        # формы, «оба сразу» так же неоднозначны, как «ни одного» — в первом
+        # случае непонятно, какая из двух форм марша истинна, во втором
+        # строить нечего. Догадка здесь означала бы ТИХО ДРУГУЮ лестницу.
+        #
+        # ПРАВИЛО ЧИТАЕТСЯ ИЗ РЕЕСТРА: пара — это параметр рода `spiral` и
+        # концы отрезка (род `pt_xy`) у одной операции. Второй оп, которому
+        # достанется винт, получит проверку вместе с полем, а не отдельным
+        # коммитом «мы забыли».
+        #
+        # Заменить прямые концы винтом было нельзя: обратный ход
+        # (decompile/lift.py::_lift_stairs) эмитирует именно `p0_mm`/`p1_mm`.
+        spiral_p = next((p.name for p in ospec.params if p.kind == "spiral"),
+                        None)
+        if spiral_p:
+            ends = [p.name for p in ospec.params if p.kind == "pt_xy"]
+            present_ends = [k for k in ends if k in n]
+            has_spiral = spiral_p in n
+            # Поле, о котором уже сказано конкретнее (битая точка, битый
+            # винт), здесь не пересказывается вторым, более общим голосом.
+            named = {d.field_name for d in diags if d.op_id == n["id"]}
+            if not (named & ({spiral_p} | set(ends))
+                    or any(isinstance(f, str) and f.startswith(spiral_p + ".")
+                           for f in named)):
+                if present_ends and has_spiral:
+                    diags.append(Diagnostic(
+                        code=PARSE_EXCLUSIVE_FIELDS, op_index=idx,
+                        op_id=n["id"], field_name=spiral_p,
+                        expected=f"{'/'.join(ends)} ЛИБО {spiral_p}",
+                        got=f"и {'/'.join(present_ends)}, и {spiral_p}",
+                        message_ru=(
+                            f"{n['op']}: марш задан дважды — "
+                            f"{'/'.join(ends)} (прямой) и {spiral_p} "
+                            f"(винтовой). Нужно ровно одно из двух: какая из "
+                            f"двух форм истинна, компилятор угадывать не "
+                            f"станет")))
+                elif not present_ends and not has_spiral:
+                    diags.append(Diagnostic(
+                        code=PARSE_EXCLUSIVE_FIELDS, op_index=idx,
+                        op_id=n["id"], field_name=ends[0],
+                        expected=f"{'/'.join(ends)} ЛИБО {spiral_p}", got=None,
+                        message_ru=(
+                            f"{n['op']}: марш не задан — нужны либо оба конца "
+                            f"{'/'.join(ends)} (прямой марш), либо "
+                            f"{spiral_p} (винтовой: center_mm, radius_mm, "
+                            f"start_angle_deg, included_angle_deg, "
+                            f"clockwise)")))
+                elif len(present_ends) == 1:
+                    # Половина прямого марша — не марш: одна точка отрезка не
+                    # задаёт кривую (тот же довод, что у place_family).
+                    diags.append(Diagnostic(
+                        code=PARSE_EXCLUSIVE_FIELDS, op_index=idx,
+                        op_id=n["id"], field_name=present_ends[0],
+                        expected=f"{'/'.join(ends)} вместе",
+                        got=present_ends[0],
+                        message_ru=(
+                            f"{n['op']}: одна точка марша не задаёт прямую "
+                            f"лестницу — нужны оба конца "
+                            f"{'/'.join(ends)}, либо винтовой {spiral_p} "
+                            f"вместо них")))
         # place_family: ровно ОДИН способ задать положение.
         #
         # У Revit это две разные перегрузки NewFamilyInstance — по точке и по
@@ -793,6 +1104,254 @@ def _parse_and_check(program: Any, *, bulk: bool = False) -> list[dict]:
     return plan_program(program, bulk=bulk).to_ops()
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ПЛАН СТРОИТЕЛЬСТВА — ОДИН СКРИПТ РЕЖЕТСЯ НА ПАЧКУ ПРОГРАММ
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# ЧТО ЭТО ЗАКРЫВАЕТ, ЧИСЛОМ. Здание сегодня нельзя написать одним скриптом
+# ВООБЩЕ: скрипт с `phase()` получает СРАЗУ ДВА отказа — KIR-P003 («неизвестное
+# поле конверта 'phases'») и KIR-L002 («create_stairs — единственный оп своей
+# программы»), — и второй отказ сам же советует то, что и есть работа, которую
+# модель делает в уме: «здание — это ПАЧКА программ: тело отдельно, лестницы
+# отдельно; уровень доступен лестничной по ИМЕНИ». Замер по корпусу отказов
+# (`data/telemetry/kir_rejections.jsonl`, 1469 строк, 16.07–04.08, попытками
+# авторства, а не строками: 349 попыток при склейке строк одной компиляции —
+# `coverage_feed.record_rejections` пишет их подряд, каждую со своим now()):
+# в 105 попытках из 349 (30.1%) отказ — это ГРАНИЦА ПРОГРАММЫ, и ни один из
+# четырёх её видов не является ошибкой в геометрии:
+#
+#     бюджет программы (KIR-L001)          50 попыток
+#     ссылка через границу (KIR-L003)      44
+#     уровень по ИМЕНИ не найден           10   ← ровно тот совет, что выше
+#     соло-оп с соседом (KIR-L002)          1
+#
+# Разметку границ автор уже рисует (`course.phase()`, 09.08). Здесь стоит
+# ВТОРАЯ половина: план превращается в ПАЧКУ программ — ту самую единицу,
+# которой здание уже является для судьи (`design_check.check_bundle`), для
+# чертежа (`preview`) и для витрины (`live/plan_stream`). Второго механизма не
+# заводится: и вход (таблица `phases`), и выход (пачка) уже существовали.
+#
+# ЧЕГО ЗДЕСЬ НЕТ И НЕ БУДЕТ. Бюджет `MAX_OPS_PER_PROGRAM` не поднимается ни на
+# единицу: каждое звено пачки идёт через тот же `plan_program` и меряется тем
+# же бюджетом. План не даёт написать программу БОЛЬШЕ — он даёт написать
+# ЗДАНИЕ, не считая границы в уме.
+
+
+@dataclass(frozen=True)
+class PhaseLink:
+    """Одно звено плана: имя фазы, её номер и её ПРОГРАММА.
+
+    Имя едет РЯДОМ с программой, а не внутри неё, и это не стиль: конверт
+    программы закрыт (`known_top`), и лишнее поле в нём — типизированный отказ
+    KIR-P003. Звено обязано быть программой, неотличимой от написанной руками,
+    иначе «исполняется то же самое» перестало бы быть правдой.
+    """
+
+    index: int
+    name: str
+    program: dict
+
+
+def _refuse_plan(message: str, **fields: Any) -> KirRefusal:
+    return KirRefusal([Diagnostic(code=PLAN_PHASE_SHAPE,
+                                  message_ru=message, **fields)])
+
+
+def split_phases(program: Any) -> list[PhaseLink]:
+    """Программа с таблицей `phases` -> ПАЧКА программ, по одной на фазу.
+
+    ЧИСТАЯ ФУНКЦИЯ: ничего не исполняет, ничего не заземляет, ни одного опа не
+    трогает. Опы уезжают в звенья ПОБАЙТОВО теми же — их дайджест подписывает
+    замысел, и переписанный по дороге оп сделал бы подпись подписью не того.
+
+    ЗАКОН, КОТОРЫЙ ЗДЕСЬ ПРОВЕРЯЕТСЯ, РОВНО ОДИН — РАЗБИЕНИЕ. `op_ids` всех
+    фаз, сцепленные по порядку, обязаны быть ТЕМ ЖЕ списком id, что и `ops`
+    программы: тот же порядок, каждый ровно один раз. Всё остальное —
+    бюджет, соло-оп, DAG ссылок, границы чисел — проверяет `plan_program` НАД
+    КАЖДЫМ ЗВЕНОМ, и повторять его здесь значило бы завести второй экземпляр
+    правила, который разойдётся с первым на первой же правке реестра.
+
+    ПОЧЕМУ ПРОВЕРЯЕТСЯ ХОТЬ ЧТО-ТО, если таблицу строит `course.phase()`,
+    который уже её и держит. Потому что таблица приезжает в КОНВЕРТЕ, а конверт
+    может прислать кто угодно: `serving` не отличает конверт, собранный
+    песочницей, от конверта, набранного руками. Разбиение — единственный факт,
+    который здесь нельзя восстановить ниоткуда ещё, и молча съеденный лишний
+    оп означал бы элемент, который никто не построит и о котором никто не
+    скажет.
+    """
+    if not isinstance(program, dict):
+        raise _refuse_plan("план строительства — это программа с таблицей "
+                           "`phases` в конверте",
+                           field_name="program",
+                           got=type(program).__name__)
+    phases = program.get("phases")
+    ops = program.get("ops")
+    if not isinstance(ops, list) or not ops:
+        raise _refuse_plan("ops — непустой список", field_name="ops")
+    if not isinstance(phases, list) or not phases:
+        raise _refuse_plan(
+            "у плана строительства обязана быть непустая таблица `phases`",
+            field_name="phases", got=type(phases).__name__)
+    flat: list[str] = []
+    links: list[PhaseLink] = []
+    envelope = {key: value for key, value in program.items()
+                if key not in ("ops", "phases")}
+    by_id = {}
+    for op in ops:
+        if not isinstance(op, dict) or not isinstance(op.get("id"), str):
+            raise _refuse_plan(
+                "план режется ПО ИДЕНТИФИКАТОРАМ опов, и оп без строкового "
+                "`id` в нём неадресуем",
+                field_name="ops", got=type(op).__name__)
+        by_id[op["id"]] = op
+    for position, row in enumerate(phases):
+        if not isinstance(row, dict):
+            raise _refuse_plan(
+                f"строка `phases[{position}]` — не объект",
+                field_name="phases", got=type(row).__name__)
+        if row.get("index") != position:
+            raise _refuse_plan(
+                f"фазы плана нумеруются подряд с нуля, а `phases[{position}]` "
+                f"назвалась номером {row.get('index')!r}. Номер фазы — её "
+                f"адрес в отчёте и в метке `{spec.CROSS_PHASE_BY}`, и пропуск "
+                f"в нумерации сделал бы этот адрес неоднозначным",
+                field_name="phases", expected=position, got=row.get("index"))
+        name = row.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise _refuse_plan(
+                f"у фазы №{position} нет имени: отказ и отчёт называют фазу, "
+                f"на которой план встал, и безымянное звено нечем назвать",
+                field_name="phases", got=repr(name))
+        op_ids = row.get("op_ids")
+        if not isinstance(op_ids, list) or not op_ids:
+            raise _refuse_plan(
+                f"фаза «{name}» (№{position}) не назвала ни одной операции. "
+                f"Пустая фаза — это пустая транзакция и лишний чекпойнт",
+                field_name="phases", got=op_ids)
+        link_ops = []
+        for oid in op_ids:
+            if not isinstance(oid, str) or oid not in by_id:
+                raise _refuse_plan(
+                    f"фаза «{name}» (№{position}) называет операцию "
+                    f"{oid!r}, которой в программе нет",
+                    field_name="phases", got=oid,
+                    candidates=sorted(by_id)[:12])
+            link_ops.append(by_id[oid])
+        flat.extend(op_ids)
+        links.append(PhaseLink(
+            index=position, name=name.strip(),
+            program={**envelope, "ops": link_ops}))
+    written = [op["id"] for op in ops]
+    if flat != written:
+        missing = [oid for oid in written if oid not in set(flat)]
+        twice = sorted({oid for oid in flat if flat.count(oid) > 1})
+        raise _refuse_plan(
+            f"таблица `phases` не является РАЗБИЕНИЕМ программы: она называет "
+            f"{len(flat)} адресов при {len(written)} операциях"
+            + (f"; не попали в план: {', '.join(missing[:8])}" if missing else "")
+            + (f"; названы дважды: {', '.join(twice[:8])}" if twice else "")
+            + (""
+               if (missing or twice) else
+               "; порядок фаз разошёлся с порядком операций в скрипте"),
+            field_name="phases", expected=len(written), got=len(flat),
+            candidates=(missing or twice)[:12])
+    return links
+
+
+def phase_products(ops: Sequence[Any], payload: Any) -> dict[str, int]:
+    """id опа -> ElementId, взятый из КВИТАНЦИИ ИСПОЛНЕНИЯ этой фазы.
+
+    ЧТО СЧИТАЕТСЯ ПРОДУКТОМ. Только результат, который реестр объявил
+    ССЫЛАЕМЫМ (`ResultSpec.referenceable`) — то есть ровно то, на что внутри
+    программы законен `by=ref`. Группа и удаление несут идентичность и
+    ссылаемыми НЕ являются, и это записано в докстроке самого `ResultSpec`:
+    подставить их id в селектор следующей фазы значило бы разрешить через
+    границу больше, чем разрешено внутри программы.
+
+    ГДЕ ЛЕЖИТ ЧИСЛО — ГОВОРИТ РЕЕСТР (`identity_field`), а не догадка по имени
+    ключа. Ключ сегодня всюду `"id"`, но он объявлен полем спецификации, и
+    зашитая строка `"id"` разошлась бы с реестром молча.
+
+    МОЛЧАНИЕ ЗДЕСЬ ЗАКОННО: строка без идентичности просто не становится
+    продуктом. Отказ поднимает ПОТРЕБИТЕЛЬ (`substitute_phase_results`), когда
+    метка ищет продукта и не находит, — потому что только там известно, что
+    его действительно ждали.
+    """
+    products: dict[str, int] = {}
+    if not isinstance(payload, dict):
+        return products
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        ospec = spec.OPS.get(op.get("op"))
+        if ospec is None or not ospec.result.referenceable:
+            continue
+        row = payload.get(op.get("id"))
+        if not isinstance(row, dict):
+            continue
+        value = row.get(ospec.result.identity_field)
+        if isinstance(value, bool):
+            continue
+        try:
+            number = int(value)                     # мост шлёт и "42", и 42
+        except (TypeError, ValueError):
+            continue
+        if 1 <= number <= ELEMENT_ID_MAX:
+            products[str(op["id"])] = number
+    return products
+
+
+def substitute_phase_results(program: Any, products: Any) -> dict:
+    """Метки `phase_result` -> `{"by": "element_id", "value": <int>}`.
+
+    ЭТО И ЕСТЬ ТО ЕДИНСТВЕННОЕ, ЧТО ПЕРЕСЕКАЕТ ГРАНИЦУ ПРОГРАММЫ. `by=ref`
+    через границу НЕ проходит и проходить не может: соседняя фаза исполнена
+    ОТДЕЛЬНОЙ транзакцией, и внутрипрограммной ссылки на её элемент к этому
+    моменту не существует. Что существует — настоящий ElementId в квитанции
+    той фазы; подстановка переносит его туда, куда автор поставил метку, и
+    ровно этим снимает с автора перепечатывание id из прошлой квитанции.
+
+    НЕНАЙДЕННЫЙ ПРОДУКТ — ТИПИЗИРОВАННЫЙ ОТКАЗ, А НЕ ПРОПУСК. Метка есть
+    ОБЯЗАТЕЛЬСТВО подставить: оставить её как есть значило бы отправить в
+    `plan_program` форму селектора, которой в языке нет, и получить отказ,
+    указывающий не на ту причину.
+    """
+    if not isinstance(program, dict):
+        raise _refuse_plan("звено плана — программа", field_name="program",
+                           got=type(program).__name__)
+    table = products if isinstance(products, dict) else {}
+
+    def walk(value: Any, oid: str) -> Any:
+        if isinstance(value, dict):
+            if value.get("by") == spec.CROSS_PHASE_BY:
+                producer = str(value.get("value"))
+                number = table.get(producer)
+                if number is None:
+                    raise _refuse_plan(
+                        f"оп `{oid}` ссылается на результат фазы "
+                        f"№{value.get('phase')} (оп `{producer}`), а та фаза "
+                        f"не вернула его ElementId. Подставить нечего: "
+                        f"свидетель произведшей фазы такого продукта не "
+                        f"назвал",
+                        field_name="by=" + spec.CROSS_PHASE_BY, op_id=oid,
+                        got=producer, candidates=sorted(table)[:12])
+                return {"by": "element_id", "value": number}
+            return {key: walk(item, oid) for key, item in value.items()}
+        if isinstance(value, list):
+            return [walk(item, oid) for item in value]
+        return value
+
+    ops = []
+    for op in program.get("ops") or ():
+        if not isinstance(op, dict):
+            ops.append(op)
+            continue
+        oid = str(op.get("id"))
+        ops.append({key: (item if key in ("op", "id") else walk(item, oid))
+                    for key, item in op.items()})
+    return {**{k: v for k, v in program.items() if k != "ops"}, "ops": ops}
+
+
 # ── emit ─────────────────────────────────────────────────────────────────────
 
 def _emit_collector(kind: str, where: dict, var: str) -> str:
@@ -855,6 +1414,22 @@ _TYPE_POOL_COLLECTOR_CS: dict[str, str] = {
     "duct_types": ".OfClass(typeof(Autodesk.Revit.DB.Mechanical.DuctType))",
     "duct_system_types": ".OfClass(typeof(Autodesk.Revit.DB.Mechanical.MechanicalSystemType))",
     "cable_tray_types": ".OfClass(typeof(Autodesk.Revit.DB.Electrical.CableTrayType))",
+    # wave/mep-electrical (2026-08-09) — зеркало трёх новых __AddPool в
+    # open_model.GROUND_SNAPSHOT_CS (два места, один закон; ворота компилируют
+    # обе таблицы независимо, так что расхождение видно, а не тихо).
+    "conduit_types": ".OfClass(typeof(Autodesk.Revit.DB.Electrical.ConduitType))",
+    "flex_duct_types": ".OfClass(typeof(Autodesk.Revit.DB.Mechanical.FlexDuctType))",
+    "flex_pipe_types": ".OfClass(typeof(Autodesk.Revit.DB.Plumbing.FlexPipeType))",
+    # wave/analysis (2026-08-09) — зеркало четырёх новых __AddPool в
+    # open_model.GROUND_SNAPSHOT_CS (два места, один закон; ворота компилируют
+    # обе таблицы независимо, так что расхождение видно, а не тихо). Спросить
+    # каталог ДО попытки здесь важнее обычного: в реальном расчётном проекте
+    # случаев загружения десятки, и `by=name` без предварительного списка —
+    # это KIR-G101/G102 ходом позже.
+    "load_cases": ".OfClass(typeof(Autodesk.Revit.DB.Structure.LoadCase))",
+    "point_load_types": ".OfClass(typeof(Autodesk.Revit.DB.Structure.PointLoadType))",
+    "line_load_types": ".OfClass(typeof(Autodesk.Revit.DB.Structure.LineLoadType))",
+    "area_load_types": ".OfClass(typeof(Autodesk.Revit.DB.Structure.AreaLoadType))",
     "column_symbols_structural": (".OfClass(typeof(FamilySymbol))"
                                   ".OfCategory(BuiltInCategory.OST_StructuralColumns)"),
     "column_symbols_architectural": (".OfClass(typeof(FamilySymbol))"
@@ -876,6 +1451,35 @@ _TYPE_POOL_COLLECTOR_CS: dict[str, str] = {
                    " || __pt == FamilyPlacementType.CurveBased; } catch { return false; } })"),
     "foundation_symbols": (".OfClass(typeof(FamilySymbol))"
                             ".OfCategory(BuiltInCategory.OST_StructuralFoundation)"),
+    # wave/framing (2026-08-09) — зеркало нового __AddPool в
+    # open_model.GROUND_SNAPSHOT_CS (два места, один закон; ворота компилируют
+    # обе таблицы независимо, так что расхождение видно, а не тихо).
+    # ЖИВОЙ ЗАМЕР 10.08.2026: `TrussType` компилируется 6/6 и ЕСТЬ в API,
+    # но Revit 2023 бросает на нём в рантайме («exists in the API, but not
+    # in Revit's native object model — try FamilySymbol»). Снимок собирается
+    # ОДНИМ телом, поэтому падал весь снимок и с ним ЛЮБАЯ живая запись.
+    "truss_types": (".OfClass(typeof(FamilySymbol))"
+                    ".OfCategory(BuiltInCategory.OST_Truss)"),
+    # wave/sweep (2026-08-09). `slab_edge_types` — обычный сбор по классу.
+    # `wall_sweep_types` — ЕДИНСТВЕННАЯ строка этой таблицы, собранная по
+    # категориям, и это не вкус: класса `WallSweepType`-как-ElementType в API
+    # НЕТ ВОВСЕ (`WallSweepType` — перечисление {Sweep, Reveal}, замерено
+    # компиляцией на шести версиях), а сам тип профиля живёт обычным
+    # ElementType в OST_Cornices либо OST_Reveals. `WhereElementIsElementType`
+    # обязателен: без него в пул попали бы и сами построенные профили.
+    "slab_edge_types": ".OfClass(typeof(SlabEdgeType))",
+    "wall_sweep_types": (".WherePasses(new ElementMulticategoryFilter("
+                         "new List<BuiltInCategory> { "
+                         "BuiltInCategory.OST_Cornices, "
+                         "BuiltInCategory.OST_Reveals }))"
+                         ".WhereElementIsElementType()"),
+    # wave/detail (2026-08-09) — зеркало нового __AddPool в
+    # open_model.GROUND_SNAPSHOT_CS (два места, один закон; ворота компилируют
+    # обе таблицы независимо, так что расхождение видно, а не тихо). ПО
+    # КЛАССУ, а не по категории: OST_FilledRegion держит и сами заливки, и их
+    # типы, то есть категорийный каталог показал бы модели строки, которые
+    # `FilledRegion.Create` отвергнет.
+    "filled_region_types": ".OfClass(typeof(FilledRegionType))",
 }
 
 
@@ -1041,7 +1645,11 @@ def compile_program(program: Any, revit_version: str = "2026",
                     expected_document: Any = None,
                     expected_identities: Sequence[
                         ElementIdentityProof] | None = None,
-                    open_model_profile: Any = None) -> CompileOutput:
+                    open_model_profile: Any = None,
+                    turn_id: str = "",
+                    action_id: str = "",
+                    query_fingerprint: str = "",
+                    source_kind: str = "unknown") -> CompileOutput:
     """The public entry: any input -> ok+C# or refused+diagnostics(+handoff).
     Never raises (Any-Query invariant §14: the only forbidden outcome is a
     silently-wrong answer). EVERY refusal is reported to the rejection
@@ -1066,18 +1674,15 @@ def compile_program(program: Any, revit_version: str = "2026",
         # can classify before the snapshot read, then lower this SAME object
         # after the read instead of silently planning twice.
         planned = plan_program(program, bulk=bulk)
+        stage = "target_profile"
         # Grounders/emitters still operate on dicts; this is a detached lowering
         # view, never the plan object whose digest acceptance/evidence records.
         normed = planned.to_ops()
-        stage = "target_profile"
         if revit_version not in spec.REVIT_VERSIONS:
             raise KirRefusal([Diagnostic(code="KIR-E001", field_name="revit_version",
                                          expected=list(spec.REVIT_VERSIONS),
                                          got=revit_version,
                                          message_ru="неизвестная версия Revit")])
-        from kukai.compiler_contract import load_target_profile_manifest
-        target_profile = load_target_profile_manifest().profile_for_year(
-            revit_version)
         if normed and spec.OPS[normed[0]["op"]].family in spec.WRITE_FAMILIES:
             from kukai.ir import authoring, ground as ground_mod
             stage = "ground"
@@ -1121,28 +1726,20 @@ def compile_program(program: Any, revit_version: str = "2026",
                     if expected_identities is None
                     else tuple(expected_identities) + derived
                 )
-            stage = "lower"
-            lowered_program = lower_program(
-                grounded_program,
-                target_profile,
+            stage = "emit_authoring"
+            cs = authoring.emit_program(
+                grounded, revit_version,
+                planned.intent,
                 isolation=isolation,
                 disallow_wall_joins=disallow_wall_joins,
                 stamp_scope=stamp_scope,
                 expected_document=expected_document,
-                expected_identities=guarded_identities,
-                open_model_profile_digest=(
-                    open_model_profile.digest
-                    if open_model_profile is not None else None
-                ),
-            )
-            stage = "emit_authoring"
-            emitted_artifact = authoring.emit_artifact(lowered_program)
+                expected_identities=guarded_identities)
             return CompileOutput(
-                ok=True, csharp=emitted_artifact.source, planned=planned,
+                ok=True, csharp=cs, planned=planned,
                 grounded=grounded_program,
-                lowered=lowered_program,
-                emitted=emitted_artifact,
-                grounding_report=ground_mod.compiler_choices(grounded))
+                grounding_report=ground_mod.compiler_choices(grounded),
+                grounded_ops=grounded)
         stage = "emit_query"
         cs = emit_for_version(normed, revit_version)
         return CompileOutput(ok=True, csharp=cs, planned=planned)
@@ -1153,29 +1750,43 @@ def compile_program(program: Any, revit_version: str = "2026",
                    else [])
         from kukai.ir import coverage_feed
         coverage_feed.record_rejections(r.diagnostics, raw_ops,
-                                        query_id=query_id, revit_version=revit_version)
+                                        query_id=query_id,
+                                        revit_version=revit_version,
+                                        turn_id=turn_id,
+                                        action_id=action_id,
+                                        query_fingerprint=query_fingerprint,
+                                        source_kind=source_kind)
         unsupported = [d for d in r.diagnostics if d.code == GROUND_UNSUPPORTED_KIND]
         if unsupported:
             kinds = sorted({str(d.got) for d in unsupported if d.got is not None})
             out.handoff = {"route": "recipe-path", "reason": "unsupported_kind",
                            "kinds": kinds}
         return out
-    except Exception as e:  # noqa: BLE001 — compiler must never panic (RISK R1/R4 discipline)
+    except Exception:  # noqa: BLE001 — compiler must never panic (RISK R1/R4 discipline)
         incident_id = uuid.uuid4().hex
-        logger.exception(
-            "KIR compiler panic incident_id=%s stage=%s query_id=%s "
-            "revit_version=%s plan_digest=%s input_type=%s",
+        query_ref = _incident_log_ref(
+            query_id if isinstance(query_id, str) and query_id
+            else query_fingerprint
+        )
+        plan_digest = (
+            planned.plan_digest if isinstance(planned, PlannedProgram) else "-"
+        )
+        # Deliberately attach no exception object or stack information:
+        # messages and traceback source lines may contain source IR, model
+        # names, paths, or secrets.  incident_id is the correlation key.
+        logger.error(
+            "KIR compiler panic incident_id=%s stage=%s revit_version=%s "
+            "query_id_or_digest=%s plan_digest=%s input_type=%s",
             incident_id,
             stage,
-            query_id or "-",
-            revit_version,
-            planned.plan_digest if planned is not None else "-",
-            type(program).__name__,
+            _incident_revit_version_ref(revit_version),
+            query_ref,
+            plan_digest,
+            _incident_input_type(program),
         )
         return CompileOutput(ok=False, diagnostics=[Diagnostic(
             code="KIR-P000",
-            message_ru=("внутренняя ошибка компилятора; сообщите "
-                        f"incident_id={incident_id}"),
+            message_ru="внутренняя ошибка компилятора",
             incident_id=incident_id,
         )])
 
@@ -1187,7 +1798,11 @@ def compile_rebuild_chunk(program: Any, revit_version: str = "2026",
                           expected_identities: Sequence[
                               ElementIdentityProof] | None = None,
                           open_model_profile: Any = None,
-                          snapshot: Any = None) -> CompileOutput:
+                          snapshot: Any = None,
+                          turn_id: str = "",
+                          action_id: str = "",
+                          query_fingerprint: str = "",
+                          source_kind: str = "unknown") -> CompileOutput:
     """THE single policy point for INTERNAL rebuild-chunk compilation.
 
     Every internal rebuild path (handle_revit_rebuild dry-run gate, the A5
@@ -1222,4 +1837,8 @@ def compile_rebuild_chunk(program: Any, revit_version: str = "2026",
                            stamp_scope=stamp_scope,
                            expected_document=expected_document,
                            expected_identities=expected_identities,
-                           open_model_profile=open_model_profile)
+                           open_model_profile=open_model_profile,
+                           turn_id=turn_id,
+                           action_id=action_id,
+                           query_fingerprint=query_fingerprint,
+                           source_kind=source_kind)

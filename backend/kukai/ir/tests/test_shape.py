@@ -320,5 +320,232 @@ class RoundTripThroughTheArtefact(unittest.TestCase):
         self.assertEqual(back["triangles"], t)
 
 
+# ── свидетель ПОВЕРХНОСТИ (09.08.2026) ───────────────────────────────────────
+
+def _flat_grid(n: int = 2, step: float = 1000.0) -> tuple[list, list]:
+    """Плоская сетка n×n квадратов: у неё есть ВНУТРЕННИЕ вершины.
+
+    Именно внутренняя вершина отделяет новый свидетель от двух прежних: её
+    можно унести куда угодно, не тронув ни габарит (его держат углы), ни
+    число граней.
+    """
+    w = n + 1
+    verts = [[i * step, j * step, 0.0] for i in range(w) for j in range(w)]
+    tris = []
+    for i in range(n):
+        for j in range(n):
+            a, b = i * w + j, i * w + j + 1
+            c, d = (i + 1) * w + j, (i + 1) * w + j + 1
+            tris += [[a, b, c], [b, d, c]]
+    return verts, tris
+
+
+def _expected_payload(verts, tris) -> str:
+    """Прообраз, который свидетель обязан требовать, — тем же канонизатором."""
+    from kukai.ir.decompile.geometry_acceptance import mesh_surface_payload
+    from kukai.ir.decompile.recompile import GmMesh
+    from kukai.ir.shape_emit import _emitted_vertices
+
+    emitted = _emitted_vertices(verts)
+    return mesh_surface_payload(GmMesh(
+        vertices_mm=tuple(tuple(v) for v in emitted),
+        triangles=tuple(tuple(t) for t in tris)))
+
+
+class SurfaceWitnessIsTheExactPredicate(unittest.TestCase):
+    """Число граней закрывает молчание Salvage только наполовину.
+
+    Пересборка, сохранившая ЧИСЛО граней и сдвинувшая вершину, проходила и
+    габарит, и счётчик — и снаружи это успех. Точный предикат существовал с
+    первого дня Tier-G (`mesh_surface_payload`), но авторская ветка его не
+    звала НИ ОДНИМ импортом. Тесты ниже держат оба конца: что предикат тот
+    самый, и что он может ОТКАЗАТЬ.
+    """
+
+    def test_the_emitter_uses_the_tier_g_canonicaliser_itself(self):
+        """Не «такой же», а ТОТ ЖЕ: ожидание в C# — байт в байт прообраз
+        `mesh_surface_payload`, чей SHA-256 и есть `mesh_surface_digest`."""
+        import hashlib
+
+        from kukai.ir.decompile.geometry_acceptance import (
+            mesh_surface_digest, mesh_surface_payload)
+        from kukai.ir.decompile.recompile import GmMesh
+        from kukai.ir.emit_utils import cs_string_literal
+        from kukai.ir.shape_emit import _emitted_vertices
+
+        v, t = tetra()
+        cs = compile_program(_prog(v, t), revit_version="2026",
+                             snapshot={"levels": []}).csharp
+        self.assertIn(cs_string_literal(_expected_payload(v, t)), cs)
+        gm = GmMesh(
+            vertices_mm=tuple(tuple(x) for x in _emitted_vertices(v)),
+            triangles=tuple(tuple(x) for x in t))
+        self.assertEqual(
+            hashlib.sha256(mesh_surface_payload(gm).encode("utf-8")).hexdigest(),
+            mesh_surface_digest(gm))
+
+    def test_the_expectation_is_taken_from_the_EMITTED_vertices(self):
+        """Ожидание обязано считаться от вершин, которые реально уедут.
+
+        Координата, лёгшая ближе 0.005 мм к границе ячейки канона, при
+        округлении до сотых меняет ячейку. Ожидание, посчитанное от СЫРОГО
+        входа, требовало бы от Revit ячейку, которую ему никто не посылал, —
+        ложный отказ на верно построенном меше.
+        """
+        from kukai.ir.decompile.geometry_acceptance import mesh_surface_payload
+        from kukai.ir.decompile.recompile import GmMesh
+        from kukai.ir.emit_utils import cs_string_literal
+
+        # 1000.2451 -> в C# уедет 1000.25 -> ячейка 2001;
+        # сырое 1000.2451                  -> ячейка 2000. РАЗНЫЕ.
+        v, t = tetra()
+        v = [list(p) for p in v]
+        v[1][0] = 1000.2451
+        raw = mesh_surface_payload(GmMesh(
+            vertices_mm=tuple(tuple(x) for x in v),
+            triangles=tuple(tuple(x) for x in t)))
+        emitted = _expected_payload(v, t)
+        self.assertNotEqual(raw, emitted, "предпосылка теста: ячейки разошлись")
+        cs = compile_program(_prog(v, t), revit_version="2026",
+                             snapshot={"levels": []}).csharp
+        self.assertIn(cs_string_literal(emitted), cs)
+        self.assertNotIn(cs_string_literal(raw), cs)
+
+    def test_a_relocated_interior_vertex_is_invisible_to_the_older_witnesses(self):
+        """Тот самый случай, ради которого свидетель написан.
+
+        Габарит держат углы, число граней не меняется — оба прежних свидетеля
+        МОЛЧАТ. Прообраз поверхности меняется.
+        """
+        from kukai.ir.mesh import mesh_bbox
+
+        v, t = _flat_grid(2)
+        moved = [list(p) for p in v]
+        moved[4][0] += 400.0                     # внутренняя вершина
+        tol = spec.OPS["create_directshape"].tolerances["bbox_mm"]
+        self.assertFalse(
+            any(abs(a - b) > tol
+                for a, b in zip(mesh_bbox(v), mesh_bbox(moved))),
+            "габарит обязан остаться в допуске — иначе тест не о том")
+        self.assertEqual(len(t), len(t))
+        self.assertNotEqual(_expected_payload(v, t),
+                            _expected_payload(moved, t))
+
+    def test_the_canon_grid_is_the_tolerance_and_it_is_derived(self):
+        """Допуск — это шаг решётки, и он НЕ выведен здесь.
+
+        `surface_canon_mm` обязан быть равен `GEOM_CANON_MM` — замороженной
+        решётке Tier-G, на которой уже стоят контентно-адресуемое хранилище
+        геометрии и живой пост-коммитный предикат стенда. Разъедься они, и
+        свидетель сравнивал бы два разных канона, не сказав об этом.
+        """
+        from kukai.ir.decompile.schema import GEOM_CANON_MM
+
+        self.assertEqual(
+            spec.OPS["create_directshape"].tolerances["surface_canon_mm"],
+            GEOM_CANON_MM)
+
+    def test_mutation_above_the_grid_fires_and_below_it_does_not(self):
+        """Граница обнаружимости, обе стороны, ЧИСЛАМИ.
+
+        Ячейка канона шириной ровно `GEOM_CANON_MM`; координата 1000.0 мм —
+        её центр. Отсюда, без изобретения: сдвиг ≥ шага меняет номер ячейки
+        ВСЕГДА, сдвиг < половины шага от центра не меняет его НИКОГДА.
+        """
+        from kukai.ir.decompile.schema import GEOM_CANON_MM
+
+        v, t = tetra()
+        v = [list(p) for p in v]
+        v[1] = [1000.0, 0.0, 0.0]        # центр ячейки по всем трём осям
+        base = _expected_payload(v, t)
+        for delta, must_fire in (
+            (GEOM_CANON_MM, True),               # 0.5 — шаг решётки
+            (GEOM_CANON_MM / 2.0, True),         # 0.25 — ровно край ячейки
+            (0.24, False),
+            (0.2, False),
+            (-0.2, False),
+            (-0.24, False),
+            (5.0, True),                         # допуск габарита — а он молчит
+        ):
+            with self.subTest(delta=delta):
+                moved = [list(p) for p in v]
+                moved[1][0] += delta
+                fired = _expected_payload(moved, t) != base
+                self.assertEqual(must_fire, fired)
+
+    def test_the_witness_is_constructible_only_with_a_verdict(self):
+        """Свидетель поверхности обязан быть в реестре обязательств и
+        разряжаться КЛЮЧОМ, а не подстрокой."""
+        from kukai.ir.translation_cert import (
+            _ensure_table, audit_registry_coverage)
+
+        spec_row = _ensure_table()["create_directshape"]
+        self.assertEqual("model", spec_row.witness_source)
+        self.assertIn("surface", {o.key for o in spec_row.obligations})
+        self.assertEqual(
+            (), tuple(p for p in audit_registry_coverage()
+                      if "directshape" in p))
+
+    def test_surface_check_reads_the_same_geometry_as_the_count(self):
+        """Порядок проверок НЕСУЩИЙ: свидетель поверхности читает `__ge_`,
+        объявленный свидетелем числа граней. Переставь их — CS0103 у
+        пользователя, а не у нас."""
+        from kukai.ir.shape_emit import emit_directshape
+
+        v, t = tetra()
+        op = {"id": "D1", "mesh": {"vertices_mm": v, "triangles": t},
+              "category": "mass", "name": "меш"}
+        _d, _c, checks, _r = emit_directshape(op, "2026", "kir:test")
+        keys = [c.obligation_key for c in checks]
+        self.assertEqual(["bbox", "triangles", "surface"], keys)
+        declares = [c for c in checks if "var __ge_D1 =" in c.reader_cs]
+        self.assertEqual(1, len(declares))
+        self.assertEqual("triangles", declares[0].obligation_key)
+        self.assertLess(keys.index("triangles"), keys.index("surface"))
+
+    def test_no_hash_is_emitted_because_the_client_cannot_bind_one(self):
+        """Замер :52412 (09.08): `System.Security.Cryptography.SHA256` даёт
+        CS1069 на 2025 и 2026 — тип переадресован в сборку вне замыкания
+        ссылок клиента. Эмитировать хеш нельзя; сравнивается прообраз."""
+        v, t = tetra()
+        cs = compile_program(_prog(v, t), revit_version="2026",
+                             snapshot={"levels": []}).csharp
+        self.assertNotIn("Cryptography", cs)
+        self.assertNotIn("SHA256", cs)
+        self.assertIn("__KirCanonPayload(", cs)
+
+    def test_the_helper_is_absent_when_nothing_calls_it(self):
+        """Отсутствие остаётся отсутствием: программа без меша обязана быть
+        байт в байт прежней (тот же закон, что у `__ClassName`)."""
+        wall = {"ir_version": "1.0", "intent": "t",
+                "ops": [{"op": "create_wall", "id": "W1", "p0_mm": [0, 0],
+                         "p1_mm": [6000, 0], "height_mm": 3000,
+                         "level": {"by": "element_id", "value": 42}}]}
+        cs = compile_program(wall, revit_version="2026",
+                             snapshot={"levels": []}).csharp
+        self.assertNotIn("__KirCanonUnit", cs)
+        self.assertNotIn("__KirCanonPayload", cs)
+
+    def test_a_face_that_the_emission_grid_collapses_is_a_typed_refusal(self):
+        """Округление до сотых может СХЛОПНУТЬ иглу, которую законы mesh.py
+        пропускают (min ребро 1 мм, min площадь 1 мм²). Такой меш уехал бы в
+        Revit вырожденной гранью — здесь названный отказ, а не тихая потеря
+        свидетеля."""
+        # основание 1000 мм, высота 0.002 мм: площадь 1 мм², min ребро ~500 мм
+        verts = [[0.0, 0.0, 0.0], [1000.0, 0.0, 0.0], [500.0, 0.002, 0.0],
+                 [500.0, 400.0, 800.0]]
+        tris = [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]
+        diags: list = []
+        self.assertIsNotNone(
+            validate_mesh({"vertices_mm": verts, "triangles": tris},
+                          "D1", "mesh", diags),
+            "предпосылка теста: законы формы этот меш ПРОПУСКАЮТ")
+        out = compile_program(_prog(verts, tris), revit_version="2026",
+                              snapshot={"levels": []})
+        self.assertFalse(out.ok)
+        self.assertEqual([MESH_DEGENERATE], [d.code for d in out.diagnostics])
+        self.assertEqual("D1", out.diagnostics[0].op_id)
+
+
 if __name__ == "__main__":
     unittest.main()

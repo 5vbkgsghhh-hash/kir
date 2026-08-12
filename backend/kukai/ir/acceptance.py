@@ -45,9 +45,23 @@
   ``tools/capability_map.py``: там плечо ищется по роду параметра, а здесь оно
   в поведении Revit;
 * фитинги: ``route_pipe_system`` строит РОВНО len(segments) труб (connect.py
-  ``emit_segments_cs`` — одна строка Create на ребро), а 2 652 фитинга и 152
-  единицы арматуры Snowdon сделал Revit сам при НУЛЕ авторских. Значит
-  ``OST_PipeFitting`` — производная категория и не сверяется вовсе;
+  ``emit_segments_cs`` — одна строка Create на ребро), а вот ЧИСЛА фитингов
+  операция не называет. ПРИЧИНА ЗДЕСЬ БЫЛА НЕВЕРНОЙ до 10.08.2026 — стояло
+  «2 652 фитинга и 152 единицы арматуры Snowdon сделал Revit сам при НУЛЕ
+  авторских», и обе половины опровергнуты дёшево проверяемым. Фитинги
+  АВТОРСКИЕ: ``connect.emit_fittings_cs`` сам зовёт
+  ``doc.Create.NewElbowFitting``/``NewTeeFitting``/``NewTransitionFitting``
+  в каждом узле степени >= 2 (три места вызова: ``authoring.py`` 2951/3038/3137).
+  А числа — перепись ИСХОДНОЙ модели, а не выход пересборки: заголовок L0 у
+  ``snowdon_plumb_v3`` даёт ``OST_PipeFitting`` 2652, ``OST_DuctFitting`` 152,
+  ``OST_PipeAccessory`` 126 (замер 10.08.2026), то есть «152 арматуры» — это
+  счёт фитингов ВОЗДУХОВОДОВ с чужим ярлыком, арматуры в модели 126, и
+  арматуру не создаёт НИ ОДИН эмиттер пакета. Настоящая причина уже,
+  и она названа как незамеренная: ``classify_junction`` может свести стык к
+  голому ``Connector.ConnectTo`` и не породить элемента, а какое семейство
+  подставится в вызов, решают routing preferences — ни то, ни другое не
+  замерено. Поэтому ``OST_PipeFitting`` не сверяется: счётный свидетель
+  гейтил бы незамеренную величину, а не чужое решение;
 * производные категории существуют и у мирных опов: ``OST_SketchLines`` есть
   в 31 разборе из 31 (366 902 элемента), ``OST_StairsRuns``/``Landings``/
   ``RailingHandRail``/``RailingTopRail`` появляются сами вслед за лестницей и
@@ -77,12 +91,12 @@ acceptance-контуру.
 * ЛИШНЕЕ В НЕОБЪЯВЛЕННОЙ КАТЕГОРИИ — только справка. Отказ там валил бы
   каждую честную постройку (см. про производные выше);
 * ВЕРХНИЕ ГРАНИЦЫ СНИМАЮТСЯ ЦЕЛИКОМ, стоит программе содержать хоть один оп
-  с неизвестной категорией. На настоящем фасаде это 270 опов из 2 720
-  (``set_curtain_panel``, ``create_curtain_grid_line``, ``place_family``) —
-  то есть дубликаты в таких программах не ловятся. Снимаются они и точечно:
-  у категории, которая входит в две группы сразу (перекрытие и
-  фундаментная плита), и у категории, которую в этой же программе кто-то
-  порождает производно (ограждения при лестнице);
+  с неизвестной категорией (``set_curtain_panel``,
+  ``create_curtain_grid_line``) либо оп, чья дельта не ограничена сверху
+  (``place_family``: см. ниже) — то есть дубликаты в таких программах не
+  ловятся. Снимаются они и точечно: у категории, которая входит в две группы
+  сразу (перекрытие и фундаментная плита), и у категории, которую в этой же
+  программе кто-то порождает производно (ограждения при лестнице);
 * ИМЕНА УРОВНЕЙ СРАВНИВАЮТСЯ ДОСЛОВНО (после обрезки пробелов). Переименовали
   уровень между двумя переписями — будет расхождение, которого нет;
 * ДЕЛЬТУ СОЗДАНИЯ ОТ ЧУЖОЙ ПРАВКИ ОТЛИЧИТЬ НЕЧЕМ: если другой актор добавил
@@ -95,6 +109,48 @@ acceptance-контуру.
   document-bound bridge-read, строгий wire parser, разные ``before/after``
   фазы. Автономный новый вызывающий обязан использовать тот же адаптер.
 
+``PLACE_FAMILY`` БОЛЬШЕ НЕ СЛЕП, И ЭТО НЕ ОСЛАБЛЕНИЕ ПРАВИЛА, А ЗАКРЫТИЕ ДЫРЫ
+В НЁМ (09.08). Самый нагруженный пишущий оп реестра (7 000 построенных
+экземпляров, 6 обвинённых) до сегодня не мог дойти до независимого
+``ACCEPTED``: ``blind_ops`` непусто ⇒ ``AcceptanceRegistration.blind`` ⇒
+``INCONCLUSIVE`` при любой постройке. Причина слепоты была названа так:
+«категория экземпляра = категория семейства, а семейство приходит селектором
+symbol — из программы она не читается». Первая половина верна, вторая — нет,
+и разница решает всё: категория не читается ИЗ ПРОГРАММЫ, но она лежит в
+СНИМКЕ МОДЕЛИ. Каждая строка пула ``family_symbols`` несёт ``category``,
+прочитанную у Revit тем же ``Enum.GetName(BuiltInCategory, …)``, которым
+ключует элементы живая перепись (``open_model.GROUND_SNAPSHOT_CS`` против
+``acceptance_live.scope_census_fragment``) — то есть ДАННЫЕ О МОДЕЛИ, а не
+мнение автора программы, ровно как ``level_names_by_id`` из пула ``levels``.
+Снимок берётся ДО записи (``acceptance_runtime.prepare_acceptance``), поэтому
+пред-регистрация сохраняется по построению.
+
+ЧТО ЗДЕСЬ ОБЕЩАНО И ЧТО НЕТ:
+
+* обещано РОВНО «в клетке категории C прибавилось не менее N» — нижняя
+  граница по одной оси. Это единственное утверждение, которое верно у ЛЮБОЙ
+  правильной постройки, и его достаточно, чтобы несостоявшееся размещение
+  дало ``category_shortfall``;
+* ЧИСЛО НЕ ТОЧНОЕ (``AT_LEAST``), потому что вложенные общие семейства Revit
+  создаёт САМ: на 59-этажной башне это 21 555 элементов
+  (``tools/content_coverage.py``, 30.07), и часть из них ложится в категорию
+  родителя. ``EXACT`` завернул бы каждую честную постройку такого семейства;
+* по той же причине снимаются ВЕРХНИЕ ГРАНИЦЫ ВСЕЙ программы: вложенный
+  ребёнок вправе лечь в любую категорию, в том числе объявленную соседним
+  опом. Это ровно то, что было и при слепоте, — потери нет;
+* УРОВНЯ НЕТ (строка «плавающая»). Дверь и окно — тоже FamilyInstance, и у
+  них уровень объявлен НЕИЗВЕСТНЫМ по замеру: 76 из 15 569 дверей стоят на
+  уровне, отличном от уровня хозяина. Утверждать уровень у ``place_family``
+  значило бы поставить на неизмеренное там, где ошибка = ложный отказ верной
+  постройки;
+* КОГДА КАТЕГОРИЯ НЕ ДОКАЗАНА — ИМЕНОВАННЫЙ ОТКАЗ ОТ СУЖДЕНИЯ, а не тихая
+  деградация: пул недоступен или обрезан; кандидаты дают разные категории;
+  символа нет в снимке (его создаёт ``create_type``/``load_family`` этой же
+  программы — тот самый ``partial_blind_scope`` из контракта); категория
+  названа не именем ``BuiltInCategory`` (снимок падает на числовой запасной
+  путь) — такую клетку живая перепись НЕ ВЫДЕЛЯЕТ. Каждый случай остаётся
+  ``BlindOp`` со своей причиной, то есть ``ok:false``.
+
 ГРАНИЦА МОДУЛЯ. Обе публичные функции ЧИСТЫЕ: ни Revit, ни сети, ни диска, ни
 времени. Ожидание сериализуемо (:meth:`Expectation.to_dict`) и стабильно между
 процессами: строки отсортированы, множества выведены в кортежи. Уровень L2 и
@@ -104,6 +160,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
@@ -111,6 +168,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from kukai.ir import spec
 from kukai.ir.diag import KirRefusal
 from kukai.ir.midend import PlannedProgram
+from kukai.ir.record_ratchet import CLOSE_BY, STANDS, Entry, Ledger
 
 
 #: Уровень элемента, у которого его нет. НЕ None и не «неизвестно»: отсутствие
@@ -271,14 +329,35 @@ class Mismatch:
         }
 
 
+#: ПОЧЕМУ вердикт таков. Три исхода, и «проверять было нечего» среди них —
+#: отдельным словом, а не оттенком `accepted=False`. Отказ по замеру и
+#: отсутствие замера чинятся ПРОТИВОПОЛОЖНЫМ концом (первое — постройку,
+#: второе — ожидание), поэтому сливать их в один булев нельзя.
+VERDICT_MEASURED = "measured"
+VERDICT_MISMATCHED = "mismatched"
+VERDICT_NOTHING_TO_CHECK = "nothing_to_check"
+
+
 @dataclass(frozen=True, slots=True)
 class Verdict:
     """Итог сверки. ``accepted`` — единственное, что имеет силу.
 
+    ``accepted`` ВЫВЕДЕН, А НЕ ЗАПИСАН, И ПАДАЕТ ЗАКРЫТО. Прежде это было
+    ПОЛЕ, и `check_acceptance` клал в него `not mismatches`. При нуле
+    проверенных групп расхождений нет ПО ПОСТРОЕНИЮ — значит вердикт объявлял
+    успех, не проверив ничего, ровно в том случае, ради запрета которого
+    написан весь модуль. Теперь успех требует ДВУХ вещей сразу: ни одного
+    расхождения И хотя бы одной проверенной группы. Поля с именем ``accepted``
+    больше нет вовсе, поэтому вердикт, который врёт, нельзя и сконструировать.
+
+    ``reason`` ОТДЕЛЯЕТ НАХОДКУ ОТ ПУСТОТЫ. Оба случая дают ``accepted=False``,
+    но `mismatched` значит «постройка разошлась с ожиданием», а
+    `nothing_to_check` — «ожидание нечем провалить»; голое ``False`` слило бы
+    их, а лечатся они разным.
+
     ``vacuous=True`` — приёмка НИЧЕГО НЕ ПРОВЕРИЛА (ожидание пустое или всё в
-    нём неизвестно). Это состояние выведено в отдельное поле, потому что
-    ``accepted=True`` при нулевой проверке — ровно тот «уверенный успех, за
-    которым ничего нет», ради запрета которого написан весь модуль.
+    нём неизвестно). Поле оставлено: оно старше ``reason`` и на него уже
+    ссылаются снаружи (`preview` держит тот же приём под тем же именем).
 
     ``unexpected`` — категории, где дельта есть, а в ожидании их нет. Это
     СПРАВКА, а не отказ: производных элементов Revit делает больше, чем
@@ -286,12 +365,23 @@ class Verdict:
     бы каждую честную постройку.
     """
 
-    accepted: bool
     mismatches: tuple[Mismatch, ...]
     checked_groups: int
     unexpected: tuple[tuple[str, int], ...]
     upper_bounds_checked: bool
     blind_ops: tuple[BlindOp, ...]
+
+    @property
+    def accepted(self) -> bool:
+        """Успех = НЕТ расхождений И БЫЛО что проверять. Оба конъюнкта нужны:
+        первый без второго — это «сошлось» о пустом множестве."""
+        return not self.mismatches and self.checked_groups > 0
+
+    @property
+    def reason(self) -> str:
+        return (VERDICT_MISMATCHED if self.mismatches
+                else VERDICT_NOTHING_TO_CHECK if self.checked_groups == 0
+                else VERDICT_MEASURED)
 
     @property
     def vacuous(self) -> bool:
@@ -300,6 +390,7 @@ class Verdict:
     def to_dict(self) -> dict[str, Any]:
         return {
             "accepted": self.accepted,
+            "reason": self.reason,
             "vacuous": self.vacuous,
             "mismatches": [m.to_dict() for m in self.mismatches],
             "checked_groups": self.checked_groups,
@@ -315,8 +406,8 @@ class Verdict:
                     "проверяемой строки")
         if self.accepted:
             tail = "" if self.upper_bounds_checked else \
-                " (верхние границы не проверялись: в программе есть опы с "\
-                "неизвестной категорией)"
+                " (верхние границы не проверялись: в программе есть оп, чья "\
+                "дельта категорий не ограничена сверху)"
             return (f"сошлось; проверено групп категорий: "
                     f"{self.checked_groups}{tail}")
         parts = "; ".join(m.detail for m in self.mismatches[:4])
@@ -338,50 +429,31 @@ class Verdict:
 # поэтому связь между таблицами держит ТЕСТ (``test_acceptance``), а не
 # импорт.
 
-#: Оп → ключи переписи, куда попадёт его результат. Кортеж длиннее одного =
-#: «в одну из них, а в какую — не видно» (сверяется сумма).
-_OP_CATEGORIES: Mapping[str, tuple[str, ...]] = {
-    "create_wall": ("OST_Walls",),
-    "create_floor": ("OST_Floors",),
-    "create_floor_by_contour": ("OST_Floors",),
-    "create_roof": ("OST_Roofs",),
-    "create_ceiling": ("OST_Ceilings",),
-    "create_door": ("OST_Doors",),
-    "create_window": ("OST_Windows",),
-    "create_room": ("OST_Rooms",),
-    "create_level": ("OST_Levels",),
-    "create_grid": ("OST_Grids",),
-    "create_beam": ("OST_StructuralFraming",),
-    "create_stairs": ("OST_Stairs",),
-    "create_pipe": ("OST_PipeCurves",),
-    "create_duct": ("OST_DuctCurves",),
-    "create_cable_tray": ("OST_CableTray",),
-    "create_pipe_system": ("OST_PipeCurves",),
-    "route_pipe_system": ("OST_PipeCurves",),
-    "route_duct_system": ("OST_DuctCurves",),
-    "create_text": ("OST_TextNotes",),
-    "create_dimension": ("OST_Dimensions",),
-    # wave/room (2026-08-03): категория известна ТОЧНО — её задаёт сам вызов
-    # NewRoomBoundaryLines, а не селектор типа (типа у операции нет вовсе).
-    "create_room_separator": ("OST_RoomSeparationLines",),
-    # Колонна: категорию выбирает ЗАКРЫТОЕ перечисление самого опа, поэтому
-    # она известна точно — см. _category_of_op.
-    "create_column": ("OST_StructuralColumns", "OST_Columns"),
-    # Ограждение: ``OST_Railings`` не встретился НИ В ОДНОМ из 31 разбора, но
-    # таблица лифтера знает обе, и версия Revit могла бы решить иначе. Сумма
-    # по двум верна при любом ответе; выбрать одну значило бы поставить на
-    # догадку там, где ставить не на что.
-    "create_railing": ("OST_Railings", "OST_StairsRailing"),
-    # Марка: род марки определяет КАТЕГОРИЯ ЦЕЛИ, а цель — id или ссылка,
-    # то есть из программы не читается. Сумма по десяти родам, которые вообще
-    # читает конвейер (tag_extract.TAG_CATEGORIES).
-    "create_tag": (
-        "OST_AreaTags", "OST_DoorTags", "OST_FloorTags", "OST_MaterialTags",
-        "OST_MechanicalEquipmentTags", "OST_MultiCategoryTags",
-        "OST_RoomTags", "OST_StairsRailingTags", "OST_StructuralFramingTags",
-        "OST_WallTags",
-    ),
-}
+#: ОДНА ТАБЛИЦА, И ЖИВЁТ ОНА В РЕЕСТРЕ. До 10.08 «в какую категорию попадёт
+#: результат этого опа» знали ДВА словаря: этот и `clash_bundle.OP_CATEGORY`
+#: (29 опов против 43), а `spec.op_census_categories` спрашивал ответ У СУДЬИ
+#: ПРИЁМКИ — то есть реестр зависел от приёмки, а не наоборот. Вопрос про
+#: результат опа — вопрос К РЕЕСТРУ, поэтому таблица и её разрешатель уехали
+#: в `spec`, а здесь остались имена, на которые уже ссылаются снаружи.
+#:
+#: ОСТАВШИЙСЯ ДУБЛИКАТ НАЗВАН: `clash_bundle.OP_CATEGORY`. Мигрировать его
+#: этой сессией было нельзя (файл занят другим агентом), а знать про него
+#: следующему — обязательно, вместе с тем, чью сторону брать:
+#:
+#:   * `create_column` СТОРОНЫ НЕ ПРОТИВОРЕЧАТ, хотя выглядит наоборот.
+#:     Приёмка отвечает `("OST_StructuralColumns", "OST_Columns")`, clash
+#:     держит `""` — но `clash_bundle.category_of` читает эту строку как
+#:     `OP_CATEGORY.get(name) or None` и разбирает колонну ВЕТКОЙ выше
+#:     (`_column_category`). Пустая строка там — маркер «решено не таблицей»,
+#:     а не заявление о пустой категории.
+#:   * `create_railing` — А ВОТ ЭТО НАСТОЯЩЕЕ РАСХОЖДЕНИЕ, и ветки-исключения
+#:     нет ни у одной стороны: приёмка ждёт СУММУ по
+#:     `("OST_Railings", "OST_StairsRailing")`, clash называет одну
+#:     `"OST_StairsRailing"`. Верна сторона приёмки, и причина записана прямо
+#:     в строке ниже: `OST_Railings` не встретился ни в одном из 31 разбора,
+#:     но таблица лифтера знает ОБЕ, и версия Revit могла бы решить иначе;
+#:     сумма по двум верна при любом ответе, выбор одной — ставка.
+_OP_CATEGORIES: Mapping[str, tuple[str, ...]] = spec.OP_RESULT_CATEGORIES
 
 #: Производные категории: элементы, которые Revit делает САМ вслед за опом.
 #: Не сверяются никогда и не попадают в справку «неожиданное».
@@ -393,16 +465,37 @@ _OP_DERIVED: Mapping[str, tuple[str, ...]] = {
     "create_floor": ("OST_SketchLines",),
     "create_floor_by_contour": ("OST_SketchLines",),
     "create_roof": ("OST_SketchLines",),
+    # Выдавленная кровля рождает те же эскизные линии, что и
+    # контурная, — профиль в Revit есть настоящий эскиз.
+    "create_extrusion_roof": ("OST_SketchLines",),
     "create_ceiling": ("OST_SketchLines",),
     "create_foundation": ("OST_SketchLines",),
     "create_stairs": ("OST_StairsRuns", "OST_StairsLandings",
                       "OST_StairsRailing", "OST_StairsRailingBaluster",
                       "OST_RailingHandRail", "OST_RailingTopRail",
                       "OST_SketchLines"),
+    # ConnectLevels порождает по маршу на каждый добавленный уровень,
+    # и каждый из них тянет за собой тот же выводок, что обычная
+    # лестница. Число производных здесь пропорционально числу
+    # уровней, а не единице, — поэтому перепись обязана знать их
+    # как ПРОИЗВОДНЫЕ, иначе честный успех читался бы как
+    # незаказанный чужой create.
+    "create_multistory_stairs": ("OST_Stairs", "OST_StairsRuns",
+                                 "OST_StairsLandings",
+                                 "OST_StairsRailing",
+                                 "OST_StairsRailingBaluster",
+                                 "OST_RailingHandRail",
+                                 "OST_RailingTopRail",
+                                 "OST_SketchLines"),
     "create_railing": ("OST_StairsRailingBaluster", "OST_RailingHandRail",
                        "OST_RailingTopRail",
                        "OST_RailingRailPathExtensionLines"),
-    # 2 652 фитинга и 152 единицы арматуры Snowdon при НУЛЕ авторских.
+    # Фитинги авторские (emit_fittings_cs зовёт NewElbow/NewTee/
+    # NewTransitionFitting), но ЧИСЛА их оп не называет и оно не выведено
+    # ни одним замером; арматуру не создаёт ни один эмиттер пакета. Прежняя
+    # строка ссылалась на «2 652 фитинга и 152 арматуры при НУЛЕ авторских» —
+    # это перепись snowdon_plumb_v3 (PF=2652, DF=152, PA=126), а не выход
+    # пересборки; см. модульную докстроку (10.08.2026).
     "create_pipe_system": ("OST_PipeFitting", "OST_PipeAccessory"),
     "route_pipe_system": ("OST_PipeFitting", "OST_PipeAccessory"),
     "route_duct_system": ("OST_DuctFitting", "OST_DuctAccessory"),
@@ -420,11 +513,23 @@ _LEVEL_FROM_PARAM: frozenset[str] = frozenset({
     "create_wall", "create_floor", "create_floor_by_contour", "create_roof",
     "create_ceiling", "create_column", "create_room", "create_pipe",
     "create_duct", "create_cable_tray", "create_foundation",
+    # wave/mep-electrical: у всех пяти уровень передаётся В САМ ВЫЗОВ
+    # (`levelId`), то есть равен разрешённому селектору по построению, а не
+    # по совпадению — ровно как у трубы и лотка выше. Проверяется тем же
+    # свидетелем `RBS_START_LEVEL_PARAM`.
+    "create_conduit", "create_pipe_placeholder", "create_duct_placeholder",
+    "create_flex_duct", "create_flex_pipe",
     "create_pipe_system", "route_pipe_system", "route_duct_system",
     # wave/room: плоскость эскиза строится ИЗ САМОГО УРОВНЯ
     # (SketchPlane.Create(doc, levelId)), поэтому уровень результата равен
     # разрешённому селектору по построению, а не по совпадению.
     "create_room_separator",
+    # wave/space (10.08): уровень уезжает В САМ ВЫЗОВ
+    # (`NewSpace(Level, UV)`), то есть равен разрешённому селектору по
+    # построению — ровно как у create_room строкой выше. Проверяется тем
+    # же `Element.LevelId`, которым его читает и свидетель опа, и сторона
+    # извлечения: один вопрос, один судья.
+    "create_space",
 })
 
 #: Пишущие опы, которые НЕ добавляют ни одного элемента в перепись.
@@ -438,23 +543,133 @@ _OPS_WITHOUT_ELEMENTS: frozenset[str] = frozenset({
 #: Опы, чью дельту нельзя ни назвать, ни ограничить снизу, — с причиной.
 #: Причина попадает в отчёт дословно: «слепо» без объяснения неотличимо от
 #: «забыли».
-_OPS_BLIND: Mapping[str, str] = {
-    "place_family": (
-        "категория экземпляра = категория семейства, а семейство приходит "
-        "селектором symbol — из программы она не читается"),
-    "delete": (
+#:
+#: ``place_family`` остаётся здесь ТОЛЬКО как заголовок отказа: с 09.08 его
+#: категория берётся из пула ``family_symbols`` снимка (см. шапку модуля), и в
+#: слепые он попадает лишь тогда, когда снимок этого не доказывает. Причина
+#: тогда дописывается конкретная — «пул обрезан», «разные категории»,
+#: «символа нет до записи» — потому что «слепо» без разбора неотличимо от
+#: «не посмотрели».
+#: С 09.08.2026 КАЖДАЯ СТРОКА ДАТИРОВАНА И НЕСЁТ ВЕРДИКТ (`record_ratchet`).
+#: Повод именно у этого журнала: строка `place_family` объясняла слепоту тем,
+#: что категория «из программы не читается». Это ВЕРНО и при этом не та
+#: причина: категория лежала в СНИМКЕ, которым программа заземлена, и приёмка
+#: просто никогда его не спрашивала. Самый нагруженный оп корпуса — 7000
+#: построек — был слеп из-за ПОДМЕНЫ В ОБОСНОВАНИИ, а обоснование выглядело
+#: измеренным. Правда без срока — архив.
+#:
+#: `stands-because` против `close-by` здесь не косметика, а РАЗНЫЕ вещи:
+#: шесть строк структурны (снимок не хранит того, чего в нём нет; раскладку
+#: выбирает Revit внутри транзакции), и дедлайн у них был бы фикцией. Две
+#: закрываются работой, и у них дедлайн есть.
+_OPS_BLIND_ENTRIES: Mapping[str, Entry] = {
+    "place_family": Entry(
+        STANDS, "2026-07-30", "",
+        "категория экземпляра = категория семейства, и снимок её не "
+        "подтверждает"),
+    "delete": Entry(
+        STANDS, "2026-07-30", "",
         "цель адресуется id или ссылкой; какой категории элемент удалён, "
         "программа не говорит"),
-    "change_type": (
+    # СЛЕД СЛИЯНИЯ 09.08. Волна датумов заводила этот журнал ПРОСТЫМИ
+    # СТРОКАМИ — её база предшествовала храповику, — и текстовое объединение
+    # разрезало литерал словаря пополам: конец записи `delete` от одной
+    # стороны и новое объявление `_OPS_BLIND` от другой. Урок записан здесь,
+    # потому что он общий: ОБЪЕДИНЕНИЕ СЛОВАРЯ — НЕ ОБЪЕДИНЕНИЕ ТЕКСТА, и
+    # дубли ключей питон разрешает молча, оставляя последний. Записи волны
+    # приведены к форме журнала, дубли `place_family` и `delete` сняты —
+    # у датированных версий причина точнее (см. шапку про подмену в
+    # обосновании `place_family`).
+    #
+    # wave/datums (09.08.2026). Слепота НАЗВАНА и имеет ровно две причины,
+    # обе про перепись, а не про оп. ПЕРВАЯ: контейнер и звенья делят ОДНУ
+    # ячейку — каждое звено цепи это обычный Grid категории OST_Grids, и
+    # ячейка получила бы «+1» там, где Revit кладёт 1 + (len(path)-1);
+    # заявить «+1» значило бы, что ВЕРНО построенная цепь читается как чужой
+    # create. ВТОРАЯ, честнее первой: категория самого MultiSegmentGrid НЕ
+    # ЗАМЕРЕНА, а догадка в таблице переписи неотличима от факта.
+    # ЧТО ЭТО НЕ ОТМЕНЯЕТ: свидетель опа проверяет и ЧИСЛО осей, и КОНЦЫ
+    # каждого звена перечитыванием из документа. Слепа перепись, а не оп.
+    "create_multi_segment_grid": Entry(
+        CLOSE_BY, "2026-08-09", "2026-09-08",
+        "контейнер цепи и каждое её звено — элементы одной категории "
+        "OST_Grids, поэтому одна ячейка переписи получает 1+N вместо 1; "
+        "к тому же категория самого MultiSegmentGrid не замерена живым "
+        "Revit — оп при этом проверяется своим свидетелем (число осей и "
+        "концы каждого звена, перечитанные из документа)"),
+    "change_type": Entry(
+        STANDS, "2026-07-30", "",
         "смена типа обычно идёт НА МЕСТЕ, но документированный случай "
         "стена ↔ витражная панель создаёт НОВЫЙ элемент другой категории"),
-    "set_curtain_panel": (
+    "set_curtain_panel": Entry(
+        STANDS, "2026-07-30", "",
         "ChangePanelType при типе-стене строит стену вместо панели "
         "(замер 28.07) — дельта категорий не выводима"),
-    "create_curtain_grid_line": (
+    "create_curtain_grid_line": Entry(
+        STANDS, "2026-07-30", "",
         "линия разрезки делит ячейки: число панелей и импостов после неё "
         "определяет Revit"),
+    # ЧИСЛО ИЗВЕСТНО (ровно один элемент), КАТЕГОРИЯ — НЕТ, и это замер, а не
+    # лень. Ни в одном из сохранённых на диске разборов нет НИ ОДНОГО
+    # WallFoundation (grep по L0.jsonl всех разборов, 09.08), то есть
+    # проверить, в какую клетку переписи ложится ленточный фундамент, не на
+    # чем. Написать сюда «OST_StructuralFoundation» по таксономии Revit —
+    # соблазн ровно того сорта, из-за которого приёмка заворачивала ПРАВИЛЬНО
+    # построенные программы: ошибка здесь даёт ЛОЖНЫЙ ОТКАЗ верной постройки,
+    # а слепота — только потерю верхней границы. Из двух зол выбрано
+    # обратимое. Закрывает ОДИН живой прогон: достаточно прочитать
+    # Category.Id созданного элемента (квитанция его уже везёт).
+    # Срок ЕСТЬ, потому что запись сама называет, чем закрывается: один живой
+    # прогон, Category.Id созданного элемента, квитанция его уже везёт.
+    "create_wall_foundation": Entry(
+        CLOSE_BY, "2026-08-09", "2026-09-08",
+        "категория ленточного фундамента не замерена: WallFoundation не "
+        "встретился ни в одном сохранённом разборе, а назвать клетку "
+        "переписи по памяти значит завернуть верную постройку"),
+    # wave/framing (09.08). У ОБЕИХ операций слепота не про категорию
+    # обёртки, а про ПОРОЖДЁННОЕ: один вызов кладёт и сам объект, и
+    # неизвестное заранее число элементов внутри него. Это ровно случай
+    # create_pipe_system, где число фитингов оп не называет (сами фитинги
+    # авторские, а их счёт незамерен), — и там он тоже назван, а не оценён.
+    "create_beam_system": Entry(
+        STANDS, "2026-08-09", "",
+        "число балок выбирает LayoutRule уже внутри транзакции: ни одного "
+        "количества операция не называет, поэтому дельта каркаса не выводима "
+        "ни сверху, ни снизу — тот же случай, что фитинги у трубной системы"),
+    "create_truss": Entry(
+        STANDS, "2026-08-09", "",
+        "стержни фермы (пояса, раскосы, стойки) порождает семейство фермы, а "
+        "их число и категории зависят от него — из программы не читается "
+        "ничего, кроме того, что стержни будут"),
+    # wave/reinforcement (10.08). Слепота ДВОЙНАЯ, и обе половины замерены, а
+    # не предположены. ПЕРВАЯ: один вызов кладёт и саму систему армирования, и
+    # неизвестное заранее число стержней (`RebarInSystem`), причём их может не
+    # быть вовсе — Autodesk пишет, что при выключенной
+    # `ReinforcementSettings.HostStructuralRebar` их не создаётся НИ ОДНОГО.
+    # ВТОРАЯ: клетка переписи самой системы не замерена — в 38 сохранённых
+    # разборах с переписью НОЛЬ элементов OST_AreaRein (замер 10.08 по
+    # census-записям всего корпуса). Написать сюда клетку по таксономии Revit
+    # — соблазн того же сорта, что у ленточного фундамента: ошибка здесь даёт
+    # ЛОЖНЫЙ ОТКАЗ верной постройки, слепота — только потерю верхней границы.
+    # Свой свидетель у опа при этом полноценный (носитель, тип, тип стержня и
+    # непустота стержней под включённой настройкой) — слепа перепись, а не оп.
+    "create_area_reinforcement": Entry(
+        STANDS, "2026-08-10", "",
+        "один вызов кладёт систему и неизвестное заранее число стержней "
+        "(RebarInSystem), а при выключенной ReinforcementSettings."
+        "HostStructuralRebar не кладёт ни одного — дельта не выводима ни "
+        "сверху, ни снизу; клетка переписи самой системы к тому же не "
+        "замерена (ноль OST_AreaRein во всём корпусе разборов)"),
 }
+
+#: ЖУРНАЛ СЛЕПЫХ ОПОВ. Потребители берут причину ОДНИМ текстом — через
+#: `.reason`, а не переписывая её в третий раз рядом с местом отказа.
+_OPS_BLIND = Ledger(
+    "acceptance._OPS_BLIND", _OPS_BLIND_ENTRIES,
+    instrument=(
+        "derive_expectation() на программе из одного этого опа и снимке "
+        "заземления: строка держится, пока оп попадает в blind, а не в rows; "
+        "у place_family решает наличие его символа в пуле family_symbols"))
 
 # These operations may delete or replace a pre-existing instance.  Because
 # the current L2 wire predicate does not preregister the old category x level
@@ -465,6 +680,127 @@ _OPS_CAN_INVALIDATE_LOWER_BOUNDS: frozenset[str] = frozenset({
     "delete", "change_type", "set_curtain_panel",
     "create_curtain_grid_line",
 })
+
+
+#: Ключ переписи обязан быть ИМЕНЕМ ``BuiltInCategory``. Живая перепись
+#: (``acceptance_live.scope_census_fragment``) ключует элемент строкой
+#: ``Enum.GetName(typeof(BuiltInCategory), id)`` и отбрасывает всё, чего нет в
+#: заявленном множестве; снимок пишет ту же строку тем же вызовом, НО имеет
+#: числовой запасной путь (``?? __categoryId.ToString()``) на случай категории
+#: без имени в перечислении. Числовой ключ живая перепись не выделит НИКОГДА —
+#: значит это и есть тот самый случай «клетку выделить нечем», где единственный
+#: честный ответ — отказ от суждения.
+_CENSUS_CATEGORY_RE = re.compile(r"OST_[A-Za-z0-9_]+\Z")
+
+#: Строка ожидания ``place_family``: почему верх открыт.
+_PLACE_FAMILY_WHY = (
+    "экземпляр ровно один, но ВЛОЖЕННЫЕ общие семейства Revit создаёт сам "
+    "(21 555 элементов на 59-этажной башне) — верх клетки открыт")
+
+#: Почему верхние границы сняты во всей программе, когда категория известна.
+_PLACE_FAMILY_OPEN_NOTE = (
+    "верхние границы сняты целиком: вложенные общие семейства, которые Revit "
+    "создаёт вслед за place_family, вправе лечь в ЛЮБУЮ категорию, в том "
+    "числе объявленную соседним опом")
+
+
+def symbol_rows_from_snapshot(
+        snapshot: Mapping[str, Any] | None) -> tuple[Mapping[str, Any], ...] | None:
+    """Строки пула ``family_symbols`` — или ``None``, если верить им нельзя.
+
+    ``None`` (а не пустой кортеж) означает «данных нет», и это разные факты:
+    пустой пул говорит, что символов в модели не нашлось, а отсутствующий —
+    что мы не смотрели. Обрезанный коллектором пул (``__truncated``) тоже
+    даёт ``None``: за срезом мог остаться символ другой категории, и «все
+    видимые кандидаты согласны» перестало бы что-либо доказывать — тот же
+    довод, по которому ``ground`` отказывает там в sole-entry.
+    """
+    if not isinstance(snapshot, Mapping):
+        return None
+    if snapshot.get("family_symbols__truncated"):
+        return None
+    rows = snapshot.get("family_symbols")
+    if not isinstance(rows, list):
+        return None
+    return tuple(row for row in rows if isinstance(row, Mapping))
+
+
+def _symbol_candidates(selector: Any,
+                       rows: Sequence[Mapping[str, Any]],
+                       ) -> tuple[list[Mapping[str, Any]] | None, str]:
+    """Строки пула, которыми ``ground`` МОГ БЫ разрешить этот селектор.
+
+    Множество НАМЕРЕННО ШИРЕ того, что выберет ``ground``: сужение по
+    ``disambiguate_by`` не повторяется, а у ``by=default`` кандидатами
+    становится весь пул. Приёмке нужна не личность символа, а его КАТЕГОРИЯ,
+    и «все кандидаты согласны» — утверждение более сильное, чем «победит вот
+    этот». Ошибиться в сторону лишнего кандидата можно только к отказу от
+    суждения; ошибиться в сторону меньшего — к ложному отказу постройки.
+    """
+    if selector is None:
+        # symbol опущен: ground берёт единственного в пуле (правила
+        # most_used у family_symbols нет — пул исключён из MOST_USED_POOLS).
+        return (list(rows), "")
+    if not isinstance(selector, Mapping):
+        return (None, "селектор symbol не объект")
+    by = selector.get("by")
+    value = selector.get("value")
+    if by == "family_type":
+        want = {key: selector.get(key)
+                for key in ("category", "family_name", "type_name")}
+        if any(not isinstance(item, str) or not item.strip()
+               for item in want.values()):
+            return (None, "family_type-селектор неполон")
+        want = {key: item.strip() for key, item in want.items()}
+        return ([row for row in rows
+                 if all(row.get(key) == item for key, item in want.items())], "")
+    if by == "element_id":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return (None, "element_id-селектор не целое")
+        return ([row for row in rows if row.get("id") == value], "")
+    if by == "name":
+        if not isinstance(value, str) or not value.strip():
+            return (None, "name-селектор пуст")
+        want_name = value.strip()
+        exact = [row for row in rows
+                 if str(row.get("name", "")).strip() == want_name]
+        if not exact:
+            # Тот же запасной путь, что у ground._resolve_one.
+            exact = [row for row in rows
+                     if str(row.get("name", "")).strip().lower()
+                     == want_name.lower()]
+        return (exact, "")
+    if by == "default":
+        return (list(rows), "")
+    return (None, f"селектор symbol вида {by!r} по снимку не разрешается")
+
+
+def _family_symbol_category(selector: Any,
+                            rows: Sequence[Mapping[str, Any]] | None,
+                            ) -> tuple[str | None, str]:
+    """Категория будущего экземпляра, либо ``None`` и причина отказа.
+
+    Утверждение доказывается ТОЛЬКО согласием всех кандидатов: одна
+    категория на всех — и тогда неважно, кого именно выберет ``ground``.
+    Любая неопределённость возвращает причину, а не догадку.
+    """
+    if rows is None:
+        return (None, "пул family_symbols снимка недоступен или обрезан")
+    candidates, refusal = _symbol_candidates(selector, rows)
+    if candidates is None:
+        return (None, refusal)
+    if not candidates:
+        return (None, "символа нет в снимке ДО записи (например, его создаёт "
+                      "create_type/load_family в этой же программе)")
+    found = {row.get("category") for row in candidates}
+    if len(found) != 1:
+        return (None, f"кандидаты дают {len(found)} разных категорий")
+    category = found.pop()
+    if (not isinstance(category, str)
+            or _CENSUS_CATEGORY_RE.fullmatch(category) is None):
+        return (None, "категория символа названа не именем BuiltInCategory — "
+                      "живая перепись такую клетку не выделяет")
+    return (category, "")
 
 
 def _level_from_selector(selector: Any,
@@ -498,50 +834,15 @@ def _level_from_selector(selector: Any,
 
 
 def _category_of_op(op: Mapping[str, Any]) -> tuple[str, ...] | None:
-    """Ключи переписи для результата опа; None — категория неизвестна."""
-    name = op.get("op")
-    if name == "create_column":
-        # Закрытое перечисление с умолчанием — категория известна точно.
-        category = op.get("category", "structural")
-        return (("OST_StructuralColumns",) if category == "structural"
-                else ("OST_Columns",))
-    if name == "create_directshape":
-        # ДВА КЛЮЧА, И ЭТО НЕ ПЕРЕСТРАХОВКА. Перепись §18.1 ключует элемент
-        # его BuiltInCategory, а строки извлечения кладут в поле литерал
-        # "DirectShape" (extract.py) — в 31 разборе ключа "DirectShape" в
-        # переписи нет ни разу, а в строках он есть. Сумма по двум верна при
-        # любом источнике переписи.
-        from kukai.ir.ops_shape import DIRECTSHAPE_CATEGORIES
-        built_in = DIRECTSHAPE_CATEGORIES.get(op.get("category"))
-        if built_in is None:
-            return None
-        return tuple(sorted((built_in, "DirectShape")))
-    if name == "create_opening":
-        # ПРОЁМ ОБЯЗАН НАЗВАТЬ СВОЮ КАТЕГОРИЮ, иначе одна новая операция
-        # ослабила бы L2 для ВСЕЙ программы: оп с неизвестной категорией
-        # снимает верхние границы целиком (на настоящем фасаде это уже стоило
-        # 270 опов из 2 720).
-        if op.get("variety") == "wall_rect":
-            # Перегрузка NewOpening(Wall, XYZ, XYZ) даёт ровно один род.
-            return ("OST_SWallRectOpening",)
-        # variety="host_face": род определяет КАТЕГОРИЯ НОСИТЕЛЯ, а носитель —
-        # id или ссылка, то есть из программы не читается. Сумма по трём
-        # родам, которые эта перегрузка вообще умеет («Creates a new opening
-        # in a roof, floor and ceiling» — документация метода, а не догадка о
-        # модели). Потолочный проём в переписи восьми зданий не встретился ни
-        # разу; он здесь потому, что его умеет ОПЕРАЦИЯ.
-        return ("OST_FloorOpening", "OST_RoofOpening", "OST_CeilingOpening")
-    if name == "create_foundation":
-        if op.get("variety") == "isolated":
-            # Символ грунтуется пулом foundation_symbols — это
-            # FilteredElementCollector(...).OfCategory(OST_StructuralFoundation)
-            # (open_model.py), значит категория известна точно.
-            return ("OST_StructuralFoundation",)
-        # variety="slab" эмитируется через Floor.Create с типом из пула
-        # floor_types: перекрытие это или фундаментная плита — решает ТИП,
-        # которого компилятор не видит.
-        return ("OST_Floors", "OST_StructuralFoundation")
-    return _OP_CATEGORIES.get(name)
+    """Ключи переписи для результата опа; None — категория неизвестна.
+
+    ТОНКАЯ ОБЁРТКА НАД РЕЕСТРОМ, а не второй ответ. Разрешатель уехал в
+    `spec.op_result_categories` вместе с таблицей: раньше `spec` импортировал
+    ЭТУ функцию, то есть реестр спрашивал категорию у приёмки. Имя оставлено
+    потому, что на него ссылаются снаружи (`test_opening`, `test_mass`) и
+    внутри этого файла.
+    """
+    return spec.op_result_categories(op)
 
 
 def _plural_count(op: Mapping[str, Any]) -> tuple[int, Certainty, str]:
@@ -615,7 +916,9 @@ def _contributions(ops: Iterable[Mapping[str, Any]],
                    id_prefix: str,
                    rows: list[ExpectedRow],
                    blind: list[BlindOp],
-                   derived: set[str]) -> None:
+                   derived: set[str],
+                   family_symbols: Sequence[Mapping[str, Any]] | None,
+                   open_scope: list[str]) -> None:
     """Разложить плоский список опов на строки ожидания (рекурсивно в группы)."""
     for op in ops:
         name = op.get("op")
@@ -637,8 +940,33 @@ def _contributions(ops: Iterable[Mapping[str, Any]],
 
         if name in _OPS_WITHOUT_ELEMENTS:
             continue
+
+        if name == "place_family":
+            # САМЫЙ НАГРУЖЕННЫЙ ПИШУЩИЙ ОП РЕЕСТРА. Категория берётся из
+            # снимка модели (пул family_symbols), а не из программы; когда
+            # снимок её не доказывает, оп остаётся слепым С НАЗВАННОЙ
+            # причиной. Подробности — в шапке модуля.
+            category, refusal = _family_symbol_category(op.get("symbol"),
+                                                        family_symbols)
+            if category is None:
+                blind.append(BlindOp(
+                    op_id, name, f"{_OPS_BLIND.reason(name)}: {refusal}"))
+                continue
+            open_scope.append(op_id)
+            rows.append(ExpectedRow(
+                categories=(category,),
+                # Уровня НЕТ намеренно: дверь и окно — те же FamilyInstance, и
+                # у них уровень объявлен неизвестным по замеру (76 из 15 569).
+                level=None,
+                count=multiplier,
+                certainty=Certainty.AT_LEAST,
+                op_ids=(op_id,),
+                why=_PLACE_FAMILY_WHY,
+            ))
+            continue
+
         if name in _OPS_BLIND:
-            blind.append(BlindOp(op_id, name, _OPS_BLIND[name]))
+            blind.append(BlindOp(op_id, name, _OPS_BLIND.reason(name)))
             continue
 
         if name == "create_group":
@@ -654,14 +982,16 @@ def _contributions(ops: Iterable[Mapping[str, Any]],
                 dict(level_names), level_names_by_id,
                 multiplier=multiplier * (1 + len(placements)),
                 id_prefix=f"{op_id}/",
-                rows=rows, blind=blind, derived=derived)
+                rows=rows, blind=blind, derived=derived,
+                family_symbols=family_symbols, open_scope=open_scope)
             continue
 
         categories = _category_of_op(op)
         if categories is None:
             blind.append(BlindOp(
                 op_id, name,
-                _OPS_BLIND.get(name, "категория результата не выводится")))
+                (_OPS_BLIND.reason(name) if name in _OPS_BLIND
+                 else "категория результата не выводится")))
             continue
 
         count, certainty, why = _plural_count(op)
@@ -709,6 +1039,7 @@ def _merge_rows(rows: Sequence[ExpectedRow]) -> tuple[ExpectedRow, ...]:
 def derive_expectation(program: Any,
                        *,
                        level_names_by_id: Mapping[Any, str] | None = None,
+                       family_symbols: Sequence[Mapping[str, Any]] | None = None,
                        ) -> Expectation:
     """Вывести предикат приёмки ИЗ ПРОГРАММЫ. Чистая функция.
 
@@ -716,6 +1047,13 @@ def derive_expectation(program: Any,
     буквально тот неизменяемый план, который был понижен в C#. Для автономного
     использования принимается и тот же конверт, что у ``compile_program``
     (либо голый список): он проходит публичный ``plan_program`` ровно один раз.
+
+    ``family_symbols`` — строки пула ``family_symbols`` снимка (получать через
+    :func:`symbol_rows_from_snapshot`, чтобы обрезанный пул не выдавал себя за
+    полный). Не переданы — категория семейства не доказана, и КАЖДЫЙ
+    ``place_family`` честно остаётся слепым: тот же принцип, что у уровней
+    ниже, — данные о модели ослабить предикат не могут, а без них предиката
+    просто нет.
 
     ``level_names_by_id`` — ``ElementId`` уровня → его имя, из пула ``levels``
     снимка модели. Не передан — уровни, пришпиленные по id, останутся
@@ -735,15 +1073,23 @@ def derive_expectation(program: Any,
     blind: list[BlindOp] = []
     derived: set[str] = set()
     level_names: dict[str, str] = {}
+    open_scope: list[str] = []
+    symbols = (tuple(row for row in family_symbols if isinstance(row, Mapping))
+               if family_symbols is not None else None)
     _contributions(ops, level_names, by_id, multiplier=1, id_prefix="",
-                   rows=rows, blind=blind, derived=derived)
+                   rows=rows, blind=blind, derived=derived,
+                   family_symbols=symbols, open_scope=open_scope)
     return Expectation(
         rows=_merge_rows(rows),
         derived_categories=tuple(sorted(derived)),
         blind_ops=tuple(blind),
-        upper_bounds_valid=not blind,
+        # Разрешённая категория place_family возвращает НИЖНЮЮ границу, но не
+        # верхнюю: вложенные общие семейства Revit создаёт сам. Сняв здесь
+        # верх, мы остаёмся ровно там же, где были при слепоте, — и не
+        # покупаем ловлю дубликатов ценой ложного отказа верной постройки.
+        upper_bounds_valid=not blind and not open_scope,
         op_count=len(ops),
-        notes=notes,
+        notes=notes + ((_PLACE_FAMILY_OPEN_NOTE,) if open_scope else ()),
     )
 
 
@@ -971,7 +1317,9 @@ def check_acceptance(expectation: Expectation,
         key=lambda item: (-item[1], item[0]))
 
     return Verdict(
-        accepted=not mismatches,
+        # `accepted` здесь БОЛЬШЕ НЕ ПЕРЕДАЁТСЯ: он выводится из этих же
+        # чисел и требует `checked > 0`. Прежнее `accepted=not mismatches`
+        # при `checked == 0` давало успех без единой проверки.
         mismatches=tuple(mismatches),
         checked_groups=checked,
         unexpected=tuple(unexpected),
@@ -998,6 +1346,9 @@ __all__ = [
     "Mismatch",
     "MismatchCode",
     "ScopeCensus",
+    "VERDICT_MEASURED",
+    "VERDICT_MISMATCHED",
+    "VERDICT_NOTHING_TO_CHECK",
     "Verdict",
     "census_delta",
     "check_acceptance",
@@ -1005,4 +1356,5 @@ __all__ = [
     "expectation_categories",
     "expectation_digest",
     "scope_census_from_elements",
+    "symbol_rows_from_snapshot",
 ]

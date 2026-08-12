@@ -74,6 +74,12 @@ def _max_ops_per_record() -> int:
 
 _MAX_OPS_PER_RECORD = _max_ops_per_record()
 _MAX_VIOLATIONS = 10
+#: Потолок ОДНОЙ строки свободного текста в записи. Не новый: ровно столько
+#: корпус хранит у каждого нарушения с самого появления фида
+#: (`violations` = `str(v)[:200]`), и личность отказа едет по той же мерке —
+#: заводить второй потолок для текста той же природы значило бы иметь две
+#: дисциплины размера вместо одной.
+_MAX_TEXT = 200
 _WRITE_LOCK = threading.Lock()
 _ZERO_CHECKSUM = "0" * 64
 
@@ -250,14 +256,43 @@ def op_skeleton_hash(op: Any) -> str:
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 
 
+def _text(value: Any) -> Optional[str]:
+    """Одна строка свободного текста для корпуса, или None — «нечего писать».
+
+    Пустая строка НЕ пишется: поле, присутствующее и пустое, читалось бы как
+    «причина была и она пуста», а это третий факт, которого никто не сообщал.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:_MAX_TEXT] if text else None
+
+
+#: Значения `refusal_cause` — ГДЕ в этой строке лежит причина красноты.
+#:
+#: Поле пишется ТОЛЬКО у не-зелёной строки: у успеха причины нет, и «отсутствие
+#: причины» — не значение, а отсутствие. Зелёная строка обязана остаться
+#: побайтно прежней (закон «absent stays absent»), поэтому здесь нет варианта
+#: «none».
+_CAUSE_DIAGNOSTIC = "diagnostic"    # причина названа кодом: `diag_code` и рядом
+_CAUSE_VIOLATIONS = "violations"    # причина названа нарушениями постусловий
+_CAUSE_ACCEPTANCE = "acceptance"    # коммит состоялся; красноту дала приёмка
+_CAUSE_UNKNOWN = "unknown"          # НАЗВАННОЕ НЕЗНАНИЕ, см. блок ниже
+
+
 def record_witness(*, program: Any, family: str, revit_version: str,
                    ok: bool, witness: Optional[dict], duration_ms: float,
                    diag_code: Optional[str] = None,
+                   diag_op_id: Optional[str] = None,
+                   diag_field: Optional[str] = None,
+                   diag_message: Optional[str] = None,
+                   diag_detail: Optional[str] = None,
                    violations: Optional[list] = None,
                    result_payload: Optional[dict] = None,
                    outcome: Optional[dict] = None,
                    acceptance_evidence: Optional[Mapping[str, Any]] = None,
                    author_digest: Optional[str] = None,
+                   env_digest: Optional[str] = None,
                    ) -> None:
     """Записать одно ЖИВОЕ исполнение. Никогда не raises (fail-open)."""
     path = _feed_path()
@@ -295,6 +330,14 @@ def record_witness(*, program: Any, family: str, revit_version: str,
         if isinstance(author_digest, str) and author_digest:
             record["author_digest"] = author_digest[:128]
             record["authored_in"] = "python"
+        # ПОДПИСЬ СРЕДЫ — третье звено того же ряда. `plan_digest` отвечает
+        # «что скомпилировано», `author_digest` — «чем это написано»,
+        # `env_digest` — «на чём посчитано». Корпус append-only и переживает
+        # обновления библиотек; без этого поля два ряда одного скрипта с
+        # разными исходами неотличимы от недетерминизма, а причиной был апгрейд
+        # shapely. Поля нет вовсе, когда программу написали операциями.
+        if isinstance(env_digest, str) and env_digest:
+            record["env_digest"] = env_digest[:128]
         if len(raw_ops) > _MAX_OPS_PER_RECORD:
             record["ops_truncated"] = len(raw_ops) - _MAX_OPS_PER_RECORD
         if witness is not None:
@@ -309,8 +352,59 @@ def record_witness(*, program: Any, family: str, revit_version: str,
             record["acceptance_evidence"] = acceptance
         if diag_code is not None:
             record["diag_code"] = diag_code
+        # ОПЕРАЦИЯ, КОТОРУЮ ДИАГНОСТИКА УЖЕ НАЗВАЛА.
+        #
+        # `serving._translate_runtime` кладёт `op_id` в диагностику, когда
+        # рантайм его сообщил, — а телеметрия брала оттуда ОДИН код и адрес
+        # выбрасывала. Цена замерена 09.08 на корпусе: 181 живая красная
+        # строка несёт X003/X999 — коды, которые по построению не называют
+        # виновного (различающий признак живёт в `detail`, а `detail` в корпус
+        # не пишется). Все они уходят в «неприписываемо», и восстановить их
+        # нечем. Поле стоит здесь, чтобы у следующих строк такой дыры не было;
+        # утечки оно не добавляет — те же идентификаторы уже лежат в
+        # `op_outcomes` и дословно внутри `violations`.
+        if diag_op_id is not None:
+            record["diag_op_id"] = str(diag_op_id)[:64]
+        # ─── ЛИЧНОСТЬ ОТКАЗА ЦЕЛИКОМ, А НЕ ОДИН ЕЁ КОД ──────────────────────
+        #
+        # ЧТО ИЗМЕРЕНО (09.08.2026, перечислением ВСЕХ ключей ВСЕХ 1306 строк
+        # `kir_witness.jsonl`): ни одна строка не несёт поля с сообщением
+        # отказа — никакого. Следствие, тоже замеренное: из 204 красных строк
+        # 165 неприписываемы ПО ПОСТРОЕНИЮ (79 X999, 41 unconfirmed, 38 X003,
+        # 7 разноимённых без id). У X003 и X999 различающий признак живёт
+        # РОВНО в `detail`, а `detail` телеметрия выбрасывала — поэтому целый
+        # класс расследования оставался чтением текста рядом с корпусом
+        # вместо запроса к корпусу. Ровно так 04.08 родился «компилятор 5 /
+        # Revit 11» по 12 отказам `create_door`: не замер, а пересказ.
+        #
+        # ЧТО ЗДЕСЬ ЗАПИСЫВАЕТСЯ — только то, что диагностика УЖЕ несёт
+        # (`Diagnostic`: code / op_id / field_name / message_ru, плюс `detail`
+        # у рантайм-перевода). Ни одного нового факта: список закрыт ЗДЕСЬ, а
+        # не у вызывающего, чтобы «записать заодно» нельзя было мимоходом.
+        #
+        # ЧТО РЕШЕНО ПО ПРИВАТНОСТИ. Корпус дописывается навсегда и лежит на
+        # проде, поэтому вопрос не «можно ли», а «что именно».
+        #   * `diag_message` — НАШ текст (`message_ru`), закрытый набор строк
+        #     компилятора; данных модели в нём нет по построению;
+        #   * `diag_detail` — слова САМОГО рантайма, и вот в них имя семейства
+        #     или уровня встречается (отказ неповорачиваемой створки называет
+        #     `FamilySymbol.Family.Name`). Пишем всё равно, и вот почему это
+        #     не расширение периметра: тексты `violations` — той же природы и
+        #     из той же модели — корпус хранит дословно с первого дня, файл
+        #     открывается 0600 на КАЖДОЙ записи и принадлежит установке
+        #     (`install_paths`), а без `detail` X999 остаётся без причины
+        #     навсегда. Геометрия по-прежнему не покидает модель: числа в
+        #     скелетах — «#», координат тут не было и нет.
+        #   * потолок — общий `_MAX_TEXT` нарушений, а не новый.
+        for key, value in (("diag_field", diag_field),
+                           ("diag_message", diag_message),
+                           ("diag_detail", diag_detail)):
+            text = _text(value)
+            if text is not None:
+                record[key] = text
         if violations:
-            record["violations"] = [str(v)[:200] for v in violations[:_MAX_VIOLATIONS]]
+            record["violations"] = [str(v)[:_MAX_TEXT]
+                                    for v in violations[:_MAX_VIOLATIONS]]
             # Усечение обязано быть НАЗВАНО. Двадцатибалочная программа с
             # двадцатью нарушениями оставляла в корпусе десять и ни следа о
             # том, что были ещё, — и читалась как «столько и было».
@@ -320,6 +414,22 @@ def record_witness(*, program: Any, family: str, revit_version: str,
             isinstance(outcome, dict)
             and outcome.get("execution") == "committed"
         )
+        # ─── НЕИЗВЕСТНАЯ ПРИЧИНА — ЭТО ТОЖЕ ЗАПИСЬ ──────────────────────────
+        #
+        # У читателя корпуса красная строка без кода и без нарушений выглядит
+        # ровно как строка, у которой причину не записали, — и различить
+        # «причины не было названо» от «поле забыли» нечем. Поэтому не-зелёная
+        # строка ВСЕГДА говорит, ГДЕ её причина, а последнее из значений
+        # называет незнание вслух: `unknown` — это утверждение, а не пробел.
+        #
+        # Зелёной строки это не касается ни одним байтом: у успеха причины
+        # нет, и её отсутствие обязано выглядеть как отсутствие.
+        if not ok:
+            record["refusal_cause"] = (
+                _CAUSE_DIAGNOSTIC if diag_code is not None
+                else _CAUSE_VIOLATIONS if violations
+                else _CAUSE_ACCEPTANCE if committed
+                else _CAUSE_UNKNOWN)
         if (ok or committed) and isinstance(result_payload, dict):
             # Пост-коммитные ридбэки по опам: только НЕгеометрические факты
             # (id создан/refused) — сами координаты остаются в модели.

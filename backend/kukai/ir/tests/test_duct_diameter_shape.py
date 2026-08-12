@@ -30,6 +30,21 @@ def _duct(**extra) -> dict:
     return {"ir_version": "1.0", "ops": [op]}
 
 
+def _route_duct(**extra) -> dict:
+    op = {
+        "op": "route_duct_system",
+        "id": "RD",
+        "nodes": [
+            {"id": "a", "xyz_mm": [0, 0, 3000]},
+            {"id": "b", "xyz_mm": [8000, 0, 3000]},
+        ],
+        "segments": [{"from": "a", "to": "b"}],
+        "level": {"by": "element_id", "value": 42},
+    }
+    op.update(extra)
+    return {"ir_version": "1.0", "ops": [op]}
+
+
 class DiameterRefusalTests(unittest.TestCase):
 
     def _emit(self, program: dict) -> str:
@@ -59,6 +74,30 @@ class DiameterRefusalTests(unittest.TestCase):
     def test_without_a_diameter_no_check_is_emitted_at_all(self) -> None:
         """Не спросили диаметр — нечего и сверять: отсутствие остаётся отсутствием."""
         code = self._emit(_duct())
+        self.assertNotIn("RBS_CURVE_DIAMETER_PARAM", code)
+
+
+class RouteDiameterRefusalTests(DiameterRefusalTests):
+    """The graph-shaped duct path must preserve the same diagnosis."""
+
+    def test_absent_parameter_names_the_cross_section(self) -> None:
+        code = self._emit(_route_duct(diameter_mm=200))
+        self.assertIn("__dp == null", code)
+        self.assertIn("сечение не круглое", code)
+        self.assertIn("нет параметра диаметра", code)
+
+    def test_a_wrong_value_stays_a_plain_mismatch(self) -> None:
+        code = self._emit(_route_duct(diameter_mm=200))
+        tail = code.split("сечение не круглое")[1]
+        self.assertIn("else if (Math.Abs(", tail)
+        self.assertIn("segment 0 diameter (semantic)", tail)
+
+    def test_the_two_cases_are_separate_branches(self) -> None:
+        code = self._emit(_route_duct(diameter_mm=200))
+        self.assertNotIn("__dp == null || Math.Abs(", code)
+
+    def test_without_a_diameter_no_check_is_emitted_at_all(self) -> None:
+        code = self._emit(_route_duct())
         self.assertNotIn("RBS_CURVE_DIAMETER_PARAM", code)
 
 

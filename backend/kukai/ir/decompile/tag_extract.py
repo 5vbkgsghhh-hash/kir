@@ -16,7 +16,10 @@
 (``tools/api_trap_index.py``), а не памятью:
 
     P:IndependentTag.TaggedLocalElementId       2021-2022, УДАЛЁН после 2022
-    M:IndependentTag.GetTaggedLocalElementIds   2022-2026, НЕТ в 2021
+    M:IndependentTag.GetTaggedLocalElements     2022-2026, НЕТ в 2021
+    (M:IndependentTag.GetTaggedLocalElementIds  2022-2026, но ЗАПРЕЩЁН нам:
+     возвращает ``ISet<>`` из ``System.dll``, которой нет у развёрнутого
+     плагина — CS0012 живьём 04.08; см. _TAG_TARGET_2022_CS)
 
 То есть 2022 — единственный год, где есть ОБА, и ни одного члена, живущего во
 всех шести версиях, у цели марки нет. Один текст C#, проверенный против шести
@@ -54,7 +57,7 @@ PYTHON: на каждую версию эмитируется РОВНО ОДИ�
                     SpatialElementTag.TagHeadPosition           все 6
                     (спроецирована базисом вида НА МОСТУ)
     target          IndependentTag.TaggedLocalElementId         2021-2022
-                    IndependentTag.GetTaggedLocalElementIds()   2022-2026
+                    IndependentTag.GetTaggedLocalElements()     2022-2026
                     RoomTag.Room / AreaTag.Area / SpaceTag.Space  все 6
                     (НЕ SpatialElementTag.SpatialElement: см. ниже)
     leader          IndependentTag.HasLeader                    все 6
@@ -156,7 +159,8 @@ TAG_CATEGORIES = frozenset({
 
 #: Версии, на которые компилируется прямой ход. Шов проходит ровно посередине.
 TAG_SUPPORTED_VERSIONS = ("2021", "2022", "2023", "2024", "2025", "2026")
-#: Первая версия, где ``GetTaggedLocalElementIds`` существует.
+#: Первая версия, где марка умеет держать НЕСКОЛЬКО целей (и где появился
+#: множественный член чтения вместо свойства ``TaggedLocalElementId``).
 TAG_MULTI_REFERENCE_SINCE = 2022
 
 
@@ -651,16 +655,39 @@ __TAG_TARGET_SPATIAL__
 """
 
 
-#: Цель марки на 2022+: ``GetTaggedLocalElementIds()`` — МНОЖЕСТВО. Одна марка
-#: с 2022 умеет помечать несколько элементов, и это не редкость, а
-#: задокументированная возможность API. У опа ``target`` ровно один, поэтому
-#: множественная марка — квитанция ``address_ambiguous``, а не «возьмём
-#: первый»: первый из множества зависел бы от порядка перечисления Revit.
+#: Цель марки на 2022+: множество, а не один элемент. Одна марка с 2022 умеет
+#: помечать несколько элементов, и это не редкость, а задокументированная
+#: возможность API. У опа ``target`` ровно один, поэтому множественная марка —
+#: квитанция ``address_ambiguous``, а не «возьмём первый»: первый из множества
+#: зависел бы от порядка перечисления Revit.
+#:
+#: СПРАШИВАЕМ ЭЛЕМЕНТЫ, А НЕ ИХ ID, И ЭТО НЕ СТИЛЬ. ``GetTaggedLocalElementIds``
+#: возвращает ``ISet<ElementId>``, а ``ISet<>`` на net48 объявлен в
+#: ``System.dll``, которой НЕТ в замыкании ссылок развёрнутого плагина: живое
+#: извлечение 13A-RD-AR-K2_v33 (Revit 2023) умерло 04.08 в 17:22:39 на ПЕРВОЙ
+#: же пачке стадии марок — ``CS0012: The type 'ISet<>' is defined in an assembly
+#: that is not referenced``, отпечаток текста ``5f48cd823928``.
+#:
+#: ОБОЙТИ КАСТОМ НЕЛЬЗЯ: любое использование выражения требует, чтобы компилятор
+#: загрузил его тип, — ни ``object``, ни негенерик ``IEnumerable`` этого не
+#: снимают (тот же разбор в ``group_extract.py`` о
+#: ``GetAvailableAttachedDetailGroupTypeIds``). Но здесь, в отличие от групп,
+#: поле обязательное: без цели марка не операция. Поэтому взят СОСЕДНИЙ член
+#: того же класса, живущий в те же 2022-2026 и возвращающий тип из ``mscorlib``:
+#:
+#:     M:IndependentTag.GetTaggedLocalElementIds  -> ISet<ElementId>          ❌
+#:     M:IndependentTag.GetTaggedLocalElements    -> ICollection<Element>     ✅
+#:
+#: Возвраты замерены оракулом Roslyn (``tests/emitted_csharp_signature_closure``
+#: — намеренная ошибка CS0029 заставляет компилятор НАЗВАТЬ тип), а не взяты из
+#: документации. Множество то же самое — те же помеченные элементы этого
+#: документа, — меняется только форма ответа: ``Element.Id`` вместо ``ElementId``
+#: напрямую.
 _TAG_TARGET_2022_CS = r"""
         if (__tgInd != null)
         {
-            __tgStep = "IndependentTag.GetTaggedLocalElementIds (>=2022)";
-            var __tgTargets = __tgInd.GetTaggedLocalElementIds();
+            __tgStep = "IndependentTag.GetTaggedLocalElements (>=2022)";
+            var __tgTargets = __tgInd.GetTaggedLocalElements();
             int __tgTargetCount = (__tgTargets == null) ? 0 : __tgTargets.Count;
             if (__tgTargetCount == 0)
             {
@@ -677,9 +704,10 @@ _TAG_TARGET_2022_CS = r"""
                          "address_ambiguous");
                 continue;
             }
-            foreach (ElementId __tgOne in __tgTargets)
+            foreach (Element __tgOne in __tgTargets)
             {
-                __tgTargetId = __tgOne;
+                if (__tgOne == null) continue;
+                __tgTargetId = __tgOne.Id;
                 break;
             }
         }

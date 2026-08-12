@@ -104,7 +104,7 @@ class ArcLaws(unittest.TestCase):
                                                "arcs": [{"edge": 2, "bulge": -0.5}]}}),
                               snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
-        self.assertIn("KIR-T003", [d.code for d in out.diagnostics])
+        self.assertIn("KIR-T004", [d.code for d in out.diagnostics])
 
     def test_positive_bulge_ccw_sampling_matches_emitted_midpoint(self):
         p0, p1 = [0.0, 0.0], [10.0, 0.0]
@@ -215,7 +215,7 @@ class RegionComposition(unittest.TestCase):
                           "size_mm": [3000, 3000]}]}   # shares x=0 edge
         out = compile_program(_prog(bad), snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
-        self.assertIn("KIR-T003", [d.code for d in out.diagnostics])
+        self.assertIn("KIR-T004", [d.code for d in out.diagnostics])
 
     def test_crossing_holes_without_contained_vertices_are_refused(self):
         bad = {"outer": {"shape": "rect", "origin": [0, 0],
@@ -228,7 +228,7 @@ class RegionComposition(unittest.TestCase):
                ]}
         out = compile_program(_prog(bad), snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
-        self.assertIn("KIR-T003", [d.code for d in out.diagnostics])
+        self.assertIn("KIR-T004", [d.code for d in out.diagnostics])
 
     def test_2021_divergence(self):
         ok21 = compile_program(_prog({"outer": {"shape": "poly",

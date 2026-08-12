@@ -63,6 +63,20 @@ DirectShape — ГЕОМЕТРИЯ БЕЗ BIM-СМЫСЛА. Это не огов
   TessellatedShapeBuilderOutcome.{Nothing,Mesh,Solid}       → 6/6
   ElementId.IntegerValue                                    → 5/6  (нет в 2026)
 
+ЗАМЕР ПОД СВИДЕТЕЛЯ ПОВЕРХНОСТИ (тот же сервис, 09.08):
+
+  Mesh.NumTriangles / Mesh.get_Triangle(int)                → 6/6
+  MeshTriangle.get_Vertex(int) / Mesh.Vertices              → 6/6
+  List<long[]>.Sort(Comparison<long[]>)                     → 6/6
+  long.ToString(CultureInfo.InvariantCulture)               → 6/6
+  System.Security.Cryptography.SHA256.Create()              → 4/6  ← ПАМЯТЬ
+      2025, 2026: CS1069 тип переадресован в сборку вне замыкания ссылок
+  System.Security.Cryptography.SHA256Managed                → 4/6  (тот же)
+  SHA256.HashData(byte[])                                   → 0/6
+
+Хешировать в эмитируемой C# нельзя на двух из шести версий, поэтому свидетель
+сравнивает ПРООБРАЗ дайджеста, а не дайджест — разбор в шапке shape_emit.py.
+
 Четырёхаргументный CreateElement — это ровно тот случай, о котором
 предупреждает шапка extract.py: по памяти он пишется первым (так выглядит
 почти весь код DirectShape в интернете и в старых версиях API), компилятор
@@ -80,6 +94,16 @@ DirectShape — ГЕОМЕТРИЯ БЕЗ BIM-СМЫСЛА. Это не огов
 * СОЛИД. TessellatedShapeBuilderTarget.Solid компилируется, но требует
   замкнутого тела, а открытая оболочка — половина осмысленных мешей. Солид —
   отдельная волна с живым замером, а не флажок здесь.
+
+  ВОЛНА СОСТОЯЛАСЬ 09.08 — и не флажком, а ДРУГОЙ ДВЕРЬЮ: `ops_solid.py`
+  строит тело семью фабриками `GeometryCreationUtilities` (из семи взяты две
+  — выдавливание и вращение), а не тесселятором. Причина смены двери сильнее
+  первоначальной: у параметрического тела объём вычисляется АНАЛИТИЧЕСКИ на
+  компиляции из профиля CONTOUR, то есть свидетель сверяет величину, которой
+  во входе не было, — чего меш не умеет по построению (там сверяются
+  габарит и число треугольников, то есть наш же вход). Флажок Target=Solid
+  здесь так и не появился и не появится: он дал бы замкнутый меш, а не
+  параметрику, и свидетеля бы не усилил.
 
 ЗАМЕР, КОТОРЫЙ ВОРОТА НЕ ЛОВЯТ (и потому записан отдельно). Пара
 Target=Mesh + Fallback=Abort компилируется 6/6 и НЕ ЯВЛЯЕТСЯ поддерживаемой:
@@ -107,19 +131,19 @@ from kukai.ir.registry_base import *  # noqa: F401,F403 (OpSpec/ParamSpec/...)
 #: и в родном Revit означают «объём без BIM-роли». Категории, у которых в KIR
 #: есть настоящая операция (стены, перекрытия, кровли, колонны, каркас),
 #: отсутствуют намеренно — см. пункт 2 шапки. Все члены замерены 6/6.
-DIRECTSHAPE_CATEGORIES = freeze_registry_mapping({
+DIRECTSHAPE_CATEGORIES = {
     "generic_model": "OST_GenericModel",
     "mass": "OST_Mass",
     "site": "OST_Site",
     "entourage": "OST_Entourage",
     "specialty_equipment": "OST_SpecialityEquipment",
     "furniture": "OST_Furniture",
-})
+}
 
 #: Категории, которые компилируются, но запрещены здесь, и операция, которая
 #: делает то же самое ЧЕСТНО. Читается отказом, поэтому пользователь узнаёт не
 #: «нельзя», а «вот чем это делается».
-IMPERSONATION_ROUTES = freeze_registry_mapping({
+IMPERSONATION_ROUTES = {
     "walls": "create_wall",
     "floors": "create_floor / create_floor_by_contour",
     "roofs": "create_roof",
@@ -128,7 +152,7 @@ IMPERSONATION_ROUTES = freeze_registry_mapping({
     "structural_framing": "create_beam",
     "ceilings": "create_ceiling",
     "stairs": "create_stairs",
-})
+}
 
 OPS = [
     OpSpec(
@@ -155,17 +179,35 @@ OPS = [
             # пишущая операция реестра с такой клеткой.
             capability=(("create", "geometry"),),
             # Обещано ровно то, что проверяется, и каждое обещание читает
-            # РЕЗУЛЬТАТ, а не наш вызов: габарит и число треугольников
-            # вычитываются из построенной геометрии элемента.
+            # РЕЗУЛЬТАТ, а не наш вызов: габарит, число треугольников и сама
+            # поверхность вычитываются из построенной геометрии элемента.
             post=("direct shape exists (materialized or typed refusal); "
                   "bbox extents == mesh vertex extents in XYZ (±5mm, "
                   "geometry); "
-                  "built mesh triangle count == triangles count (geometry)"),
+                  "built mesh triangle count == triangles count (geometry); "
+                  "built mesh surface multiset == authored surface multiset "
+                  "on the ±0.5mm canon grid (geometry)"),
             writes_model=True,
             # ПУСТО, И ЭТО СОДЕРЖАТЕЛЬНО: у DirectShape нет типа, значит нет
             # ни пула, ни грунтовки. Единственная пишущая операция реестра без
             # grounded — см. «ЧЕСТНАЯ ЭТИКЕТКА».
             grounded=(),
-            tolerances={"bbox_mm": 5.0},
+            # ДВА ДОПУСКА, И ВТОРОЙ НЕ ВЫВЕДЕН ЗДЕСЬ. `surface_canon_mm` — это
+            # `GEOM_CANON_MM` из decompile/schema.py, замороженная решётка
+            # Tier-G, на которой уже стоит контентно-адресуемое хранилище
+            # геометрии и живой пост-коммитный предикат стенда идемпотентности.
+            # Свидетель поверхности обязан квантовать РОВНО так же, иначе он
+            # сравнивал бы два разных канона. Число не переписано сюда как
+            # мнение: равенство реестра и константы прибито тестом
+            # (`test_shape.py::SurfaceWitness...canon_grid...`), потому что
+            # импортировать `decompile.schema` из реестра значит тянуть весь
+            # пакет разбора (замер 09.08: +0.57 с на импорт) в старт сервиса.
+            #
+            # ПОЧЕМУ РЕШЁТКА И ЕСТЬ ДОПУСК. Сравнение точное (строка==строка),
+            # но сравниваются КВАНТОВАННЫЕ координаты, поэтому обнаружимость
+            # задаётся шагом: сдвиг вершины на ≥0.5 мм по любой оси меняет
+            # номер ячейки ГАРАНТИРОВАННО (ячейки шириной ровно 1 единицу),
+            # сдвиг <0.25 мм от центра ячейки не меняет его НИКОГДА.
+            tolerances={"bbox_mm": 5.0, "surface_canon_mm": 0.5},
         ),
 ]

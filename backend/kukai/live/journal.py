@@ -55,6 +55,7 @@ __all__ = (
     "append",
     "get",
     "key_for",
+    "remember_sections",
     "reset",
     "sessions",
     "stats",
@@ -174,6 +175,16 @@ class SessionJournal:
     #: не заведя второй экземпляр правила принадлежности, — поэтому она честно
     #: одна на здание, а не выдуманная поэтажная.
     op_tally: dict[str, int] = field(default_factory=dict)
+    #: ГЕОМЕТРИЯ ТИПОВ ЭТОГО ДОКУМЕНТА (волна sections): отметки уровней и
+    #: сечения типов, снятые стадией ground у ЖИВОЙ модели и уже очищенные
+    #: (`open_model.prune_ground_snapshot`). Журнал их не толкует и ничего о
+    #: них не знает — он их ХРАНИТ, потому что он единственное место, где
+    #: сессия переживает ход, а тело стены нельзя построить из одной программы.
+    #:
+    #: `None` и `{}` — РАЗНЫЕ факты: «ground не отвечал» против «ответил, а
+    #: сечений у типов нет». Читатель обязан их различать, поэтому и здесь
+    #: они разные значения.
+    sections: dict[str, Any] | None = None
 
     # -- запись -----------------------------------------------------------
     def append(self, record: ProgramRecord) -> ProgramRecord:
@@ -305,6 +316,27 @@ def append(key: SessionKey, program: Any, *, plan_digest: str = "",
         )
         journal.next_seq += 1
         return journal.append(record)
+
+
+def remember_sections(key: SessionKey, sections: Any) -> None:
+    """Запомнить геометрию типов документа этой сессии. Никогда не бросает.
+
+    Отдельным входом, а не полем `append`, намеренно: программа ложится в
+    журнал ДО того, как ground сходит к мосту (`serving`: publish на 1362,
+    снапшот на 1387), и связать их одним вызовом значило бы либо задержать
+    запись исходного кода здания, либо потерять сечения первого хода.
+    """
+    if sections is not None and not isinstance(sections, dict):
+        return
+    with _LOCK:
+        journal = _SESSIONS.get(key)
+        if journal is None:
+            journal = SessionJournal(key=key)
+            _SESSIONS[key] = journal
+            while len(_SESSIONS) > _max_sessions():
+                _SESSIONS.popitem(last=False)
+        _SESSIONS.move_to_end(key)
+        journal.sections = None if sections is None else dict(sections)
 
 
 def get(key: SessionKey) -> SessionJournal | None:

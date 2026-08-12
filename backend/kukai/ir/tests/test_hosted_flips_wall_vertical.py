@@ -230,9 +230,15 @@ class F5EmitFlips(unittest.TestCase):
         hosted»), но в код доведён не был — правило, заведённое рассуждением
         и не сомкнутое с кодом. Этот тест смыкает.
 
-        Недостигнутый флип — не молчание: постусловие сравнивает состояние и
-        называет причину (`CanFlipHand`), поэтому в strict откат честный, а в
-        report расхождение попадает в отчёт.
+        НЕДОСТИЖИМЫЙ ФЛИП — ТИПИЗИРОВАННЫЙ ОТКАЗ (обновлено 09.08). Раньше
+        он доезжал до постусловия, а вердикт свидетеля программный, поэтому за
+        одну неповорачиваемую створку платила вся программа (16 красных строк
+        `create_door` 21.07; у всех ЧЕТЫРЁХ с записанными нарушениями
+        geometry_ok и topology_ok — ЗЕЛЁНЫЕ). Теперь отказ стоит на флипе, называет
+        семейство и следующий ход; под `per_op` он стоит своего опа, а не
+        соседей. Закон «никаких зеркал на hosted» этим не ослаблен: отказ —
+        это отсутствие действия, а не новое действие. Подробности и
+        опровергающие тесты — `test_hosted_flip_refusal.py`.
         """
         prog = copy.deepcopy(self._PROG)
         door = prog["ops"][1]
@@ -241,11 +247,14 @@ class F5EmitFlips(unittest.TestCase):
         out = compile_program(prog, snapshot=GROUND_SNAPSHOT)
         self.assertTrue(out.ok)
         cs = out.csharp
-        self.assertIn("if (__el_D1.CanFlipHand)", cs)     # стабильный путь жив
+        # стабильный путь жив, но недостижимость теперь ОТКАЗ, а не молчание
+        self.assertIn("if (!__el_D1.CanFlipHand)", cs)
         self.assertIn("flipHand()", cs)
         self.assertNotIn("MirrorElements", cs)            # ветки больше нет
         self.assertNotIn("__kirLockedMirror", cs)         # и её бюджета тоже
-        # причина недостигнутого флипа названа, а не подразумевается
+        # причина названа И у отказа, и у уцелевшего постусловия
+        self.assertIn("не допускает смену стороны навески", cs)
+        self.assertIn("выберите другой тип двери", cs)
         self.assertIn("семейство не допускает флипа", cs)
 
     def test_flip_free_hosted_emission_is_byte_stable(self) -> None:

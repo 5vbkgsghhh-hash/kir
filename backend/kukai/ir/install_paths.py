@@ -6,13 +6,12 @@ each guarded by ``os.path.isdir("/opt/kukai-rebuild1")``.  That condition asks
 whether the path EXISTS ON THIS MACHINE, not whether the running code was
 imported FROM it — so on the production box every worktree, test sandbox and
 offline experiment resolved to the PRODUCTION corpora.  Measured 2026-08-02: a
-process started in `/home/claude/kir-product-lead` returned
+process started in a sibling worktree returned
 `/opt/kukai-rebuild1/backend/data/telemetry/kir_witness.jsonl`.
 
 Nothing was measured wrong by it — the corpora carry no worktree rows — but an
 instrument any neighbour can append to is not an instrument, and this package
-holds its measuring tools to the discipline of the measured
-(`CLAUDE.md`, "The measuring instruments deserve the same discipline").
+holds its measuring tools to the same discipline as the measured system.
 
 The rule, stated once instead of four times: **data belongs to the installation
 this module was imported from**.  A source checkout owns ``backend/data/…``
