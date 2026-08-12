@@ -59,10 +59,15 @@ def _grounded_programs():
 
     for pname, prog in PROGRAMS.items():
         min_ver = prog.get("__min_ver__", "2021")
-        prog = {k: v for k, v in prog.items() if k != "__min_ver__"}
+        # Верхняя граница версии — та же симметрия, что в самом корпусе (см.
+        # его шапку): у волны нагрузок ось версий смотрит в другую сторону,
+        # и на 2024-2026 честный ответ — типизированный KIR-E003, а не C#.
+        max_ver = prog.get("__max_ver__", VERSIONS[-1])
+        prog = {k: v for k, v in prog.items()
+                if k not in ("__min_ver__", "__max_ver__")}
         normed = _parse_and_check(prog)
         grounded = ground_mod.ground(normed, GROUND_SNAPSHOT)
-        for ver in [v for v in VERSIONS if v >= min_ver]:
+        for ver in [v for v in VERSIONS if min_ver <= v <= max_ver]:
             yield pname, ver, grounded
 
 

@@ -71,6 +71,7 @@ __all__ = (
     "drain",
     "enabled",
     "publish",
+    "remember_sections",
     "reset",
     "stats",
 )
@@ -536,6 +537,23 @@ async def _send(device_id: str, payload: dict) -> None:
 
 # ── кран ────────────────────────────────────────────────────────────────────
 
+def remember_sections(*, device_id: Optional[str], doc_key: str = "",
+                      sections: Any = None) -> None:
+    """Отдать журналу геометрию типов документа. Синхронно, никогда не бросает.
+
+    Отдельный вход, а не аргумент `publish`: снапшот приходит ПОЗЖЕ программы
+    (`serving`: publish, потом ground), и ждать его значило бы задержать
+    запись исходного кода здания ради картинки.
+    """
+    try:
+        if not enabled():
+            return
+        _journal.remember_sections(
+            _journal.key_for(device_id, doc_key), sections)
+    except Exception:  # noqa: BLE001 — поток не имеет права стоить хода
+        logger.debug("live plan sections failed", exc_info=True)
+
+
 def publish(*, device_id: Optional[str], doc_key: str = "",
             program: Any = None, plan_digest: str = "",
             author_digest: str = "", source: str = "") -> None:
@@ -559,6 +577,18 @@ def publish(*, device_id: Optional[str], doc_key: str = "",
         if record is None:
             return
         _COUNTERS["journaled"] += 1
+        # ── ТОЛЧОК ВЬЮЕРУ. Здесь и только здесь растёт `seq`, поэтому здесь
+        #    и только здесь можно разбудить, не заводя второго источника
+        #    курсора: номер принадлежит журналу, а сюда он лишь передаётся.
+        #    Вызов синхронный, ограниченный и fail-open — те же три свойства,
+        #    что у самого `publish`; иначе он мог бы стоить хода.
+        #    СТОИТ ДО проверки `attached`: панель чата и страница вьюера —
+        #    РАЗНЫЕ подписчики, и отсутствие первой не повод не будить вторую.
+        try:
+            from kukai.viewer import push as _push
+            _push.notify(device_id, doc_key, record.seq)
+        except Exception:  # noqa: BLE001 — вьюер не имеет права стоить хода
+            pass
         if not attached(key[0]):
             # Панель не подключена — рисование не запускается ВОВСЕ.
             _COUNTERS["skipped_no_panel"] += 1

@@ -169,6 +169,15 @@ using (Transaction __t = new Transaction(doc, "KIR: стояк ВК с отво�
             if (__reachedSegs < 2)
                 __post.Add("SYS1: network not fully connected (topology)");
         }
+            { var __lvp = __seg_SYS1_0.get_Parameter(BuiltInParameter.RBS_START_LEVEL_PARAM);
+              if (__lvp == null || __lvp.AsElementId() == null
+                  || __lvp.AsElementId().ToString() != "42")
+                __post.Add("SYS1: segment 0 level binding (topology)"); }
+            { var __lvp = __seg_SYS1_1.get_Parameter(BuiltInParameter.RBS_START_LEVEL_PARAM);
+              if (__lvp == null || __lvp.AsElementId() == null
+                  || __lvp.AsElementId().ToString() != "42")
+                __post.Add("SYS1: segment 1 level binding (topology)"); }
+
         // slope witness SYS1 (checked, not generated — see ops_connect.py note)
         { var __slc = __seg_SYS1_1.Location as LocationCurve;
           if (__slc == null) __post.Add("SYS1: __seg_SYS1_1 no curve for slope check");

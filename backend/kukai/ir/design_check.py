@@ -1770,12 +1770,22 @@ def spatial_model_from_program(
             continue
         width = params.get("width_mm")
         footprint: list[tuple[float, float]] = []
-        if width:
+        if width and params.get("p0_mm") is not None:
             p0 = (float(params["p0_mm"][0]), float(params["p0_mm"][1]))
             p1 = (float(params["p1_mm"][0]), float(params["p1_mm"][1]))
             band = LineString([p0, p1]).buffer(float(width) / 2.0, cap_style=2)
             if not band.is_empty:
                 footprint = _ring(band)
+        elif params.get("spiral") is not None:
+            # ВИНТОВОЙ МАРШ (09.08): плана у него здесь НЕТ, и это названный
+            # пробел, а не молчание. Полосу вокруг отрезка винт не описывает
+            # вовсе — его след это кольцевой сектор, — и подставить сюда
+            # прямую полосу значило бы дать HAB012 правдоподобно НЕВЕРНЫЙ
+            # план. Пусто честнее: ровно так же ведёт себя марш без ширины.
+            witness.note("stair_spiral_no_footprint",
+                         "винтовой марш: `create_stairs.spiral` — кольцевой "
+                         "сектор, полосой вокруг отрезка он не выражается, "
+                         "и плана марша здесь нет")
         else:
             witness.note("stair_no_width",
                          "`create_stairs.width_mm` не задан — плана марша нет, "
@@ -1930,6 +1940,119 @@ def _polygon_or_none(boundary: Sequence[tuple[float, float]]) -> Polygon | None:
     return poly
 
 
+#: НИЧЬЯ при выборе смежности проёма. Это НЕ порог и НЕ «мелкая разница».
+#:
+#: ЗАМЕР 10.08.2026 (прибор — сырой разбор `L0.jsonl`, корпус
+#: `backend/backend/data/decompile`, машинно-локальный): зазор между ВТОРЫМ и
+#: ТРЕТЬИМ кандидатом по расстоянию распадается НАДВОЕ и в полосе между
+#: половинами нет ни одного наблюдения.
+#:
+#:     `демо-v3`      66 дверей со степенью >=3: зазор РОВНО 0.0 у 36 (54.5%),
+#:                    у остальных 30 — от 145.702 до 204.951 мм
+#:     `k2_ar_rd_v7`  34 двери: зазор 0.0 у НУЛЯ, у всех 34 — 115.242 либо
+#:                    237.894 мм
+#:
+#: То есть различать надо ТОЧНОЕ равенство, а величина ниже защищает только от
+#: шума двоичной арифметики и не решает НИЧЕГО. Поднимать её до «разумных»
+#: миллиметров ЗАПРЕЩЕНО: это превратит защиту от шума в границу, заведённую
+#: рассуждением, — главный класс дефекта этого кода. Пустая полоса
+#: 0.0 … 115.242 мм измерена, а не назначена; если новое здание её заполнит,
+#: правило обязано пересматриваться замером, а не подкруткой числа.
+_ADJACENCY_TIE_EPS_MM: float = 1e-6
+
+
+def _adjacent_pair(ranked: Sequence[tuple[float, str]],
+                   witness: BuildWitness) -> tuple[str | None, str | None]:
+    """Две комнаты, которые дверь РАЗДЕЛЯЕТ, — по геометрии либо никак.
+
+    ЧТО ЗДЕСЬ ИСПРАВЛЕНО. Прежний код брал `near[0]`, `near[1]` из списка,
+    отсортированного ПО ИДЕНТИФИКАТОРУ КОМНАТЫ. Когда точка касалась трёх и
+    более помещений, пара выбиралась алфавитом — величиной, не имеющей
+    отношения ни к геометрии, ни к зданию. Следствие сильнее, чем счёт
+    попавших: ПЕРЕИМЕНОВАНИЕ КОМНАТ МЕНЯЛО СМЕЖНОСТЬ ЗДАНИЯ, НЕ МЕНЯЯ ЗДАНИЯ,
+    а смежность идёт ребром в `checker/graph.py` и дальше в вывод квартир и в
+    правила эвакуации.
+
+    ПОЧЕМУ ОТКАЗ, А НЕ «ДВЕ БЛИЖАЙШИЕ». Замер показал, что на `демо-v3` в
+    54.5% случаев второе место занято ВНИЧЬЮ (`d = [0.0, 150.0, 150.0]`):
+    одна комната содержит точку, а две соседние стоят ровно на 150 мм. Взять
+    «две ближайшие» здесь значит снова спросить алфавит, только тише. Поэтому
+    пара объявляется, ТОЛЬКО если между вторым и третьим кандидатом есть
+    зазор; иначе называется то, что известно, и молчится о том, что нет.
+
+    ПОЧЕМУ ОТКАЗ БЕЗОПАСЕН ИМЕННО У ДВЕРИ. Ребро смежности неверной парой
+    делает правило эвакуации НЕСПОСОБНЫМ ОТКАЗАТЬ — тот же дефект, из-за
+    которого один узел OUTSIDE сваривал этажи через улицу и HAB010 не мог
+    провалиться. Дверь без ребра — состояние, которое пакет уже умеет:
+    `derive.py` снимает рёбра фантомных дверей (`exclude_door_ids`), а
+    `_landing_room_on_level` при неоднозначных площадках возвращает None и
+    НЕ СТРОИТ ребра. Здесь тот же выбор, тем же основанием.
+
+    Порядок внутри пары (кто `from`, кто `to`) СЕМАНТИКИ НЕ НЕСЁТ: реальный
+    экстрактор ставит FromRoom/ToRoom по развороту двери, а не по смыслу
+    внутри/снаружи, и потребители читают пару как НЕУПОРЯДОЧЕННУЮ
+    (`building_entrance_rooms` берёт любую непустую сторону, `build_graph`
+    строит НЕОРИЕНТИРОВАННОЕ ребро). Инвариант — множество, а не слоты.
+    """
+    if not ranked:
+        return None, None
+    if len(ranked) == 1:
+        return ranked[0][1], None
+    if len(ranked) == 2:
+        return ranked[0][1], ranked[1][1]
+    if ranked[2][0] - ranked[1][0] > _ADJACENCY_TIE_EPS_MM:
+        return ranked[0][1], ranked[1][1]
+    if ranked[1][0] - ranked[0][0] > _ADJACENCY_TIE_EPS_MM:
+        witness.note(
+            "opening_second_side_undecidable",
+            f"у двери первая сторона определена геометрией, а ВТОРАЯ занята "
+            f"вничью ({len(ranked)} помещений в допуске, кандидаты на второе "
+            f"место равноудалены): вторая сторона не объявлена, потому что "
+            f"выбрать её можно было бы только по имени помещения")
+        return ranked[0][1], None
+    witness.note(
+        "opening_sides_undecidable",
+        f"у двери НИ ОДНА сторона не определяется геометрией: {len(ranked)} "
+        f"помещений в допуске равноудалены. Стороны не объявлены — прежний код "
+        f"брал две первые ПО АЛФАВИТУ идентификатора")
+    return None, None
+
+
+def _nearest_room(ranked: Sequence[tuple[float, str]],
+                  witness: BuildWitness) -> str | None:
+    """Помещение, которое окно освещает: БЛИЖАЙШЕЕ, а при ничьей — названное.
+
+    ОТЛИЧИЕ ОТ ДВЕРИ НАМЕРЕННОЕ, И ВОТ ЕГО ОСНОВАНИЕ. У двери отказ снимает
+    ребро и может лишь лишить правило зелёного света. У окна отказ снимает
+    `room_id`, а на нём стоит HAB030 («в помещении нет окна»): отказаться
+    значит ОБВИНИТЬ здание — ровно тот класс ложных BLOCKING, против которого
+    в чекере v2 заведены `APARTMENT_MARKERS` и оговорки `_caveats`. Поэтому
+    здесь выбор не снимается, а УТОЧНЯЕТСЯ до геометрического и НАЗЫВАЕТСЯ,
+    когда геометрия молчит.
+
+    ЗАМЕР 10.08, почему это не теория: `sob62_r23_v5` — 24 окна из 31 касаются
+    ДВУХ помещений, и ВСЕ 24 стоят к ним РОВНО НА ОДНОМ расстоянии. То есть на
+    этом здании выбор помещения у каждого неоднозначного окна делался
+    алфавитом. Прочие здания корпуса неоднозначных окон не дают вовсе
+    (`демо-v3` — 0, `k2_ar_rd_v7` — 0, `snowdon_plumb_v5` — 0).
+
+    Смена семантики HAB030 на «окно МОЖЕТ освещать любое из N» — решение о
+    продукте, а не механическая правка, и здесь оно не принимается.
+    """
+    if not ranked:
+        return None
+    if len(ranked) == 1:
+        return ranked[0][1]
+    if ranked[1][0] - ranked[0][0] > _ADJACENCY_TIE_EPS_MM:
+        return ranked[0][1]
+    witness.note(
+        "window_room_undecidable",
+        f"окно равноудалено от {len(ranked)} помещений: помещение выбрано ПО "
+        f"ИМЕНИ, потому что геометрия их не различает. Число сказано, чтобы "
+        f"HAB030 читался с этой поправкой, а не как факт о здании")
+    return ranked[0][1]
+
+
 def _openings(
     *,
     door_elements: Iterable[Any],
@@ -1965,17 +2088,28 @@ def _openings(
         if ids:
             trees[level_id] = (ids, STRtree([room_polys[rid] for rid in ids]))
 
-    def touching(level_id: str, point: Point) -> list[str]:
+    def touching(level_id: str, point: Point) -> list[tuple[float, str]]:
+        """Комнаты, которых касается точка, РАНЖИРОВАННЫЕ ПО РАССТОЯНИЮ.
+
+        Возвращается расстояние, а не один адрес: без него выбрать сторону
+        можно только сортировкой строк, а лексикографический порядок
+        идентификаторов не есть свойство постройки. Прежняя `sorted(out)`
+        отдавала комнаты ПО АЛФАВИТУ, и `near[0]`/`near[1]` брали первые две.
+        """
         got = trees.get(level_id)
         if got is None:
             return []
         ids, tree = got
-        out: list[str] = []
+        out: list[tuple[float, str]] = []
         for index in tree.query(point.buffer(tol)):
             rid = ids[int(index)]
             poly = room_polys[rid]
-            if poly.exterior.distance(point) <= tol or poly.contains(point):
-                out.append(rid)
+            if poly.contains(point):
+                out.append((0.0, rid))
+                continue
+            distance = poly.exterior.distance(point)
+            if distance <= tol:
+                out.append((distance, rid))
         return sorted(out)
 
     doors: list[Door] = []
@@ -1996,12 +2130,13 @@ def _openings(
             witness.drop("doors", "уровень не разрешается")
             continue
         size = size_of(element)
-        near = touching(level_id, Point(location))
+        first, second = _adjacent_pair(
+            touching(level_id, Point(location)), witness)
         doors.append(Door(
             id=id_of(element), level_id=level_id, location=location,
             width_mm=float(size[0]) if size else 0.0,
-            from_room_id=near[0] if near else None,
-            to_room_id=near[1] if len(near) > 1 else None,
+            from_room_id=first,
+            to_room_id=second,
             is_exterior=False,
             host_wall_id=host,
         ))
@@ -2030,7 +2165,7 @@ def _openings(
             witness.drop("windows", "уровень не разрешается")
             continue
         size = size_of(element)
-        near = touching(level_id, Point(location))
+        lit_room = _nearest_room(touching(level_id, Point(location)), witness)
         if size is not None:
             measured_any = True
             width, height = size
@@ -2042,7 +2177,7 @@ def _openings(
             width, height, area = 0.0, None, float(nominal or 0.0)
         windows.append(Window(
             id=id_of(element), level_id=level_id, host_wall_id=host,
-            room_id=near[0] if near else None,
+            room_id=lit_room,
             width_mm=width, area_m2=area, height_mm=height, location=location,
         ))
     witness.opening_size_measured = measured_any
@@ -2153,6 +2288,8 @@ def verdict_headline_text(verdict: Verdict | None, *, evaluated: int,
     word = _VERDICT_RU.get(verdict, str(verdict))
     if verdict is Verdict.PASS and total and evaluated < total:
         return f"{word} ПО {evaluated} ПРАВИЛАМ ИЗ {total}, ОСТАЛЬНОЕ НЕ ОЦЕНЕНО"
+    if verdict is Verdict.NOT_EVALUATED and total:
+        return f"ИТОГ НЕ ОЦЕНЕН; ОЦЕНЕНО {evaluated} ПРАВИЛ ИЗ {total}"
     return word
 
 

@@ -32,12 +32,12 @@ using (Transaction __t = new Transaction(doc, "KIR: проём в существ
         doc.Regenerate();
         var __hbb_O1 = __hst_O1.get_BoundingBox(null);
         if (__hbb_O1 == null) { __t.RollBack(); return __Refuse("O1", "у носителя проёма нет габарита — отметку профиля взять неоткуда, а нулевая была бы тихой неправдой"); }
-        double __z_O1 = (__hbb_O1.Min.Z + __hbb_O1.Max.Z) / 2.0;
+        double __z_O1 = MM((__hbb_O1.Min.Z + __hbb_O1.Max.Z) / 2.0);
         CurveArray __ca_O1 = new CurveArray();
-        __ca_O1.Append(Line.CreateBound(new XYZ(U(1000), U(1000), __z_O1), new XYZ(U(3000), U(1000), __z_O1)));
-        __ca_O1.Append(Line.CreateBound(new XYZ(U(3000), U(1000), __z_O1), new XYZ(U(3000), U(3000), __z_O1)));
-        __ca_O1.Append(Line.CreateBound(new XYZ(U(3000), U(3000), __z_O1), new XYZ(U(1000), U(3000), __z_O1)));
-        __ca_O1.Append(Line.CreateBound(new XYZ(U(1000), U(3000), __z_O1), new XYZ(U(1000), U(1000), __z_O1)));
+        __ca_O1.Append(Line.CreateBound(new XYZ(U(1000), U(1000), U(__z_O1)), new XYZ(U(3000), U(1000), U(__z_O1))));
+        __ca_O1.Append(Line.CreateBound(new XYZ(U(3000), U(1000), U(__z_O1)), new XYZ(U(3000), U(3000), U(__z_O1))));
+        __ca_O1.Append(Line.CreateBound(new XYZ(U(3000), U(3000), U(__z_O1)), new XYZ(U(1000), U(3000), U(__z_O1))));
+        __ca_O1.Append(Line.CreateBound(new XYZ(U(1000), U(3000), U(__z_O1)), new XYZ(U(1000), U(1000), U(__z_O1))));
         __el_O1 = doc.Create.NewOpening(__hst_O1, __ca_O1, false);
         if (__el_O1 == null) { __t.RollBack(); return __Refuse("O1", "создание проёма по профилю вернуло null"); }
         try { Parameter __cm = __el_O1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:6cf8a99a:O1"); } catch { }

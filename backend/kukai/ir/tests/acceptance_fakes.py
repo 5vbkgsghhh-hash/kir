@@ -10,7 +10,7 @@ import hashlib
 import re
 from typing import Any, Callable, Mapping
 
-from kukai.ir.acceptance import derive_expectation
+from kukai.ir.acceptance import derive_expectation, symbol_rows_from_snapshot
 from kukai.ir.acceptance_live import observation_from_census
 from kukai.ir.acceptance_mutation import (
     MutationKind,
@@ -58,7 +58,14 @@ class PassingAcceptanceBridge:
                     and row.get("id") is not None
                     and isinstance(row.get("name"), str))
             }
-        return derive_expectation(self.plan, level_names_by_id=by_id)
+        # Обязано совпадать с acceptance_runtime.prepare_acceptance байт в
+        # байт: ожидание участвует в подписи, и лишний/недостающий справочник
+        # тут же ломает строгий разбор переписи.
+        return derive_expectation(
+            self.plan,
+            level_names_by_id=by_id,
+            family_symbols=symbol_rows_from_snapshot(self.snapshot),
+        )
 
     def _mutation_expectation(self):
         assert self.plan is not None

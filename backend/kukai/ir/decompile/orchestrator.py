@@ -186,6 +186,7 @@ def decompile(
     curtain_index: Any = None,
     annotation_index: Any = None,
     tag_index: Any = None,
+    dimension_index: Any = None,
     mep_system_index: Any = None,
     group_index: GroupExtraction | Mapping[str, Any] | None = None,
     target_contract: TargetContract | str = TargetContract.SAME_ENVIRONMENT,
@@ -208,6 +209,7 @@ def decompile(
         curtain_index=curtain_index,
         annotation_index=annotation_index,
         tag_index=tag_index,
+        dimension_index=dimension_index,
         mep_system_index=mep_system_index,
     )
     l1_nodes = lift_result.nodes
@@ -218,7 +220,10 @@ def decompile(
     )
     name_result = name_document(document, tree)
     dependency_manifest = build_dependency_manifest(
-        document, target_contract=target_contract)
+        document,
+        target_contract=target_contract,
+        family_placement=retained_placements,
+    )
     build_status = BuildStatuses.initial(
         unresolved_dependencies=dependency_manifest.unresolved_count)
     equivalence = EquivalenceClaim.unverified(equivalence_scope)

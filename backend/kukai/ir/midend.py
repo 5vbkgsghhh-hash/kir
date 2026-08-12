@@ -1,4 +1,4 @@
-"""Typed, immutable KIR mid-end plan.
+"""Typed, immutable KIR plan and grounded mid-end evidence.
 
 The parser historically returned a mutable ``list[dict]``.  That made the
 normalised program an implicit convention: compilation, result checking and
@@ -11,6 +11,13 @@ Callers receive a fresh object from :meth:`PlannedOp.to_dict`, so no downstream
 stage can mutate the plan that was hashed.  The digest covers both executable
 payload and typed registry contracts; changing an op's effect/result semantics
 therefore changes the evidence identity even when its source spelling does not.
+
+``GroundedProgram`` is a parent-bound child of that exact plan.  It freezes the
+model-dependent selector decisions that authoring emitters still consume as
+legacy dictionaries and accounts for every nested ``__grounded__`` marker.
+The digest names the exact trusted-grounder output; it does **not** attest the
+identity or revision of the snapshot that produced it.  That requires a future
+authoritative context contract and must not be inferred from ``ground_digest``.
 """
 from __future__ import annotations
 
@@ -33,14 +40,21 @@ class PlanEncodingError(ValueError):
 
 def _canonical_json(value: Any) -> str:
     try:
-        return json.dumps(
+        encoded = json.dumps(
             value,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
         )
-    except (TypeError, ValueError) as exc:
+        # ``ensure_ascii=False`` otherwise accepts an isolated UTF-16
+        # surrogate and fails only later, while hashing.  Reject it at the
+        # canonical boundary: planning converts it to a typed input refusal,
+        # while an impossible ground-stage payload becomes fail-closed
+        # KIR-P000 at the public compiler facade instead of escaping.
+        encoded.encode("utf-8", errors="strict")
+        return encoded
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
         raise PlanEncodingError(str(exc)) from exc
 
 
@@ -270,7 +284,7 @@ class PlannedProgram:
 
 @dataclass(frozen=True, slots=True)
 class GroundingResolution:
-    """One explicit model-dependent decision made by the ground stage."""
+    """One explicit model-dependent selector resolution."""
 
     op_id: str
     field_name: str
@@ -283,7 +297,7 @@ class GroundingResolution:
         if not isinstance(self.op_id, str) or not self.op_id:
             raise ValueError("grounding resolution needs an op id")
         if not isinstance(self.field_name, str) or not self.field_name:
-            raise ValueError("grounding resolution needs a field name")
+            raise ValueError("grounding resolution needs a field path")
         if not isinstance(self.via, str) or not self.via:
             raise ValueError("grounding resolution needs a named rule")
         if isinstance(self.resolved_id, bool) or not isinstance(
@@ -296,7 +310,8 @@ class GroundingResolution:
             detail = json.loads(self._detail_json)
         except (TypeError, ValueError) as exc:
             raise ValueError("grounding detail must be canonical JSON") from exc
-        if not isinstance(detail, dict) or _canonical_json(detail) != self._detail_json:
+        if (not isinstance(detail, dict)
+                or _canonical_json(detail) != self._detail_json):
             raise ValueError("grounding detail must be a canonical object")
 
     @classmethod
@@ -307,10 +322,16 @@ class GroundingResolution:
         field_name: str,
         detail: dict[str, Any],
     ) -> "GroundingResolution":
+        via = detail.get("via")
+        if not isinstance(via, str) or not via:
+            # A missing rule is not evidence named "unknown".  Reject it:
+            # inventing provenance here would make an unaccounted resolution
+            # look complete merely because it was included in the digest.
+            raise ValueError("grounding resolution needs a named rule")
         return cls(
             op_id=op_id,
             field_name=field_name,
-            via=str(detail.get("via") or "unknown"),
+            via=via,
             resolved_id=detail.get("id", detail.get("ref")),
             resolved_name=detail.get("name"),
             _detail_json=_canonical_json(detail),
@@ -323,19 +344,28 @@ class GroundingResolution:
         op_id: str,
         payload: dict[str, Any],
     ) -> tuple["GroundingResolution", ...]:
-        """Collect grounded selectors recursively with stable field paths."""
+        """Collect every nested marker once, with a stable field path.
+
+        Selectors can be nested below lists (``levels[0]`` on multistory
+        stairs) and below authored containers (group members).  Stopping at
+        top-level fields would produce a green digest with unaccounted model
+        choices, so traversal is recursive and deterministic.
+        """
         found: list[GroundingResolution] = []
 
         def visit(value: Any, path: str) -> None:
             if isinstance(value, dict):
-                detail = value.get("__grounded__")
-                if isinstance(detail, dict):
+                if "__grounded__" in value:
+                    detail = value["__grounded__"]
+                    if not isinstance(detail, dict):
+                        raise ValueError(
+                            f"grounding marker at {path or '<root>'} "
+                            "must be an object")
                     found.append(cls.from_dict(
                         op_id=op_id,
-                        field_name=path,
+                        field_name=path or "<root>",
                         detail=detail,
                     ))
-                    return
                 for key in sorted(value):
                     child_path = f"{path}.{key}" if path else key
                     visit(value[key], child_path)
@@ -366,6 +396,10 @@ class GroundedOp:
     _payload_json: str = field(repr=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.op_id, str) or not self.op_id:
+            raise ValueError("grounded op id must be a non-empty string")
+        if not isinstance(self.op_name, str) or not self.op_name:
+            raise ValueError("grounded op name must be a non-empty string")
         try:
             payload = json.loads(self._payload_json)
         except (TypeError, ValueError) as exc:
@@ -379,6 +413,8 @@ class GroundedOp:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "GroundedOp":
+        if not isinstance(payload, dict):
+            raise TypeError("grounded op payload must be an object")
         return cls(
             op_id=payload["id"],
             op_name=payload["op"],
@@ -386,6 +422,7 @@ class GroundedOp:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a detached mutable copy for legacy emitters."""
         return json.loads(self._payload_json)
 
     @property
@@ -395,7 +432,13 @@ class GroundedOp:
 
 @dataclass(frozen=True, slots=True)
 class GroundedProgram:
-    """Immutable result of grounding one exact :class:`PlannedProgram`."""
+    """Immutable exact output of grounding one :class:`PlannedProgram`.
+
+    Parent binding fixes operation order/identity and prevents a changed
+    output from retaining the same digest.  It does not independently prove
+    that each changed planned value was a legal lowering: ``ground_program``
+    trusts the existing ground stage for that semantic transformation.
+    """
 
     planned: PlannedProgram
     ops: tuple[GroundedOp, ...]
@@ -405,22 +448,30 @@ class GroundedProgram:
     def __post_init__(self) -> None:
         if not isinstance(self.planned, PlannedProgram):
             raise TypeError("grounded program needs a typed parent plan")
-        if not isinstance(self.ops, tuple) or any(
-                not isinstance(op, GroundedOp) for op in self.ops):
+        if (not isinstance(self.ops, tuple)
+                or any(not isinstance(op, GroundedOp) for op in self.ops)):
             raise TypeError("grounded operations must be a typed tuple")
-        if not isinstance(self.resolutions, tuple) or any(
-                not isinstance(item, GroundingResolution)
-                for item in self.resolutions):
+        if (not isinstance(self.resolutions, tuple)
+                or any(not isinstance(item, GroundingResolution)
+                       for item in self.resolutions)):
             raise TypeError("grounding resolutions must be a typed tuple")
+
         planned_identity = [
             (op.op_id, op.op_name) for op in self.planned.ops
         ]
         grounded_identity = [(op.op_id, op.op_name) for op in self.ops]
         if grounded_identity != planned_identity:
-            raise ValueError("grounded operations disagree with parent plan")
+            raise ValueError(
+                "grounded operations must preserve parent order and identity")
+
+        # Grounding legitimately replaces selectors and addressed geometry,
+        # so equality with planned values is not a valid law here.  Preserve
+        # every planned field, then bind the exact resulting values in the
+        # payload digest below.  Legality remains the trusted grounder's job.
         for planned_op, grounded_op in zip(self.planned.ops, self.ops):
             if not set(planned_op.to_dict()).issubset(grounded_op.to_dict()):
                 raise ValueError("grounding removed a planned field")
+
         known_ids = {op.op_id for op in self.ops}
         if any(item.op_id not in known_ids for item in self.resolutions):
             raise ValueError("grounding report references an unknown op")
@@ -432,10 +483,10 @@ class GroundedProgram:
                 payload=op.to_dict(),
             )
         )
-        if ([item.to_dict() for item in self.resolutions]
-                != [item.to_dict() for item in expected_resolutions]):
+        if self.resolutions != expected_resolutions:
             raise ValueError(
                 "grounding report must cover every grounded selector exactly")
+
         computed = hashlib.sha256(
             _canonical_json(self._unsigned_evidence()).encode("utf-8")
         ).hexdigest()
@@ -448,11 +499,21 @@ class GroundedProgram:
         cls,
         planned: PlannedProgram,
         ops: list[dict[str, Any]],
-        resolutions: tuple[GroundingResolution, ...],
+        resolutions: tuple[GroundingResolution, ...] | None = None,
     ) -> "GroundedProgram":
+        grounded_ops = tuple(GroundedOp.from_dict(op) for op in ops)
+        if resolutions is None:
+            resolutions = tuple(
+                item
+                for op in grounded_ops
+                for item in GroundingResolution.collect(
+                    op_id=op.op_id,
+                    payload=op.to_dict(),
+                )
+            )
         return cls(
             planned=planned,
-            ops=tuple(GroundedOp.from_dict(op) for op in ops),
+            ops=grounded_ops,
             resolutions=resolutions,
         )
 

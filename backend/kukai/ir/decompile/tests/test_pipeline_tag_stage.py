@@ -179,7 +179,7 @@ class TheEmittedBodyFollowsTheDocumentsVersion(unittest.TestCase):
     """Шов 2022 обязан ехать из ПРОЧИТАННОГО документа, а не из умолчания."""
 
     PROPERTY_CALL = "__tgInd.TaggedLocalElementId"
-    METHOD_CALL = "__tgInd.GetTaggedLocalElementIds()"
+    METHOD_CALL = "__tgInd.GetTaggedLocalElements()"
 
     def _body(self, revit_version: str) -> str:
         with TemporaryDirectory() as tmp:

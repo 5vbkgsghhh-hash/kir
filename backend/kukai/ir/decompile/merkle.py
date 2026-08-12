@@ -18,9 +18,17 @@ Design decisions, trade-offs and the equivalence-class differences against
 ``fold.canon_hash`` are documented in ``MERKLE_SPEC.md`` at the worktree
 root.  The headline points:
 
-* Every node is hashed against its **own canonical origin** (rounded
-  ``facts.bbox_min_mm``), so translation invariance holds at *every* level,
-  not only for whole floors.  A parent edge carries
+* Every node is hashed against its **own canonical origin** — ``node_origin``:
+  the component-wise minimum over the located points of the subtree, with z
+  taken from genuinely 3D points only — so translation invariance holds at
+  *every* level, not only for whole floors.  It is deliberately NOT
+  ``facts.bbox_min_mm``: fold zero-fills the z of 2D param points, which would
+  pin every elevated floor's origin to world zero (measured 2026-08-09: 20 364
+  such nodes on ``k2_ar_rd_v6``, 2 404 on ``sob62_fas_r23_v17``).  This
+  paragraph named ``facts.bbox_min_mm`` until 2026-08-10 and was therefore the
+  exact opposite of what ``node_origin``'s own docstring says; the line is held
+  by ``test_node_origin_is_not_bbox_min_where_they_must_differ``.
+* A parent edge carries
   ``offset = child_origin - parent_origin``; both terms are multiples of
   ``CANON_MM`` so the subtraction is float-exact.  Moving a child therefore
   changes the parent hash — equal root hashes still mean equal buildings

@@ -1126,14 +1126,60 @@ class QueryTypes(unittest.TestCase):
         self.assertFalse(out.ok)
         self.assertIn("KIR-L002", [d.code for d in out.diagnostics])
 
-    def test_all_sixteen_pools_compile_offline(self):
+    def test_all_twenty_five_pools_compile_offline(self):
         """Every pool in the closed enum must actually emit — a stale/typo'd
         entry in the choices tuple vs. _TYPE_POOL_COLLECTOR_CS would KeyError
         at emit time (an internal bug, not a refusal); this proves the two
-        tables stay in lockstep (16 pools — the type subset serving.py's
-        _SNAPSHOT_CS collects live, see ops_authoring.py's OpSpec comment)."""
+        tables stay in lockstep (the type subset serving.py's _SNAPSHOT_CS
+        collects live, see ops_authoring.py's OpSpec comment).
+
+        16 -> 19: wave/mep-electrical добавила conduit_types, flex_duct_types
+        и flex_pipe_types. Число держится руками намеренно — молча выросшее,
+        оно перестало бы что-либо утверждать.
+
+        19 -> 23: wave/analysis добавила load_cases, point_load_types,
+        line_load_types и area_load_types. Спросить каталог ДО попытки здесь
+        нужнее, чем где бы то ни было: `load_case` у всех трёх нагрузок
+        ОБЯЗАТЕЛЕН, а в расчётном проекте случаев загружения десятки.
+
+        23 -> 24: wave/framing добавила truss_types. У фермы документного типа
+        по умолчанию НЕТ вовсе (ElementTypeGroup.TrussType — CS0117 на всех
+        шести версиях), поэтому спросить каталог заранее для неё не удобство,
+        а единственный способ назвать тип, не нарвавшись на отказ уже внутри
+        программы. Балочная система своего пула не приносит: её `symbol` —
+        тот же beam_types, что у create_beam.
+
+        24 ПЕРЕСНЯТО ПРИБОРОМ ПОСЛЕ СЛИЯНИЯ, а не сложено: обе волны считали
+        от 19 и назвали 23 и 20 соответственно.
+
+        24 -> 26: wave/sweep добавила wall_sweep_types и slab_edge_types, и
+        первый из них — ЕДИНСТВЕННЫЙ пул этой таблицы, собранный по ДВУМ
+        КАТЕГОРИЯМ вместо класса: класса `WallSweepType`-как-ElementType в API
+        не существует вовсе (`WallSweepType` — перечисление {Sweep, Reveal},
+        замерено компиляцией на шести версиях). Именно поэтому здесь пул один
+        на карнизы и русты, и именно поэтому предварительный запрос ему нужнее
+        всех: у стенного профиля тип задаёт ГЕОМЕТРИЮ целиком (ремарка
+        Autodesk), а имя типа — обычно единственный способ отличить карниз от
+        руста.
+
+        26 -> 27: wave/detail добавила filled_region_types. Спросить каталог
+        заранее здесь по существу, а не для удобства: имена типов заливки
+        ОФОРМИТЕЛЬСКИЕ («Бетон», «Грунт», «Штриховка 45»), их у настоящего
+        проекта десятки, и промах по имени — это KIR-G101/G102 ходом позже.
+        Документное умолчание у заливки есть, но выбирать штриховку
+        умолчанием — то же самое, что выбирать её жребием.
+
+        ЗАМЕТКА ДЛЯ СЛЕДУЮЩЕЙ ВОЛНЫ: этот список УЖЕ упирался в бюджет
+        программы (MAX_OPS_PER_PROGRAM = 20), и живые ворота с 09.08 гоняют
+        его ЧАНКАМИ, а не срезом. 27 пулов — это два чанка (20 + 7); срез
+        `[:20]` купил бы зелёный цвет ценой покрытия последнего чанка.
+
+        ЧИСЛО ПЕРЕСНЯТО НА СВЕДЁННОМ ДЕРЕВЕ: волна детализации написала «25»
+        против своей базы в 24, не зная про два пула волны навесных профилей,
+        а та написала «26», не зная про заливку. Ни одна цифра не верна
+        здесь — верна только снятая прогоном."""
         pools = spec.OPS["query_types"].params[0].choices
-        self.assertEqual(len(pools), 16)
+        self.assertEqual(len(pools), 27)
         for pool in pools:
             with self.subTest(pool=pool):
                 out = compile_program({"ir_version": "1.0",

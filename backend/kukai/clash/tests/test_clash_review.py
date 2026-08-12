@@ -65,15 +65,103 @@ def test_01_arc_profile_hull_must_contain_the_arc_bulge():
                 f"({rec.hull_source}/{rec.grade})")
 
 
-def test_01b_arc_profile_falls_back_to_coarse():
-    """Правка D1 (ревью №1): при ЛЮБОЙ дуге в контуре — откат в bbox/coarse.
+def test_01b_arc_profile_is_bounded_outward_not_dropped():
+    """ВОЛНА DECOMPOSE отменяет откат в bbox — но только вместе с ДОКАЗАТЕЛЬСТВОМ.
 
-    Доказанной наружной аппроксимации дуги у нас нет, а хорда режет тело;
-    единственная честная оболочка до неё — габаритный бокс.
+    Прежняя правка D1 отправляла дуговой контур в габаритный бокс, и причина
+    была названа честно: «доказанной наружной аппроксимации дуги у нас нет».
+    Теперь она есть, и это не формулировка, а конструкция: дуга не больше
+    полуокружности целиком лежит в прямоугольнике «хорда × стрелка наружу»
+    (`hulls._arc_outward_rect`), а стрелка берётся из `arc_midpoints` разбора,
+    а не из константы.
+
+    Тест поэтому проверяет не «какой источник победил», а ТО ЖЕ САМОЕ, что и
+    №1, — закон консервативности, — и вдобавок требует, чтобы величина
+    огрубления была ОПУБЛИКОВАНА. Оболочка, ставшая тоньше молча, ничем не
+    лучше оболочки, ставшей тоньше неправомерно.
     """
     el, prof = floor_9981227()
     rec, _ = H.build_hull(el, profile=prof)
+    assert rec.hull_source == "profile" and rec.grade == "conservative"
+    slack = rec.extra.get("arc_outward_slack_mm")
+    assert slack is not None and slack > 0.0, (
+        "раздутие наружу обязано быть названо числом: без него «наружная "
+        "аппроксимация» — обещание, а не замер")
+    # Ровно та величина, которой ревью №1 измерило нарушение: середина дуги
+    # лежала на 752.832 мм снаружи хордовой оболочки. Стрелка обязана её
+    # накрыть — иначе прямоугольник не содержит дугу.
+    assert slack >= 752.832
+
+
+def test_01f_the_bbox_clip_may_never_cut_the_declared_contour():
+    """Обрезка накладок обязана резать НАКЛАДКИ, а не объявленную область.
+
+    Живой контрпример (`snowdon_plumb_v5`, пол 1424071, замер 10.08.2026):
+    контур доходит до x = 974.73, габарит элемента — только до x = −1854.20.
+    Обрезка по габариту ЭЛЕМЕНТА срезала 21.13 % объявленной области, и проба
+    вложенности увидела 95 точек контура вне оболочки. Это пропуск клеша, а не
+    неточность, поэтому границей служит габарит САМОЙ области.
+
+    Здесь то же самое в мелком масштабе: квадрат с одной дугой и заведомо
+    ВРУЩИМ габаритом элемента, обрезающим половину контура.
+    """
+    prof = {"profile_available": True,
+            "exterior_loop": [[0, 0], [100, 0], [100, 100], [0, 100]],
+            "curve_kinds": [["arc", "line", "line", "line"]],
+            "arc_midpoints": [[[50, -20], None, None, None]], "holes": []}
+    el = {"element_id": "c", "category": "OST_Floors",
+          # габарит ВРЁТ: он вдвое уже контура
+          "bbox_min_mm": [0, -20, 0], "bbox_max_mm": [50, 100, 10]}
+    rec, _ = H.build_hull(el, profile=prof)
+    assert rec.hull_source == "profile"
+    for x, y in ((0, 0), (100, 0), (100, 100), (0, 100), (50, -20), (99, 99)):
+        assert G.contains_point(rec.hull, (float(x), float(y), 5.0)), (
+            f"объявленная точка ({x},{y}) вырезана обрезкой")
+    zc = (el["bbox_min_mm"][2] + el["bbox_max_mm"][2]) / 2.0
+    for loop in [prof["exterior_loop"]] + list(prof.get("holes") or []):
+        for p in loop:
+            assert G.contains_point(rec.hull, (float(p[0]), float(p[1]), zc)), (
+                "объявленная вершина контура вне оболочки")
+
+
+def test_01d_a_curve_we_cannot_bound_still_falls_back():
+    """Замок не открыт настежь: неограничиваемая кривая по-прежнему в bbox.
+
+    Дуга получила наружную оболочку ПОТОМУ, что для неё есть доказательство.
+    У сплайна его нет, и он обязан вести себя ровно как дуга до этой волны.
+    """
+    el = {"element_id": "s", "category": "OST_Floors",
+          "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [10, 10, 1]}
+    prof = {"profile_available": True,
+            "exterior_loop": [[0, 0], [10, 0], [10, 10], [0, 10]],
+            "curve_kinds": [["line", "hermite_spline", "line", "line"]],
+            "arc_midpoints": [[None, None, None, None]], "holes": []}
+    assert H.profile_refusal(prof) == "profile_curve_hermite_spline"
+    rec, _ = H.build_hull(el, profile=prof)
     assert rec.hull_source == "bbox" and rec.grade == "coarse"
+
+
+def test_01e_half_circle_arc_is_refused_not_guessed():
+    """Формула наружного прямоугольника верна только до полуокружности.
+
+    За этой границей проекция дуги вылезает за торцы хорды, и прямоугольник её
+    больше не содержит. Здесь обязан быть ОТКАЗ, а не формула вне области
+    применимости — та же болезнь, что чинил `arc_chord_polyline` для span > π.
+    """
+    # Полуокружность радиуса 5: хорда 10, стрелка 5 = L/2.
+    prof = {"profile_available": True,
+            "exterior_loop": [[0, 0], [10, 0], [10, 10], [0, 10]],
+            "curve_kinds": [["arc", "line", "line", "line"]],
+            "arc_midpoints": [[[5, -5], None, None, None]], "holes": []}
+    assert H.profile_refusal(prof) is None, "дуга сама по себе больше не отказ"
+    reg = H.profile_loops(prof)
+    assert reg.reason == "profile_arc_over_half_circle"
+    assert reg.loops == () and reg.arc_patches == ()
+    el = {"element_id": "h", "category": "OST_Floors",
+          "bbox_min_mm": [0, -5, 0], "bbox_max_mm": [10, 10, 1]}
+    rec, _ = H.build_hull(el, profile=prof)
+    assert rec.hull_source == "bbox", "неограничиваемая дуга обязана уронить контур"
+    assert "profile_arc_over_half_circle" in (rec.extra.get("downgraded_from") or [])
 
 
 def test_01c_invalid_profile_vertex_is_not_silently_dropped():
@@ -649,3 +737,115 @@ def test_17b_golden_covers_every_pair_type():
     grades = {f["hull_grade"] for f in g["findings"]}
     assert {"overlap", "contact"} <= kinds, kinds
     assert {"coarse", "conservative"} <= grades, grades
+
+
+# ── ВОЛНА DECOMPOSE: минимальность хода на НЕВЫПУКЛОМ теле ─────────────────
+
+def test_19_minimal_exit_takes_the_opening_not_the_whole_slab():
+    """Плита с ПРОЁМОМ: труба выходит в проём, а не за край плиты.
+
+    Опровергающий замер до правки (`w1_exit_probe.py`, 11.08.2026): 400
+    пересекающихся пар «плита с проёмом против бруска», у 92 из них (23.0 %)
+    бисекция выдавала ход длиннее наименьшего, в худшем случае в 6.79 раза.
+    Причина названа в `resolve.minimal_exit`: у объединения кусков множество
+    пересечения распадается на отрезки с промежутками, и вилка бисекции
+    накрывала промежуток целиком.
+    """
+    from kukai.clash import decompose as D
+    from kukai.clash import resolve as R
+    plate = [[0, 0], [100, 0], [100, 60], [0, 60]]
+    hole = [[30, 10], [50, 10], [50, 50], [30, 50]]
+    dec = D.decompose(plate, [hole])
+    assert dec.ok, dec.reason
+    slab = G.PrismSet(dec.cells, 0.0, 10.0)
+    box = G.Prism(((20.0, 20.0), (26.0, 20.0), (26.0, 26.0), (20.0, 26.0)), 2.0, 8.0)
+    assert G.signed_distance(slab, box) < 0, "фикстура обязана пересекаться"
+    t = R.minimal_exit(box, slab, (1.0, 0.0, 0.0))
+    assert t is not None
+    # Брусок [20,26] чист ровно тогда, когда ЛЕВЫЙ его край зайдёт за кромку
+    # проёма x=30, то есть при t=10; правый край окажется на 36 < 50, всё ещё
+    # внутри проёма. Плита кончается на x=100, и выход за неё стоил бы t=80 —
+    # именно его и находила бисекция, накрывая проём вилкой целиком.
+    assert abs(t - 10.0) < 1e-6, f"ход {t} вместо выхода в проём (10.0)"
+    assert G.separates(box, slab, (t, 0.0, 0.0)), "обещанный ход не разводит"
+    # Эталон без единого допущения: плотный скан по t.
+    scan = next(k * 0.01 for k in range(0, 20001)
+                if G.separates(box, slab, (k * 0.01, 0.0, 0.0)))
+    assert abs(t - scan) < 0.02, f"точный путь {t} против скана {scan}"
+
+
+def test_19b_the_exit_is_verified_not_asserted():
+    """Каждый кандидат проверяется ПЕРЕНОСОМ, а не берётся на слово.
+
+    Ровно на пол-шага раньше найденного выхода пара обязана ещё пересекаться —
+    иначе `t` не наименьший, а просто какой-то.
+    """
+    from kukai.clash import decompose as D
+    from kukai.clash import resolve as R
+    plate = [[0, 0], [100, 0], [100, 60], [0, 60]]
+    hole = [[30, 10], [50, 10], [50, 50], [30, 50]]
+    slab = G.PrismSet(D.decompose(plate, [hole]).cells, 0.0, 10.0)
+    box = G.Prism(((20.0, 20.0), (26.0, 20.0), (26.0, 26.0), (20.0, 26.0)), 2.0, 8.0)
+    t = R.minimal_exit(box, slab, (1.0, 0.0, 0.0))
+    assert G.separates(box, slab, (t, 0.0, 0.0))
+    assert not G.separates(box, slab, (t - 0.01, 0.0, 0.0)), (
+        "пара разведена ещё до объявленного хода — значит он не наименьший")
+
+
+# ── ВОЛНА 2: слияние выпуклых соседок ──────────────────────────────────────
+
+def test_20_merge_only_when_the_union_stays_convex():
+    """Слияние законно РОВНО при выпуклом объединении, и это проверяется.
+
+    Опровергающий замер до правки (`w3_merge_probe.py`, 11.08.2026, весь
+    корпус): из 16 052 пар соседних ячеек 6 265 (39.0 %) имели выпуклое
+    объединение — каждая третья граница проведена зря.
+
+    Здесь важно не то, что склейка происходит, а то, что она НЕ происходит,
+    когда объединение вогнуто: невыпуклый кусок среди выпуклых молча вернул бы
+    ответ своей выпуклой оболочки и сломал бы и точное расстояние, и замкнутую
+    форму наименьшего выхода.
+    """
+    from kukai.clash import decompose as D
+    # Ступенька: объединение двух соседних трапеций ВОГНУТО.
+    step = [[0, 0], [10, 0], [10, 4], [20, 4], [20, 10], [0, 10]]
+    dec = D.decompose(step)
+    assert dec.ok, dec.reason
+    for c in dec.cells:
+        assert len(c) < 3 or D.loop_is_convex(c), f"невыпуклая ячейка {c}"
+    total = sum(D.polygon_area(c) for c in dec.cells if len(c) >= 3)
+    assert abs(total - D.polygon_area([(float(x), float(y)) for x, y in step])) \
+        <= 1e-9 * total, "слияние изменило площадь области"
+
+
+def test_20b_merge_preserves_the_region_exactly():
+    """Склейка меняет ЗАПИСЬ области, а не саму область.
+
+    Проверяется на контуре с отверстием: площадь до последнего разряда и
+    принадлежность точек — и внутри материала, и в проёме.
+    """
+    from kukai.clash import decompose as D
+    plate = [[0, 0], [100, 0], [100, 60], [0, 60]]
+    hole = [[30, 10], [50, 10], [50, 50], [30, 50]]
+    dec = D.decompose(plate, [hole])
+    assert dec.ok, dec.reason
+    area = sum(D.polygon_area(c) for c in dec.cells if len(c) >= 3)
+    assert abs(area - (100 * 60 - 20 * 40)) < 1e-9
+    hull = G.PrismSet(dec.cells, 0.0, 5.0)
+    assert G.contains_point(hull, (10.0, 30.0, 2.0)), "материал вне оболочки"
+    assert not G.contains_point(hull, (40.0, 30.0, 2.0)), "проём внутри оболочки"
+    for c in dec.cells:
+        assert len(c) < 3 or D.loop_is_convex(c)
+
+
+def test_20c_a_degenerate_sliver_is_repaired_not_swallowed():
+    """Вырожденная ячейка чинится выпуклой оболочкой ТОЛЬКО без роста площади.
+
+    Замер: все 20 невыпуклых ячеек корпуса выпускает заметание, ни одной —
+    слияние, и все двадцать вырождены (различие координат в восемнадцатом
+    разряде). Чинить их выпуклой оболочкой законно, потому что у вырожденного
+    набора она вырождена и сама; подменять же настоящую область её оболочкой
+    молча — нельзя, и на этот случай стоит отказ по имени.
+    """
+    from kukai.clash import decompose as D
+    assert "decomposition_cell_not_convex" in D.REASONS

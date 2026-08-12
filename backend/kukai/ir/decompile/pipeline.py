@@ -83,6 +83,13 @@ from kukai.ir.decompile.tag_extract import (
     extract_tags,
     merge_tags,
 )
+from kukai.ir.decompile.dimension_extract import (
+    DIMENSION_CATEGORIES,
+    DimensionExtraction,
+    build_dimension_extract_cs,
+    extract_dimensions,
+    merge_dimensions,
+)
 from kukai.ir.decompile.mep_system_extract import (
     MEP_SYSTEM_CATEGORIES,
     MepSystemExtraction,
@@ -132,7 +139,11 @@ from kukai.ir.decompile.honesty import (
     EquivalenceClaim,
     EquivalenceScope,
 )
+from kukai.ir.decompile.journal import journal_enabled
+from kukai.ir.decompile.journal_store import record_revision
 from kukai.ir.decompile.lift_cache import cached_lift_document_detailed
+from kukai.ir.decompile.merkle import merkle_enabled
+from kukai.ir.decompile.merkle_report import building_report
 from kukai.ir.decompile.name import name_document
 from kukai.ir.decompile.passport import build_passport, passport_bytes
 from kukai.ir.decompile.schema import EXTRACT_TIMEOUT_MS, L0Document
@@ -156,6 +167,8 @@ _SIDE_MANIFEST_NAME = "side_index.manifest.json"
 _SIDE_MANIFEST_VERSION = "kir-decompile-side-manifest/1"
 _REVISION_PROOF_VERSION = "document-revision/1"
 _OPEN_MODEL_PROFILE_NAME = "open_model.profile.json"
+_MERKLE_NAME = "merkle.json"
+_JOURNAL_NAME = "journal.json"
 _REVISION_GUARD_MARKER = "KIR_DOCUMENT_REVISION_GUARD_V1"
 
 
@@ -719,6 +732,8 @@ def _default_cs_builders(
         # документа (``Application.VersionNumber``), а не угадывается.
         # Аргумент необязателен ровно затем, чтобы вызов без него — а он
         # есть в тестах контракта — по-прежнему перечислял стадии.
+        "dimension": lambda ids: build_dimension_extract_cs(
+            list(ids), link_title=link_title),
         "tag": lambda ids: build_tag_extract_cs(
             list(ids), revit_version=revit_version, link_title=link_title),
         # Tier G is dynamic: unlike the semantic side indexes, it receives
@@ -763,6 +778,10 @@ _STAGE_CATEGORIES: dict[str, frozenset[str]] = {
     # что и оформление: строка в таблице и коллектор в съёмщике обязаны
     # ходить парой, и единственный способ это гарантировать — один источник.
     "tag": TAG_CATEGORIES,
+    # Размеры держит СВОЙ модуль (dimension_extract) по той же причине, что
+    # марки и оформление: строка в таблице и коллектор в съёмщике обязаны
+    # ходить парой, и единственный способ это гарантировать — один источник.
+    "dimension": DIMENSION_CATEGORIES,
     # Категории, чьи элементы суть ЭКЗЕМПЛЯРЫ СЕМЕЙСТВ. Без строки в боковом
     # индексе такой элемент не поднимется никогда: лифт узнаёт из него и вид
     # размещения, и точку, и кривую, и флипы.
@@ -1368,6 +1387,31 @@ def _passport_markdown(passport: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _persist_core_artifacts(
+    directory: Path,
+    passport: Mapping[str, Any],
+    tree: Mapping[str, Any],
+    name_result: Mapping[str, Any],
+) -> Path:
+    """Serialize the large frozen-tail artifacts outside the event loop.
+
+    This helper deliberately preserves the former byte formats and write
+    order.  It only gives the CPU-heavy JSON rendering and filesystem waits
+    one explicit offload boundary; artifact ownership and contents do not
+    move.
+    """
+    (directory / "passport.json").write_bytes(passport_bytes(passport))
+    passport_md = directory / "passport.md"
+    passport_md.write_text(_passport_markdown(passport), encoding="utf-8")
+
+    # ``tree`` and NAME's tree are already JSON-shaped TypedDicts.
+    _atomic_write_json(directory / "tree.json", tree)
+    named_tree = name_result.get("tree")
+    if isinstance(named_tree, Mapping):
+        _atomic_write_json(directory / "named.json", named_tree)
+    return passport_md
+
+
 # ── the run ──────────────────────────────────────────────────────────────────
 async def run_decompile(
     executor: BridgeExecutor,
@@ -1627,6 +1671,13 @@ async def run_decompile(
             directory / "tag.index.json",
             TagExtraction, timeout_ms=timeout_ms,
             window_budget=window_budget, link_title=link_title)
+        dimensions = await _side_or_resume(
+            guarded_executor, document, "dimension",
+            extract_dimensions, merge_dimensions,
+            builders, state, status_cb,
+            directory / "dimension.index.json",
+            DimensionExtraction, timeout_ms=timeout_ms,
+            window_budget=window_budget, link_title=link_title)
         mep_systems = await _side_or_resume(
             guarded_executor, document, "mep_system",
             extract_mep_systems, merge_mep_systems,
@@ -1649,6 +1700,7 @@ async def run_decompile(
             "group": groups,
             "annotation": annotations,
             "tag": tags,
+            "dimension": dimensions,
             "mep_system": mep_systems,
         }
         side_failures = summarize_side_failures(side_products)
@@ -1685,6 +1737,10 @@ async def run_decompile(
             # Без этого индекса каждая марка остаётся честным атомом
             # source_contract_gap — ровно как до волны.
             tag_index=tags,
+            # Без этого индекса каждый размер остаётся честным атомом
+            # source_contract_gap — ровно как до волны (замер k2_ar_rd_v8:
+            # 13 905 размеров = 13 905 таких атомов, ВСЕ до единого).
+            dimension_index=dimensions,
             mep_system_index=mep_systems,
             enabled=True,
             cache_dir=str(directory / "lift_cache"),
@@ -1764,8 +1820,14 @@ async def run_decompile(
 
         state.stage = "verify"
         _write_status(state, status_cb)
-        manifest = await _timed(state, "verify",
-            _offload(build_dependency_manifest, document))
+        # The family axis is the only thing measured to separate name
+        # collisions inside one document (115 of 275 cells, 2026-08-11),
+        # and it lives in a side index the manifest was never handed.
+        manifest = await _timed(state, "verify", _offload(
+            build_dependency_manifest,
+            document,
+            family_placement=(family_index if family is not None else None),
+        ))
         build_status = BuildStatuses.initial(
             unresolved_dependencies=manifest.unresolved_count)
         equivalence = EquivalenceClaim.unverified(
@@ -1808,16 +1870,67 @@ async def run_decompile(
             "lifted_pct_extracted": balance.extracted_pct(ops_lifted),
             "lifted_pct_document": balance.document_pct(ops_lifted),
         }
-        (directory / "passport.json").write_bytes(passport_bytes(passport))
-        passport_md = directory / "passport.md"
-        passport_md.write_text(_passport_markdown(passport), encoding="utf-8")
+        passport_md = await _offload(
+            _persist_core_artifacts,
+            directory,
+            passport,
+            tree,
+            name_result,
+        )
 
-        # tree/named artifacts for downstream waves.  ``tree`` and NAME's tree
-        # are already JSON-shaped TypedDicts — persist them directly.
-        _atomic_write_json(directory / "tree.json", tree)
-        named_tree = name_result.get("tree")
-        if isinstance(named_tree, Mapping):
-            _atomic_write_json(directory / "named.json", named_tree)
+        # ── merkle: адрес содержимого здания рядом с самим зданием ──────────
+        # Флаг ВЫКЛЮЧЕН по умолчанию, и выключенный означает буквально то же
+        # дерево и тот же паспорт побайтно: ни одного лишнего файла, ни одной
+        # лишней строки в `timing`.  Считается по УЖЕ свёрнутому `tree` — это
+        # ровно тот вход, который `merkle` и ждёт, поэтому переходника нет.
+        # Отказ слоя НЕ роняет прогон: паспорт — продукт стадии, `merkle.json`
+        # — приложение к нему; но и не молчит — отказ ложится в тот же файл
+        # с `ok:false`, потому что «повторов не найдено» и «посчитать не
+        # удалось» обязаны выглядеть по-разному.
+        if merkle_enabled():
+            merkle_json = await _timed(state, "merkle", _offload(
+                building_report, tree, label=directory.name))
+            _atomic_write_json(directory / _MERKLE_NAME, merkle_json)
+            if not merkle_json.get("ok"):
+                error = merkle_json.get("error") or {}
+                state.errors.append(
+                    f"merkle: {error.get('type')}: {error.get('message')}")
+
+        # ── journal: разбор как РЕВИЗИЯ здания, а не как отдельный факт ─────
+        # До этой волны два чтения одного здания не были связаны ничем: на
+        # диске 52 разбора, они складываются в 10 зданий по `doc_name` (у
+        # фасада — 18 ревизий), и «что изменилось с прошлого раза» стоило
+        # держать оба `tree.json` и считать различие заново. Слой `journal`
+        # умел вести такой лог с 27.07, но его не звал никто; здесь у него
+        # появляется вызывающий.
+        #
+        # Журнал ОБЩИЙ для здания и лежит рядом с каталогами прогонов
+        # (`_journals/`), а не внутри этого прогона: внутри он не смог бы
+        # ответить на единственный вопрос, ради которого заведён, — какая
+        # ревизия была предыдущей.
+        #
+        # Флаг ВЫКЛЮЧЕН по умолчанию, и выключенный означает прежние байты:
+        # ни `journal.json`, ни строки в `timing`. Отказ слоя НЕ роняет
+        # прогон — паспорт продукт стадии, журнал приложение к нему, — но и
+        # не молчит: отказ ложится в тот же файл с `ok:false`, потому что
+        # «истории ещё нет» и «дописать не удалось» обязаны выглядеть
+        # по-разному.
+        if journal_enabled():
+            journal_json = await _timed(state, "journal", _offload(
+                record_revision,
+                directory.parent,
+                doc_name=getattr(document, "doc_name", ""),
+                doc_stamp=change_stamp,
+                out_dir=str(directory),
+                tree=tree,
+                revit_version=str(
+                    getattr(document, "revit_version", "") or ""),
+            ))
+            _atomic_write_json(directory / _JOURNAL_NAME, journal_json)
+            if not journal_json.get("ok"):
+                error = journal_json.get("error") or {}
+                state.errors.append(
+                    f"journal: {error.get('type')}: {error.get('message')}")
 
         state.stage = "done"
         state.stages_done.append("passport")

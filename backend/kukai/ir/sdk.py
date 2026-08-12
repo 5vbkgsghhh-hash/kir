@@ -143,7 +143,11 @@ def _plain(v: Any) -> Any:
 SELECTOR_KINDS = frozenset({"sel", "target", "target_w"})
 
 #: ...и то же самое списком (`create_dimension.refs`, `move_elements.targets`).
-SELECTOR_LIST_KINDS = frozenset({"refs_w", "targets_w"})
+#: `sel_list` (wave/datums) — множественное число рода `sel`
+#: (`create_multistory_stairs.levels`): КАТАЛОЖНЫЙ селектор списком, поэтому
+#: он здесь, а не в PLAIN_KINDS — иначе автор потерял бы удобство `by=name`
+#: ровно там, где уровни только по имени и называют.
+SELECTOR_LIST_KINDS = frozenset({"refs_w", "targets_w", "sel_list"})
 
 
 def unclassified_kinds() -> list[str]:
@@ -168,14 +172,27 @@ PLAIN_KINDS = frozenset({
     # ровно как `pts`: это геометрия списком чисел, а не селектор, и никакого
     # удобства над ней SDK предложить не может.
     "path",
+    # `path3` (wave/mep-electrical) — та же ломаная, но трёхмерная
+    # (create_flex_duct / create_flex_pipe). По той же причине plain.
+    "path3",
     # `mesh` (wave/shape) — {vertices_mm, triangles} у create_directshape.
     # Тоже едет как есть: это ОДНО значение с внутренним инвариантом (индексы
     # осмысленны только вместе со своим вершинным массивом), и разбирать его
     # на удобства SDK нечем — законы формы живут в mesh.py и проверяются
     # компилятором.
     "mesh",
-    "placements", "pt_view2d", "pt_xy", "pt_xyz", "pts", "pts_list", "region",
-    "slopes", "str", "str_long", "value", "vec3_mm",
+    # `pts_xyz` (wave/site) — облако точек рельефа. Едет как есть, ровно как
+    # `pts`: геометрия списком чисел, и удобства над ней SDK предложить нечем.
+    "placements", "pt_view2d", "pt_xy", "pt_xyz", "pts", "pts_list",
+    "pts_xyz", "region",
+    "slopes",
+    # `spiral` (09.08) — {center_mm, radius_mm, start_angle_deg,
+    # included_angle_deg, clockwise} у create_stairs. Едет как есть, ровно как
+    # `arc`: это ОДНО значение со своим внутренним законом (радиус и ширина
+    # марша связаны), и разобрать его на удобства SDK нечем — законы живут в
+    # authoring_validation и проверяются компилятором.
+    "spiral",
+    "str", "str_long", "value", "vec3_mm",
 })
 
 

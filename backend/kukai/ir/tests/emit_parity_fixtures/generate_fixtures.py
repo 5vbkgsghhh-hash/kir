@@ -191,11 +191,9 @@ INTENDED_CHANGES: dict[str, str] = {
     # Байты сдвинулись только позицией: формально проверено, что множество
     # строк эмиссии ДО и ПОСЛЕ совпадает (8 и 4 строки переставлены, ноль
     # добавлено, ноль удалено). Допуск, сообщения и BuiltInParameter те же.
-    "golden:route_pipe_system_riser_branch|":
-        "диаметр вынесен в свой свидетель (ключ diameter) сразу за концами; "
-        "множество строк эмиссии не изменилось, только порядок",
-    "golden:route_duct_system_tee|":
-        "то же для ОВ",
+    # Обоснование этих двух ключей сведено ниже с более ранним изменением
+    # CONNECT. Два объявления одного ключа опасны: Python молча оставляет
+    # последнее и теряет одну из причин разрешённого изменения golden.
     # ── Схема ключей по видам: пачки по 20 → одна запись на вид (27.07) ─────
     # `query:all_kinds_NN` нумеровались смещением в списке всех видов, поэтому
     # добавление ЛЮБОГО вида пересобирало состав пачек и «расхаживало» байты у
@@ -266,10 +264,13 @@ INTENDED_CHANGES: dict[str, str] = {
     "golden:route_pipe_system_riser_branch|":
         "CONNECT: удалён NewPipingSystem, добавлен пост-коммитный readback; "
         "pinned by route_pipe_system_riser_branch golden + "
-        "SystemMembershipMEP в test_mep",
+        "SystemMembershipMEP в test_mep. Сертификат: диаметр вынесен в свой "
+        "свидетель (ключ diameter) сразу за концами; множество строк эмиссии "
+        "не изменилось, только порядок",
     "golden:route_duct_system_tee|":
         "то же для ОВ (NewMechanicalSystem); pinned by route_duct_system_tee "
-        "golden + SystemMembershipMEP в test_mep",
+        "golden + SystemMembershipMEP в test_mep. Сертификат: то же "
+        "вынесение диаметра в собственный ключ свидетеля",
     "scope:pipe_system|":
         "то же изменение у create_pipe_system; pinned by "
         "SystemMembershipIsDerivedNotForced в test_connect",
@@ -734,8 +735,28 @@ def _min_ver(prog: dict) -> str:
     return prog.get("__min_ver__", "2021")
 
 
+#: Служебные ключи ОБВЯЗКИ, которых в конверте программы нет: снимать их
+#: обязан КАЖДЫЙ читатель корпуса, иначе схема ответит KIR-P003 «неизвестное
+#: поле» и программа не дойдёт до эмиттера вовсе.
+#:
+#: `__ver__` добавлен в этот список при слиянии 09.08, и цена его отсутствия
+#: показательна. Волна нагрузок завела ВТОРОЙ такой ключ рядом с уже
+#: существовавшим `__min_ver__` (у неё пин обратный: свободная нагрузка живёт
+#: только на 2021-2023, то есть это ПОТОЛОК, а не пол, поэтому переименовать
+#: его в `__min_ver__` нельзя) — и научила снимать его РОВНО ОДНОГО читателя,
+#: `test_golden`. Читателей же три, и оба остальных молча ослепли:
+#:   * `gate_runner` отдавал KIR-P003 на всех шести версиях;
+#:   * этот корпус ловил KirRefusal и делал `continue`, из-за чего три опа
+#:     нагрузок НЕ ДОХОДИЛИ ДО ЭМИТТЕРА НИ РАЗУ — и анти-Гудхарт-тест
+#:     `test_the_corpus_actually_reaches_a_guard_in_every_kind` показал 49
+#:     видов против 52 в `_EMITTERS`. Это ровно тот случай, ради которого он
+#:     написан: паритетный корпус выглядел бы чистым, потому что до трёх
+#:     операций он просто не добирался.
+_HARNESS_KEYS = ("__min_ver__", "__ver__")
+
+
 def _strip(prog: dict) -> dict:
-    return {k: v for k, v in prog.items() if k != "__min_ver__"}
+    return {k: v for k, v in prog.items() if k not in _HARNESS_KEYS}
 
 
 def _is_write(prog: dict) -> bool:

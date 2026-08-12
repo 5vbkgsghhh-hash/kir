@@ -33,6 +33,12 @@ JSON целиком проходит типизированную проверк
   L5  БЕЛЫЙ СПИСОК ИМПОРТОВ (не чёрный: чёрный всегда неполон). Ровно
       math / itertools / functools + сам DSL, который отдан скрипту уже
       импортированным. Хук на __import__ скрипта + страж в sys.meta_path.
+      Оба рубежа читают ОДИН И ТОТ ЖЕ кортеж (`policy.allowed_imports`),
+      поэтому разъехаться не могут. Флаг оператора
+      KUKAI_IR_AUTHOR_GEOMETRY_LIBS (по умолчанию ВЫКЛ) добавляет к списку
+      shapely и numpy — и НИ ОДНОГО слоя изоляции при этом не трогает:
+      расширение C держит ядро, а не питоновский список имён
+      (см. `author_geometry_libs_enabled`).
   L6  ОГРАНИЧЕННЫЕ BUILTINS. Не «удалить», а ЗАМЕНИТЬ на заглушку, которая
       объясняет, почему имени нет: NameError ничему не учит.
   L7  ТИПИЗИРОВАННЫЙ ОТКАЗ. Питоновское исключение НИКОГДА не выходит наружу
@@ -43,6 +49,13 @@ JSON целиком проходит типизированную проверк
       может испортить разбор), проверка JSON-представимости с указанием пути,
       потолок на число операций и байты, экран недетерминизма (адрес объекта
       в выходе), опциональная ПОВТОРНАЯ прогонка с сверкой дайджеста.
+
+  L9  ПОДПИСЬ СРЕДЫ. `author_digest` подписывает ТЕКСТ скрипта; в квитанцию
+      рядом идёт `environment` — интерпретатор и версии всего, что скрипт мог
+      импортировать. Без неё один и тот же `author_digest` удостоверял бы
+      РАЗНЫЕ `program_digest` после обновления библиотеки, и читатель не имел
+      бы ни одного поля, чтобы отличить правку скрипта от дрейфа среды
+      (см. §ПОДПИСЬ СРЕДЫ ниже).
 
 ПОЧЕМУ НЕДЕТЕРМИНИЗМ ЗАПРЕЩЁН ЖЁСТКО, А НЕ ПО ВКУСУ: исходник скрипта
 подписывается в квитанции (`author_digest` ниже). Подпись недетерминированного
@@ -130,6 +143,19 @@ SCRIPT_FILENAME = "<kir-script>"
 #: Ровно то, что разрешено импортировать. Белый список, не чёрный.
 ALLOWED_IMPORTS: tuple[str, ...] = ("math", "itertools", "functools")
 
+#: Библиотеки геометрии, которые ФЛАГ ОПЕРАТОРА добавляет к белому списку.
+#: Сами по себе они ничего не открывают — см. `author_geometry_libs_enabled`.
+GEOMETRY_IMPORTS: tuple[str, ...] = ("shapely", "numpy")
+
+#: Имя флага оператора — ЗДЕСЬ ТОЛЬКО ДЛЯ ЧТЕНИЯ СНАРУЖИ (тесты, документация).
+#: В самой калитке `author_geometry_libs_enabled` оно написано ЛИТЕРАЛОМ, и это
+#: не дублирование по недосмотру: `tools/capability_map.py` ищет флаги
+#: регуляркой `os.getenv("ИМЯ")` по тексту, и вызов через константу инвентарь
+#: НЕ УВИДИТ — флаг станет невидимым, то есть лежащим на складе по построению.
+#: Что имена не разъехались, держит тест (`test_author_geometry_libs`), а не
+#: договорённость.
+AUTHOR_GEOMETRY_LIBS_FLAG = "KUKAI_IR_AUTHOR_GEOMETRY_LIBS"
+
 #: ПЕРЕКЛЮЧАТЕЛИ ОПЕРАТОРА, доезжающие до ребёнка. Белый список, не чёрный, и
 #: короткий намеренно: окружение ребёнка собирается нами с нуля, а не
 #: наследуется, поэтому «забыли перенести» здесь выглядит как «оператор
@@ -168,7 +194,16 @@ _BUILD_CANDIDATES = ("build", "build_program", "main")
 #: Поля конверта программы, которые скрипт вправе выставить сам. Совпадают с
 #: `known_top` компилятора: конверт должен доезжать целиком, иначе вызывающий
 #: пересобирает его на глазок и теряет то, что автор указал явно.
-_ENVELOPE_KEYS = ("ir_version", "intent", "defaults", "allow_destructive")
+#:
+#: `phases` — ИСКЛЮЧЕНИЕ ИЗ ЭТОГО СОВПАДЕНИЯ, и оно осознанное. Таблицу фаз
+#: кладёт `course.take_ops` (границы, которые нарисовал автор через `phase()`);
+#: `known_top` компилятора её ПОКА не знает, поэтому программа с фазами,
+#: поданная как ОДНА программа, получает типизированный отказ KIR-P003 вместо
+#: тихого исполнения одной транзакцией. Пофазное исполнение — отдельная работа
+#: (`serving.py`); до неё fail-closed здесь и есть правильное поведение:
+#: чекпойнта между фазами ещё нет, и молча делать вид, что он есть, нельзя.
+_ENVELOPE_KEYS = ("ir_version", "intent", "defaults", "allow_destructive",
+                  "phases")
 
 #: След дефолтного repr — адрес объекта. Единственный вид недетерминизма,
 #: который ВИДЕН в выходе, поэтому он и ловится экраном, а не проповедью.
@@ -216,10 +251,13 @@ class SandboxPolicy:
 
     #: Модуль, публичные имена которого кладутся в пространство скрипта.
     #:
-    #: `course.language` — это `dsl` ПЛЮС четыре имени курса (`course`,
-    #: `recipe`, `score`, `unit`), склеенные без собственной семантики. Язык от
-    #: этого не меняется: скрипт, написанный под `kukai.ir.dsl`, работает здесь
-    #: без единой правки — объекты функций те же.
+    #: `course.language` — это `dsl` ПЛЮС имена курса (`course.SANDBOX_NAMES`:
+    #: `course`, `recipe`, `score`, `unit`, `preview`, `design_check`, `spec`),
+    #: склеенные без собственной семантики. Перечень СОСТАВА держится там, а не
+    #: здесь: эта строка уже врала — она называла четыре имени, когда их было
+    #: шесть, и читатель уносил отсюда неверный состав шва.  Язык от склейки не
+    #: меняется: скрипт, написанный под `kukai.ir.dsl`, работает здесь без
+    #: единой правки — объекты функций те же.
     #:
     #: ПОЧЕМУ УМОЛЧАНИЕ, А НЕ ОПЦИЯ. Курс за выключателем — это курс, которого
     #: для модели не существует; сегодня же измерено, чем такое кончается:
@@ -230,7 +268,10 @@ class SandboxPolicy:
     #:
     #: Цена постоянного присутствия замерена и мала: указатель 176 токенов,
     #: типичный запрос урока ~1 076, весь курс 10 808 — против 7 140 у
-    #: `skill.py`, которые платятся КАЖДЫМ запросом.
+    #: `skill.py`, которые платятся КАЖДЫМ запросом. (Замер 03.08; с тех пор
+    #: указатель получил седьмое имя и остался ниже своего предела — его
+    #: держит `test_course.test_the_pointer_is_small_enough_to_hang_permanently`,
+    #: а не эта строка.)
     dsl_module: str = "kukai.ir.course.language"
     extra_sys_path: tuple[str, ...] = ()
     python_exe: str = ""
@@ -347,11 +388,23 @@ class SandboxResult:
     stdout: str = ""
     #: ЗАМЕРЕННОЕ (не задуманное) состояние изоляции этого запуска
     isolation: dict = field(default_factory=dict)
+    #: ЧЕМ ИСПОЛНЕН скрипт: интерпретатор и версии всего, что он мог
+    #: импортировать (`environment_signature`). Отдельным полем, а не внутри
+    #: `isolation`: изоляция отвечает «что песочница СДЕЛАЛА», среда — «на чём
+    #: это посчитано», и склеивать два разных вопроса в один словарь значит
+    #: спрятать второй. Пусто ровно тогда, когда ребёнок не запускался.
+    environment: dict = field(default_factory=dict)
     duration_s: float = 0.0
     #: пик RSS ИМЕННО ЭТОГО запуска (`VmHWM` ребёнка, КБ). Ноль — значит
     #: ребёнок умер, не сказав: врать родительским водоразделом нельзя, он
     #: зависит от того, кто бежал раньше (см. `_read_vm_hwm`).
     peak_rss_kb: int = 0
+
+    @property
+    def env_digest(self) -> str:
+        """Подпись среды одной строкой — то, что едет в фиксируемые улики."""
+        value = self.environment.get("digest") if self.environment else ""
+        return value if isinstance(value, str) else ""
 
     def as_dict(self) -> dict:
         out = {
@@ -363,6 +416,8 @@ class SandboxResult:
             "duration_s": round(self.duration_s, 4),
             "peak_rss_kb": self.peak_rss_kb,
         }
+        if self.environment:
+            out["environment"] = self.environment
         if self.ok:
             out["ops"] = self.ops
             if self.envelope:
@@ -376,6 +431,174 @@ class SandboxResult:
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ПОДПИСЬ СРЕДЫ
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ЧТО ЭТО ЧИНИТ. `author_digest` подписывает ТЕКСТ скрипта и больше ничего.
+# Пока скрипту разрешён только stdlib, дыра незаметна; как только в белый
+# список попадает хоть одна внешняя библиотека, тот же самый `author_digest`
+# начинает удостоверять РАЗНЫЕ `program_digest` — потому что между двумя
+# аудитами обновился shapely или GEOS под ним. В квитанции при этом не было бы
+# ни одного поля, по которому читатель отличил бы «правку скрипта» от
+# «обновления библиотеки»: одно здание, две подписи, и обе выглядят законными.
+#
+# `replay_check` этого не ловит: он гоняет скрипт дважды В ОДНОМ ПРОЦЕССЕ на
+# ОДНОЙ установке и меряет недетерминизм, а не дрейф во времени.
+#
+# ПОЧЕМУ БЕЗ РУЧНОГО СПИСКА. Подписывается ровно то, что скрипт может
+# импортировать, — `policy.allowed_imports`. Добавили в белый список модуль —
+# он появился в подписи сам; список, который надо не забыть пополнить, забыли
+# бы ровно в тот раз, когда это важно.
+
+#: Атрибуты с версией НАТИВНОЙ библиотеки под модулем (GEOS под shapely и т.п.).
+#: Ищутся по имени, а не по списку: список знал бы про shapely и не знал бы про
+#: следующую библиотеку. Модули и приватные имена отбрасываются.
+_NATIVE_VERSION_RE = re.compile(r"version", re.I)
+_MAX_NATIVE_FACTS = 8
+
+
+def _module_version(name: str, module: Any) -> tuple[str, str]:
+    """Версия модуля и ЧЕМ она получена. Порядок — от точного к слабому."""
+    if name in getattr(sys, "stdlib_module_names", frozenset()):
+        # stdlib версионируется интерпретатором, отдельной версии у него нет.
+        # Спрашивать метаданные бессмысленно и не бесплатно (промах ~0.6 мс на
+        # обход sys.path), а счастливый путь состоит ровно из трёх таких имён.
+        return "stdlib", "stdlib"
+    try:
+        import importlib.metadata as _md
+        return _md.version(name), "importlib.metadata"
+    except Exception:
+        pass
+    raw = getattr(module, "__version__", None)
+    if isinstance(raw, str) and raw:
+        return raw, "__version__"
+    return "unknown", "none"
+
+
+def _native_facts(module: Any) -> dict:
+    """Версии нативных библиотек под модулем — только у ЗАГРУЖЕННОГО модуля.
+
+    Спросить `shapely.geos_version` не импортировав shapely невозможно, поэтому
+    этот блок появляется ровно у тех модулей, которые исходник назвал (и
+    которые из-за этого прогреты). Условие детерминировано по исходнику: тот же
+    скрипт в той же среде даёт ту же подпись."""
+    out: dict[str, str] = {}
+    if module is None:
+        return out
+    for attr in sorted(dir(module)):
+        # Приватные имена отброшены заодно с `__version__`: та версия уже
+        # названа полем `version`, и повторять её здесь значило бы
+        # подписывать один факт дважды.
+        if attr.startswith("_"):
+            continue
+        if not _NATIVE_VERSION_RE.search(attr):
+            continue
+        try:
+            value = getattr(module, attr)
+        except Exception:
+            continue
+        if isinstance(value, str):
+            out[attr] = value[:64]
+        elif isinstance(value, tuple) and all(isinstance(x, int) for x in value):
+            out[attr] = ".".join(str(x) for x in value)
+        if len(out) >= _MAX_NATIVE_FACTS:
+            break
+    return out
+
+
+def environment_signature(allowed: tuple[str, ...]) -> dict:
+    """Чем именно исполнен скрипт: интерпретатор + всё, что он мог импортировать.
+
+    Считается В РЕБЁНКЕ и ДО chroot: `importlib.metadata` читает dist-info с
+    диска, а в пустом корне диска нет.
+
+    `digest` покрывает блок ЦЕЛИКОМ — интерпретатор, имена, версии и нативные
+    факты. Сравнили две квитанции одного скрипта, дайджесты разошлись — среда
+    поехала, и это видно без чтения глазами.
+
+    ЦЕНА, ЗАМЕР 09.08 НА ПРОД-БОКСЕ (python3.12, `replay_check=True`, ход =
+    две прогонки): белый список по умолчанию — НОЛЬ (три имени stdlib
+    отвечают из `sys.stdlib_module_names`, метаданные не читаются вовсе;
+    медиана хода 341.6 мс против 357.9 мс на коде до правки, то есть внутри
+    шума). С флагом геометрии и БЕЗ упоминания shapely в исходнике — +64 мс и
+    +2 МБ на ход, и почти всё это разовый `import importlib.metadata` (59.8
+    мс); сами запросы версии — 3.1 мс на первый и ~0.6 мс на каждый
+    следующий. С упоминанием shapely к этому добавляется прогрев самой
+    библиотеки (+16 МБ пика, 40.8 против 25.0 МБ).
+    """
+    modules = []
+    for name in sorted(set(allowed)):
+        module = sys.modules.get(name)
+        version, via = _module_version(name, module)
+        row: dict[str, Any] = {
+            "name": name,
+            "version": version,
+            "via": via,
+            # ЗАГРУЖЕН ЛИ модуль в этом запуске — факт, а не украшение: только у
+            # загруженного можно спросить версию нативной библиотеки под ним, и
+            # читатель обязан отличать «нативных фактов нет» от «их не спросили».
+            "loaded": module is not None,
+        }
+        native = _native_facts(module)
+        if native:
+            row["native"] = native
+        modules.append(row)
+
+    body = {
+        "python": ".".join(str(p) for p in sys.version_info[:3]),
+        # Полная строка версии несёт дату сборки и компилятор: подмена самого
+        # интерпретатора при том же «3.12.13» отсюда видна, а из короткой — нет.
+        "python_build": sys.version.replace("\n", " "),
+        "implementation": sys.implementation.name,
+        "modules": modules,
+    }
+    payload = json.dumps(body, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+    body["digest"] = _digest(payload.encode("utf-8"))
+    return body
+
+
+def author_geometry_libs_enabled() -> bool:
+    """Калитка: пускать ли shapely и numpy в белый список авторского скрипта.
+
+    ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ. При выключенном флаге белый список — прежний
+    (`ALLOWED_IMPORTS`), прогрев прежний, цена прежняя, а `import shapely`
+    отказывает ровно тем же типизированным KIR-B004 с номером строки модели,
+    что и до этой правки.
+
+    ЧТО ДЕРЖИТ БЕЗОПАСНОСТЬ, КОГДА ФЛАГ ВКЛЮЧЁН. Не белый список — он и раньше
+    не был границей (см. §«ЧЕГО ЭТА ПЕСОЧНИЦА НЕ ДЕЛАЕТ»). Держат СЛОИ ОС, и
+    ни один из них здесь не ослаблен: L0 отдельный процесс (никакого exec в
+    нашем адресном пространстве), L1 пространства имён user+mount+net с
+    ЗАМЕРОМ недостижимости сети, L2 chroot в пустой каталог ПОСЛЕ прогрева,
+    L3 RLIMIT_FSIZE=0 / RLIMIT_NPROC=0 / RLIMIT_AS / RLIMIT_CPU / RLIMIT_CORE=0,
+    L4 стена с снятием группы процессов, L8 экран выхода. Расширение C — это
+    произвольный машинный код в адресном пространстве ребёнка, и удержать его
+    может ТОЛЬКО ядро: ни один питоновский белый список на него не действует.
+    Именно поэтому флаг трогает РОВНО ОДНУ строчку политики
+    (`allowed_imports`) и не касается ни одного слоя изоляции.
+
+    Вторая половина ответа — подпись среды выше: библиотека, которую скрипт
+    может позвать, обязана быть НАЗВАНА ВЕРСИЕЙ в квитанции. Поэтому шаг 1
+    (подпись) ушёл в прод безусловно, а этот флаг — за выключателем.
+    """
+    return os.getenv("KUKAI_IR_AUTHOR_GEOMETRY_LIBS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def allowed_imports_for_env() -> tuple[str, ...]:
+    """Белый список ЭТОГО запуска: читается живьём, а не при импорте модуля.
+
+    Живьём — чтобы правка на службе действовала со следующего хода, тем же
+    правилом, что `checker.flags.checker_v2_enabled`. Кэш здесь был бы
+    молчаливым несогласием с оператором."""
+    if author_geometry_libs_enabled():
+        return ALLOWED_IMPORTS + GEOMETRY_IMPORTS
+    return ALLOWED_IMPORTS
 
 
 def _program_digest(ops: list, envelope: dict) -> str:
@@ -458,6 +681,13 @@ def execute_author_script(source: str,
             first.ops = []
         first.isolation = dict(first.isolation)
         first.isolation["replay_checked"] = True
+        # Повтор сверяет и СРЕДУ, раз уж он всё равно есть. Разойтись двум
+        # прогонкам одного процесса-родителя почти невозможно — но «почти»
+        # называется словом, а не замалчивается: обновление пакета ровно между
+        # двумя запусками сделало бы `program_digest` первого прогона подписью
+        # среды, которой уже нет.
+        first.isolation["environment_replay"] = (
+            "same" if second.env_digest == first.env_digest else "CHANGED")
         first.duration_s = time.perf_counter() - started
 
     return first
@@ -682,6 +912,7 @@ def _classify_dead_child(proc, timed_out: bool, policy: SandboxPolicy,
 
 def _result_from_payload(payload: dict, policy: SandboxPolicy) -> SandboxResult:
     isolation = dict(payload.get("isolation") or {})
+    environment = dict(payload.get("environment") or {})
     stdout = str(payload.get("stdout") or "")
     peak = int(payload.get("peak_rss_kb") or 0)
 
@@ -690,12 +921,13 @@ def _result_from_payload(payload: dict, policy: SandboxPolicy) -> SandboxResult:
         envelope = dict(payload.get("envelope") or {})
         return SandboxResult(
             ok=True, ops=list(ops), envelope=envelope, stdout=stdout,
-            isolation=isolation, peak_rss_kb=peak,
+            isolation=isolation, environment=environment, peak_rss_kb=peak,
             program_digest=_program_digest(list(ops), envelope))
 
     refusal = SandboxRefusal.from_dict(payload.get("refusal") or {})
     return SandboxResult(ok=False, refusal=refusal, stdout=stdout,
-                         isolation=isolation, peak_rss_kb=peak)
+                         isolation=isolation, environment=environment,
+                         peak_rss_kb=peak)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -771,6 +1003,11 @@ def _import_reason(module: str, allowed: tuple[str, ...]) -> str:
               "importlib", "builtins", "gc", "inspect", "sysconfig", "pty"}
     net = {"socket", "urllib", "http", "requests", "ftplib", "smtplib",
            "asyncio", "ssl", "telnetlib", "xmlrpc", "webbrowser"}
+    # ОТДЕЛЬНОЙ СЕМЬИ ДЛЯ shapely/numpy ЗДЕСЬ НЕТ НАМЕРЕННО. Она сработала бы
+    # РОВНО при выключенном флаге (при включённом эти имена разрешены и до
+    # отказа не доходят) — то есть изменила бы текст отказа на пути, который
+    # обязан остаться байт-в-байт прежним. Общая фраза ниже уже правдива:
+    # белый список закрыт, и перечислен он целиком.
     if root in nondet:
         return (f"НЕДЕТЕРМИНИЗМ ЗАПРЕЩЁН: исходник скрипта подписывается в "
                 f"квитанции, и подпись недетерминированного скрипта не "
@@ -858,11 +1095,12 @@ def _child_main() -> None:  # pragma: no cover — исполняется в д�
     except Exception:
         cfg = {}
 
-    state: dict = {"isolation": {}, "stdout": "", "source_lines": [],
-                   "hwm_fd": -1}
+    state: dict = {"isolation": {}, "environment": {}, "stdout": "",
+                   "source_lines": [], "hwm_fd": -1}
 
     def emit(payload: dict) -> None:
         payload.setdefault("isolation", state["isolation"])
+        payload.setdefault("environment", state["environment"])
         payload.setdefault("stdout", state["stdout"])
         payload.setdefault("peak_rss_kb", _read_vm_hwm(state["hwm_fd"]))
         try:
@@ -940,7 +1178,14 @@ def _child_main() -> None:  # pragma: no cover — исполняется в д�
     allowed = tuple(cfg.get("allowed_imports") or ALLOWED_IMPORTS)
     warm: dict[str, Any] = {}
     import importlib
-    warm_names = list(allowed) + [
+    # ЗДЕСЬ ГРЕЕТСЯ ТОЛЬКО STDLIB, И ЭТО ДО `unshare` — значит ни одна строка
+    # этого списка не смеет поднять пул потоков. Внешние модули из белого
+    # списка (shapely/numpy) греются НИЖЕ, в окне между пространствами имён и
+    # пустым корнем, и только если исходник их назвал: numpy тянет OpenBLAS, а
+    # `unshare(CLONE_NEWUSER)` в многопоточном процессе отвечает EINVAL
+    # (замер 03.08 — прогрев до `unshare` срывал КАЖДЫЙ такой запуск).
+    warm_names = [n for n in allowed
+                  if n in getattr(sys, "stdlib_module_names", frozenset())] + [
         "collections", "collections.abc", "numbers", "decimal", "fractions",
         "copy", "reprlib", "operator", "keyword", "linecache", "encodings.idna",
         "codecs", "abc", "enum", "typing", "re", "string", "textwrap",
@@ -1043,6 +1288,28 @@ def _child_main() -> None:  # pragma: no cover — исполняется в д�
             state["isolation"]["warmed"] = list(warm_hook(source) or ())
         except Exception as exc:
             state["isolation"]["warmed"] = f"failed ({type(exc).__name__}: {exc})"
+
+    # ── ТО ЖЕ ОКНО, ВТОРАЯ ПОЛОВИНА: БЕЛЫЙ СПИСОК, А НЕ ИМЕНА ЯЗЫКА ──────────
+    #
+    # Хук выше решает про ИМЕНА, которые язык положил в пространство скрипта
+    # (`preview`, `design_check`). Здесь решается про ИМПОРТЫ — а импорты
+    # целиком принадлежат песочнице: белый список её поле, и никто, кроме неё,
+    # не знает, что в нём лежит сегодня. Тот же приём (решает ИСХОДНИК), та же
+    # причина (цена), то же окно (после `unshare`, до chroot).
+    #
+    # Условие по тексту здесь не эвристика, а ТОЧНОЕ УСЛОВИЕ, и даже более
+    # точное, чем у хука: чтобы импортировать модуль, его имя надо написать —
+    # `__import__`, `eval`, `exec` и `globals` скрипту закрыты.
+    state["isolation"]["warmed_libs"] = _warm_allowed_third_party(source, allowed)
+
+    # ── ПОДПИСЬ СРЕДЫ: ПОСЛЕДНЕЕ, ЧТО ДЕЛАЕТСЯ ПРИ ЖИВОМ ДИСКЕ ───────────────
+    # `importlib.metadata` читает dist-info С ДИСКА, а строкой ниже корень
+    # станет пустым. Считается ПОСЛЕ прогрева намеренно: только у загруженного
+    # модуля можно спросить версию нативной библиотеки под ним (GEOS у shapely).
+    try:
+        state["environment"] = environment_signature(allowed)
+    except Exception as exc:                       # подпись не может сорвать ход
+        state["environment"] = {"error": f"{type(exc).__name__}: {exc}"}
 
     # БЮДЖЕТ ПАМЯТИ СНИМАЕТСЯ ПОСЛЕ ВСЕХ НАШИХ ИМПОРТОВ, И ЭТО НЕ МЕЛОЧЬ.
     #
@@ -1153,11 +1420,31 @@ def _child_main() -> None:  # pragma: no cover — исполняется в д�
     # ── 5. пространство скрипта ──────────────────────────────────────────────
     real_import = builtins.__import__
 
+    def _import_permitted(name: str) -> bool:
+        """ОДНО правило на ОБА рубежа — и хук `__import__`, и страж meta_path.
+
+        Одно, а не два, потому что два разъезжаются: до 09.08 хук требовал
+        точного имени, а страж проверял только корень, и белый список означал
+        разное в зависимости от того, каким путём пришёл импорт.
+
+        ПОДМОДУЛЬ ЕДЕТ ВМЕСТЕ С ПАКЕТОМ, и решает это `__path__`, а не список
+        имён: `shapely.geometry` разрешён, потому что `shapely` — пакет;
+        `math.foo` по-прежнему отказ, потому что `math` пакетом не является и
+        подмодуля у него не бывает вовсе. При белом списке по умолчанию (три
+        непакетных модуля stdlib) правило НЕОТЛИЧИМО от прежнего — это и есть
+        условие «выключенный флаг ничего не меняет».
+        """
+        if name in allowed:
+            return True
+        root = name.split(".")[0]
+        if root not in allowed:
+            return False
+        return hasattr(sys.modules.get(root), "__path__")
+
     def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
         if level != 0:
             raise _ForbiddenImport(("." * level) + (name or ""))
-        root = (name or "").split(".")[0]
-        if name in allowed or (root in allowed and name == root):
+        if _import_permitted(name or ""):
             return real_import(name, globals, locals, fromlist, level)
         raise _ForbiddenImport(name or "")
 
@@ -1168,8 +1455,7 @@ def _child_main() -> None:  # pragma: no cover — исполняется в д�
             return self.find_spec(fullname, path)
 
         def find_spec(self, fullname, path=None, target=None):
-            root = fullname.split(".")[0]
-            if root in allowed:
+            if _import_permitted(fullname):
                 return None
             raise _ForbiddenImport(fullname)
 
@@ -1423,6 +1709,53 @@ def _child_main() -> None:  # pragma: no cover — исполняется в д�
     sys.exit(0)
 
 
+def _dotted_mentions(source: str, root: str) -> list[str]:
+    """Все модульные пути с этим корнем, НАЗВАННЫЕ в исходнике, плюс сам корень.
+
+    Зачем не одним корнем. `import shapely` подтягивает `shapely.geometry`, но
+    НЕ `shapely.ops` (замер на прод-боксе: 35 подмодулей в `sys.modules`, `ops`
+    среди них нет). После chroot ненайденный подмодуль стал бы ImportError'ом
+    внутри исправного скрипта — то есть отказом не по адресу.
+
+    Список путей не хранится нигде: он ВЫЧИТЫВАЕТСЯ ИЗ ИСХОДНИКА, поэтому новая
+    библиотека в белом списке не требует правки здесь.
+    """
+    pattern = re.compile(r"\b" + re.escape(root) + r"(?:\.[A-Za-z_]\w*)*")
+    names = {root}
+    for hit in pattern.findall(source):
+        parts = hit.split(".")
+        for i in range(1, len(parts) + 1):
+            names.add(".".join(parts[:i]))
+    # По длине: корень раньше подмодуля — иначе импорт подмодуля потянет корень
+    # сам, и порядок в отчёте перестанет соответствовать порядку загрузки.
+    return sorted(names, key=lambda n: (n.count("."), n))
+
+
+def _warm_allowed_third_party(source: str, allowed: tuple[str, ...]) -> list:
+    """Прогреть внешние модули белого списка, НАЗВАННЫЕ исходником.
+
+    Молчит при неудаче: непрогретый модуль — это отсутствующая способность, о
+    которой скажет сам импорт скрипта типизированным отказом, а исключение
+    отсюда обвалило бы ход, который мог бы собраться и без библиотеки.
+    """
+    import importlib
+
+    stdlib = getattr(sys, "stdlib_module_names", frozenset())
+    loaded: list[str] = []
+    for root in allowed:
+        if root in stdlib or root in sys.builtin_module_names:
+            continue
+        if root not in source:
+            continue
+        for dotted in _dotted_mentions(source, root):
+            try:
+                importlib.import_module(dotted)
+            except Exception:
+                continue
+            loaded.append(dotted)
+    return loaded
+
+
 def _read_vm_hwm(fd: int) -> int:
     """Пик RSS ЭТОГО процесса (`VmHWM`, КБ) через заранее открытый дескриптор.
 
@@ -1581,6 +1914,11 @@ __all__ = [
     "SandboxResult",
     "DEFAULT_POLICY",
     "execute_author_script",
+    "environment_signature",
+    "author_geometry_libs_enabled",
+    "allowed_imports_for_env",
+    "AUTHOR_GEOMETRY_LIBS_FLAG",
+    "GEOMETRY_IMPORTS",
     "SCRIPT_FILENAME",
     "ALLOWED_IMPORTS",
     "MAX_SCRIPT_OPS",

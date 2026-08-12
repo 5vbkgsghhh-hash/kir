@@ -37,6 +37,56 @@ RELATE вырос, и оно здесь не пересматривается.
 (тот же замок, что у ``macros._REF_RE``).
 
 ────────────────────────────────────────────────────────────────────────────
+ВТОРОЕ СЕМЕЙСТВО УЗЛОВ: АДРЕС ОТ ЭЛЕМЕНТА (09.08.2026)
+────────────────────────────────────────────────────────────────────────────
+
+    <адрес-xy>   ::= { "at_element": <селектор>, "point": <точка> }
+    <адрес-xyz>  ::= { "at_element": <селектор>, "point": <точка>,
+                       "z": <отметка> }
+                   | { "at_element": <селектор>, "point": <точка>,
+                       "z_mm": <число> }
+
+    <селектор>   ::= { "by": "ref", "value": "<id опа выше по программе>" }
+    <точка>      ::= "start" | "end" | "center"
+    <отметка>    ::= "base" | "top" | "axis"
+
+ЗАЧЕМ. Запрет композиции — про БИНАРНЫЕ ОПЕРАТОРЫ НАД ЛИНИЯМИ ОСЕЙ, и про
+адрес от элемента он не говорит ничего. А дыра тут ровно того же рода, что
+закрыл ``at_grid``: чтобы положить балку по верху колонны, модель обязана
+СЛОЖИТЬ отметку уровня с отступом верха и ПЕРЕПИСАТЬ план колонны — числами,
+которые сама же написала строкой выше. Это и есть класс арифметики, ради
+снятия которого подъязык адреса существует.
+
+ЧТО ЗДЕСЬ ЗАКРЫТО ТАК ЖЕ, КАК В ``at_grid``. Три реестра, и разборщик не
+догадывается ни по одному: :data:`ELEMENT_ADDRESS_FORMS` (набор ключей узла),
+:data:`PLAN_POINTS`/:data:`ELEVATIONS` (закрытые словари имён) и
+:data:`ELEMENT_GEOMETRY` — ТАБЛИЦА ОПЕРАЦИЙ, у элементов которых геометрия
+названа. Незнакомый набор, незнакомое имя, отсутствующая строка таблицы —
+отказ, ПЕЧАТАЮЩИЙ реестр. Композиции нет и здесь: узел берёт РОВНО ОДИН
+селектор, и выразить «середину между А и Б» им нельзя по построению —
+второго операнда в грамматике не существует.
+
+ОТКУДА БЕРУТСЯ ЧИСЛА — И ПОЧЕМУ ТОЛЬКО ``by: ref``. Из САМОЙ ПРОГРАММЫ:
+адресуемый элемент создаётся выше по этой же программе, и его план, уровень и
+отступы автор УЖЕ НАПИСАЛ. Это чистая функция от текста программы плюс пул
+``levels`` снапшота (отметка уровня), то есть ровно та же дисциплина, что у
+``at_grid``.
+
+Остальные формы замороженного диалекта (``element_id``, ``name``,
+``family_type``, ``phase_result``, вторая ступень ``face``) ОТКАЗАНЫ, и
+причина ЗАМЕРЕНА, а не выведена: ``open_model.GROUND_SNAPSHOT_CS`` собирает
+пулы ТИПОВ плюс три пула экземпляров — ``levels`` (id, name, elevation_mm),
+``load_cases`` (id, name) и ``grids`` (id, name, p0_mm, p1_mm). Ни одной
+строки про стену, колонну или помещение МОДЕЛИ в снапшоте нет: геометрии
+существующего элемента у компилятора НЕТ. Дочитать её в эмитируемом C# —
+значит вернуть тригонометрию в Revit и убить литеральность точки; поэтому
+здесь честный отказ, а не половина механизма (см. :data:`ELEMENT_SELECTOR_RU`).
+
+ЧЕГО НЕТ И ПОЧЕМУ — ПОИМЁННО, в :data:`ELEMENT_REJECTED`. Пустая строка
+таблицы отправила бы автора гадать, поэтому отказ называет причину именно для
+той операции, о которой он спросил.
+
+────────────────────────────────────────────────────────────────────────────
 ТРИ ЛАТЕНТНЫХ ДЕФЕКТА ШИППЕД-МЕХАНИЗМА, КОТОРЫЕ ЭТОТ МОДУЛЬ ЧИНИТ
 ────────────────────────────────────────────────────────────────────────────
 
@@ -103,7 +153,6 @@ from typing import Any, Optional
 
 from kukai.ir.diag import Diagnostic, TYPE_BAD_TYPE, TYPE_BOUNDS
 from kukai.ir.emit_utils import is_finite_number
-from kukai.ir.numeric_contracts import MODEL_COORD_LIMIT_MM
 
 # ── коды отказа ──────────────────────────────────────────────────────────────
 #
@@ -118,6 +167,13 @@ GRID_AMBIGUOUS = "KIR-G109"          # несколько осей носят э
 GRID_NO_INTERSECTION = "KIR-G110"    # пара параллельна / угол < порога (Д3)
 GRID_NO_GEOMETRY = "KIR-G111"        # ось есть, прямой геометрии нет (дуга)
 GRID_TOWARD_INVALID = "KIR-G112"     # toward не годится в «сторону»
+
+# АДРЕС ОТ ЭЛЕМЕНТА (09.08). Тот же закон «код на ремонт, а не на место»:
+# четыре кода, потому что четыре РАЗНЫХ следующих хода.
+ELEMENT_REF_UNKNOWN = "KIR-G113"      # ссылка не на более ранний оп ЭТОЙ программы
+ELEMENT_NOT_ADDRESSABLE = "KIR-G114"  # у элементов ЭТОЙ операции адреса нет вовсе
+ELEMENT_PART_INVALID = "KIR-G115"     # операция адресуема, но НЕ этой точкой/отметкой
+ELEMENT_CAPTURE_GAP = "KIR-G116"      # отметки уровня нет в снапшоте (пробел захвата)
 
 #: Пул осей пуст / снапшота нет — переиспользуются коды ground как есть
 #: (ремонт другой: не «поправь имя», а «сначала построй оси»). Импортируются
@@ -196,7 +252,7 @@ LINE_FORMS: dict[frozenset, str] = {
         '{"grid": <имя>, "offset_mm": <число>, "toward": <имя>}',
 }
 
-#: ЕДИНСТВЕННОЕ ИСКЛЮЧЕНИЕ из правила «всякий pt_xy/pt_xyz адресуем».
+#: Исключения из правила «всякий pt_xy/pt_xyz адресуем».
 #:
 #: ``move_elements.delta_mm`` — СМЕЩЕНИЕ, а не положение: «сдвинь на
 #: пересечение А и 3» не значит ничего. Он носит род ``pt_xyz`` только потому,
@@ -204,10 +260,217 @@ LINE_FORMS: dict[frozenset, str] = {
 #: ``authoring_validation``), и это ровно тот случай, когда род говорит о
 #: ФОРМЕ, а не о СМЫСЛЕ.
 #:
+#: ``create_face_wall.face_normal`` — НАПРАВЛЕНИЕ выбора грани, а не точка.
+#: Если разрешить там адрес, пересечение осей становится вектором нормали и
+#: может молча выбрать другую грань. Это найдено на merged registry 10.08:
+#: новый op унаследовал адресацию только из-за общего рода ``pt_xyz``.
+#:
 #: Список ПРОВЕРЯЕМЫЙ: :func:`_lint` падает, если пара исчезла из реестра или
 #: сменила род. Исключение, которое перестало на что-то указывать, — это
 #: правило, которого никто не применяет.
-ADDRESS_EXCLUDED: frozenset = frozenset({("move_elements", "delta_mm")})
+ADDRESS_EXCLUDED: frozenset = frozenset({
+    ("move_elements", "delta_mm"),
+    ("create_face_wall", "face_normal"),
+    # `place_family.ref_dir` — НАПРАВЛЕНИЕ отсчёта на рабочей плоскости, а
+    # не положение, и разбор у него дословно тот же, что строкой выше:
+    # адрес от осей разрешается в МОДЕЛЬНЫЕ МИЛЛИМЕТРЫ, а миллиметры в поле
+    # направления — это не «примерно туда», это другая величина.
+    ("place_family", "ref_dir"),
+})
+
+
+# ── РЕЕСТРЫ ВТОРОГО СЕМЕЙСТВА: АДРЕС ОТ ЭЛЕМЕНТА ────────────────────────────
+
+#: Формы узла <адрес-от-элемента>. Ключ — набор ключей объекта, значение —
+#: (размерность, подпись). Тот же приём, что у :data:`ADDRESS_FORMS`: реестр
+#: сужается ДО размерности параметра, поэтому отказ печатает форму, годную
+#: ИМЕННО ЗДЕСЬ, а не весь список.
+ELEMENT_ADDRESS_FORMS: dict[frozenset, tuple[int, str]] = {
+    frozenset({"at_element", "point"}):
+        (2, '{"at_element": {"by": "ref", "value": "<id опа>"}, '
+            '"point": "start|end|center"}'),
+    frozenset({"at_element", "point", "z"}):
+        (3, '{"at_element": {"by": "ref", "value": "<id опа>"}, '
+            '"point": "start|end|center", "z": "base|top|axis"}'),
+    frozenset({"at_element", "point", "z_mm"}):
+        (3, '{"at_element": {"by": "ref", "value": "<id опа>"}, '
+            '"point": "start|end|center", "z_mm": <число>}'),
+}
+
+#: Станции ПЛАНА. Словарь закрыт: имя, которого здесь нет, — отказ со списком.
+PLAN_POINTS: tuple[str, ...] = ("start", "end", "center")
+
+#: Отметки. ``axis`` — отметка САМОЙ станции у объёмной оси (балка, труба):
+#: у неё нет «низа» и «верха» в программе, толщина сечения живёт в ТИПЕ, а тип
+#: разрешается против документа. ``base``/``top`` — у элементов, чью высоту
+#: программа задаёт уровнями.
+ELEVATIONS: tuple[str, ...] = ("base", "top", "axis")
+
+#: ЕДИНСТВЕННАЯ форма ступени 1, которую этот узел принимает, и текст, которым
+#: он отказывает всем остальным. Отдельной константой, потому что текст —
+#: ЗАМЕР, и он обязан читаться рядом с решением, а не быть спрятан в f-строке.
+ELEMENT_SELECTOR_RU = (
+    'адресуется только элемент, созданный ЭТОЙ ЖЕ программой: '
+    '{"by": "ref", "value": "<id опа выше>"}. Существующий элемент модели '
+    '(element_id / name / family_type / phase_result / face) адресовать '
+    'нельзя, и это не забывчивость: снапшот ground несёт пулы ТИПОВ и три '
+    'пула экземпляров — levels, load_cases, grids. Геометрии стены, колонны '
+    'или помещения МОДЕЛИ в нём нет ни одной строки, а дочитывать её в '
+    'эмитируемом C# запрещено — тогда точка перестала бы быть литералом и '
+    'тригонометрия уехала бы в Revit. Задайте такую точку литералом [x, y]')
+
+#: ТАБЛИЦА АДРЕСУЕМОЙ ГЕОМЕТРИИ. Строка = «у элемента этой операции названы
+#: такие-то точки и такие-то отметки, и вот ИЗ КАКИХ ПОЛЕЙ они выводятся».
+#:
+#: Таблица ЯВНАЯ, а не выведенная из рода параметров, и это не лень. Род
+#: ``pt_xyz`` у ``create_opening.p0_mm/p1_mm`` — это ДВА УГЛА прямоугольника, а
+#: не ось; «start/end» там читались бы как концы оси и врали бы молча. Род
+#: говорит о ФОРМЕ значения, а таблица — о СМЫСЛЕ элемента, и вывести второе из
+#: первого нельзя (тот же довод, что у :data:`ADDRESS_EXCLUDED`).
+#:
+#: Каждая строка стоила чтения ЭМИТТЕРА, и вот что прочитано (09.08.2026):
+#:
+#: * ``plan="axis"`` — пара точек ЕСТЬ ОСЬ элемента. Проверено по вызову
+#:   создания: ``Wall.Create(doc, Line.CreateBound(P(x0,y0,0), P(x1,y1,0)),…)``
+#:   (``authoring.py``), ``Line.CreateBound(P(x0,y0,z0), P(x1,y1,z1))`` у балки
+#:   (``struct_emit.emit_beam``), ``Pipe.Create/Duct.Create/CableTray.Create/
+#:   Conduit.Create(…, P(x0,y0,z0), P(x1,y1,z1), …)``.
+#: * ``dims=3`` в строке означает, что Z станции ЕСТЬ В САМОЙ ПРОГРАММЕ и
+#:   является АБСОЛЮТНОЙ отметкой модели в мм. Это ЗАМЕР, а не соглашение:
+#:   все перечисленные вызовы пропускают z через ``P()`` (мм -> футы) БЕЗ
+#:   вычитания ``Level.Elevation``. Единственное известное исключение
+#:   (``place_family``, где эмиттер пишет ``U(z) - __lv.Elevation``) в таблицу
+#:   не входит и назван в :data:`ELEMENT_REJECTED`.
+#: * ``base``/``top`` — только там, где ОБЕ отметки задаёт программа:
+#:   ``base = level.elevation + base_offset_mm``,
+#:   ``top  = top_level.elevation + top_offset_mm``.
+#:   У стены это ``WALL_BASE_OFFSET`` и пара ``WALL_HEIGHT_TYPE`` +
+#:   ``WALL_TOP_OFFSET``; у колонны — ``FAMILY_BASE_LEVEL_OFFSET`` и пара
+#:   ``FAMILY_TOP_LEVEL_PARAM`` + ``FAMILY_TOP_LEVEL_OFFSET`` (читается прямо
+#:   в наклонной ветке ``authoring.py``: ``top_z = __ctl.Elevation + U(off)``).
+#:   У наклонной колонны плановая станция тоже зависит от отметки:
+#:   ``base`` берёт ``xy``, ``top`` — ``top_xy``. Плоский адрес и ``z_mm``
+#:   для неё отказаны: без выбора конца оси единственной плановой точки нет.
+#:
+#: ПОЧЕМУ ``top`` ТРЕБУЕТ ``top_level`` И БЕЗ НЕГО ОТКАЗЫВАЕТ. Без привязки
+#: верха высота стены приезжает из УМОЛЧАНИЯ РЕЕСТРА (``height_mm`` = 3000 мм,
+#: подставляется молча — закрытый список ``tests/test_silent_defaults.py``), а
+#: высота колонны — из типоразмера, которого в программе нет вовсе. Ответить
+#: «верх = низ + 3000» значило бы выдать за слова автора умолчание, которого он
+#: не произносил, — ровно тот дефект, из-за которого свидетель высоты
+#: откатывал ПРАВИЛЬНО построенные фасадные стены (замер 29.07).
+ELEMENT_GEOMETRY: dict[str, dict] = {
+    "create_wall":       {"plan": "axis", "fields": ("p0_mm", "p1_mm"),
+                          "dims": 2, "z": ("base", "top")},
+    "create_grid":       {"plan": "axis", "fields": ("p0_mm", "p1_mm"),
+                          "dims": 2, "z": ()},
+    "create_column":     {"plan": "point", "fields": ("xy",),
+                          "dims": 2, "z": ("base", "top")},
+    "create_beam":       {"plan": "axis", "fields": ("p0_mm", "p1_mm"),
+                          "dims": 3, "z": ("axis",)},
+    "create_pipe":       {"plan": "axis", "fields": ("p0_mm", "p1_mm"),
+                          "dims": 3, "z": ("axis",)},
+    "create_duct":       {"plan": "axis", "fields": ("p0_mm", "p1_mm"),
+                          "dims": 3, "z": ("axis",)},
+    "create_conduit":    {"plan": "axis", "fields": ("p0_mm", "p1_mm"),
+                          "dims": 3, "z": ("axis",)},
+    "create_cable_tray": {"plan": "axis", "fields": ("p0_mm", "p1_mm"),
+                          "dims": 3, "z": ("axis",)},
+}
+
+#: ОТВЕРГНУТО ПОИМЁННО. Отсутствие строки в :data:`ELEMENT_GEOMETRY` — это
+#: факт, а не объяснение: автор, спросивший про помещение, обязан узнать
+#: ПОЧЕМУ, иначе он попробует ещё раз тем же способом. Пустая таблица причин
+#: превратила бы закрытую грамматику в «неизвестное поле».
+ELEMENT_REJECTED: dict[str, str] = {
+    "create_space": (
+        "у пространства ОВК `xy` — это ТОЧКА ПОСЕВА для "
+        "Document.NewSpace, тот же род аргумента, что у помещения строкой "
+        "ниже: Revit ставит пространство в ту область, куда точка попала, и "
+        "центр построенного объёма к ней отношения не имеет. Контура "
+        "пространства в программе нет вовсе"),
+    "create_room": (
+        "у помещения `xy` — это ТОЧКА ПОСЕВА для Document.NewRoom, а не центр "
+        "помещения: Revit ставит помещение в ту ячейку, куда точка попала, и "
+        "центр построенного помещения к ней отношения не имеет. Назвать её "
+        "«center» значило бы соврать. Контура помещения в программе нет вовсе"),
+    "create_floor": (
+        "форма перекрытия — МНОГОУГОЛЬНИК (`outline`), у него нет ни начала, "
+        "ни конца, а «центр» многоугольника требует правила центроида, "
+        "которого никто не мерил (у невыпуклого контура центр масс лежит вне "
+        "плиты)"),
+    "create_floor_by_contour": (
+        "типизированный эскиз — тот же МНОГОУГОЛЬНИК, что и у create_floor, "
+        "плюс дуговые рёбра: у него нет ни начала, ни конца, а «центр» требует "
+        "правила центроида, которого никто не мерил"),
+    "create_ceiling": (
+        "форма потолка — МНОГОУГОЛЬНИК (outline либо типизированный эскиз), "
+        "и довод тот же, что у create_floor: ни начала, ни конца, а центр "
+        "невыпуклого контура лежит вне элемента"),
+    "create_roof": (
+        "форма кровли — МНОГОУГОЛЬНИК, и довод тот же, что у create_floor; "
+        "вдобавок у скатной кровли отметка меняется вдоль контура, и одна "
+        "«отметка элемента» её не описывает"),
+    "create_extrusion_roof": (
+        "`p0_mm`/`p1_mm` задают СЛЕД РАБОЧЕЙ ПЛОСКОСТИ на плане, а не ось "
+        "и не границу построенной кровли. Тело задают профиль в координатах "
+        "этой плоскости и границы выдавливания вдоль её нормали; назвать "
+        "start/end точками элемента означало бы выдать служебную линию за "
+        "геометрию кровли"),
+    "create_opening": (
+        "`p0_mm`/`p1_mm` у проёма — ДВА ПРОТИВОПОЛОЖНЫХ УГЛА прямоугольника, а "
+        "не концы оси. Имена start/end читались бы как ось и врали бы молча"),
+    "place_family": (
+        "операция несёт ДВЕ формы сразу (точка `xyz` либо кривая `p0_mm`/"
+        "`p1_mm`), и у точечной формы `xyz` — ТОЧКА ВСТАВКИ семейства, чьё "
+        "отношение к видимому телу задаёт само семейство, а не программа. "
+        "Вдобавок это единственная известная операция, у которой эмиттер "
+        "пишет `U(z) - __lv.Elevation`, то есть кадр отсчёта Z у неё свой"),
+    "create_stairs": (
+        "`p0_mm`/`p1_mm` задают ОДИН прямой марш, а построенная лестница — это "
+        "марши, площадки и ограждения, чьи концы Revit расставляет сам"),
+    "create_truss": (
+        "`p0_mm`/`p1_mm` — линия ОПОРНОЙ КРИВОЙ фермы; положение поясов и "
+        "раскосов задаёт семейство фермы, и «начало» построенного элемента с "
+        "концом этой линии не совпадает"),
+    "create_path_of_travel": (
+        "путь эвакуации ПРОКЛАДЫВАЕТ REVIT: `p0_mm`/`p1_mm` — это запрос "
+        "«откуда куда», а построенная линия огибает препятствия, и её концы "
+        "программе неизвестны"),
+    "create_point_load": (
+        "нагрузка — не тело: адресоваться от точки её приложения можно, но "
+        "надобности замером не подтверждено; строка откроется первым живым "
+        "случаем, а не заранее"),
+    "create_line_load": (
+        "нагрузка — не тело: адресоваться от концов линии её приложения можно, "
+        "но надобности замером не подтверждено; строка откроется первым живым "
+        "случаем, а не заранее"),
+    "create_pipe_placeholder": (
+        "заготовка выражает ту же ось, что и труба, но её единственный смысл — "
+        "быть ЗАМЕНЁННОЙ на настоящую трассу; адрес от временного элемента "
+        "открывать без живого случая незачем"),
+    "create_duct_placeholder": (
+        "заготовка выражает ту же ось, что и воздуховод, но её единственный "
+        "смысл — быть ЗАМЕНЁННОЙ на настоящую трассу; адрес от временного "
+        "элемента открывать без живого случая незачем"),
+    "create_foundation": (
+        "`xy` есть только у рода `isolated`; у рода `slab` формы вообще "
+        "другая, и одна строка таблицы описывала бы два разных элемента"),
+    "create_curtain_grid_line": (
+        "`position_mm` — точка НА ПОВЕРХНОСТИ витража, задающая, где резать "
+        "сетку; построенная линия принадлежит носителю, и её концы задаёт он"),
+    "create_solid_revolve": (
+        "`axis_xy_mm` задаёт ВЕРТИКАЛЬНУЮ ОСЬ ВРАЩЕНИЯ, а не точку тела: "
+        "профиль лежит справа от неё и после поворота может окружать пустую "
+        "ось. Назвать эту координату center/start/end означало бы молча "
+        "поставить следующий элемент на служебную ось вместо геометрии"),
+    "create_face_wall": (
+        "`face_normal` — НАПРАВЛЕНИЕ отбора грани носителя, а не положение. "
+        "Саму точку или контур выбранной грани программа не несёт; превращать "
+        "вектор нормали в адрес либо дочитывать геометрию в эмитируемом C# "
+        "означало бы молчаливо выбрать другую точку или перенести вычисление "
+        "из компилятора в Revit"),
+}
 
 
 def _lint() -> None:
@@ -218,7 +481,65 @@ def _lint() -> None:
     for keys in LINE_FORMS:
         if "grid" not in keys:
             raise AssertionError(f"LINE_FORMS: битая форма {sorted(keys)}")
+    for keys, (dims, _sig) in ELEMENT_ADDRESS_FORMS.items():
+        if "at_element" not in keys or dims not in (2, 3):
+            raise AssertionError(
+                f"ELEMENT_ADDRESS_FORMS: битая форма {sorted(keys)}")
     from kukai.ir import spec
+    # ТАБЛИЦА АДРЕСУЕМОЙ ГЕОМЕТРИИ СВЕРЯЕТСЯ С РЕЕСТРОМ НА ИМПОРТЕ. Строка,
+    # называющая несуществующий оп или поле не того рода, — это молчаливо
+    # мёртвая половина грамматики: отказ печатал бы её как доступную форму,
+    # а резолвер падал бы KeyError на первой же попытке. Тот же замок, что у
+    # ADDRESS_EXCLUDED ниже, и по той же причине.
+    both = set(ELEMENT_GEOMETRY) & set(ELEMENT_REJECTED)
+    if both:
+        raise AssertionError(
+            f"операция и разрешена, и отвергнута: {sorted(both)}")
+    for op_name, row in ELEMENT_GEOMETRY.items():
+        op_spec = spec.OPS.get(op_name)
+        if op_spec is None:
+            raise AssertionError(
+                f"ELEMENT_GEOMETRY называет {op_name!r}, которого нет в реестре")
+        if not op_spec.result.referenceable:
+            raise AssertionError(
+                f"ELEMENT_GEOMETRY: {op_name} не производит адресуемый "
+                "результат — на него нельзя сослаться by=ref")
+        if row["plan"] not in ("axis", "point"):
+            raise AssertionError(f"ELEMENT_GEOMETRY: {op_name} — род плана?")
+        if len(row["fields"]) != (2 if row["plan"] == "axis" else 1):
+            raise AssertionError(
+                f"ELEMENT_GEOMETRY: {op_name} — число полей не по роду плана")
+        want_kind = "pt_xyz" if row["dims"] == 3 else "pt_xy"
+        for field in row["fields"]:
+            if not any(p.name == field and p.kind == want_kind
+                       for p in op_spec.params):
+                raise AssertionError(
+                    f"ELEMENT_GEOMETRY: у {op_name} нет параметра {field} "
+                    f"рода {want_kind}")
+        for name in row["z"]:
+            if name not in ELEVATIONS:
+                raise AssertionError(
+                    f"ELEMENT_GEOMETRY: {op_name} называет отметку {name!r} "
+                    f"вне закрытого словаря {ELEVATIONS}")
+        # «axis» означает «Z станции лежит в самой программе», а он лежит там
+        # ровно тогда, когда станция трёхмерна. Пара, разошедшаяся здесь,
+        # вернула бы Z из ниоткуда.
+        if ("axis" in row["z"]) != (row["dims"] == 3):
+            raise AssertionError(
+                f"ELEMENT_GEOMETRY: {op_name} — отметка axis есть только у "
+                "трёхмерной станции, и наоборот")
+        for name in ("base", "top"):
+            if name in row["z"] and not any(
+                    p.name == ("level" if name == "base" else "top_level")
+                    for p in op_spec.params):
+                raise AssertionError(
+                    f"ELEMENT_GEOMETRY: {op_name} обещает отметку {name}, но "
+                    "уровня, из которого её выводят, у операции нет")
+    for op_name in ELEMENT_REJECTED:
+        if op_name not in spec.OPS:
+            raise AssertionError(
+                f"ELEMENT_REJECTED называет {op_name!r}, которого нет в "
+                "реестре — причина отказа про несуществующую операцию")
     for op_name, param in ADDRESS_EXCLUDED:
         op_spec = spec.OPS.get(op_name)
         if op_spec is None:
@@ -254,11 +575,24 @@ def addressable_params(op_name: str) -> dict[str, int]:
 def is_address(value: Any) -> bool:
     """Дешёвый классификатор: «это вообще адрес?».
 
-    Намеренно ГРУБЫЙ — достаточно ключа ``at_grid``, чтобы отличить попытку
-    адреса от литерала. Всё остальное говорит :func:`validate_address`, и
-    говорит ТИПИЗИРОВАННЫМ ОТКАЗОМ, а не молчаливым «не адрес».
+    Намеренно ГРУБЫЙ — достаточно ключа-маркера семейства, чтобы отличить
+    попытку адреса от литерала. Всё остальное говорит :func:`validate_address`,
+    и говорит ТИПИЗИРОВАННЫМ ОТКАЗОМ, а не молчаливым «не адрес».
+
+    ДВА СЕМЕЙСТВА, ОДИН КЛАССИФИКАТОР — и это не обобщение ради обобщения.
+    Каждый вызывающий (``authoring_validation``, ``macros``, ``ground``)
+    задаёт ровно один вопрос: «литерал или адрес?». Заведи мы второй предикат,
+    и любой пропустивший его вызывающий молча принял бы новый узел за
+    литеральную точку — то есть за список из двух чисел, которым он не
+    является.
     """
-    return isinstance(value, dict) and "at_grid" in value
+    return isinstance(value, dict) and (
+        "at_grid" in value or "at_element" in value)
+
+
+def is_element_address(value: Any) -> bool:
+    """Адрес ВТОРОГО семейства — от элемента, а не от осей."""
+    return isinstance(value, dict) and "at_element" in value
 
 
 def program_uses_address(op: Any) -> bool:
@@ -447,6 +781,80 @@ def _validate_line(node: Any, oid, field: str, diags: list) -> bool:
     return True
 
 
+def _validate_element_address(value: dict, oid, field: str, diags: list, *,
+                              dims: int) -> bool:
+    """Статические законы адреса ОТ ЭЛЕМЕНТА. Чистая функция от текста.
+
+    Черта та же, что у ``at_grid`` (спека §4.1): здесь доказывается «есть в
+    тексте» — форма, закрытые словари имён, границы отметки. «Есть в
+    программе» — существование опа, его род, наличие у него уровня — живёт в
+    :func:`resolve_element_address`, потому что для этого нужна сама программа.
+    """
+    forms = {k: v for k, v in ELEMENT_ADDRESS_FORMS.items() if v[0] == dims}
+    keys = frozenset(value)
+    form = forms.get(keys)
+    if form is None:
+        hint = ""
+        if "z" in keys and "z_mm" in keys:
+            hint = (" Отметка названа ДВАЖДЫ: `z` берёт её у самого элемента, "
+                    "`z_mm` задаёт числом. Одновременно — два разных ответа на "
+                    "один вопрос, и выбирать за вас нельзя.")
+        elif dims == 2 and ("z" in keys or "z_mm" in keys):
+            hint = (" Этот параметр плоский (pt_xy) — отметку держит уровень, "
+                    "отметка здесь лишняя.")
+        elif dims == 3 and not ("z" in keys or "z_mm" in keys):
+            hint = (" Этот параметр объёмный (pt_xyz): у станции плана отметки "
+                    "нет, её обязан назвать сам адрес — допишите z (взять у "
+                    "элемента) либо z_mm (числом). Молча подставленный ноль "
+                    "поставил бы элемент на отметку нуля модели, и свидетель "
+                    "принял бы это — он сверяет с тем же нулём.")
+        expected = next((sig for _d, sig in forms.values()), None)
+        return _bad(diags, oid, field,
+                    f"{field}: неизвестная форма адреса от элемента "
+                    f"{sorted(keys)}. Грамматика ЗАКРЫТА; для этого параметра "
+                    f"принимается {expected}.{hint}",
+                    got=sorted(keys), expected=expected,
+                    candidates=[sig for _d, sig in forms.values()])
+    sel = value.get("at_element")
+    # Селектор проверяется ЗДЕСЬ, а не в ground: «by должен быть ref» — чистая
+    # функция от текста, и отказ, который можно выдать без модели, обязан
+    # выдаваться без модели.
+    if not isinstance(sel, dict) or set(sel) != {"by", "value"} \
+            or sel.get("by") != "ref" or not isinstance(sel.get("value"), str) \
+            or not sel["value"].strip():
+        return _bad(diags, oid, f"{field}.at_element",
+                    f"{field}.at_element: {ELEMENT_SELECTOR_RU}",
+                    got=sel, expected='{"by": "ref", "value": "<id опа>"}')
+    point = value.get("point")
+    if point not in PLAN_POINTS:
+        return _bad(diags, oid, f"{field}.point",
+                    f"{field}.point: станция плана — одно из {list(PLAN_POINTS)}. "
+                    f"Словарь ЗАКРЫТ; какие из них выражает конкретный элемент, "
+                    f"скажет отказ при разрешении — это зависит от операции, "
+                    f"которая его создаёт",
+                    code=TYPE_BAD_TYPE, got=point, expected=list(PLAN_POINTS),
+                    candidates=list(PLAN_POINTS))
+    if "z" in value and value["z"] not in ELEVATIONS:
+        return _bad(diags, oid, f"{field}.z",
+                    f"{field}.z: отметка — одно из {list(ELEVATIONS)}. "
+                    f"base/top — у элемента, чью высоту задают уровни "
+                    f"(стена, колонна); axis — отметка самой станции у "
+                    f"объёмной оси (балка, труба, воздуховод)",
+                    code=TYPE_BAD_TYPE, got=value.get("z"),
+                    expected=list(ELEVATIONS), candidates=list(ELEVATIONS))
+    if "z_mm" in value:
+        z = value["z_mm"]
+        if not is_finite_number(z):
+            return _bad(diags, oid, f"{field}.z_mm",
+                        f"{field}.z_mm: отметка — конечное число (мм)", got=z)
+        from kukai.ir.authoring_validation import _COORD_LIMIT_MM
+        if abs(float(z)) > _COORD_LIMIT_MM:
+            return _bad(diags, oid, f"{field}.z_mm",
+                        f"{field}.z_mm: |отметка| не более "
+                        f"{_COORD_LIMIT_MM:.0f} мм", code=TYPE_BOUNDS, got=z)
+    return True
+
+
 def validate_address(value: Any, oid, field: str, diags: list, *,
                      dims: int, allow_world_offset: bool = False) -> bool:
     """Статические законы адреса. Возвращает True, если разбирается.
@@ -459,6 +867,8 @@ def validate_address(value: Any, oid, field: str, diags: list, *,
     """
     if not isinstance(value, dict):
         return _bad(diags, oid, field, f"{field}: адрес — объект", got=value)
+    if "at_element" in value:
+        return _validate_element_address(value, oid, field, diags, dims=dims)
     forms = dict(ADDRESS_FORMS)
     if allow_world_offset:
         forms.update(LEGACY_ADDRESS_FORMS)
@@ -508,11 +918,11 @@ def validate_address(value: Any, oid, field: str, diags: list, *,
             ok = _bad(diags, oid, f"{field}.z_mm",
                       f"{field}.z_mm: отметка — конечное число (мм)", got=z)
         else:
-            if abs(float(z)) > MODEL_COORD_LIMIT_MM:
+            from kukai.ir.authoring_validation import _COORD_LIMIT_MM
+            if abs(float(z)) > _COORD_LIMIT_MM:
                 ok = _bad(diags, oid, f"{field}.z_mm",
                           f"{field}.z_mm: |отметка| не более "
-                          f"{MODEL_COORD_LIMIT_MM:.0f} мм",
-                          code=TYPE_BOUNDS, got=z)
+                          f"{_COORD_LIMIT_MM:.0f} мм", code=TYPE_BOUNDS, got=z)
     if allow_world_offset and "offset_mm" in keys and not _is_pt(value["offset_mm"]):
         ok = _bad(diags, oid, f"{field}.offset_mm",
                   f"{field}.offset_mm: мировой отступ — [dx, dy]",
@@ -593,9 +1003,12 @@ def _find_grid(name: str, pool: list, oid, field: str, diags: list, *,
         _bad(diags, oid, field,
              f"{field}: оси «{want}» нет в модели{note}. Список осей: "
              f'{{"op": "query_list", "kind": "grid"}}. Если «{want}» создаётся '
-             f"ЭТОЙ ЖЕ программой — адресовать её нельзя: адрес читает снимок, "
-             f"снятый ДО программы. Это два хода: создать оси, перечитать "
-             f"модель, строить",
+             f"ЭТОЙ ЖЕ программой, ПЕРЕСЕЧЕНИЕ с ней здесь невыразимо: "
+             f"at_grid читает снимок, снятый ДО программы, — это два хода "
+             f"(создать оси, перечитать модель, строить). Отдельные КОНЦЫ "
+             f"такой оси адресуются другим узлом, читающим саму программу: "
+             f'{{"at_element": {{"by": "ref", "value": "<id опа create_grid>"}}, '
+             f'"point": "start|end|center"}}',
              code=GRID_NOT_FOUND, got=want,
              candidates=_nearest_names(want, pool))
         return None
@@ -709,6 +1122,16 @@ def resolve_address(value: Any, grids_pool: list, oid, field: str, diags: list,
     отступ, сторона, итоговая точка). Выбор, который некому предъявить,
     неотличим от ``.FirstOrDefault()`` в костюме.
     """
+    # ФУНКЦИЯ ОБЯЗАНА БЫТЬ ТОТАЛЬНОЙ. `validate_address` с 09.08 принимает ДВА
+    # семейства узлов, и без этой строки адрес от элемента прошёл бы проверку
+    # формы и упал бы ниже на `value["at_grid"]` — то есть типизированный
+    # отказ подменился бы «внутренней ошибкой компилятора». Ровно тот обмен,
+    # который этой же ночью нашёлся на повторной площадке законов.
+    if is_element_address(value):
+        _bad(diags, oid, field,
+             f"{field}: адрес от ЭЛЕМЕНТА разрешает "
+             f"`resolve_element_address` — ему нужна программа, а не пул осей")
+        return None
     if not validate_address(value, oid, field, diags, dims=dims,
                             allow_world_offset=allow_world_offset):
         return None
@@ -766,10 +1189,323 @@ def resolve_address(value: Any, grids_pool: list, oid, field: str, diags: list,
     return out
 
 
+# ── стадия GROUND: адрес от ЭЛЕМЕНТА (чистая функция от ПРОГРАММЫ) ──────────
+
+def element_address_refs(op: Any) -> list:
+    """``[(параметр, id опа-адресата)]`` — ссылки, спрятанные внутри адресов.
+
+    Существует ради ОДНОГО потребителя — обхода DAG в ``compiler.plan_program``,
+    и это не удобство, а закон, записанный там же (комментарий про вторую
+    ступень селектора): обход рёбер смотрит на ВЕРХНИЙ уровень значения
+    параметра, поэтому ссылка, уехавшая на уровень глубже, стала бы для него
+    невидимой — и «ref не указывает на более ранний оп» перестало бы
+    срабатывать МОЛЧА. Учить об этом надо ровно одно место, и вот его вход.
+    """
+    if not isinstance(op, dict):
+        return []
+    out = []
+    for param in addressable_params(str(op.get("op", ""))):
+        value = op.get(param)
+        if not is_element_address(value):
+            continue
+        sel = value.get("at_element")
+        if isinstance(sel, dict) and sel.get("by") == "ref" \
+                and isinstance(sel.get("value"), str):
+            out.append((param, sel["value"].strip()))
+    return out
+
+
+def _pt_of(value: Any, dims: int) -> Optional[list]:
+    """Литеральная точка нужной размерности, либо None."""
+    if (isinstance(value, list) and len(value) == dims
+            and all(is_finite_number(c) for c in value)):
+        return [float(c) for c in value]
+    return None
+
+
+def _level_elevation_mm(src: dict, param: str, program: dict, levels_pool: list,
+                        oid, field: str, diags: list) -> Optional[float]:
+    """Отметка уровня, на который сослался адресуемый оп, в мм. Или None+отказ.
+
+    ДВА ИСТОЧНИКА, И ОБА ЧЕСТНЫЕ. Уровень модели — строка пула ``levels``
+    снапшота: ключ ``elevation_mm`` пришёл туда волной сечений 09.08 (до неё
+    комментарий эмиттера стены прямо писал «отметки уровней компилятору
+    недоступны — в снапшоте только id и имя», и это перестало быть правдой).
+    Уровень, созданный ЭТОЙ ЖЕ программой, — параметр ``elev_mm`` операции
+    ``create_level``, то есть число, которое автор написал сам.
+
+    ПРОБЕЛ ЗАХВАТА НАЗЫВАЕТСЯ, А НЕ ОБХОДИТСЯ. Строка пула без
+    ``elevation_mm`` (старый мост, коллектор бросил на ``Level.Elevation``) —
+    это KIR-G116, а не ноль по умолчанию: подставленный ноль поставил бы
+    элемент на отметку нуля модели и прошёл бы свидетеля, который сверяет с
+    тем же нулём.
+    """
+    sel = src.get(param)
+    if not isinstance(sel, dict) or not isinstance(sel.get("__grounded__"), dict):
+        _bad(diags, oid, field,
+             f"{field}: у опа «{src.get('id')}» ({src.get('op')}) нет "
+             f"привязки «{param}», из которой выводится эта отметка. "
+             f"СЛЕДУЮЩИЙ ХОД: допишите «{param}» у того опа либо назовите "
+             f"отметку числом (z_mm)",
+             code=ELEMENT_PART_INVALID, got=param)
+        return None
+    grounded = sel["__grounded__"]
+    if grounded.get("via") == "ref":
+        # Уровень тоже строится этой программой — числа лежат в ней же.
+        ref = str(grounded.get("ref", ""))
+        level_op = program.get(ref)
+        if not isinstance(level_op, dict) or level_op.get("op") != "create_level":
+            _bad(diags, oid, field,
+                 f"{field}: «{param}» опа «{src.get('id')}» ссылается на "
+                 f"«{ref}», а отметку программа знает только у create_level",
+                 code=ELEMENT_PART_INVALID, got=ref)
+            return None
+        elev = level_op.get("elev_mm")
+        if not is_finite_number(elev):
+            _bad(diags, oid, field,
+                 f"{field}: у create_level «{ref}» нет числовой отметки "
+                 f"elev_mm", code=ELEMENT_PART_INVALID, got=elev)
+            return None
+        return float(elev)
+    level_id = grounded.get("id")
+    if not isinstance(level_id, int) or isinstance(level_id, bool):
+        _bad(diags, oid, field,
+             f"{field}: «{param}» опа «{src.get('id')}» разрешён без "
+             f"ElementId (via={grounded.get('via')!r}) — отметку такого уровня "
+             f"компилятор не знает",
+             code=ELEMENT_PART_INVALID, got=grounded.get("via"))
+        return None
+    row = next((r for r in (levels_pool or [])
+                if isinstance(r, dict) and r.get("id") == level_id), None)
+    if row is None:
+        _bad(diags, oid, field,
+             f"{field}: уровня id {level_id} нет в пуле levels снапшота — "
+             f"отметку взять неоткуда. СЛЕДУЮЩИЙ ХОД: перечитайте модель",
+             code=ELEMENT_CAPTURE_GAP, got=level_id)
+        return None
+    elev = row.get("elevation_mm")
+    if not is_finite_number(elev):
+        _bad(diags, oid, field,
+             f"{field}: строка уровня «{row.get('name')}» (id {level_id}) "
+             f"пришла БЕЗ elevation_mm — это пробел ЗАХВАТА, а не свойство "
+             f"модели: ключ собирает open_model.GROUND_SNAPSHOT_CS. Пока его "
+             f"нет, отметку задайте числом (z_mm)",
+             code=ELEMENT_CAPTURE_GAP, got=row.get("elevation_mm"))
+        return None
+    return float(elev)
+
+
+def _offset_mm(src: dict, param: str) -> float:
+    """Отступ, который автор МОГ не называть. Отсутствие = ноль, и это ЗАМЕР.
+
+    Не умолчание реестра: у ``base_offset_mm``/``top_offset_mm`` его нет
+    (``default=None``), а эмиттер при отсутствии значения либо не пишет
+    параметр вовсе (стена: блок ``WALL_BASE_OFFSET`` не эмитируется), либо
+    пишет литеральный ``0.0`` (``WALL_TOP_OFFSET``, ``FAMILY_TOP_LEVEL_OFFSET``).
+    То есть ноль здесь — построенное состояние элемента, а не наша догадка.
+    """
+    value = src.get(param)
+    return float(value) if is_finite_number(value) else 0.0
+
+
+def resolve_element_address(value: Any, program: dict, levels_pool: list,
+                            oid, field: str, diags: list, *, dims: int,
+                            receipt: Optional[list] = None) -> Optional[list]:
+    """Адрес от элемента -> литеральная точка, либо ``None`` + отказы.
+
+    ``program`` — уже ЗАЗЕМЛЁННЫЕ опы, стоящие СТРОГО ВЫШЕ адресующего,
+    по их id. Ссылка вперёд поэтому не находится — и это не побочный эффект
+    порядка обхода, а тот же закон, что у ``by=ref`` в эмиссии: адресовать
+    можно только то, что уже сказано.
+
+    Чистая функция: ни моста, ни транзакции. Тригонометрии здесь нет вовсе —
+    станции плана это концы и середина отрезка, а отметки — суммы двух чисел.
+    """
+    if not _validate_element_address(value, oid, field, diags, dims=dims):
+        return None
+    ref = str(value["at_element"]["value"]).strip()
+    src = program.get(ref)
+    if not isinstance(src, dict):
+        _bad(diags, oid, field,
+             f"{field}: «{ref}» — не оп, стоящий ВЫШЕ в этой программе. "
+             f"Адрес читает числа, которые автор уже написал, поэтому "
+             f"адресуемый оп обязан быть РАНЬШЕ адресующего (ссылка вперёд и "
+             f"ссылка на чужую программу здесь одинаково невыразимы). "
+             f"Доступны: {sorted(program)}",
+             code=ELEMENT_REF_UNKNOWN, got=ref, candidates=sorted(program))
+        return None
+    op_name = str(src.get("op", ""))
+    row = ELEMENT_GEOMETRY.get(op_name)
+    if row is None:
+        why = ELEMENT_REJECTED.get(op_name)
+        # ПРИЧИНА, А НЕ ПУСТАЯ СТРОКА ТАБЛИЦЫ. Автор, спросивший про
+        # помещение, обязан узнать, ЧТО ИМЕННО не выражается, иначе он
+        # попробует ещё раз тем же способом.
+        tail = (f" Причина: {why}." if why else
+                " Операции нет ни среди адресуемых, ни среди названных "
+                "исключений — значит вопрос про неё ещё никто не решал.")
+        _bad(diags, oid, field,
+             f"{field}: у элементов операции «{op_name}» адресуемой геометрии "
+             f"нет.{tail} Адресуются: {sorted(ELEMENT_GEOMETRY)}. Задайте эту "
+             f"точку литералом",
+             code=ELEMENT_NOT_ADDRESSABLE, got=op_name,
+             candidates=sorted(ELEMENT_GEOMETRY))
+        return None
+    point_name = value["point"]
+    src_dims = row["dims"]
+    # ── станция плана ────────────────────────────────────────────────────
+    if row["plan"] == "point":
+        if point_name != "center":
+            _bad(diags, oid, f"{field}.point",
+                 f"{field}.point: элемент «{ref}» ({op_name}) задан ОДНОЙ "
+                 f"точкой — у него нет ни начала, ни конца. Выражается "
+                 f"только «center»",
+                 code=ELEMENT_PART_INVALID, got=point_name,
+                 expected="center", candidates=["center"])
+            return None
+        plan_field = row["fields"][0]
+        if op_name == "create_column" and src.get("top_xy") is not None:
+            # CURRENT-REGISTRY SEAM (10.08.2026). После появления `top_xy`
+            # колонна перестала иметь одну плановую точку: нижний и верхний
+            # концы оси различны. Старая строка таблицы молча возвращала `xy`
+            # даже при z=top — правильная отметка, неправильный план, и оба
+            # числа затем проходили бы собственный свидетель балки.
+            z_selector = value.get("z") if dims == 3 else None
+            if z_selector not in ("base", "top"):
+                _bad(diags, oid, field,
+                     f"{field}: колонна «{ref}» наклонная (`top_xy` задан), "
+                     f"поэтому одной плановой точки у неё нет. Адрес обязан "
+                     f"выбрать конец оси через z=base либо z=top; плоский "
+                     f"адрес и z_mm не определяют, брать xy или top_xy",
+                     code=ELEMENT_PART_INVALID, got=z_selector,
+                     expected="z=base|top", candidates=["base", "top"])
+                return None
+            plan_field = "top_xy" if z_selector == "top" else "xy"
+        plan = _pt_of(src.get(plan_field), src_dims)
+        if plan is None:
+            _bad(diags, oid, field,
+                 f"{field}: у опа «{ref}» точка «{plan_field}» не "
+                 f"разрешена в числа — адресоваться не от чего",
+                 code=ELEMENT_PART_INVALID, got=src.get(plan_field))
+            return None
+        station = plan
+    else:
+        p0 = _pt_of(src.get(row["fields"][0]), src_dims)
+        p1 = _pt_of(src.get(row["fields"][1]), src_dims)
+        if p0 is None or p1 is None:
+            _bad(diags, oid, field,
+                 f"{field}: у опа «{ref}» концы "
+                 f"{row['fields'][0]}/{row['fields'][1]} не разрешены в "
+                 f"числа — адресоваться не от чего",
+                 code=ELEMENT_PART_INVALID,
+                 got=[src.get(row["fields"][0]), src.get(row["fields"][1])])
+            return None
+        # ДУГА. Середина хорды — НЕ середина дуги, и подставить её молча
+        # значило бы промахнуться тем сильнее, чем круче стена изогнута.
+        # Концы при этом честные: `materialize._reconcile_arc_endpoints`
+        # выводит p0/p1 дуговой стены ИЗ САМОЙ ДУГИ.
+        if point_name == "center" and src.get("arc") is not None:
+            _bad(diags, oid, f"{field}.point",
+                 f"{field}.point: у опа «{ref}» ось ДУГОВАЯ (задан arc), а "
+                 f"«center» вернул бы середину ХОРДЫ — точку, лежащую вне "
+                 f"элемента. Выражаются только start и end",
+                 code=ELEMENT_PART_INVALID, got=point_name,
+                 candidates=["start", "end"])
+            return None
+        station = (p0 if point_name == "start" else
+                   p1 if point_name == "end" else
+                   [(a + b) / 2.0 for a, b in zip(p0, p1)])
+    out = [_canon_mm(station[0]), _canon_mm(station[1])]
+    detail: dict = {"of": ref, "op": op_name, "point": point_name}
+    # ── отметка ──────────────────────────────────────────────────────────
+    if dims == 3:
+        if "z_mm" in value:
+            out.append(_canon_mm(value["z_mm"]))
+            detail["z"] = "z_mm"
+        else:
+            z_name = value["z"]
+            if z_name not in row["z"]:
+                legal = list(row["z"])
+                move = (f"выражаются только {legal}" if legal else
+                        "у этого элемента отметки в программе нет вовсе — "
+                        "задайте её числом (z_mm)")
+                extra = ""
+                if z_name == "top" and "top" not in legal and "base" in legal:
+                    # САМАЯ ВЕРОЯТНАЯ ПРОМАШКА, и общий «имя не из словаря»
+                    # послал бы автора перечитывать словарь вместо того,
+                    # чтобы дописать одно поле у ДРУГОГО опа.
+                    extra = (" Верх выражается, только когда программа его "
+                             "ПРИВЯЗЫВАЕТ: допишите top_level у опа "
+                             f"«{ref}». Без привязки высота приезжает из "
+                             "умолчания (у стены 3000 мм) либо из "
+                             "типоразмера, и назвать её словами автора нельзя")
+                _bad(diags, oid, f"{field}.z",
+                     f"{field}.z: у элемента «{ref}» ({op_name}) отметка "
+                     f"«{z_name}» не выражается — {move}.{extra}",
+                     code=ELEMENT_PART_INVALID, got=z_name, candidates=legal)
+                return None
+            if z_name == "axis":
+                out.append(_canon_mm(station[2]))
+                detail["z"] = "axis"
+            else:
+                level_param = "level" if z_name == "base" else "top_level"
+                if z_name == "top" and not isinstance(
+                        src.get("top_level"), dict):
+                    _bad(diags, oid, f"{field}.z",
+                         f"{field}.z: у опа «{ref}» верх НЕ ПРИВЯЗАН "
+                         f"(top_level не задан), поэтому верхней отметки в "
+                         f"программе нет: высота приезжает из умолчания либо "
+                         f"из типоразмера. СЛЕДУЮЩИЙ ХОД: допишите top_level "
+                         f"у «{ref}» либо назовите отметку числом (z_mm)",
+                         code=ELEMENT_PART_INVALID, got=None,
+                         expected="top_level")
+                    return None
+                elevation = _level_elevation_mm(
+                    src, level_param, program, levels_pool, oid, field, diags)
+                if elevation is None:
+                    return None
+                offset = _offset_mm(
+                    src, "base_offset_mm" if z_name == "base"
+                    else "top_offset_mm")
+                out.append(_canon_mm(elevation + offset))
+                detail["z"] = z_name
+                detail["z_detail"] = {"level_param": level_param,
+                                      "elevation_mm": _canon_mm(elevation),
+                                      "offset_mm": _canon_mm(offset)}
+    if receipt is not None:
+        receipt.append({"op_id": oid, "param": field, "point_mm": list(out),
+                        "element": detail})
+    return out
+
+
 def describe_receipt_ru(rows: list) -> list:
     """Квитанция адресов одной строкой на адрес — для ответа автору."""
     out = []
     for row in rows or []:
+        point = row.get("point_mm") or []
+        coords = ", ".join(f"{c:g}" for c in point)
+        element = row.get("element")
+        if isinstance(element, dict):
+            # Квитанция адреса от элемента печатается ВСЕГДА и той же строкой,
+            # что и адрес от осей: вопрос у обеих один — «что компилятор вывел
+            # из написанного автором». Отметка называется вместе со СЛАГАЕМЫМИ,
+            # потому что предъявлять надо арифметику, которую мы взяли на себя.
+            text = (f"«{element.get('of')}» ({element.get('op')}) "
+                    f"→ {element.get('point')}")
+            z_detail = element.get("z_detail")
+            if isinstance(z_detail, dict):
+                # Знак печатается ОТДЕЛЬНО от числа: «3300 + -400» читается
+                # как опечатка, а квитанцию читает человек и обязан сверить
+                # арифметику глазами, не спотыкаясь о вёрстку.
+                offset = float(z_detail.get("offset_mm") or 0.0)
+                text += (f", отметка {element.get('z')} = "
+                         f"{z_detail.get('elevation_mm'):g} "
+                         f"{'+' if offset >= 0 else '−'} {abs(offset):g} мм")
+            elif element.get("z"):
+                text += f", отметка {element.get('z')}"
+            out.append(f"{row.get('op_id')}.{row.get('param')}: "
+                       f"{text} -> [{coords}]")
+            continue
         parts = []
         for one in row.get("lines", ()):
             text = f"«{one['grid']['name']}» (id {one['grid']['id']})"

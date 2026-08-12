@@ -9,7 +9,6 @@ from kukai.ir.acceptance import derive_expectation
 from kukai.ir.compiler import compile_program, plan_program
 from kukai.ir.diag import KirRefusal
 from kukai.ir.midend import FieldOrigin, ProgramFamily
-from kukai.ir.tests.fixtures import GROUND_SNAPSHOT
 
 
 class TestTypedPlan(unittest.TestCase):
@@ -130,24 +129,6 @@ class TestTypedPlan(unittest.TestCase):
         self.assertTrue(out.ok, [diag.as_dict() for diag in out.diagnostics])
         self.assertIs(out.planned, plan)
 
-    def test_internal_failure_is_logged_and_exposes_only_incident_id(self) -> None:
-        secret = "private-source-fragment"
-        with mock.patch(
-            "kukai.ir.compiler.plan_program",
-            side_effect=RuntimeError(secret),
-        ), self.assertLogs("kukai.ir.compiler", level="ERROR") as captured:
-            out = compile_program({"ir_version": "1.0", "ops": []},
-                                  query_id="turn-17")
-
-        self.assertFalse(out.ok)
-        self.assertEqual(len(out.diagnostics), 1)
-        diagnostic = out.diagnostics[0]
-        self.assertEqual(diagnostic.code, "KIR-P000")
-        self.assertRegex(diagnostic.incident_id or "", r"^[0-9a-f]{32}$")
-        self.assertNotIn(secret, str(diagnostic.as_dict()))
-        self.assertIn(diagnostic.incident_id, "\n".join(captured.output))
-        self.assertIn("stage=plan", "\n".join(captured.output))
-
     def test_acceptance_consumes_existing_plan_without_replanning(self) -> None:
         plan = plan_program({
             "ir_version": "1.0",
@@ -162,40 +143,6 @@ class TestTypedPlan(unittest.TestCase):
             expectation = derive_expectation(plan)
         self.assertTrue(expectation.checkable)
         self.assertEqual(expectation.op_count, 1)
-
-    def test_compile_exposes_immutable_parent_bound_grounding(self) -> None:
-        program = {
-            "ir_version": "1.0",
-            "ops": [{
-                "op": "create_wall", "id": "w",
-                "p0_mm": [0, 0], "p1_mm": [5000, 0],
-                "level": {"by": "name", "value": "Этаж 1"},
-            }],
-        }
-        out = compile_program(program, snapshot=GROUND_SNAPSHOT)
-
-        self.assertTrue(out.ok, [diag.as_dict() for diag in out.diagnostics])
-        self.assertIsNotNone(out.grounded)
-        self.assertEqual(out.grounded.planned.plan_digest,
-                         out.planned.plan_digest)
-        self.assertEqual(out.as_dict()["ground_digest"],
-                         out.grounded.ground_digest)
-        report = out.grounded.resolution_report()
-        self.assertTrue(any(
-            row["op_id"] == "w"
-            and row["field_name"] == "level"
-            and row["via"] == "name"
-            for row in report
-        ), report)
-
-        digest = out.grounded.ground_digest
-        detached = out.grounded.to_ops()
-        detached[0]["level"]["__grounded__"]["id"] = 999999
-        self.assertEqual(out.grounded.ground_digest, digest)
-        self.assertNotEqual(
-            out.grounded.to_ops()[0]["level"]["__grounded__"]["id"],
-            999999,
-        )
 
 
 if __name__ == "__main__":

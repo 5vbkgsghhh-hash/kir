@@ -6,18 +6,31 @@ no emitter or live-execution authority: accepted values are handed to
 """
 from __future__ import annotations
 
+import json
 import math
 from typing import Any
 
-from kukai.ir import docspace, relate, spec
+from kukai.ir import docspace, faceref, relate, spec
 from kukai.ir.diag import (
     Diagnostic,
+    GROUND_BAD_SELECTOR,
     PARSE_MISSING_FIELD,
     TYPE_BAD_TYPE,
     TYPE_BOUNDS,
 )
 from kukai.ir.emit_utils import ELEMENT_ID_MAX, is_finite_number
-from kukai.ir.numeric_contracts import MODEL_COORD_LIMIT_MM
+# Закон многоугольного профиля объявлен ОДИН РАЗ в geom (там же его
+# происхождение и замер вреда). Здесь он ЧИТАЕТСЯ: прямой ход обязан
+# отвергать ровно то, что обратный превращает в атом.
+from kukai.ir.geom import (
+    MAX_HOLE_RING_POINTS,
+    MAX_HOLES,
+    MAX_PATH_POINTS,
+    MAX_RING_POINTS,
+    MIN_PATH_POINTS,
+    MIN_RING_AREA_MM2,
+    MIN_RING_POINTS,
+)
 
 
 def _num(x) -> bool:
@@ -28,10 +41,7 @@ def _num(x) -> bool:
 # extent is ~16 km from origin; a coordinate beyond that is a unit/garbage
 # error that previously sailed to a late Revit runtime refusal.  Refused
 # statically here instead — same enforcement point as every numeric bound.
-# Backward-compatible name used by authoring and the bounds inventory. The
-# value itself is owned by numeric_contracts so RELATE need not import this
-# validator and form a dependency cycle.
-_COORD_LIMIT_MM = MODEL_COORD_LIMIT_MM
+_COORD_LIMIT_MM = 16_000_000.0
 
 #: Потолок длины `create_text.content`.
 #:
@@ -156,6 +166,141 @@ def _validate_arc(v: dict, i: int, oid: str, p0, p1, diags: list):
     return canonical
 
 
+#: Потолок радиуса винтового марша, мм. НЕ придуман и НЕ выведен рассуждением:
+#: это ДОКУМЕНТИРОВАННАЯ граница самого API, дословно —
+#: «The given value for radius must be greater than 0 and no more than 30000
+#: feet» (ArgumentOutOfRangeException у `StairsRun.CreateSpiralRun`,
+#: RevitAPI.xml, одинаково во всех шести поставляемых версиях). 30000 фут ×
+#: 304.8 мм/фут = 9 144 000 мм РОВНО. Отказать здесь дешевле, чем узнать то же
+#: самое исключением внутри StairsEditScope на устройстве пользователя.
+_SPIRAL_RADIUS_MAX_MM = 30_000 * 304.8
+
+#: Потолок охватываемого угла, градусы. ЧИСЛО НАЗНАЧЕНО, и вот чем именно оно
+#: обосновано: путь марша — ОДНА дуга, а ограниченная дуга Revit по построению
+#: не бывает длиннее полного оборота, поэтому «больше 360°» не является
+#: винтовым маршем в смысле этого вызова. API верхней границы НЕ называет
+#: (сказано лишь «includedAngle must be positive»), и низ он тоже не называет
+#: числом: «The includedAngle doesn't satisfy riser restriction to generate
+#: spiral run (probably it's too small)» — эта граница зависит от высоты
+#: подступенка ТИПА лестницы и от перепада base→top, то есть офлайн неизвестна
+#: ни нам, ни автору программы. Мы её НЕ моделируем и не выдумываем: снизу
+#: стоит только документированное «строго положительный», а настоящий отказ
+#: приходит от Revit и приходит громко.
+_SPIRAL_MAX_INCLUDED_DEG = 360.0
+
+
+def _validate_spiral(v: dict, i: int, oid: str, width_mm, diags: list):
+    """Канонический словарь винтового марша -> нормализованный словарь|None.
+
+    Форма ровно та, что принимает `StairsRun.CreateSpiralRun` (одинаковая на
+    2021-2026), но в АВТОРСКИХ единицах KIR: миллиметры и ГРАДУСЫ. Радианы
+    канонической дуги (`arc`) приезжают с обратного хода — их пишет прибор;
+    сюда же пишет человек или модель, а весь остальной авторский угол в языке
+    измеряется в градусах (`rotation_deg`, `slopes[].angle_deg`). Перевод в
+    радианы делает эмиттер на КОМПИЛЯЦИИ, в C# тригонометрии не остаётся.
+
+    Ключ `clockwise` обязателен и БЕЗ УМОЛЧАНИЯ намеренно: направление закрутки
+    видно в модели с первого взгляда, и молча выбранное за автора «против
+    часовой» — это ровно тот «тихо другой результат», ради запрета которого
+    существует весь этот компилятор.
+    """
+    required = {"center_mm", "radius_mm", "start_angle_deg",
+                "included_angle_deg", "clockwise"}
+    if set(v) != required:
+        diags.append(Diagnostic(
+            code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name="spiral",
+            expected=sorted(required), got=sorted(v),
+            message_ru="spiral — {center_mm: [x,y], radius_mm, "
+                       "start_angle_deg, included_angle_deg, clockwise}"))
+        return None
+    if not _pt_ok(v["center_mm"], dims=(2,)):
+        diags.append(Diagnostic(
+            code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+            field_name="spiral.center_mm", got=v["center_mm"],
+            message_ru="spiral.center_mm — точка [x,y] мм (отметку центра "
+                       "даёт base_level, а не автор: у CreateSpiralRun Z "
+                       "центра И ЕСТЬ базовая отметка марша)"))
+        return None
+    if not isinstance(v["clockwise"], bool):
+        diags.append(Diagnostic(
+            code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+            field_name="spiral.clockwise", got=v["clockwise"],
+            message_ru="spiral.clockwise — true (по часовой) или false"))
+        return None
+    for key in ("radius_mm", "start_angle_deg", "included_angle_deg"):
+        if not _num(v[key]):
+            diags.append(Diagnostic(
+                code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                field_name=f"spiral.{key}", got=v[key],
+                message_ru=f"spiral.{key} — конечное число"))
+            return None
+    radius = float(v["radius_mm"])
+    if not 0.0 < radius <= _SPIRAL_RADIUS_MAX_MM:
+        diags.append(Diagnostic(
+            code=TYPE_BOUNDS, op_index=i, op_id=oid,
+            field_name="spiral.radius_mm", got=radius,
+            expected=f"0 < radius_mm <= {_SPIRAL_RADIUS_MAX_MM}",
+            message_ru=(f"spiral.radius_mm вне границ самого API: радиус "
+                        f"обязан быть больше 0 и не больше "
+                        f"{_SPIRAL_RADIUS_MAX_MM:.0f} мм (30000 футов)")))
+        return None
+    included = float(v["included_angle_deg"])
+    if not 0.0 < included <= _SPIRAL_MAX_INCLUDED_DEG:
+        diags.append(Diagnostic(
+            code=TYPE_BOUNDS, op_index=i, op_id=oid,
+            field_name="spiral.included_angle_deg", got=included,
+            expected=f"0 < included_angle_deg <= {_SPIRAL_MAX_INCLUDED_DEG}",
+            message_ru=(f"spiral.included_angle_deg — строго положительный "
+                        f"угол не больше {_SPIRAL_MAX_INCLUDED_DEG:.0f}° "
+                        f"(путь марша — ОДНА дуга, а дуга длиннее полного "
+                        f"оборота не бывает; направление задаёт clockwise, а "
+                        f"не знак угла)")))
+        return None
+    # ВЫВЕДЕННАЯ, А НЕ НАЗНАЧЕННАЯ ПРОВЕРКА. Марш создаётся с
+    # `StairsRunJustification.Center` — той же, что и прямой, — а значит
+    # дуга-путь идёт по СЕРЕДИНЕ марша и внутренняя кромка лежит на радиусе
+    # `radius - width/2`. При `radius <= width/2` внутреннего края не
+    # существует вовсе: это не узкая лестница, это не лестница. Ровно этот
+    # случай API называет своим отказом «The radius is too small to generate
+    # a spiral run at the given justification», и здесь он ловится ДО
+    # StairsEditScope, из тех же двух чисел, которые уже есть у компилятора.
+    if width_mm is not None and radius <= float(width_mm) / 2.0:
+        diags.append(Diagnostic(
+            code=TYPE_BOUNDS, op_index=i, op_id=oid,
+            field_name="spiral.radius_mm", got=radius,
+            expected=f"radius_mm > {float(width_mm) / 2.0}",
+            message_ru=(f"spiral.radius_mm={radius:g} не больше половины "
+                        f"width_mm={float(width_mm):g}: марш строится по "
+                        f"середине (justification=Center), поэтому внутренняя "
+                        f"кромка легла бы на радиус "
+                        f"{radius - float(width_mm) / 2.0:g} мм — внутреннего "
+                        f"края у такого марша нет")))
+        return None
+    return {"center_mm": [float(v["center_mm"][0]), float(v["center_mm"][1])],
+            "radius_mm": radius,
+            "start_angle_deg": float(v["start_angle_deg"]),
+            "included_angle_deg": included,
+            "clockwise": bool(v["clockwise"])}
+
+
+def _impersonation_route(pspec, value) -> str | None:
+    """Честная операция вместо запрещённой категории DirectShape, или None.
+
+    Срабатывает ТОЛЬКО на перечислении, чей набор вариантов В ТОЧНОСТИ равен
+    закрытой таблице категорий DirectShape: это и есть машинный признак «здесь
+    действует запрет самозванства», и он не зависит ни от имени опа, ни от
+    имени параметра. Оп, объявивший другой набор, никакого маршрута не
+    получает — молчание тут дешевле, чем совет невпопад.
+    """
+    from kukai.ir.ops_shape import DIRECTSHAPE_CATEGORIES, IMPERSONATION_ROUTES
+
+    if not isinstance(value, str):
+        return None
+    if set(pspec.choices) != set(DIRECTSHAPE_CATEGORIES):
+        return None
+    return IMPERSONATION_ROUTES.get(value)
+
+
 def _sel_shape_ok(sel) -> bool:
     if not isinstance(sel, dict):
         return False
@@ -209,6 +354,183 @@ def _target_w_ok(sel) -> bool:
         v = sel.get("value")
         return isinstance(v, str) and bool(v.strip())
     return False
+
+
+#: ГДЕ вторая ступень селектора вообще законна — ИМЕНОВАННЫМ списком, а не
+#: «везде, где `refs_w`». Грань — часть тела элемента; `move_elements.targets`
+#: тоже `refs_w`, но «подвинуть грань» не значит ничего, и разрешить форму по
+#: РОДУ параметра значило бы отгрузить бессмысленную операцию как побочный
+#: эффект. Новый носитель добавляется сюда явно, вместе со своим эмиттером.
+_FACE_SEL_SITES: frozenset = frozenset({("create_dimension", "refs")})
+
+
+def _face_sel_key(sel: dict) -> tuple:
+    """Ключ ТОЖДЕСТВА селектора грани — для той же проверки на повтор.
+
+    Повтор запрещён по той же причине, что и у ступени 1: размер между гранью
+    и ей же — нулевой размер. Две РАЗНЫЕ грани одного элемента при этом
+    законны и обязаны различаться ключом, поэтому в ключ входит предикат."""
+    inner = sel["of"]
+    pred = sel["predicate"]
+    return (faceref.BY_FACE, inner["by"],
+            inner["value"].strip() if inner["by"] == "ref" else inner["value"],
+            pred.get("side"),
+            tuple(pred["normal"]) if "normal" in pred else None)
+
+
+def _validate_refs_w_with_faces(v: list, *, name: str, param, oid: str, i: int,
+                                lo: int, hi: int, reject_dupes: bool,
+                                diags: list) -> list | None:
+    """`refs_w`, в котором есть хотя бы один селектор ГРАНИ (ступень 2).
+
+    Возвращает нормализованный список или None (отказы уже в `diags`).
+
+    Порядок проверок выбран так, чтобы отказ называл СВОЮ причину: сперва
+    «формы вообще нет» (флаг/носитель), потом форма каждого элемента, и лишь
+    затем длина и повторы. Обратный порядок отвечал бы «список из 2..16
+    селекторов element_id/ref» на верно написанную грань — то есть посылал бы
+    ремонт не туда."""
+    where = param.name
+    if (name, param.name) not in _FACE_SEL_SITES:
+        diags.append(Diagnostic(
+            code=GROUND_BAD_SELECTOR, op_index=i, op_id=oid, field_name=where,
+            expected="element_id|ref", got=faceref.BY_FACE,
+            message_ru=(
+                f"{where}: селектор грани у операции «{name}» не принят — "
+                f"грань адресует ЧАСТЬ ТЕЛА элемента, и смысл у этого есть "
+                f"только там, где операция действительно связывается с "
+                f"гранью. Носители названы поимённо: "
+                f"{sorted(f'{o}.{p}' for o, p in _FACE_SEL_SITES)}")))
+        return None
+    if not faceref.face_ref_enabled():
+        diags.append(Diagnostic(
+            code=GROUND_BAD_SELECTOR, op_index=i, op_id=oid, field_name=where,
+            expected="element_id|ref", got=faceref.BY_FACE,
+            message_ru=(
+                f"{where}: селектор грани выключен флагом оператора "
+                f"{faceref.FACE_REF_FLAG} (по умолчанию ВЫКЛ). Пока он "
+                f"выключен, грань назвать нельзя: адресуй элемент целиком "
+                f"({{\"by\": \"element_id\"|\"ref\"}}) — компилятор возьмёт "
+                f"геометрическую ссылку сам, но КАКУЮ именно, программа не "
+                f"назовёт")))
+        return None
+    if not (isinstance(v, list) and lo <= len(v) <= hi):
+        diags.append(Diagnostic(
+            code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=where,
+            expected=f"{lo}..{hi} селекторов", got=v,
+            message_ru=f"{where} — список из {lo}..{hi} селекторов"))
+        return None
+    out: list[dict] = []
+    keys: list[tuple] = []
+    for j, x in enumerate(v):
+        if faceref.is_face_sel(x):
+            face = faceref.validate_face_sel(
+                x, oid=oid, field=param.name, i=j,
+                inner_ok=_target_w_ok, diags=diags)
+            if face is None:
+                return None
+            if not param.ref_kinds and face["of"]["by"] == "ref":
+                diags.append(Diagnostic(
+                    code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                    field_name=f"{where}[{j}].of", expected="element_id", got=x,
+                    message_ru=(f"{where}[{j}].of: intra-program ref не "
+                                "разрешён типизированным контрактом "
+                                "параметра")))
+                return None
+            # ВНУТРЕННИЙ СЕЛЕКТОР НОРМАЛИЗУЕТСЯ ТАК ЖЕ, КАК ВНЕШНИЙ, и это не
+            # аккуратность. Обход графа компилятора идёт по НОРМАЛИЗОВАННЫМ
+            # опам и сверяет `value` с id опов; ступень 1 обрезает пробелы
+            # (ниже), а необрезанная ступень 2 дала бы KIR-L003 «ref не
+            # указывает на более ранний оп» на ссылке, которая указывает —
+            # диагноз, посылающий ремонт не туда.
+            inner_sel = face["of"]
+            face = dict(face, of={
+                "by": inner_sel["by"],
+                "value": (inner_sel["value"].strip()
+                          if inner_sel["by"] == "ref" else inner_sel["value"])})
+            out.append(face)
+            keys.append(_face_sel_key(face))
+        elif _target_w_ok(x):
+            if not param.ref_kinds and x.get("by") == "ref":
+                diags.append(Diagnostic(
+                    code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                    field_name=where, expected="только element_id-селекторы",
+                    got=v,
+                    message_ru=(f"{where}: intra-program ref не разрешён "
+                                "типизированным контрактом параметра")))
+                return None
+            val = x["value"].strip() if x["by"] == "ref" else x["value"]
+            out.append({"by": x["by"], "value": val})
+            keys.append((x["by"], val))
+        else:
+            diags.append(Diagnostic(
+                code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                field_name=f"{where}[{j}]",
+                expected='{by: element_id|ref} либо {by: face, of, predicate}',
+                got=x,
+                message_ru=(f"{where}[{j}] — селектор элемента "
+                            "(element_id/ref) либо селектор грани")))
+            return None
+    if reject_dupes and len(set(keys)) != len(keys):
+        diags.append(Diagnostic(
+            code=TYPE_BOUNDS, op_index=i, op_id=oid, field_name=where, got=v,
+            message_ru=(f"{where}: повторяющийся селектор — нулевой размер "
+                        "размера недопустим")))
+        return None
+    return out
+
+
+#: КИНДЫ, КОТОРЫЕ РАЗБИРАЕТ НЕ ЭТОТ ФАЙЛ — С АДРЕСОМ ТОГО, КТО РАЗБИРАЕТ.
+#:
+#: Список заведён ПРОТИВ ОПЕЧАТОК, поэтому он не «прочее», а перепись: каждый
+#: ключ назван вместе с местом, где кинд действительно проверяется, и новый
+#: ключ сюда нельзя дописать, не назвав такого места. Иначе список стал бы
+#: ровно той дырой, которую замок ниже закрывает.
+#:
+#: Все четыре стоят ТОЛЬКО на опах семейства query, а `compiler._validate_op`
+#: уходит в `validate()` лишь для `spec.WRITE_FAMILIES` — то есть сегодня они
+#: до цикла ниже не доезжают вовсе. Записаны они потому, что это факт о
+#: РАСКЛАДКЕ (кто чей судья), а не о сегодняшнем маршруте: перенос опа между
+#: семействами не должен превращаться в молчание.
+_KINDS_VALIDATED_ELSEWHERE: dict[str, str] = {
+    "kind_enum": "compiler._validate_op -> _check_kind (query_count/query_list)",
+    "filters": "compiler._validate_op -> _check_filters (query_count/query_list)",
+    "fields": "compiler._validate_op, ветка `name == \"query_list\"`",
+    "target": "compiler._validate_op, ветка `name == \"query_inspect\"`",
+}
+
+
+def _assert_kind_dispatched(p, op_name: str) -> None:
+    """ЗАМОК ОТ ОПЕЧАТКИ В `ParamSpec.kind`.
+
+    `kind` — ОТКРЫТАЯ строка: закрытого перечня у неё нет, `spec._lint_registry`
+    её не проверяет (он про капабилити-клетки), и опечатка в новом кинде не
+    падает нигде. Цепочка ниже — `if/elif` без хвоста, поэтому параметр с
+    неузнанным киндом не просто «не проверен»: он не попадает и в `norm`, то
+    есть уезжает дальше так, как будто автор его не писал. Отказ бы это
+    заметил, тишина — нет.
+
+    Исключение — ошибка ПРОГРАММИСТА, а не автора программы, поэтому здесь
+    `AssertionError`, а не `Diagnostic`: диагностика сказала бы пользователю,
+    что виноват он, и отказала бы в верной программе. Тот же приём и по той же
+    причине уже стоит в `schema_gen` (`unknown param kind`) и в `dsl` — этот
+    третий замок нужен потому, что первые два защищают ЧУЖИЕ проходы: до
+    07.08 опечатка ловилась только если кто-то сгенерирует схему.
+    """
+    if p.kind in _KINDS_VALIDATED_ELSEWHERE:
+        return
+    if p.kind in ("pt_xy", "pt_xyz") and p.name in ("p0_mm", "p1_mm"):
+        # Концы отрезка НАМЕРЕННО выведены из первой ветви цикла: пара
+        # проверяется и нормализуется ЦЕЛИКОМ до цикла (там же живёт закон
+        # «длина ~0», которому нужны обе точки сразу). Ветвь по одной точке
+        # разрезала бы этот закон пополам.
+        return
+    raise AssertionError(
+        f"{op_name}.{p.name}: вид {p.kind!r} не разбирает ни одна ветвь "
+        f"`authoring_validation.validate`, и в `norm` параметр не попадёт — "
+        f"опечатка в `ParamSpec.kind` либо новый вид без ветви. Если вид "
+        f"разбирается в другом файле, назовите его в "
+        f"`_KINDS_VALIDATED_ELSEWHERE` вместе с адресом разбора")
 
 
 def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
@@ -304,6 +626,31 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                 diags.append(Diagnostic(
                     code=TYPE_BOUNDS, op_index=i, op_id=oid, field_name=p.name,
                     got=v, message_ru=f"{p.name}: нулевой перенос — переносить нечего"))
+            # wave/mass (2026-08-10): create_face_wall.face_normal — тот же
+            # приём, что у `delta_mm` строкой выше, и по той же причине
+            # (`schema_gen` исчерпывающий, форма [x,y,z] уже распознаётся, а
+            # новый род ради значения той же формы стоил бы правки в каждом
+            # потребителе схемы). Отличие от переноса — в ЕДИНИЦАХ: это
+            # НАПРАВЛЕНИЕ, а не миллиметры, поэтому потолок координат
+            # (_COORD_LIMIT_MM, рабочая протяжённость модели) к нему не
+            # применяется вовсе — у направления нет длины, значимой для
+            # операции, оно нормируется в Revit.
+            #
+            # ОТВЕРГАЕТСЯ РОВНО ОДНО: ТОЧНЫЙ НОЛЬ. Это не порог и не допуск,
+            # а вырожденность по определению — направления в [0,0,0] нет ни
+            # в какой системе. «Почти нулевой» вектор здесь НЕ трогается
+            # намеренно: где проходит эта граница, знает только Revit, и он
+            # отвечает на неё своим `XYZ.IsZeroLength()` уже в рантайме
+            # (эмиссия `faceref.resolve_cs` ставит там типизированный отказ).
+            # Назначить порог здесь значило бы завести число, которого никто
+            # не мерил, рядом с числом, которое Revit сообщает сам.
+            elif name == "create_face_wall" and p.name == "face_normal" \
+                    and all(_num(c) and float(c) == 0.0 for c in v):
+                diags.append(Diagnostic(
+                    code=TYPE_BOUNDS, op_index=i, op_id=oid, field_name=p.name,
+                    expected="ненулевой вектор [x,y,z]", got=v,
+                    message_ru=(f"{p.name}: нулевой вектор — направления в "
+                                f"[0,0,0] нет, называть грань нечем")))
             else:
                 norm[p.name] = v
         elif p.kind == "mm":
@@ -325,13 +672,23 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
                     expected="число (мм)", got=v, message_ru=f"{p.name} — число в мм"))
-            elif not (p.min_val <= v <= p.max_val):
+            elif ((p.min_val is not None and v < p.min_val)
+                  or (p.max_val is not None and v > p.max_val)):
+                if p.min_val is None:
+                    expected = f"<= {p.max_val}"
+                    replacement = p.max_val
+                elif p.max_val is None:
+                    expected = f">= {p.min_val}"
+                    replacement = p.min_val
+                else:
+                    expected = f"{p.min_val}..{p.max_val}"
+                    replacement = min(max(v, p.min_val), p.max_val)
                 diags.append(Diagnostic(
                     code=TYPE_BOUNDS, op_index=i, op_id=oid, field_name=p.name,
-                    expected=f"{p.min_val}..{p.max_val}", got=v,
-                    suggested_replacement=min(max(v, p.min_val), p.max_val),
+                    expected=expected, got=v,
+                    suggested_replacement=replacement,
                     applicability="maybe-incorrect",
-                    message_ru=f"{p.name} вне границ {p.min_val}..{p.max_val} мм"))
+                    message_ru=f"{p.name} вне границ {expected} мм"))
             else:
                 norm[p.name] = float(v)
         elif p.kind == "deg":
@@ -339,7 +696,26 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
             # normalized programs, program hashes and emitted C# do not move.
             # Explicit values remain in degrees and are compared modulo 2*pi
             # by the live postcondition.
+            #
+            # ОБЯЗАТЕЛЬНОСТЬ РОДА `deg` ДО 10.08.2026 БЫЛА НЕИСПОЛНИМА. Эта
+            # ветка выходила по `not in op` РАНЬШЕ, чем кто-либо спрашивал
+            # `p.required`, то есть `required=True` у угла был обещанием,
+            # которого валидатор не держал: программа без обязательного угла
+            # доезжала до эмиттера и падала там KeyError'ом (KIR-P000
+            # «внутренняя ошибка») вместо названного отказа. Пока все углы
+            # реестра были необязательными (`rotation_deg`, default=0.0),
+            # дыра не наблюдалась — ровно «прибор на часть диапазона».
+            # Волна армирования принесла первый обязательный угол
+            # (`create_area_reinforcement.direction_deg`: главное направление
+            # рабочей арматуры, умолчания у него нет и быть не должно), и
+            # дыра стала достижимой. Правка АДДИТИВНА: у необязательных углов
+            # ничего не меняется ни на байт.
             if p.name not in op:
+                if p.required:
+                    diags.append(Diagnostic(
+                        code=PARSE_MISSING_FIELD, op_index=i, op_id=oid,
+                        field_name=p.name, expected="конечное число (градусы)",
+                        message_ru=f"{p.name} обязателен — угол в градусах"))
                 continue
             v = op.get(p.name)
             if not _num(v):
@@ -397,6 +773,72 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                     norm[p.name]["disambiguate_by"] = dict(sel["disambiguate_by"])
                     norm[p.name]["disambiguate_by"]["param"] = \
                         sel["disambiguate_by"]["param"].strip()
+        elif p.kind == "sel_list":
+            # Множественное число рода `sel` (wave/datums): список селекторов
+            # ОДНОГО пула.  Форма каждого элемента проверяется тем же
+            # `_sel_shape_ok`, что и одиночный селектор, — одна реализация,
+            # две площадки; свой разбор разошёлся бы с `sel` на первом же
+            # новом виде селектора.
+            v = op.get(p.name)
+            if v is None:
+                if p.required:
+                    diags.append(Diagnostic(
+                        code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                        field_name=p.name,
+                        expected="список селекторов (1..64)", got=v,
+                        message_ru=f"{p.name} — список селекторов"))
+                continue
+            if not (isinstance(v, list) and 1 <= len(v) <= 64
+                    and all(_sel_shape_ok(s) for s in v)):
+                diags.append(Diagnostic(
+                    code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                    field_name=p.name,
+                    expected="список из 1..64 селекторов", got=v,
+                    message_ru=f"{p.name} — список из 1..64 селекторов"))
+                continue
+            bad_ref = next((s for s in v
+                            if s.get("by") == "ref" and not p.ref_kinds), None)
+            bad_ft = next((s for s in v if s.get("by") == "family_type"), None)
+            if bad_ref is not None or bad_ft is not None:
+                diags.append(Diagnostic(
+                    code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                    field_name=p.name,
+                    expected={"by": "name|element_id|default"},
+                    got=bad_ref if bad_ref is not None else bad_ft,
+                    message_ru=(f"{p.name}: селектор такого вида здесь не "
+                                "разрешён — имя, element_id или default")))
+                continue
+            out_sels = []
+            for s in v:
+                one = dict(s)
+                if s.get("by") in ("name", "ref"):
+                    one["value"] = s["value"].strip()
+                if "disambiguate_by" in s:
+                    one["disambiguate_by"] = dict(s["disambiguate_by"])
+                    one["disambiguate_by"]["param"] = \
+                        s["disambiguate_by"]["param"].strip()
+                out_sels.append(one)
+            # ПОВТОР — ОТКАЗ, А НЕ ТИХАЯ СКЛЕЙКА.  Множество, в которое один
+            # уровень попал дважды, неотличимо от множества, где его назвали
+            # один раз; но программа, написавшая его дважды, почти наверняка
+            # имела в виду ДВА разных уровня и ошиблась в имени.  Молча
+            # схлопнув, мы построили бы лестницу не на том числе этажей, чем
+            # просили, и свидетель равенства множеств это бы ПРОПУСТИЛ.
+            seen: list = []
+            for one in out_sels:
+                key = json.dumps(one, sort_keys=True, ensure_ascii=False)
+                if key in seen:
+                    diags.append(Diagnostic(
+                        code=TYPE_BOUNDS, op_index=i, op_id=oid,
+                        field_name=p.name,
+                        message_ru=(f"{p.name}: селектор повторён "
+                                    f"({one.get('value', one.get('by'))}) — "
+                                    "повтор в множестве неотличим от "
+                                    "опечатки в имени соседа")))
+                    break
+                seen.append(key)
+            else:
+                norm[p.name] = out_sels
         elif p.kind == "num":
             v = op.get(p.name)
             if v is None:
@@ -458,11 +900,31 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
             # том, что УЖЕ СТОИТ («сделай проём в этой плите»), а носитель,
             # построенный этой же программой, — частный случай. Требовать ref
             # значило бы запретить главный сценарий операции.
+            # create_face_wall: тот же случай, и тоже ОСНОВНОЙ. Стену по
+            # грани строят по массе, которая УЖЕ СТОИТ в модели («сделай
+            # стену по этому скату»); масса, размещённая этой же программой
+            # через place_family, — частный случай. Требовать ref значило бы
+            # запретить главный сценарий операции.
+            # create_wall_sweep / create_slab_edge: тот же случай, что у
+            # проёма, и тоже ОСНОВНОЙ. Карниз вешают на стену, которая УЖЕ
+            # СТОИТ («сделай поясок по этой стене»), капельник — по краю уже
+            # построенной плиты. Носитель, созданный этой же программой, —
+            # частный случай; требовать ref значило бы запретить главный
+            # сценарий обеих операций.
+            # create_area_reinforcement: тот же случай, что у проёма и
+            # карниза, и тоже ОСНОВНОЙ. Армируют плиту, которая УЖЕ СТОИТ
+            # («заармируй эту плиту»); плита, построенная этой же программой,
+            # — частный случай. Требовать ref значило бы запретить главный
+            # сценарий раздела КР.
             if p.name == "host" \
                     and name not in ("set_curtain_panel",
                                      "create_curtain_grid_line",
                                      "create_railing",
-                                     "create_opening") \
+                                     "create_opening",
+                                     "create_wall_sweep",
+                                     "create_slab_edge",
+                                     "create_area_reinforcement",
+                                     "create_face_wall") \
                     and name not in ("create_door", "create_window") \
                     and isinstance(sel, dict) and sel.get("by") != "ref":
                 diags.append(Diagnostic(
@@ -551,17 +1013,19 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
             # outline is required=True).
             if v is None and not p.required:
                 continue
-            if not (isinstance(v, list) and 3 <= len(v) <= 64
+            if not (isinstance(v, list)
+                    and MIN_RING_POINTS <= len(v) <= MAX_RING_POINTS
                     and all(_pt_ok(pt, dims=(2,)) for pt in v)):
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
-                    expected=">=3 точек [x,y] мм", got=v,
-                    message_ru=f"{p.name} — контур из 3..64 точек"))
+                    expected=f">={MIN_RING_POINTS} точек [x,y] мм", got=v,
+                    message_ru=(f"{p.name} — контур из {MIN_RING_POINTS}.."
+                                f"{MAX_RING_POINTS} точек")))
             else:
                 area = abs(sum(v[k][0] * v[(k + 1) % len(v)][1]
                                - v[(k + 1) % len(v)][0] * v[k][1]
                                for k in range(len(v)))) / 2.0
-                if area < 1e4:
+                if area < MIN_RING_AREA_MM2:
                     diags.append(Diagnostic(
                         code=TYPE_BOUNDS, op_index=i, op_id=oid, field_name=p.name,
                         message_ru=f"{p.name}: вырожденный контур (площадь < 0.01 м²)"))
@@ -570,6 +1034,25 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                     ring = ring_normalize(v, oid, p.name, diags)
                     if ring is not None:
                         norm[p.name] = ring
+        elif p.kind == "pts_xyz":
+            # ОБЛАКО ТОЧЕК ПОВЕРХНОСТИ (wave/site, 09.08.2026). Законы
+            # ПОЛНОСТЬЮ статические (ни один не смотрит на модель), поэтому
+            # выполняются здесь, а не на стадии ground, — как у `mesh` и в
+            # отличие от `region`, которому нужны оси из снапшота. Владелец
+            # законов один — geom.validate_points_xyz; здесь только вызов, и
+            # это намеренно: второй набор правил о том же самом разъехался бы.
+            v = op.get(p.name)
+            if v is None and not p.required:
+                continue
+            if v is None:
+                diags.append(Diagnostic(
+                    code=PARSE_MISSING_FIELD, op_index=i, op_id=oid,
+                    field_name=p.name, message_ru=f"{p.name} обязателен"))
+                continue
+            from kukai.ir.geom import validate_points_xyz
+            pts = validate_points_xyz(v, oid, p.name, diags)
+            if pts is not None:
+                norm[p.name] = pts
         elif p.kind == "path":
             # ОТКРЫТАЯ ломаная (wave/arch): 2..64 точки, БЕЗ проверки площади
             # и БЕЗ ring_normalize. Две точки — законное прямое ограждение;
@@ -580,12 +1063,14 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
             v = op.get(p.name)
             if v is None and not p.required:
                 continue
-            if not (isinstance(v, list) and 2 <= len(v) <= 64
+            if not (isinstance(v, list)
+                    and MIN_PATH_POINTS <= len(v) <= MAX_PATH_POINTS
                     and all(_pt_ok(pt, dims=(2,)) for pt in v)):
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
-                    expected=">=2 точек [x,y] мм", got=v,
-                    message_ru=f"{p.name} — ломаная из 2..64 точек"))
+                    expected=f">={MIN_PATH_POINTS} точек [x,y] мм", got=v,
+                    message_ru=(f"{p.name} — ломаная из {MIN_PATH_POINTS}.."
+                                f"{MAX_PATH_POINTS} точек")))
             else:
                 # Вырожденное ЗВЕНО — отказ, а не тихая склейка. Порог 1 мм:
                 # короткая кривая в Revit (~0.8 мм) не строится вовсе, и
@@ -601,6 +1086,45 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                                     f"1 мм (Revit такую кривую не строит)")))
                 else:
                     norm[p.name] = [[float(pt[0]), float(pt[1])] for pt in v]
+        elif p.kind == "path3":
+            # ТРЁХМЕРНАЯ открытая ломаная (wave/mep-electrical): 2..64 точки
+            # [x,y,z] мм. Отдельный род от `path`, а не его расширение: у
+            # ограждения путь лежит НА уровне и третья координата была бы
+            # ложной степенью свободы, а у гибкой подводки весь смысл как раз
+            # в подъёме к потолку. Тот же довод, по которому create_beam
+            # потребовал `pt_xyz` вместо `pt_xy`+уровень.
+            v = op.get(p.name)
+            if v is None and not p.required:
+                continue
+            if not (isinstance(v, list)
+                    and MIN_PATH_POINTS <= len(v) <= MAX_PATH_POINTS
+                    and all(_pt_ok(pt, dims=(3,)) for pt in v)):
+                diags.append(Diagnostic(
+                    code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
+                    expected=f">={MIN_PATH_POINTS} точек [x,y,z] мм", got=v,
+                    message_ru=(f"{p.name} — трёхмерная ломаная из "
+                                f"{MIN_PATH_POINTS}..{MAX_PATH_POINTS} точек")))
+            else:
+                # Совпадающие точки — ОТКАЗ, а не мелочь округления.
+                # Autodesk пишет про Flex*.Create дословно: «Note the
+                # duplicate points don't take into account» — то есть Revit
+                # их ВЫБРАСЫВАЕТ и строит трассу с ДРУГИМ числом точек, чем
+                # просили. Свидетель пути после этого честно упал бы, но
+                # диагноз «геометрия не сошлась» назвал бы следствие вместо
+                # причины, а причина видна уже здесь.
+                bad = next((k for k in range(len(v) - 1)
+                            if _dist(v[k], v[k + 1]) < _MIN_SEGMENT_MM), None)
+                if bad is not None:
+                    diags.append(Diagnostic(
+                        code=TYPE_BOUNDS, op_index=i, op_id=oid,
+                        field_name=p.name,
+                        message_ru=(f"{p.name}: звено {bad}-{bad + 1} короче "
+                                    f"{_MIN_SEGMENT_MM:g} мм — Revit считает "
+                                    "такие точки совпадающими и выбрасывает "
+                                    "их, то есть построил бы другую трассу")))
+                else:
+                    norm[p.name] = [[float(pt[0]), float(pt[1]), float(pt[2])]
+                                    for pt in v]
         elif p.kind == "pts_list":
             v = op.get(p.name)
             if v is None or (isinstance(v, list) and not v):
@@ -610,12 +1134,15 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                 # use truthiness here: False/0/""/{} are malformed payloads,
                 # not an alternative spelling of an empty hole list (F29).
                 continue
-            if not (isinstance(v, list) and 1 <= len(v) <= 8
-                    and all(isinstance(h, list) and 3 <= len(h) <= 32
+            if not (isinstance(v, list) and 1 <= len(v) <= MAX_HOLES
+                    and all(isinstance(h, list)
+                            and MIN_RING_POINTS <= len(h) <= MAX_HOLE_RING_POINTS
                             and all(_pt_ok(pt, dims=(2,)) for pt in h) for h in v)):
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
-                    message_ru=f"{p.name} — список контуров (каждый 3..32 точек)"))
+                    message_ru=(f"{p.name} — список контуров (каждый "
+                                f"{MIN_RING_POINTS}..{MAX_HOLE_RING_POINTS} "
+                                f"точек)")))
             else:
                 from kukai.ir.geom import ring_normalize
                 rings, bad = [], False
@@ -638,10 +1165,30 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                                   # refused with a type error.
             v = op.get(p.name, p.default)
             if v not in p.choices:
+                # МАРШРУТ ВМЕСТО «НЕЛЬЗЯ» (09.08). `ops_shape.IMPERSONATION_ROUTES`
+                # описывает, ЧЕМ честно делается то, ради чего человек тянется к
+                # запрещённой категории DirectShape (стена, перекрытие, кровля…).
+                # Таблица существовала с 29.07 и имела НОЛЬ импортёров: закон был
+                # записан и не произносился ни в одном отказе, а пользователь
+                # получал сухое «одно из [generic_model, mass, …]» и не узнавал,
+                # что нужная ему операция в KIR ЕСТЬ.
+                #
+                # Условие адресовано ТАБЛИЦЕ ВЫБОРА, а не имени опа: правило про
+                # DirectShape-категории, и любой оп, объявивший ровно этот набор,
+                # обязан отказывать одинаково. Имя опа здесь снова развело бы
+                # закон и его носителей (ровно та починка, что уже была сделана
+                # для рода `region` в ground.py).
+                route = _impersonation_route(p, v)
+                message = f"{p.name} — одно из {list(p.choices)}"
+                if route is not None:
+                    message += (f". Категория {v!r} тут запрещена намеренно: "
+                                f"геометрия без BIM-смысла читалась бы «{v}» в "
+                                f"каждом фильтре и каждой спецификации, не "
+                                f"будучи ничем, чем этот элемент является. "
+                                f"Это делается операцией {route}")
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
-                    expected=list(p.choices), got=v,
-                    message_ru=f"{p.name} — одно из {list(p.choices)}"))
+                    expected=list(p.choices), got=v, message_ru=message))
             else:
                 norm[p.name] = v
         elif p.kind == "slopes":
@@ -687,6 +1234,15 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                 norm[p.name] = v
         elif p.kind == "region":
             v = op.get(p.name)
+            # Тот же None-пропуск для НЕобязательного, что у pt_xy/pts/path
+            # выше. Он понадобился 09.08, когда `region` перестал быть только
+            # обязательным полем create_floor_by_contour: у create_ceiling
+            # эскиз — АЛЬТЕРНАТИВА прямому outline, и без этой строки
+            # молчаливое отсутствие второго входа читалось как битый тип
+            # (KIR-T001 на поле, которого автор не писал), а взаимная
+            # обязательность (KIR-P007) до плана вообще не доживала.
+            if v is None and not p.required:
+                continue
             if not isinstance(v, dict):
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
@@ -734,13 +1290,24 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
             # cap for genuinely long strings (load_family.path — Windows
             # MAX_PATH-class .rfa paths) via ParamSpec(..., max_val=N).
             cap = p.max_val if p.max_val is not None else 64
-            if not isinstance(v, str) or not v.strip() or len(v) > cap:
+            if not isinstance(v, str):
+                diags.append(Diagnostic(
+                    code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
+                    expected=(f"строка <={cap}" if p.exact_string
+                              else f"непустая строка <={cap}"),
+                    got=v, message_ru=f"{p.name} — строка"))
+            elif not p.exact_string and not v.strip():
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
                     expected=f"непустая строка <={cap}", got=v,
                     message_ru=f"{p.name} — непустая строка"))
+            elif len(v) > cap:
+                diags.append(Diagnostic(
+                    code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
+                    expected=f"строка <={cap}", got=v,
+                    message_ru=f"{p.name} длиннее {cap} символов"))
             else:
-                norm[p.name] = v.strip()
+                norm[p.name] = v if p.exact_string else v.strip()
         elif p.kind == "int":
             # ЦЕЛОЕ, а не «число, которое мы потом обрежем». Первый
             # авторский оп с этим видом — set_curtain_panel.u/v: адрес
@@ -839,12 +1406,33 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
             # move_elements gets its own 1..500, duplicates ALLOWED (moving
             # the same element twice is harmless — Revit's ElementId
             # collection de-duplicates — not a zero-size-dimension hazard).
+            # create_angular_dimension: EXACTLY two, and the bound is derived
+            # from the API rather than picked — RevitAPI.xml requires the
+            # references to be "rays of the arc passed", and the arc's vertex
+            # is the intersection of the two referenced planes, a construction
+            # a third plane has no place in (09.08).
             _refs_w_bounds = {
                 "move_elements": (1, 500, False),
+                "create_angular_dimension": (2, 2, True),
             }
             lo, hi, reject_dupes = _refs_w_bounds.get(name, (2, 16, True))
             v = op.get(p.name)
-            if not (isinstance(v, list) and lo <= len(v) <= hi
+            # ВТОРАЯ СТУПЕНЬ СЕЛЕКТОРА (`{"by": "face", ...}`, `faceref.py`).
+            #
+            # ОТДЕЛЬНОЙ ВЕТКОЙ, А НЕ ВПЛЕТЕНИЕМ В ПРОВЕРКУ НИЖЕ, И ЭТО НЕ
+            # СТИЛЬ. Закон флага: выключенным он обязан быть НЕОТЛИЧИМ от
+            # отсутствия формы вовсе. Пока в списке нет ни одного селектора
+            # грани, ниже исполняется ТОТ ЖЕ код, что и до этой правки, —
+            # значит побайтовое совпадение эмиссии доказуемо структурой, а не
+            # прогонкой (`test_faceref.py::FlagOffIsAbsentTests` проверяет обе
+            # стороны). Вплетённое условие пришлось бы доказывать перебором.
+            if isinstance(v, list) and any(faceref.is_face_sel(x) for x in v):
+                norm_faces = _validate_refs_w_with_faces(
+                    v, name=name, param=p, oid=oid, i=i,
+                    lo=lo, hi=hi, reject_dupes=reject_dupes, diags=diags)
+                if norm_faces is not None:
+                    norm[p.name] = norm_faces
+            elif not (isinstance(v, list) and lo <= len(v) <= hi
                     and all(_target_w_ok(x) for x in v)):
                 diags.append(Diagnostic(
                     code=TYPE_BAD_TYPE, op_index=i, op_id=oid, field_name=p.name,
@@ -908,6 +1496,29 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                                      norm.get("p1_mm"), diags)
             if arc_norm is not None:
                 norm[p.name] = arc_norm
+        elif p.kind == "spiral":
+            # Винтовой марш (09.08): АЛЬТЕРНАТИВА прямому p0_mm/p1_mm, не
+            # добавка к нему. Отсутствие — исторический прямой марш байт в
+            # байт; «оба сразу» и «ни одного» — типизированный KIR-P007 в
+            # плане (взаимную обязательность схема выразить не может).
+            # None-пропуск тот же, что у pt_xy/region выше.
+            if p.name not in op or op.get(p.name) is None:
+                continue
+            v = op.get(p.name)
+            if not isinstance(v, dict):
+                diags.append(Diagnostic(
+                    code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                    field_name=p.name, got=v,
+                    message_ru=f"{p.name} — объект винтового марша "
+                               "{center_mm, radius_mm, start_angle_deg, "
+                               "included_angle_deg, clockwise}"))
+                continue
+            # width_mm уже нормализован: род `mm` стоит в реестре ВЫШЕ, а
+            # проверка «радиус больше полуширины» читает оба числа сразу.
+            spiral_norm = _validate_spiral(v, i, oid, norm.get("width_mm"),
+                                           diags)
+            if spiral_norm is not None:
+                norm[p.name] = spiral_norm
         elif p.kind == "member_ops":
             # feat/native-groups: the group DEFINITION — 1..N PRE-GROUNDED
             # member authoring ops authored at occurrence 0's absolute coords.
@@ -1002,6 +1613,35 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                     [float(d[0]), float(d[1]), float(d[2] if len(d) > 2 else 0.0)]
                     for d in v
                 ]
+        else:
+            # ХВОСТ ЦЕПОЧКИ. Без него `if/elif` молча пропускает параметр
+            # мимо всех проверок И мимо `norm` — см. `_assert_kind_dispatched`.
+            _assert_kind_dispatched(p, name)
+    if name == "create_extrusion_roof":
+        # ХОД ВЫДАВЛИВАНИЯ — ОТРЕЗОК, А НЕ ПАРА ЧИСЕЛ. `start_mm >= end_mm`
+        # это либо пустой ход (кровли не будет вовсе), либо перевёрнутый — и
+        # второй случай опаснее: Revit, скорее всего, построит тот же объём,
+        # а свидетель сравнивает МИНИМУМ проекции со `start_mm` и МАКСИМУМ с
+        # `end_mm` и честно упадёт. Диагноз «выдавливание не то» назвал бы
+        # СЛЕДСТВИЕ, а причина видна уже здесь, до всякой эмиссии.
+        #
+        # Порог НЕ НОВЫЙ: `_MIN_SEGMENT_MM` — тот же 1 мм, которым этот файл
+        # уже отвергает вырожденное звено ломаной, с той же обоснованием
+        # («короткая кривая в Revit ~0.8 мм не строится»). Заводить второе
+        # число для той же физической величины значило бы завести второго
+        # судью.
+        a, b = norm.get("start_mm"), norm.get("end_mm")
+        if (isinstance(a, (int, float)) and isinstance(b, (int, float))
+                and float(b) - float(a) < _MIN_SEGMENT_MM):
+            diags.append(Diagnostic(
+                code=TYPE_BOUNDS, op_index=i, op_id=oid, field_name="end_mm",
+                expected=f"end_mm - start_mm >= {_MIN_SEGMENT_MM:g} мм",
+                got=float(b) - float(a),
+                message_ru=(
+                    f"end_mm ({b}) не больше start_mm ({a}) хотя бы на "
+                    f"{_MIN_SEGMENT_MM:g} мм — ход выдавливания пуст или "
+                    "перевёрнут; это отрезок ВДОЛЬ нормали плоскости, и "
+                    "начало обязано быть меньше конца")))
     if name == "set_curtain_panel":
         # У типа ячейки витража нет детерминированного правила «по
         # умолчанию»: ни doc-default (его в API нет), ни «единственная

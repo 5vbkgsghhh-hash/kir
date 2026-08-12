@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence, cast
 
+from kukai.ir import contour as _contour
+from kukai.ir import geom as _geom
 from kukai.ir import spec
 from kukai.ir.ops_authoring import WALL_LOCATION_LINE_NAMES
 from kukai.ir.reverse_contract import (
@@ -63,6 +65,7 @@ from kukai.ir.decompile.schema import (
     CANON_MM,
     GeometryKind,
     GridInfo,
+    HostSource,
     L0Document,
     L0Element,
     LevelInfo,
@@ -77,6 +80,12 @@ from kukai.ir.decompile.sketch_extract import (
     RailingPathRecord,
     SketchPayloadError,
     StairsRunPathRecord,
+)
+from kukai.ir.decompile.dimension_extract import (
+    DIMENSION_CATEGORIES,
+    DIMENSION_SHAPE_LINEAR,
+    DimensionExtraction,
+    DimensionPayloadError,
 )
 from kukai.ir.decompile.mep_system_extract import (
     MepSystemExtraction,
@@ -149,12 +158,27 @@ _CANDIDATES: dict[str, _Candidate] = {
     # прежний ответ дословно, иначе «мы ничего не сломали» непроверяемо.
     "OST_TextNotes": _Candidate(
         "text_note", "create_text", "_lift_text"),
+    # Размер поднимается, КОГДА боковой индекс размеров его принёс. Когда
+    # индекса нет (все слепки до этой волны), лифтер отказывает тем же
+    # source_contract_gap с тем же текстом, что и раньше, — прежние разборы
+    # обязаны дать прежний ответ ДОСЛОВНО, иначе «мы ничего не сломали»
+    # непроверяемо. Ровно та же дисциплина, что у примечаний и марок.
+    "OST_Dimensions": _Candidate(
+        "dimension", "create_dimension", "_lift_dimension"),
     "OST_Levels": _Candidate("level", "create_level", "_lift_level"),
     "OST_Grids": _Candidate("grid", "create_grid", "_lift_grid"),
     "OST_PipeCurves": _Candidate("pipe", "create_pipe", "_lift_pipe"),
     "OST_DuctCurves": _Candidate("duct", "create_duct", "_lift_duct"),
     "OST_CableTray": _Candidate(
         "cable_tray", "create_cable_tray", "_lift_cable_tray"),
+    # wave/mep-electrical (2026-08-09). Категория появилась здесь ровно по
+    # той же причине, что потолок и ограждение на волне архитектуры: у неё
+    # НАКОНЕЦ ЕСТЬ ОП. До неё каждый короб уходил в атом с причиной
+    # «категории нет в таблице лифтера», и это была правда; теперь причиной
+    # может быть только недостающий ФАКТ (не-прямая кривая), а разница между
+    # этими двумя ответами решает, что чинить следующим.
+    "OST_Conduit": _Candidate(
+        "conduit", "create_conduit", "_lift_conduit"),
     "OST_Stairs": _Candidate("stair", "create_stairs", "_lift_stairs"),
     # wave/arch (2026-07-29). Категории появились в этой таблице потому, что
     # у них НАКОНЕЦ ЕСТЬ ОП: до неё причина атома читалась «операции не
@@ -289,11 +313,36 @@ _validate_candidate_contracts()
 # (см. `ops_opening.VARIETIES_NOT_TAKEN["shaft"]` — связь с парой уровней
 # нечем подтвердить с построенного элемента), и `no_lifter` про неё — правда.
 # Класть её сюда значило бы обещать операцию, которой нет, — зеркальная ложь.
+#
+# wave/mep-electrical (09.08.2026): ГИБКИЕ УЧАСТКИ. Обе категории читаются с
+# 27.07 (`extract.py`, разделы ОВ и ВК), и до сегодняшнего дня каждый гибкий
+# воздуховод и каждая гибкая подводка получали `no_lifter` с текстом
+# «category is outside the exact Part 5 lifter table». Утром 09.08 это стало
+# НЕПРАВДОЙ: `create_flex_duct` и `create_flex_pipe` лежат в реестре
+# (`ops_mep.py`), то есть отказ по-прежнему посылал бы следующего писать
+# операцию, которая написана, — ровно тот класс лжи, ради которого этот код
+# заведён 29.07 для размеров.
+#
+# Категории стоят ЗДЕСЬ, а не в `_CANDIDATES`, и это точная причина, а не
+# осторожность. Строка L0 несёт ПАРУ КОНЦОВ кривой, а форма гибкого участка
+# живёт в `FlexDuct.Points`/`FlexPipe.Points` — сплайне Эрмита через N точек
+# (`ops_mep.py`, замер 6/6). Концы её НЕ ЗАДАЮТ: любая ломаная с теми же
+# концами дала бы ту же строку. Поднять такой элемент прямым участком между
+# концами значило бы ВЫДУМАТЬ геометрию и показать её покрытием — та же
+# подмена, что хорда вместо дуги (`CURVE_KIND_UNSUPPORTED`), и по той же
+# причине запрещённая. Поэтому и в манифесте (`reverse_contract.py`) у обеих
+# операций мода `capture_gap` БЕЗ `representation_ops`.
+#
+# РАЗРЫВ ЗДЕСЬ ЧАСТИЧНЫЙ, И ЭТО ПЕРВЫЙ ТАКОЙ СЛУЧАЙ В ТАБЛИЦЕ: `level` строка
+# L0 несёт, `path` — нет. Прежняя формулировка отказа («не несёт НИ ОДНОГО из
+# обязательных входов») на них соврала бы, поэтому текст собирается теперь по
+# двум таблицам — см. `_L0_ALREADY_CARRIES` ниже.
 _OPS_WITHOUT_L0_INPUTS: Mapping[str, str] = MappingProxyType({
-    "OST_Dimensions": "create_dimension",
     "OST_SWallRectOpening": "create_opening",
     "OST_FloorOpening": "create_opening",
     "OST_RoofOpening": "create_opening",
+    "OST_FlexDuctCurves": "create_flex_duct",
+    "OST_FlexPipeCurves": "create_flex_pipe",
 })
 
 #: Обязательный вход опа → тот член Revit API, который пришлось бы НАЧАТЬ
@@ -347,6 +396,35 @@ _L0_HAS_NO_SOURCE_FOR: Mapping[str, str] = MappingProxyType({
     "variety": ("Opening.Host + Opening.IsRectBoundary + "
                 "Opening.BoundaryRect/BoundaryCurves (все 6/6; "
                 "Opening.SketchId только 2022-2026)"),
+    # wave/mep-electrical (09.08.2026). Путь гибкого участка. Член живёт во
+    # ВСЕХ шести версиях (`FlexDuct.Points`/`FlexPipe.Points`, IList<XYZ> —
+    # замер компиляцией, шапка ops_mep.py), то есть это не «нельзя прочесть»,
+    # а «не читаем»: строка отказа и есть спецификация одной строки захвата.
+    # Названо ОДНОЙ записью на оба опа намеренно — параметр у них общий, и
+    # два текста про одно поле развели бы одну дыру на две строки ранжира.
+    "path": ("FlexDuct.Points / FlexPipe.Points (IList<XYZ>, 6/6) — сплайн "
+             "Эрмита через N точек; пара концов кривой его НЕ задаёт"),
+})
+
+#: Обязательные входы, которые замороженная строка L0 1.0 УЖЕ НЕСЁТ, и ПОЛЕ,
+#: которое их несёт. Таблица заведена 09.08 вместе с гибкими участками, и
+#: работы у неё ровно две.
+#:
+#: ПЕРВАЯ — не дать отказу соврать. До гибких разрыв захвата умел быть только
+#: ПОЛНЫМ: у размера, марки, примечания и проёма в L0 нет НИ ОДНОГО
+#: обязательного входа, и текст так и говорил — «НИ ОДНОГО». У
+#: `create_flex_duct` входов два, и `level` строка несёт (`level_id`/
+#: `level_name`; ровно оттуда его берут лифтеры трубы, воздуховода, лотка и
+#: короба). Оставить прежнюю формулировку значило бы соврать в том самом
+#: утверждении, ради точности которого этот отказ и заведён.
+#:
+#: ВТОРАЯ — не дать разрыву стать МОЛЧАЛИВЫМ. Отказ называет только
+#: недостающие входы; без положительного объявления новый обязательный вход,
+#: которого нет ни в одной из двух таблиц, просто исчез бы из текста, и отказ
+#: перестал бы быть спецификацией следующей волны чтения. Поэтому тест
+#: требует, чтобы каждый обязательный вход стоял РОВНО В ОДНОЙ из них.
+_L0_ALREADY_CARRIES: Mapping[str, str] = MappingProxyType({
+    "level": "L0Element.level_id / level_name",
 })
 
 
@@ -355,16 +433,32 @@ def _unsourceable_inputs_detail(op_name: str) -> str:
 
     Список обязательных входов берётся у самого опа, поэтому текст отказа не
     может разойтись со спецификацией: изменится оп — изменится и отказ.
+
+    Разрыв бывает ПОЛНЫМ и ЧАСТИЧНЫМ, и текст обязан их различать. При полном
+    (размер, марка, примечание, проём) формулировка ДОСЛОВНО прежняя — слепки,
+    разобранные до 09.08, обязаны читаться той же таксономией и тем же
+    текстом, иначе история покрытия перестаёт быть историей.
     """
 
     required = tuple(
         param.name for param in spec.OPS[op_name].params if param.required)
+    missing = tuple(
+        name for name in required if name not in _L0_ALREADY_CARRIES)
     named = "; ".join(
         f"{name} <- {_L0_HAS_NO_SOURCE_FOR.get(name, 'источник не назван')}"
-        for name in required)
+        for name in missing)
+    if len(missing) == len(required):
+        scope = "НИ ОДНОГО из его обязательных входов"
+    else:
+        carried = ", ".join(
+            f"{name} <- {_L0_ALREADY_CARRIES[name]}"
+            for name in required if name in _L0_ALREADY_CARRIES)
+        scope = (
+            f"{len(missing)} из {len(required)} его обязательных входов "
+            f"(несёт только: {carried})")
     return (
-        f"{op_name} есть в реестре операций, но L0 1.0 не несёт НИ ОДНОГО из "
-        f"его обязательных входов, и подставить их нечем: {named}")
+        f"{op_name} есть в реестре операций, но L0 1.0 не несёт {scope}, "
+        f"и подставить их нечем: {named}")
 
 
 #: Категории, которые поднимаются ВТОРЫМ проходом: их оп ссылается на хост,
@@ -378,7 +472,15 @@ _HOSTED_CATEGORIES = frozenset(
 #: ссылаться на дверь, то есть на результат второго). Множество собирается из
 #: двух источников, а не переписывается: разъехавшись, оно оставило бы
 #: элемент без узла, и общий страж в конце превратил бы его в internal_error.
-_DEFERRED_CATEGORIES = _HOSTED_CATEGORIES | TAG_CATEGORIES
+#: Оформление, которое ССЫЛАЕТСЯ на другие элементы: марка на свой
+#: помеченный элемент, размер — на измеряемые. Обе категории обязаны
+#: подниматься ПОСЛЕ всего, на что они способны сослаться (см. третий проход
+#: в ``_lift_document``), иначе их отказ зависел бы от порядка элементов в
+#: L0, а не от модели.
+_REFERENCING_ANNOTATION_CATEGORIES = TAG_CATEGORIES | DIMENSION_CATEGORIES
+
+_DEFERRED_CATEGORIES = (
+    _HOSTED_CATEGORIES | _REFERENCING_ANNOTATION_CATEGORIES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +546,7 @@ class _Context:
     # Принадлежность трубы/воздуховода СИСТЕМНОМУ ТИПУ. Пустой словарь =
     # стадии не было: оп поднимается без system_type, как до волны, и
     # пересборка честно откажется заземляться при нескольких вариантах.
+    dimensions: Mapping[str, Any] = field(default_factory=dict)
     mep_systems: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -1212,12 +1315,20 @@ def _closed_profile(
         _refuse(
             AtomReason.UNSUPPORTED_GEOMETRY,
             f"{polygon_op} requires at least three profile vertices")
-    if (len(record.exterior_loop.points_mm) > 64
-            or len(record.holes) > 8
-            or any(len(loop.points_mm) > 32 for loop in record.holes)):
+    # ТОТ ЖЕ закон, что на прямом ходу, ЧИТАЕМЫЙ ИЗ ОДНОГО МЕСТА. До 10.08 эти
+    # три числа стояли здесь своей копией, хотя строкой ниже сказано «forward
+    # polygon bounds» — то есть копия ЗНАЛА, что повторяет чужой закон. Цена
+    # расхождения здесь молчаливая: элемент становится атомом, и никакой отказ
+    # об этом не скажет.
+    if (len(record.exterior_loop.points_mm) > _geom.MAX_RING_POINTS
+            or len(record.holes) > _geom.MAX_HOLES
+            or any(len(loop.points_mm) > _geom.MAX_HOLE_RING_POINTS
+                   for loop in record.holes)):
         _refuse(
             AtomReason.UNSUPPORTED_SIGNATURE,
-            f"{polygon_op} profile exceeds the forward polygon bounds")
+            f"{polygon_op} profile exceeds the forward polygon bounds "
+            f"({_geom.MAX_RING_POINTS} pts / {_geom.MAX_HOLES} holes / "
+            f"{_geom.MAX_HOLE_RING_POINTS} pts per hole)")
     if any(
         kind is not CurveKind.LINE
         for loop in loops
@@ -1253,8 +1364,8 @@ def _closed_profile(
         normalized_holes.append(normalized)
     if (normalized_outline is None
             or len(normalized_holes) != len(holes)
-            or abs(record.exterior_loop.signed_area_mm2) < 10_000.0
-            or any(abs(loop.signed_area_mm2) < 10_000.0
+            or abs(record.exterior_loop.signed_area_mm2) < _geom.MIN_RING_AREA_MM2
+            or any(abs(loop.signed_area_mm2) < _geom.MIN_RING_AREA_MM2
                    for loop in record.holes)
             or not check_holes_relation(
                 normalized_outline,
@@ -1333,9 +1444,20 @@ def _stairs_run_endpoints(
     if not record.path_available or record.path is None:
         _refuse(AtomReason.MISSING_GEOMETRY, missing_detail)
     if any(kind is not CurveKind.LINE for kind in record.path.curve_kinds):
+        # ПРИЧИНА ОБНОВЛЕНА 09.08.2026, И ЭТО ВАЖНО: с этого дня `create_stairs`
+        # ВЫРАЖАЕТ винтовой марш (`spiral` -> StairsRun.CreateSpiralRun), так
+        # что прежняя формулировка «оп не может представить кривой марш» стала
+        # неправдой — а неверная причина атома отправляет чинить не то.
+        # Обратный ход всё ещё не может: захвачен ПУТЬ марша (точки + середины
+        # дуг), а `spiral` описывается центром и радиусом САМОГО марша, и
+        # отношение между ними (смещение на полуширину, юстировка) НЕ
+        # ИЗМЕРЕНО. Вывести из трёх точек центр дуги ПУТИ можно; выдать его за
+        # центр марша — нельзя, это и была бы тихая неправда.
         _refuse(
             AtomReason.UNSUPPORTED_GEOMETRY,
-            "create_stairs cannot exactly represent a curved source run")
+            "curved stairs run: create_stairs.spiral expresses it forward, "
+            "but the captured stairs PATH cannot yet be turned into the run's "
+            "own centre/radius (that offset is unmeasured)")
 
     points = record.path.points_mm
     p0 = points[0]
@@ -1366,6 +1488,30 @@ def _stairs_run_endpoints(
                 "stairs path is not one exact directed straight run")
         previous_fraction = fraction
     return list(p0), list(p1)
+
+
+def _dimension_side_index(dimension_index: Any) -> Mapping[str, Any]:
+    """Конверт стадии размеров -> адрес лифта (id -> строка).
+
+    Принимается и разобранный ``DimensionExtraction``, и голый
+    ``dimension_index``, и полный ``to_dict()``-конверт. Любая порча -> ``{}``,
+    то есть «индекса нет», то есть ПРЕЖНИЙ отказ дословно: слепок, снятый до
+    появления стадии, обязан читаться как отсутствие индекса, а не как пустой
+    индекс с другим смыслом (§18.2: отсутствующий и пустой — разные факты, но
+    оба обязаны дать ЧЕСТНЫЙ, а не выдуманный, ответ).
+    """
+    if dimension_index is None:
+        return {}
+    if isinstance(dimension_index, DimensionExtraction):
+        return dimension_index.dimension_index
+    if not isinstance(dimension_index, Mapping):
+        return {}
+    if "dimension_index" in dimension_index or "schema_version" in dimension_index:
+        try:
+            return DimensionExtraction.from_dict(dimension_index).dimension_index
+        except (DimensionPayloadError, ValueError, TypeError):
+            return {}
+    return dimension_index
 
 
 def _mep_system_side_index(mep_system_index: Any) -> Mapping[str, Any]:
@@ -1691,7 +1837,12 @@ def _profile_needs_contour(record: Any) -> bool:
 #: функцией и сверяется — расхождение больше 0.1 мм это отказ, а не «почти
 #: то же самое».
 _ARC_BULGE_TOL_MM = 0.1
-_CONTOUR_MAX_POINTS = 64
+
+#: НЕ САМОСТОЯТЕЛЬНОЕ ЧИСЛО, А ССЫЛКА. Предел кольца КОНТУРА обязан совпадать
+#: с тем, что подъязык принимает (`contour._validate_shape`), иначе лифтер
+#: соберёт форму, которую компилятор тут же отвергнет, — и диагноз будет о
+#: контуре, а не о нас. До 10.08 здесь стояла собственная 64.
+_CONTOUR_MAX_POINTS = _geom.MAX_RING_POINTS
 
 
 def _bulge_from_midpoint(
@@ -1735,7 +1886,12 @@ def _contour_shape(loop: Any) -> dict[str, Any] | None:
         if mid is None:
             return None
         bulge = _bulge_from_midpoint(start, end, mid)
-        if bulge is None or abs(bulge) < 1e-6 or abs(bulge) > 1.5:
+        # Порог дуги и её потолок принадлежат ПОДЪЯЗЫКУ, а не лифтеру:
+        # записать дугу, которую CONTOUR потом отвергнет, значит отдать
+        # программу, падающую на своей же валидации. До 10.08 оба числа
+        # стояли здесь копией.
+        if (bulge is None or abs(bulge) < _contour.MIN_ARC_BULGE
+                or abs(bulge) > _contour.MAX_ARC_BULGE):
             return None
         if split:
             half = math.tan(math.atan(bulge) / 2.0)
@@ -1754,12 +1910,49 @@ def _contour_shape(loop: Any) -> dict[str, Any] | None:
             return None
         arcs.append({"edge": len(out_points), "bulge": bulge})
         out_points.append([start[0], start[1]])
-    if not (3 <= len(out_points) <= _CONTOUR_MAX_POINTS):
+    if not (_geom.MIN_RING_POINTS <= len(out_points) <= _CONTOUR_MAX_POINTS):
         return None
     shape: dict[str, Any] = {"shape": "poly", "points_mm": out_points}
     if arcs:
         shape["arcs"] = arcs
     return shape
+
+
+def _contour_region(record: Any) -> dict[str, Any]:
+    """Строка бокового индекса эскизов -> регион ``contour`` (или отказ).
+
+    ОДНА функция на всех потребителей КОНТУРА, и это не вкус: 09.08 второй
+    контурной операцией стал потолок, и второй экземпляр этих же четырёх
+    проверок означал бы два ответа на один вопрос «выражается ли профиль
+    контуром». Разъехавшись, они дали бы разные атомы на одинаковых профилях
+    — тот же класс, что две таблицы категорий (потолок/ограждение, 29.07) и
+    три словаря разделов (fold, 28.07).
+
+    Оба отказа — ФОРМЕННЫЕ (`_SHAPE_REFUSALS`), то есть «элемент не той
+    формы, о которой этот оп»; про значение или ссылку здесь не говорится
+    ничего, и падать в `place_family` они вправе.
+    """
+
+    loops = (record.exterior_loop,) + tuple(record.holes)
+    shapes = [_contour_shape(loop) for loop in loops]
+    if any(shape is None for shape in shapes):
+        _refuse(
+            AtomReason.UNSUPPORTED_GEOMETRY,
+            f"профиль не выражается контуром: петля вне границ "
+            f"{_geom.MIN_RING_POINTS}..{_CONTOUR_MAX_POINTS} точек "
+            f"или дуга без точной середины")
+    # `shapes` — это внешнее кольцо ПЛЮС отверстия, поэтому предел здесь не
+    # самостоятельная девятка, а `1 + MAX_HOLES`. Голая 9 рядом с текстом
+    # «до 8 проёмов» читалась как опечатка и держалась только тем, что её
+    # никто не трогал: подвинув MAX_HOLES, эту 9 забыли бы наверняка.
+    if len(shapes) > 1 + _geom.MAX_HOLES:
+        _refuse(
+            AtomReason.UNSUPPORTED_SIGNATURE,
+            f"контур поддерживает до {_geom.MAX_HOLES} проёмов")
+    region: dict[str, Any] = {"outer": shapes[0]}
+    if len(shapes) > 1:
+        region["holes"] = shapes[1:]
+    return region
 
 
 def _lift_floor_by_contour(
@@ -1775,22 +1968,8 @@ def _lift_floor_by_contour(
     декомпайле его имени не было ни разу.
     """
 
-    loops = (record.exterior_loop,) + tuple(record.holes)
-    shapes = [_contour_shape(loop) for loop in loops]
-    if any(shape is None for shape in shapes):
-        _refuse(
-            AtomReason.UNSUPPORTED_GEOMETRY,
-            "профиль не выражается контуром: петля вне границ 3..64 точек "
-            "или дуга без точной середины")
-    if len(shapes) > 9:
-        _refuse(
-            AtomReason.UNSUPPORTED_SIGNATURE,
-            "контур поддерживает до 8 проёмов")
-    region: dict[str, Any] = {"outer": shapes[0]}
-    if len(shapes) > 1:
-        region["holes"] = shapes[1:]
     params: dict[str, Any] = {
-        "contour": region,
+        "contour": _contour_region(record),
         "level": _level_ref(element.level_id, element.level_name),
         "type": _catalog_ref(element),
     }
@@ -1841,6 +2020,39 @@ def _lift_floor(
     return _op_node(element, "create_floor", params)
 
 
+def _lift_ceiling_by_contour(
+    element: L0Element,
+    context: _Context,
+    record: Any,
+) -> L1OpNode:
+    """Потолок, чей профиль полигоном не выражается -> ``create_ceiling``.
+
+    ОТДЕЛЬНОЙ ОПЕРАЦИИ ЗДЕСЬ НЕТ, И ЭТО РАЗНИЦА С ПОЛОМ, а не недосмотр: у
+    пола контурная форма приехала своим опом (`create_floor_by_contour`), у
+    потолка — ВТОРЫМ ВХОДОМ той же операции. Поэтому имя опа то же самое, а
+    различает ветки набор полей: `contour` ЛИБО `outline`+`holes`, ровно одно
+    из двух (KIR-P007). Эмитировать оба значило бы отдать компилятору
+    программу, которую он обязан отвергнуть, — то есть заявить покрытие,
+    которое не строится.
+
+    Смещение читается тем же CEILING_HEIGHTABOVELEVEL_PARAM, что и в прямой
+    ветке: параметр — свойство КАТЕГОРИИ, а не способа задать форму.
+    """
+
+    params: dict[str, Any] = {
+        "contour": _contour_region(record),
+        "level": _level_ref(element.level_id, element.level_name),
+        "type": _catalog_ref(element),
+    }
+    height_offset = _finite(
+        element.params.get("CEILING_HEIGHTABOVELEVEL_PARAM"))
+    if height_offset is not None and _survives_canon_rounding(height_offset):
+        params["height_offset_mm"] = _bounded_param(
+            element, "CEILING_HEIGHTABOVELEVEL_PARAM", "create_ceiling",
+            "height_offset_mm")
+    return _op_node(element, "create_ceiling", params)
+
+
 def _lift_ceiling(
     element: L0Element,
     context: _Context,
@@ -1854,6 +2066,23 @@ def _lift_ceiling(
     1. Смещение читается из CEILING_HEIGHTABOVELEVEL_PARAM (6/6), а не из
        FLOOR_HEIGHTABOVELEVEL_PARAM. Имя параметра — часть тождества
        категории, и чужое имя здесь молча вернуло бы ноль.
+    3. КОНТУР (09.08.2026). Профиль с ДУГОЙ полигоном не выражается, и до
+       сегодня такой потолок оставался атомом `unsupported_geometry` — «оп не
+       умеет эту форму». Утром 09.08 это перестало быть правдой: у
+       `create_ceiling` появился второй вход формы, `contour` рода `region`
+       (ops_arch.py), то есть весь язык эскиза CONTOUR. Захват при этом
+       менять не пришлось НИ НА СТРОКУ: боковой индекс эскизов несёт потолки
+       с 29.07 (`sketch_extract`, категория в `_STAGE_CATEGORIES`) и хранит
+       для каждой петли и род сегмента, и середину дуги — ровно те три числа,
+       из которых пол собирает `bulge`. Значит здесь был не разрыв захвата, а
+       ненаписанная ветка, и это ровно тот случай, когда лифтер писать МОЖНО.
+
+       Ветка эмитирует `contour` ВМЕСТО `outline`/`holes`, а не рядом: у
+       региона отверстия свои, и держать оба описания сразу — типизированный
+       KIR-P007 (compiler.py). Полигональный путь при этом не тронут ни на
+       байт: потолок без дуг обязан дать прежний узел дословно, иначе круг
+       разомкнётся на каждом уже разобранном здании.
+
     2. ГРАНИЦА ЧЕСТНОСТИ, КОТОРУЮ НАДО ЗНАТЬ ЧИТАТЕЛЮ: наклон потолка этим
        лифтом НЕ ВОССТАНАВЛИВАЕТСЯ и восстановлен быть не может. В
        замороженном L0 наклона нет ни в каком виде: BuiltInParameter с таким
@@ -1868,6 +2097,9 @@ def _lift_ceiling(
        туда-обратно» — утверждение недоказанное, и в отчёте волны оно так и
        записано.
     """
+    record = _profile_record(element, context)
+    if record is not None and _profile_needs_contour(record):
+        return _lift_ceiling_by_contour(element, context, record)
     outline, holes = _closed_profile(
         element,
         context,
@@ -1990,10 +2222,11 @@ def _lift_railing(
             AtomReason.CURVE_KIND_UNSUPPORTED,
             "create_railing path has no arc parameter and a chord would be "
             "a different railing")
-    if not (2 <= len(path.points_mm) <= 64):
+    if not (_geom.MIN_PATH_POINTS <= len(path.points_mm) <= _geom.MAX_PATH_POINTS):
         _refuse(
             AtomReason.UNSUPPORTED_SIGNATURE,
-            "create_railing path holds 2..64 points "
+            f"create_railing path holds {_geom.MIN_PATH_POINTS}.."
+            f"{_geom.MAX_PATH_POINTS} points "
             f"(this railing has {len(path.points_mm)})")
     # Вырожденное звено отказывает ВПЕРЁД (authoring_validation, порог 1 мм:
     # Revit такую кривую не строит). Поймать здесь — значит отдать честный
@@ -2377,11 +2610,155 @@ def _lift_tag(
     return _op_node(element, "create_tag", params)
 
 
+def _lift_dimension(
+    element: L0Element,
+    context: _Context,
+    nodes_by_source: Mapping[str, L1Node],
+) -> L1OpNode:
+    """Размер -> ``create_dimension``.
+
+    ВСЕ три обязательных входа приходят из бокового индекса размеров, ни один
+    — из строки L0: вид-владелец (``Element.OwnerViewId``), точка НА ЛИНИИ
+    размера в координатах вида и ЭЛЕМЕНТЫ, между которыми он проведён
+    (``Dimension.References`` -> ``Reference.ElementId``).
+
+    ПОЧЕМУ ТОЧКА РОВНО ОДНА И ЭТОГО ДОВОЛЬНО. У прямого хода ``line_at`` —
+    ЯКОРЬ, через который проходит линия; направление он берёт из нормали
+    первой ссылки. ``Dimension.Curve`` документирована ВСЕГДА неограниченной,
+    и положение вдоль линии эмерджентно (``authoring._emit_dimension``).
+    Значит любая точка на линии замыкает круг тождеством, а не совпадением.
+
+    ЧЕТЫРЕ ОТКАЗА, КОТОРЫХ ЭТОТ ЛИФТЕР НЕ ИМЕЕТ ПРАВА ИЗБЕЖАТЬ.
+
+    1. Индекса нет -> прежний ``source_contract_gap`` ДОСЛОВНО, тем же
+       текстом из реестра. Условие сравнимости: все слепки, снятые до
+       появления стадии, обязаны давать тот же атом с той же причиной, иначе
+       история покрытия перестанет быть историей.
+    2. Форма размера не ЛИНЕЙНАЯ -> ``unsupported_forward_signature``. Прямой
+       ход строит размер РОВНО одним способом,
+       ``doc.Create.NewDimension(view, Line, ReferenceArray)``, и это линейный
+       размер. Радиальный/угловой/дуговой пересобрался бы не тем, чем был.
+    3. Хоть один измеряемый элемент не найден среди прочитанных ->
+       ``missing_reference`` С ЕГО id в тексте. Молча выкинуть ссылку или
+       подставить похожий элемент — худшее, что здесь можно сделать: размер
+       между ДРУГИМИ элементами прошёл бы схему L1 и выглядел бы покрытием,
+       а на деле был бы другим числом (§18.1).
+    4. Ссылок меньше двух -> ``source_contract_gap``: измерять нечего.
+
+    ЧЕГО ЭТОТ ЛИФТЕР НЕ ОБЕЩАЕТ, И ЭТО НАЗВАНО, А НЕ СПРЯТАНО. ``refs`` несёт
+    ЭЛЕМЕНТЫ, а ``NewDimension`` требует ГЕОМЕТРИЧЕСКИХ ссылок; КАКУЮ ГРАНЬ
+    взять, решает прямой ход своим обходом. Значит совпадение ЧИСЛА после
+    пересборки этим лифтером не гарантировано и не может быть гарантировано
+    ничем, что читается offline. Прямой ход гейтит измеренное значение сам
+    (``_emit_dimension``, 09.08), поэтому расхождение станет его типизированным
+    отказом, а не молчаливым покрытием.
+    """
+    record = context.dimensions.get(element.element_id)
+    if not record:
+        raise _CannotLift(
+            AtomReason.SOURCE_CONTRACT_GAP,
+            _unsourceable_inputs_detail("create_dimension"))
+
+    view_id = record.get("owner_view_id")
+    view_name = record.get("owner_view_name")
+    at = record.get("line_at_view_mm")
+    refs = record.get("ref_element_ids")
+    if not view_id or not view_name \
+            or not isinstance(at, (list, tuple)) or len(at) != 2 \
+            or not isinstance(refs, (list, tuple)):
+        raise _CannotLift(
+            AtomReason.SOURCE_CONTRACT_GAP,
+            "боковой индекс размеров принёс запись без вида, без его имени, "
+            "без точки вида или без измеряемых элементов "
+            f"(element_id={element.element_id!r})")
+    if len(refs) < 2:
+        raise _CannotLift(
+            AtomReason.SOURCE_CONTRACT_GAP,
+            f"размер связан с {len(refs)} элементом(ами) — измерять нечего "
+            f"(element_id={element.element_id!r})")
+
+    shape = record.get("dimension_shape")
+    if shape != DIMENSION_SHAPE_LINEAR:
+        _refuse(
+            AtomReason.UNSUPPORTED_SIGNATURE,
+            f"форма размера {shape!r} не выражается: прямой ход строит размер "
+            "единственным способом, doc.Create.NewDimension(view, Line, "
+            f"ReferenceArray), а это {DIMENSION_SHAPE_LINEAR}-размер; "
+            "пересборка дала бы размер другого рода, а не этот")
+
+    # ССЫЛКИ ВНУТРИПРОГРАММНЫЕ, как host у двери и target у марки: пересборка
+    # обязана связать УЗЛЫ, а не запомнить чужой ElementId. Узел цели может
+    # быть и атомом — тогда ссылка честно указывает на непостроенное, и это
+    # видно, а не спрятано.
+    ref_selectors: list[dict[str, Any]] = []
+    for ref_id in refs:
+        ref_node = nodes_by_source.get(str(ref_id))
+        if ref_node is None:
+            _refuse(
+                AtomReason.MISSING_REFERENCE,
+                f"измеряемый элемент {str(ref_id)!r} не найден среди "
+                "прочитанных: размер нельзя перевесить ни на что другое — "
+                "«похожий элемент» не тот же элемент, и число вышло бы другое")
+        ref_selectors.append({"ref": ref_node["_id"]})
+
+    params: dict[str, Any] = {
+        "in_view": {"by": "name", "value": str(view_name), "_id": str(view_id)},
+        "refs": ref_selectors,
+        "line_at": [float(at[0]), float(at[1])],
+    }
+    type_id = record.get("type_id")
+    type_name = record.get("type_name")
+    if type_id and type_name:
+        params["dim_type"] = {
+            "by": "name", "value": str(type_name), "_id": str(type_id)}
+    return _op_node(element, "create_dimension", params)
+
+
 def _lift_foundation(
     element: L0Element,
     context: _Context,
     _nodes_by_source: Mapping[str, L1Node],
 ) -> L1OpNode:
+    # ЛЕНТОЧНЫЙ ФУНДАМЕНТ — НЕ СТОЛБЧАТЫЙ БАШМАК, И ТЕПЕРЬ ЭТО ПРОВЕРЯЕТСЯ.
+    #
+    # `reverse_contract` про `create_wall_foundation` обещает: такой элемент —
+    # типизованный атом, НИКОГДА не переизлучаемый молча как столбчатый. До
+    # этой волны обещание держалось не кодом, а поведением Revit: у
+    # `WallFoundation` нет `LocationPoint`, значит `geom_kind` не станет
+    # POINT, значит ветка ниже не выполнится. Совпадение, а не инвариант — тот
+    # же класс, что тест, проходящий по фикстуре.
+    #
+    # Проверка стоит ДО разбора геометрии намеренно: она о КЛАССЕ элемента, а
+    # не о том, что Revit положил в его геометрию, и обязана держаться, даже
+    # если завтра у ленты появится точка.
+    #
+    # РАЗЛИЧИТЕЛЬ — `host_source`, а не «хозяин вообще есть». Отказ по
+    # непустому `host_id` отверг бы башмак на грани или рабочей плоскости —
+    # ровно тот элемент, ради которого ветка `isolated` и написана, — то есть
+    # купил бы честность ценой рабочего покрытия. В замороженном L0 непустой
+    # `host_id` вдобавок ДОКАЗЫВАЕТ `FamilyInstance`: другая ветка его не
+    # заполняла. Поэтому старый слепок обязан дать прежний ответ дословно, и
+    # `host_source is None` («не мерили») отказом не является.
+    #
+    # ПОЧЕМУ `NO_LIFTER`, А НЕ `SOURCE_CONTRACT_GAP`. Причина обязана быть
+    # самой верной, а не первой подходящей, и адресует она РАБОТУ. До волны
+    # захвата не хватало ЧТЕНИЯ (`WallFoundation.WallId` не читался вовсе) —
+    # тогда верен был бы source-gap. Теперь чтение приносит и стену, и класс,
+    # `create_wall_foundation` лежит в `spec.OPS`, и единственное недостающее
+    # звено — САМ ЛИФТЕР. `source_contract_gap` послал бы чинить чтение,
+    # которое уже починено.
+    #
+    # Причина НЕ входит в `_SHAPE_REFUSALS` — и это тоже решение: форменный
+    # отказ отдал бы ленту `place_family`, а это не «частичный успех», а
+    # потеря объекта. Сегодняшний ответ на bbox-фундамент (`MISSING_GEOMETRY`)
+    # форменный, то есть ровно эту дорогу и открывал.
+    if element.host_source is HostSource.WALL_FOUNDATION:
+        _refuse(
+            AtomReason.NO_LIFTER,
+            "ленточный фундамент (host_source=wall_foundation): "
+            "create_wall_foundation есть в реестре и захват приносит его "
+            "стену, но лифтера под него нет; create_foundation выразить его "
+            "не может — ни точки, ни контура у него нет")
     if element.geom_kind is GeometryKind.POINT:
         point = _point(element)
         rotation = _finite(element.rotation_deg)
@@ -2997,6 +3374,11 @@ def _lift_room(
         "level": _level_ref(room.level_id, room.level_name),
         "name": room.name,
     }
+    # None is the additive-wire legacy state (number was not measured).
+    # A measured value, including "", is exact model identity and must reach
+    # the forward op rather than being inferred from Room.Name or omitted.
+    if room.number is not None:
+        params["number"] = room.number
     return _op_node(
         element,
         "create_room",
@@ -3146,7 +3528,40 @@ def _lift_cable_tray(
         "level": _level_ref(element.level_id, element.level_name),
         "tray_type": _catalog_ref(element),
     }
+    # Old L0 captures predate tray-section extraction.  Preserve their valid
+    # lift byte-for-byte: each dimension is lifted only when that exact
+    # instance parameter exists, never from an invented default.
+    for source, name in (("RBS_CABLETRAY_WIDTH_PARAM", "width_mm"),
+                         ("RBS_CABLETRAY_HEIGHT_PARAM", "height_mm")):
+        if _finite(element.params.get(source)) is not None:
+            params[name] = _bounded_param(
+                element, source, "create_cable_tray", name)
     return _op_node(element, "create_cable_tray", params)
+
+
+def _lift_conduit(
+    element: L0Element,
+    context: _Context,
+    _nodes_by_source: Mapping[str, L1Node],
+) -> L1OpNode:
+    """Короб ЭОМ — зеркало лотка, и это не совпадение имён.
+
+    В строке L0 короб и лоток НЕРАЗЛИЧИМЫ по форме: оба линейные MEPCurve,
+    у обоих читается та же пара концов, тот же уровень и тот же тип из
+    каталога. Диаметра здесь нет НАМЕРЕННО — прямой оп его тоже не берёт
+    (номинал короба это торговый размер из таблицы типа, а не длина; см.
+    шапку ops_mep.py), и поднять число, которое обратно не построится, значило
+    бы выдать невыполнимую программу за круг.
+    """
+    p0, p1 = _curve(element, dimensions=3)
+    _refuse_non_line_curve(element, context, "create_conduit")
+    params: dict[str, Any] = {
+        "p0_mm": p0,
+        "p1_mm": p1,
+        "level": _level_ref(element.level_id, element.level_name),
+        "conduit_type": _catalog_ref(element),
+    }
+    return _op_node(element, "create_conduit", params)
 
 
 def _lift_stairs(
@@ -3594,6 +4009,7 @@ _LIFTERS = {
     "_lift_beam": _lift_beam,
     "_lift_text": _lift_text,
     "_lift_tag": _lift_tag,
+    "_lift_dimension": _lift_dimension,
     "_lift_foundation": _lift_foundation,
     "_lift_door": _lift_door,
     "_lift_window": _lift_window,
@@ -3603,6 +4019,7 @@ _LIFTERS = {
     "_lift_pipe": _lift_pipe,
     "_lift_duct": _lift_duct,
     "_lift_cable_tray": _lift_cable_tray,
+    "_lift_conduit": _lift_conduit,
     "_lift_stairs": _lift_stairs,
     "_lift_curtain_panel": _lift_curtain_panel,
     "_lift_ceiling": _lift_ceiling,
@@ -3857,7 +4274,15 @@ def _lift_one(
         if element.element_id not in context.family_placement_index \
                 and element.element_id not in context.family_placement_failures:
             reason = AtomReason.NO_LIFTER
-            detail = "category is outside the exact Part 5 lifter table"
+            # Категория НАЗВАНА (10.08). Замер по 67 разборам: эта причина
+            # первая в карте — 10 документов из 10, 77 733 элемента — и
+            # единственная, задевающая ВСЕ документы. Без имени категории по
+            # ней нельзя действовать: она сообщает «чего-то нет», а решают по
+            # ней, какую строку таблицы категорий писать следующей. Имя идёт
+            # ПЕРЕД прежней формулировкой, потому что на саму формулировку
+            # ссылаются три теста и два комментария в этом файле.
+            detail = (f"{element.category}: category is outside the exact "
+                      "Part 5 lifter table")
             return (
                 _atom_node(element, reason, detail),
                 _diagnostic(element, reason, detail),
@@ -3929,6 +4354,7 @@ def _context(
     curtain_index: Any = None,
     annotation_index: Any = None,
     tag_index: Any = None,
+    dimension_index: Any = None,
     mep_system_index: Any = None,
 ) -> _Context:
     profiles, stairs_paths, railing_paths = _side_indexes(profile_index)
@@ -3956,6 +4382,7 @@ def _context(
         curtain_grid_lines=curtain_grid_lines,
         text_notes=_annotation_side_index(annotation_index),
         tags=_tag_side_index(tag_index),
+        dimensions=_dimension_side_index(dimension_index),
         mep_systems=_mep_system_side_index(mep_system_index),
     )
 
@@ -3974,11 +4401,13 @@ def _lift_document(
     curtain_index: Any = None,
     annotation_index: Any = None,
     tag_index: Any = None,
+    dimension_index: Any = None,
     mep_system_index: Any = None,
 ) -> LiftResult:
     context = _context(
         document, profile_index, family_placement_index, wall_curve_index,
-        curtain_index, annotation_index, tag_index, mep_system_index)
+        curtain_index, annotation_index, tag_index, dimension_index,
+        mep_system_index)
     nodes: list[L1Node | None] = [None] * len(document.elements)
     nodes_by_source: dict[str, L1Node] = {}
     diagnostics: list[LiftDiagnostic] = []
@@ -4004,7 +4433,8 @@ def _lift_document(
         if collect_diagnostics and diagnostic is not None:
             diagnostics.append(diagnostic)
 
-    # ТРЕТИЙ ПРОХОД — МАРКИ, и он обязан быть именно третьим.
+    # ТРЕТИЙ ПРОХОД — ССЫЛАЮЩЕЕСЯ ОФОРМЛЕНИЕ (МАРКИ И РАЗМЕРЫ), и он обязан
+    # быть именно третьим.
     #
     # Марка ссылается на ЛЮБОЙ элемент документа, в том числе на дверь или
     # окно, которые сами поднимаются вторым проходом. Подними её раньше — и
@@ -4013,8 +4443,14 @@ def _lift_document(
     # внутреннего порядка лифта, а не от модели. Это тот же закон, по
     # которому второй проход завели для дверей (ссылка не должна зависеть от
     # порядка элементов в L0), применённый на шаг дальше.
+    #
+    # РАЗМЕР ПРИЕХАЛ СЮДА ЖЕ И ПО ТОЙ ЖЕ ПРИЧИНЕ, замеренной, а не
+    # предположенной: пока он поднимался первым проходом, размер между двумя
+    # обычными стенами отказывал `missing_reference` на ПЕРВОЙ же ссылке —
+    # стены существовали в L0, но узла для них ещё не было. Отказ читался бы
+    # как «этих элементов нет в модели», а правда была «лифт до них не дошёл».
     for index, element in enumerate(document.elements):
-        if element.category not in TAG_CATEGORIES:
+        if element.category not in _REFERENCING_ANNOTATION_CATEGORIES:
             continue
         node, diagnostic = _lift_one(element, context, nodes_by_source)
         nodes[index] = node
@@ -4110,6 +4546,7 @@ def lift_document_detailed(
     curtain_index: Any = None,
     annotation_index: Any = None,
     tag_index: Any = None,
+    dimension_index: Any = None,
     mep_system_index: Any = None,
 ) -> LiftResult:
     """Lift and retain one typed diagnostic for each atom fallback."""
@@ -4123,6 +4560,7 @@ def lift_document_detailed(
         curtain_index=curtain_index,
         annotation_index=annotation_index,
         tag_index=tag_index,
+        dimension_index=dimension_index,
         mep_system_index=mep_system_index,
     )
 

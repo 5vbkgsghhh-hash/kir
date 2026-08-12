@@ -74,17 +74,13 @@ using (Transaction __t = new Transaction(doc, "KIR: дверь с зеркало
         if (__el_D1 == null) { __t.RollBack(); return __Refuse("D1", "NewFamilyInstance вернул null"); }
         if (__el_D1.HandFlipped != true)
         {
-            if (__el_D1.CanFlipHand)
-            {
-                __el_D1.flipHand();
-            }
+            if (!__el_D1.CanFlipHand) { __t.RollBack(); return __Refuse("D1", "семейство «" + __sy_D1.Family.Name + " / " + __sy_D1.Name + "» не допускает смену стороны навески (CanFlipHand=false) — выберите другой тип двери"); }
+            __el_D1.flipHand();
         }
         if (__el_D1.FacingFlipped != false)
         {
-            if (__el_D1.CanFlipFacing)
-            {
-                __el_D1.flipFacing();
-            }
+            if (!__el_D1.CanFlipFacing) { __t.RollBack(); return __Refuse("D1", "семейство «" + __sy_D1.Family.Name + " / " + __sy_D1.Name + "» не допускает смену направления открывания (CanFlipFacing=false) — выберите другой тип двери"); }
+            __el_D1.flipFacing();
         }
         try { Parameter __cm = __el_D1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:fbe2471b:D1"); } catch { }
 
@@ -99,10 +95,8 @@ using (Transaction __t = new Transaction(doc, "KIR: дверь с зеркало
         if (__el_Win1 == null) { __t.RollBack(); return __Refuse("Win1", "NewFamilyInstance вернул null"); }
         if (__el_Win1.FacingFlipped != true)
         {
-            if (__el_Win1.CanFlipFacing)
-            {
-                __el_Win1.flipFacing();
-            }
+            if (!__el_Win1.CanFlipFacing) { __t.RollBack(); return __Refuse("Win1", "семейство «" + __sy_Win1.Family.Name + " / " + __sy_Win1.Name + "» не допускает смену направления открывания (CanFlipFacing=false) — выберите другой тип окна"); }
+            __el_Win1.flipFacing();
         }
         try { Parameter __cm = __el_Win1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:fbe2471b:Win1"); } catch { }
 

@@ -16,8 +16,22 @@ Op B depends on A (``A -> B``) when ``B.reads ∩ A.writes != {}`` (B reads what
 writes: a window reads its host wall).  From that dependency DAG a deterministic
 **wave schedule** is built (topological levels): ops in the same wave are
 mutually independent, hence safe to emit/run in parallel.  A cycle is an
-``EffectCycleError``; two unordered writes to one id are a
-``WriteWriteConflict`` — a static race.
+``EffectCycleError``.
+
+**Two facts used to share the name ``WriteWriteConflict``, and only one of them
+can happen (measured 2026-08-10).**  ``build_dependency_graph`` checks the input
+for a duplicate op id FIRST, and that check dominates the write-write scan
+completely: ``writes`` is exactly ``{op_id}``, so two ops can share a written id
+only by sharing their op id — which the first check has already refused.  The
+write-write scan is therefore UNREACHABLE today, and the failure a caller
+actually meets is "you handed me a malformed op list", which is a different fact
+from "two ops race".  They are named apart now: :class:`DuplicateOpId` (a
+subclass, so nothing that caught the old name stops catching it) for the input,
+:class:`WriteWriteConflict` for the race.  The scan is kept rather than deleted
+because it becomes LIVE the moment ``writes`` stops being a singleton of the op
+id — an op that writes an external target would put it back in service — and
+``test_write_write_is_dominated_by_the_id_check`` fails when that day comes, so
+nobody restores the race guard by accident and nobody deletes it either.
 
 T-SCHED: any linear order that respects the waves is valid and equivalent —
 independent ops commute (no ref, no shared write between them, by construction).
@@ -53,7 +67,21 @@ class EffectCycleError(EffectError):
 
 
 class WriteWriteConflict(EffectError):
-    """Two ops write the same id with no order between them (static race)."""
+    """Two ops write the same id with no order between them (static race).
+
+    UNREACHABLE while ``writes == {op_id}`` — see the module docstring.  Kept
+    because it returns to service the moment an op writes anything else.
+    """
+
+
+class DuplicateOpId(WriteWriteConflict):
+    """The op list itself carries one id twice.
+
+    This is the failure a caller actually meets, and it is NOT a race: it says
+    the list was never validated (``midend`` refuses with "planned op ids must
+    be unique"), not that two independent ops collided.  Subclasses
+    :class:`WriteWriteConflict` so every existing handler keeps working.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +191,10 @@ def build_dependency_graph(
 
     op_ids = frozenset(op["id"] for op in grounded_ops)
     if len(op_ids) != len(grounded_ops):
-        raise WriteWriteConflict(
-            "duplicate op id: two ops would write the same identity")
+        raise DuplicateOpId(
+            "duplicate op id: the op list was not validated (midend refuses "
+            "this with \"planned op ids must be unique\"); two ops would write "
+            "the same identity")
 
     order = {op["id"]: index for index, op in enumerate(grounded_ops)}
     signatures = {
@@ -176,6 +206,10 @@ def build_dependency_graph(
         sig = signatures[op["id"]]
         for written in sig.writes:
             if written in writer_of and writer_of[written] != op["id"]:
+                # UNREACHABLE while writes == {op_id}: reaching here needs two
+                # DIFFERENT op ids writing ONE id, and the duplicate-id check
+                # above has already refused the only way that can happen.
+                # Pinned by test_write_write_is_dominated_by_the_id_check.
                 raise WriteWriteConflict(
                     f"ops {writer_of[written]!r} and {op['id']!r} both write "
                     f"{written!r}")
@@ -315,6 +349,7 @@ def conflicts(grounded_ops: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
 
 __all__ = [
     "Dependency",
+    "DuplicateOpId",
     "EffectCycleError",
     "EffectError",
     "EffectSignature",

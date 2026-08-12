@@ -93,6 +93,13 @@ _STACKABLE = (
     "create_wall", "create_pipe", "create_column", "create_beam",
     "create_floor", "create_floor_by_contour", "create_room",
     "create_foundation", "create_duct", "create_cable_tray", "create_roof",
+    # wave/mep-electrical: короб и обе заготовки берут `level` и не являются
+    # сетевыми опами, чьи узлы несут собственные отметки, — то есть проходят
+    # то же МЕХАНИЧЕСКОЕ правило членства, что и труба с лотком. Гибкие
+    # участки СЮДА НЕ ВХОДЯТ: у них не пара концов, а `path`, и правило
+    # переноса Z (`_Z_SHIFTED` ниже) адресует именно p0_mm/p1_mm; тянуть
+    # ломаную поэтажно нужно другим переносом, которого никто не мерил.
+    "create_conduit", "create_pipe_placeholder", "create_duct_placeholder",
 )
 
 #: Ops whose points carry an explicit Z: the macro keeps them storey-local and
@@ -103,6 +110,9 @@ _Z_SHIFTED = {
     "create_beam": ("p0_mm", "p1_mm"),
     "create_duct": ("p0_mm", "p1_mm"),
     "create_cable_tray": ("p0_mm", "p1_mm"),
+    "create_conduit": ("p0_mm", "p1_mm"),
+    "create_pipe_placeholder": ("p0_mm", "p1_mm"),
+    "create_duct_placeholder": ("p0_mm", "p1_mm"),
 }
 
 

@@ -550,6 +550,20 @@ class WhereAddressesAreAllowed(unittest.TestCase):
         self.assertFalse(out.ok)
         self.assertEqual([d.code for d in out.diagnostics], ["KIR-T001"])
 
+    def test_face_normal_direction_is_not_addressable(self):
+        """Пересечение осей — точка, но face_normal задаёт направление."""
+        self.assertNotIn(
+            "face_normal", relate.addressable_params("create_face_wall"))
+        out = self._compile([{
+            "op": "create_face_wall", "id": "fw1",
+            "host": {"by": "element_id", "value": 900001},
+            "type": {"by": "name", "value": "Кирпич 250"},
+            "face_normal": {
+                "at_grid": ["А", "1"], "z_mm": 3000},
+            "location_line": "core_exterior"}])
+        self.assertFalse(out.ok)
+        self.assertIn("KIR-T001", [d.code for d in out.diagnostics])
+
     def test_no_snapshot_is_the_ground_code(self):
         out = compile_program({"ir_version": "1.0", "ops": [{
             "op": "create_column", "id": "c1",
@@ -594,6 +608,26 @@ class WhereAddressesAreAllowed(unittest.TestCase):
             "p1_mm": {"at_grid": ["А", "1"]}}])
         self.assertFalse(out.ok)
         self.assertIn("KIR-T002", [d.code for d in out.diagnostics])
+
+    def test_half_resolved_pair_keeps_its_typed_refusal(self):
+        """ОПРОВЕРГАЮЩИЙ ТЕСТ дефекта, найденного 09.08.2026 на базе
+        `2bfbec0a` и НЕ связанного с адресом от элемента: когда ОДИН конец
+        адресован верно, а второй — на несуществующую ось, повторная площадка
+        законов получала объект-адрес там, где ждала список, и вся программа
+        отвечала «KIR-P000 внутренняя ошибка компилятора: KeyError». Честный
+        KIR-G108 «оси нет в модели» к этому моменту УЖЕ лежал в диагностике и
+        просто не доезжал до автора — то есть отказ с названным следующим
+        ходом подменялся сообщением «чини компилятор»."""
+        out = self._compile([{
+            "op": "create_wall", "id": "w1",
+            "level": {"by": "name", "value": "Этаж 1"},
+            "type": {"by": "name", "value": "ЖБ 200"},
+            "p0_mm": {"at_grid": ["НЕТ ТАКОЙ", "А"]},
+            "p1_mm": {"at_grid": ["2", "А"]}}])
+        self.assertFalse(out.ok)
+        codes = [d.code for d in out.diagnostics]
+        self.assertIn(relate.GRID_NOT_FOUND, codes)
+        self.assertNotIn("KIR-P000", codes)
 
     def test_hosted_offset_law_survives_an_addressed_host(self):
         """Дверь за краем адресованной стены обязана отказывать так же, как
@@ -641,6 +675,596 @@ class MacrosAndAddresses(unittest.TestCase):
                        "xy": {"at_grid": ["А", "1"]}}]}]}
         out = compile_program(program, "2026", snapshot=_SNAPSHOT)
         self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+
+
+# ── АДРЕС ОТ ЭЛЕМЕНТА ───────────────────────────────────────────────────────
+#
+# ГРАНИЦА ЭТОГО ПРИБОРА, СЛОВАМИ. Здесь доказывается ровно одно: что число,
+# которое компилятор ВЫВЕЛ из адреса, побайтово совпадает с числом, которое
+# автор посчитал бы руками, — и что каждый случай, где вывести его честно
+# нельзя, кончается ТИПИЗИРОВАННЫМ отказом с названным следующим ходом.
+# НЕ доказывается ничего о живой модели: что колонна встала на свою отметку,
+# проверяет свидетель опа, а не этот файл.
+
+_L2_ELEV = 3300   # отметка «Этаж 2» в фикстуре
+
+
+def _columns(top: bool = True) -> list:
+    """Две колонны на пересечениях осей, с привязкой верха ко второму этажу."""
+    out = []
+    for oid, grid in (("C1", "1"), ("C2", "2")):
+        op = {"op": "create_column", "id": oid,
+              "xy": {"at_grid": [grid, "А"]},
+              "level": {"by": "name", "value": "Этаж 1"},
+              "symbol": {"by": "name", "value": "К 300x300"}}
+        if top:
+            op["top_level"] = {"by": "name", "value": "Этаж 2"}
+        out.append(op)
+    return out
+
+
+def _beam_on_columns() -> dict:
+    return {"op": "create_beam", "id": "B1",
+            "p0_mm": {"at_element": {"by": "ref", "value": "C1"},
+                      "point": "center", "z": "top"},
+            "p1_mm": {"at_element": {"by": "ref", "value": "C2"},
+                      "point": "center", "z": "top"},
+            "level": {"by": "name", "value": "Этаж 2"},
+            "symbol": {"by": "name", "value": "Балка 200x400"}}
+
+
+class ElementAddressResolves(unittest.TestCase):
+    """Что адрес от элемента ДАЁТ — и что это ровно те же числа."""
+
+    def _compile(self, ops, snapshot=None, version="2026"):
+        return compile_program({"ir_version": "1.0", "ops": ops}, version,
+                               snapshot=_SNAPSHOT if snapshot is None
+                               else snapshot)
+
+    def test_beam_on_top_of_columns(self):
+        """ГЛАВНЫЙ СЛУЧАЙ: балка по верху двух колонн. Ни одного числа о
+        положении балки в программе нет — все три вывел компилятор."""
+        out = self._compile(_columns() + [_beam_on_columns()])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn(
+            "Line.CreateBound(P(0, 0, 3300), P(4000, 0, 3300))", out.csharp)
+
+    def test_addressed_and_hand_computed_emit_the_same_csharp(self):
+        """В3 спеки для второго семейства: программа, где модель посчитала
+        координаты РУКАМИ, и программа, где их вывел компилятор, обязаны дать
+        ПОБАЙТОВО одинаковую C# — иначе адрес меняет не происхождение числа,
+        а само число."""
+        by_hand = dict(_beam_on_columns(),
+                       p0_mm=[0, 0, _L2_ELEV], p1_mm=[4000, 0, _L2_ELEV])
+        literal = self._compile(_columns() + [by_hand])
+        addressed = self._compile(_columns() + [_beam_on_columns()])
+        self.assertTrue(literal.ok and addressed.ok,
+                        [d.as_dict() for d in
+                         (literal.diagnostics + addressed.diagnostics)])
+        # Различие ровно одно и оно названо: штамп программы — дайджест
+        # АВТОРСКОГО текста, а тексты честно разные (в этом и смысл адреса).
+        stamp = re.compile(r"kir:[0-9a-f]+:")
+        self.assertNotEqual(literal.csharp, addressed.csharp)
+        self.assertEqual(stamp.sub("kir:<stamp>:", literal.csharp),
+                         stamp.sub("kir:<stamp>:", addressed.csharp))
+
+    def test_no_trigonometry_reaches_the_emitted_csharp(self):
+        """Ни одной тригонометрической функции и ни одного чтения отметки
+        уровня ради адреса: всё посчитано на компиляции."""
+        out = self._compile(_columns() + [_beam_on_columns()])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        for token in ("Math.Sin", "Math.Cos", "Math.Atan", "Math.Sqrt"):
+            self.assertNotIn(token, out.csharp)
+
+    def test_the_chain_grid_then_element(self):
+        """Колонна адресована ОТ ОСЕЙ, балка — ОТ КОЛОННЫ. Цепочка держится
+        порядком заземления, а не отдельной проверкой."""
+        out = self._compile(_columns() + [_beam_on_columns()])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        rules = {row["rule"] for row in out.grounding_report}
+        self.assertEqual(rules, {"at_grid", "at_element"})
+
+    def test_per_op_address_keeps_the_runtime_dependency_gate(self):
+        """GROUND заменяет адрес числом, но зависимость не исчезает: если
+        колонна отказана в своём SubTransaction, балка не должна строиться
+        отдельно по уже вычисленным координатам несуществующей опоры."""
+        out = compile_program(
+            {"ir_version": "1.0", "ops": _columns() + [_beam_on_columns()]},
+            "2026", snapshot=_SNAPSHOT, isolation="per_op")
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn(
+            'if (!__ok_C1) throw __OpRefuse("B1", '
+            '"опорный оп «C1» отказан — оп пропущен");', out.csharp)
+        self.assertIn(
+            'if (!__ok_C2) throw __OpRefuse("B1", '
+            '"опорный оп «C2» отказан — оп пропущен");', out.csharp)
+
+    def test_the_receipt_names_the_summands(self):
+        """Квитанция обязана показать АРИФМЕТИКУ, которую компилятор взял на
+        себя: отметку уровня и отступ по отдельности. Вывод, который некому
+        предъявить, неотличим от `.FirstOrDefault()` в костюме."""
+        from kukai.ir.ground import describe_choices_ru
+        out = self._compile(_columns() + [_beam_on_columns()])
+        text = describe_choices_ru(out.grounding_report)
+        self.assertIn("«C1» (create_column) → center", text)
+        self.assertIn("отметка top = 3300 + 0 мм", text)
+        self.assertIn("[0, 0, 3300]", text)
+
+    def test_the_receipt_formats_a_negative_offset_as_subtraction(self):
+        from kukai.ir.ground import describe_choices_ru
+        ops = _columns()
+        for op in ops:
+            op["top_offset_mm"] = -400
+        out = self._compile(ops + [_beam_on_columns()])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        text = describe_choices_ru(out.grounding_report)
+        self.assertIn("отметка top = 3300 − 400 мм", text)
+        self.assertNotIn("+ -400", text)
+
+    def test_top_offset_rides_the_elevation(self):
+        ops = _columns()
+        for op in ops:
+            op["top_offset_mm"] = -200
+        out = self._compile(ops + [_beam_on_columns()])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn("P(0, 0, 3100)", out.csharp)
+
+    def test_base_reads_the_level_and_its_offset(self):
+        ops = _columns()
+        for op in ops:
+            op["base_offset_mm"] = 150
+        beam = dict(_beam_on_columns())
+        beam["p0_mm"] = {"at_element": {"by": "ref", "value": "C1"},
+                         "point": "center", "z": "base"}
+        beam["p1_mm"] = {"at_element": {"by": "ref", "value": "C2"},
+                         "point": "center", "z": "base"}
+        out = self._compile(ops + [beam])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn("Line.CreateBound(P(0, 0, 150), P(4000, 0, 150))",
+                      out.csharp)
+
+    def test_slanted_column_top_uses_top_xy_and_is_byte_equivalent(self):
+        """В текущем реестре у колонны есть `top_xy`. Взять нижний `xy` при
+        z=top — тихий плановый промах, хотя отметка и свидетель балки верны."""
+        column = {
+            "op": "create_column", "id": "C1", "xy": [0, 0],
+            "top_xy": [1000, 500],
+            "level": {"by": "name", "value": "Этаж 1"},
+            "top_level": {"by": "name", "value": "Этаж 2"},
+            "symbol": {"by": "name", "value": "К 300x300"}}
+        beam = {
+            "op": "create_beam", "id": "B1",
+            "p0_mm": {"at_element": {"by": "ref", "value": "C1"},
+                      "point": "center", "z": "top"},
+            "p1_mm": [4000, 500, _L2_ELEV],
+            "level": {"by": "name", "value": "Этаж 2"},
+            "symbol": {"by": "name", "value": "Балка 200x400"}}
+        addressed = self._compile([column, beam])
+        literal = self._compile([
+            column, dict(beam, p0_mm=[1000, 500, _L2_ELEV])])
+        self.assertTrue(addressed.ok and literal.ok,
+                        [d.as_dict() for d in
+                         (addressed.diagnostics + literal.diagnostics)])
+        self.assertIn(
+            "Line.CreateBound(P(1000, 500, 3300), P(4000, 500, 3300))",
+            addressed.csharp)
+        stamp = re.compile(r"kir:[0-9a-f]+:")
+        self.assertEqual(stamp.sub("kir:<stamp>:", addressed.csharp),
+                         stamp.sub("kir:<stamp>:", literal.csharp))
+
+    def test_wall_end_feeds_the_next_wall(self):
+        """Плоский параметр: стык стен без переписывания координаты."""
+        out = self._compile([
+            {"op": "create_wall", "id": "W1",
+             "p0_mm": {"at_grid": ["А", "1"]},
+             "p1_mm": {"at_grid": ["А", "2"]},
+             "level": {"by": "name", "value": "Этаж 1"},
+             "type": {"by": "name", "value": "ЖБ 200"}},
+            {"op": "create_wall", "id": "W2",
+             "p0_mm": {"at_element": {"by": "ref", "value": "W1"},
+                       "point": "end"},
+             "p1_mm": [4000, 4500],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "type": {"by": "name", "value": "ЖБ 200"}}])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn(
+            "Line.CreateBound(P(4000, 0, 0), P(4000, 4500, 0))", out.csharp)
+
+    def test_center_of_a_wall(self):
+        out = self._compile([
+            {"op": "create_wall", "id": "W1",
+             "p0_mm": [0, 0], "p1_mm": [4000, 0],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "type": {"by": "name", "value": "ЖБ 200"}},
+            {"op": "create_column", "id": "C9",
+             "xy": {"at_element": {"by": "ref", "value": "W1"},
+                    "point": "center"},
+             "level": {"by": "name", "value": "Этаж 1"},
+             "symbol": {"by": "name", "value": "К 300x300"}}])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn("P(2000, 0, 0)", out.csharp)
+
+    def test_axis_elevation_of_a_beam(self):
+        """У объёмной оси отметка станции лежит в самой программе."""
+        out = self._compile([
+            {"op": "create_beam", "id": "B0",
+             "p0_mm": [0, 0, 3000], "p1_mm": [4000, 0, 3500],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "symbol": {"by": "name", "value": "Балка 200x400"}},
+            {"op": "create_beam", "id": "B1",
+             "p0_mm": {"at_element": {"by": "ref", "value": "B0"},
+                       "point": "end", "z": "axis"},
+             "p1_mm": [8000, 0, 3500],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "symbol": {"by": "name", "value": "Балка 200x400"}}])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn("P(4000, 0, 3500)", out.csharp)
+
+    def test_z_mm_is_the_third_way_to_name_an_elevation(self):
+        beam = dict(_beam_on_columns())
+        beam["p0_mm"] = {"at_element": {"by": "ref", "value": "C1"},
+                         "point": "center", "z_mm": 5000}
+        beam["p1_mm"] = {"at_element": {"by": "ref", "value": "C2"},
+                         "point": "center", "z_mm": 5000}
+        out = self._compile(_columns() + [beam])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn("Line.CreateBound(P(0, 0, 5000), P(4000, 0, 5000))",
+                      out.csharp)
+
+    def test_level_built_by_this_same_program(self):
+        """Отметка уровня, созданного ЭТОЙ ЖЕ программой, берётся из неё же —
+        снапшот про такой уровень не знает ничего и знать не может."""
+        out = self._compile([
+            {"op": "create_level", "id": "L9", "elev_mm": 7200,
+             "name": "Этаж 9"},
+            {"op": "create_column", "id": "C1", "xy": [0, 0],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "top_level": {"by": "ref", "value": "L9"},
+             "symbol": {"by": "name", "value": "К 300x300"}},
+            {"op": "create_beam", "id": "B1",
+             "p0_mm": {"at_element": {"by": "ref", "value": "C1"},
+                       "point": "center", "z": "top"},
+             "p1_mm": [4000, 0, 7200],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "symbol": {"by": "name", "value": "Балка 200x400"}}])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn("P(0, 0, 7200)", out.csharp)
+
+
+class ElementAddressRefusesLoudly(unittest.TestCase):
+    """Каждый случай, где число вывести честно нельзя, — ТИПИЗИРОВАННЫЙ отказ
+    с НАЗВАННЫМ следующим ходом. Молчаливый ноль здесь был бы дороже отказа:
+    свидетель сверяет элемент с тем же нулём и пропустил бы его."""
+
+    def _compile(self, ops, snapshot=None):
+        return compile_program({"ir_version": "1.0", "ops": ops}, "2026",
+                               snapshot=_SNAPSHOT if snapshot is None
+                               else snapshot)
+
+    def _codes(self, out) -> list:
+        return [d.code for d in out.diagnostics]
+
+    def test_existing_model_element_is_refused_with_the_measured_reason(self):
+        """ЗАМЕР, А НЕ ВКУС: в снапшоте ground нет ни одной строки геометрии
+        существующего элемента, поэтому `element_id` отказывает."""
+        beam = dict(_beam_on_columns())
+        beam["p0_mm"] = {"at_element": {"by": "element_id", "value": 12345},
+                         "point": "center", "z": "top"}
+        out = self._compile(_columns() + [beam])
+        self.assertFalse(out.ok)
+        self.assertIn("KIR-T001", self._codes(out))
+        message = " ".join(d.message_ru for d in out.diagnostics)
+        self.assertIn("levels, load_cases, grids", message)
+
+    def test_forward_reference_refuses_offline(self):
+        """Ссылка вперёд — чистая функция от текста, и отказ обязан прийти БЕЗ
+        снапшота: это тот самый обход DAG, ради которого ребро вынуто из
+        глубины значения."""
+        out = compile_program(
+            {"ir_version": "1.0", "ops": [_beam_on_columns()] + _columns()},
+            "2026", snapshot=None)
+        self.assertFalse(out.ok)
+        self.assertIn("KIR-L003", self._codes(out))
+
+    def test_a_room_is_refused_by_name_with_its_reason(self):
+        """Пустая строка таблицы отправила бы автора гадать — поэтому у
+        каждого отвергнутого рода есть ПРИЧИНА, и она в отказе."""
+        out = self._compile([
+            {"op": "create_room", "id": "R1", "xy": [1000, 1000],
+             "level": {"by": "name", "value": "Этаж 1"}},
+            {"op": "create_column", "id": "C1",
+             "xy": {"at_element": {"by": "ref", "value": "R1"},
+                    "point": "center"},
+             "level": {"by": "name", "value": "Этаж 1"},
+             "symbol": {"by": "name", "value": "К 300x300"}}])
+        self.assertFalse(out.ok)
+        self.assertIn(relate.ELEMENT_NOT_ADDRESSABLE, self._codes(out))
+        self.assertIn("ТОЧКА ПОСЕВА",
+                      " ".join(d.message_ru for d in out.diagnostics))
+
+    def test_top_without_top_level_refuses_and_names_the_move(self):
+        """Без привязки верха высота приезжает из УМОЛЧАНИЯ, которого автор не
+        произносил, — ровно тот дефект, что откатывал верные фасадные стены."""
+        out = self._compile(_columns(top=False) + [_beam_on_columns()])
+        self.assertFalse(out.ok)
+        self.assertIn(relate.ELEMENT_PART_INVALID, self._codes(out))
+        self.assertIn("допишите top_level",
+                      " ".join(d.message_ru for d in out.diagnostics))
+
+    def test_a_point_element_has_no_start(self):
+        beam = dict(_beam_on_columns())
+        beam["p0_mm"] = {"at_element": {"by": "ref", "value": "C1"},
+                         "point": "start", "z": "top"}
+        out = self._compile(_columns() + [beam])
+        self.assertFalse(out.ok)
+        self.assertIn(relate.ELEMENT_PART_INVALID, self._codes(out))
+
+    def test_slanted_column_refuses_an_ambiguous_plan_station(self):
+        """Без z=base|top у наклонной оси две честные плановые точки;
+        `center` не даёт права выбрать нижнюю молча."""
+        source = {
+            "op": "create_column", "id": "C1", "xy": [0, 0],
+            "top_xy": [1000, 500],
+            "level": {"by": "name", "value": "Этаж 1"},
+            "top_level": {"by": "name", "value": "Этаж 2"},
+            "symbol": {"by": "name", "value": "К 300x300"}}
+        follower = {
+            "op": "create_column", "id": "C2",
+            "xy": {"at_element": {"by": "ref", "value": "C1"},
+                   "point": "center"},
+            "level": {"by": "name", "value": "Этаж 1"},
+            "symbol": {"by": "name", "value": "К 300x300"}}
+        out = self._compile([source, follower])
+        self.assertFalse(out.ok)
+        self.assertIn(relate.ELEMENT_PART_INVALID, self._codes(out))
+        self.assertIn("наклонная (`top_xy` задан)",
+                      " ".join(d.message_ru for d in out.diagnostics))
+
+    def test_a_grid_has_no_elevation(self):
+        out = self._compile([
+            {"op": "create_grid", "id": "G1", "p0_mm": [0, 0],
+             "p1_mm": [0, 9000], "name": "Ф"},
+            {"op": "create_beam", "id": "B1",
+             "p0_mm": {"at_element": {"by": "ref", "value": "G1"},
+                       "point": "start", "z": "base"},
+             "p1_mm": [4000, 0, 3000],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "symbol": {"by": "name", "value": "Балка 200x400"}}])
+        self.assertFalse(out.ok)
+        self.assertIn(relate.ELEMENT_PART_INVALID, self._codes(out))
+
+    def test_a_grid_built_here_can_still_feed_a_plan_point(self):
+        """Обратная сторона того же: ось, созданная ЭТОЙ ЖЕ программой,
+        `at_grid` адресовать не может (снимок снят раньше) — а `at_element`
+        может, потому что читает программу."""
+        out = self._compile([
+            {"op": "create_grid", "id": "G1", "p0_mm": [0, 0],
+             "p1_mm": [0, 9000], "name": "Ф"},
+            {"op": "create_column", "id": "C1",
+             "xy": {"at_element": {"by": "ref", "value": "G1"},
+                    "point": "start"},
+             "level": {"by": "name", "value": "Этаж 1"},
+             "symbol": {"by": "name", "value": "К 300x300"}}])
+        self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
+        self.assertIn("P(0, 0, 0)", out.csharp)
+
+    def test_arc_wall_has_no_center(self):
+        """Середина ХОРДЫ лежит вне дуговой стены — молча вернуть её значило
+        бы промахнуться тем сильнее, чем круче изгиб."""
+        arc = {"curve_type": "Arc", "center_mm": [2000, 0, 0],
+               "radius_mm": 2000, "x_axis": [1, 0, 0], "y_axis": [0, 1, 0],
+               "start_angle_rad": 0.0, "end_angle_rad": 3.14159}
+        base = {"op": "create_wall", "id": "W1",
+                "p0_mm": [4000, 0], "p1_mm": [0, 0], "arc": arc,
+                "level": {"by": "name", "value": "Этаж 1"},
+                "type": {"by": "name", "value": "ЖБ 200"}}
+        follower = {"op": "create_column", "id": "C1",
+                    "level": {"by": "name", "value": "Этаж 1"},
+                    "symbol": {"by": "name", "value": "К 300x300"}}
+        refused = self._compile([base, dict(
+            follower, xy={"at_element": {"by": "ref", "value": "W1"},
+                          "point": "center"})])
+        self.assertFalse(refused.ok)
+        self.assertIn(relate.ELEMENT_PART_INVALID, self._codes(refused))
+        # А концы дуговой стены честные: `materialize._reconcile_arc_endpoints`
+        # выводит p0/p1 ИЗ САМОЙ дуги.
+        allowed = self._compile([base, dict(
+            follower, xy={"at_element": {"by": "ref", "value": "W1"},
+                          "point": "end"})])
+        self.assertTrue(allowed.ok, [d.as_dict() for d in allowed.diagnostics])
+
+    def test_capture_gap_is_named_not_zeroed(self):
+        """Строка уровня БЕЗ elevation_mm — пробел ЗАХВАТА, а не ноль.
+        Подставленный ноль поставил бы балку на отметку нуля модели и прошёл
+        бы свидетеля, который сверяет с тем же нулём."""
+        snapshot = dict(_SNAPSHOT)
+        snapshot["levels"] = [{"id": row["id"], "name": row["name"]}
+                              for row in _SNAPSHOT["levels"]]
+        out = self._compile(_columns() + [_beam_on_columns()],
+                            snapshot=snapshot)
+        self.assertFalse(out.ok)
+        self.assertIn(relate.ELEMENT_CAPTURE_GAP, self._codes(out))
+        self.assertIn("пробел ЗАХВАТА",
+                      " ".join(d.message_ru for d in out.diagnostics))
+
+    def test_zero_length_law_reaches_the_element_address(self):
+        """Балка «из C1 в C1» — нулевая длина, и закон обязан доехать за
+        черту снапшота вместе с адресом (прибор на часть диапазона опаснее
+        отсутствующего)."""
+        beam = dict(_beam_on_columns())
+        beam["p1_mm"] = {"at_element": {"by": "ref", "value": "C1"},
+                         "point": "center", "z": "top"}
+        out = self._compile(_columns() + [beam])
+        self.assertFalse(out.ok)
+        self.assertIn("KIR-T002", self._codes(out))
+
+    def test_z_and_z_mm_together_are_two_answers_to_one_question(self):
+        beam = dict(_beam_on_columns())
+        beam["p0_mm"] = {"at_element": {"by": "ref", "value": "C1"},
+                         "point": "center", "z": "top", "z_mm": 1000}
+        out = self._compile(_columns() + [beam])
+        self.assertFalse(out.ok)
+        self.assertIn("Отметка названа ДВАЖДЫ",
+                      " ".join(d.message_ru for d in out.diagnostics))
+
+    def test_a_flat_parameter_refuses_an_elevation(self):
+        out = self._compile([
+            {"op": "create_wall", "id": "W1", "p0_mm": [0, 0],
+             "p1_mm": [4000, 0],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "type": {"by": "name", "value": "ЖБ 200"}},
+            {"op": "create_wall", "id": "W2",
+             "p0_mm": {"at_element": {"by": "ref", "value": "W1"},
+                       "point": "end", "z": "base"},
+             "p1_mm": [4000, 4500],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "type": {"by": "name", "value": "ЖБ 200"}}])
+        self.assertFalse(out.ok)
+        self.assertIn("отметка здесь лишняя",
+                      " ".join(d.message_ru for d in out.diagnostics))
+
+    def test_a_volumetric_parameter_demands_an_elevation(self):
+        beam = dict(_beam_on_columns())
+        beam["p0_mm"] = {"at_element": {"by": "ref", "value": "C1"},
+                         "point": "center"}
+        out = self._compile(_columns() + [beam])
+        self.assertFalse(out.ok)
+        self.assertIn("допишите z",
+                      " ".join(d.message_ru for d in out.diagnostics))
+
+    def test_unknown_key_prints_the_closed_grammar(self):
+        beam = dict(_beam_on_columns())
+        beam["p0_mm"] = {"at_element": {"by": "ref", "value": "C1"},
+                         "part": "center", "z": "top"}
+        out = self._compile(_columns() + [beam])
+        self.assertFalse(out.ok)
+        message = " ".join(d.message_ru for d in out.diagnostics)
+        self.assertIn("Грамматика ЗАКРЫТА", message)
+        self.assertIn('"point": "start|end|center"', message)
+
+    def test_unknown_point_name_prints_the_closed_vocabulary(self):
+        beam = dict(_beam_on_columns())
+        beam["p0_mm"] = {"at_element": {"by": "ref", "value": "C1"},
+                         "point": "middle", "z": "top"}
+        out = self._compile(_columns() + [beam])
+        self.assertFalse(out.ok)
+        self.assertIn("['start', 'end', 'center']",
+                      " ".join(d.message_ru for d in out.diagnostics))
+
+    def test_inside_a_stack_the_reference_is_refused_not_silently_wrong(self):
+        """`stack` переименовывает опы по этажам и НЕ переписывает ссылки —
+        как и у любого `by=ref` сегодня. Проверяется, что это ГРОМКО."""
+        program = {"ir_version": "1.0", "ops": [{
+            "op": "stack", "id": "s", "levels": 2, "h_mm": 3000,
+            "floor": [
+                {"op": "create_column", "id": "c", "xy": [0, 0],
+                 "symbol": {"by": "name", "value": "К 300x300"}},
+                {"op": "create_beam", "id": "b",
+                 "p0_mm": {"at_element": {"by": "ref", "value": "c"},
+                           "point": "center", "z_mm": 3000},
+                 "p1_mm": [4000, 0, 3000],
+                 "symbol": {"by": "name", "value": "Балка 200x400"}}]}]}
+        out = compile_program(program, "2026", snapshot=_SNAPSHOT)
+        self.assertFalse(out.ok)
+        self.assertIn("KIR-L003", self._codes(out))
+
+
+    def test_a_contour_corner_says_why_the_element_address_is_not_taken(self):
+        """Слот, а не синтаксис: форма верная, но контур опускается в рёбра
+        ДО заземления программы. Общий «неизвестная форма точки» послал бы
+        автора чинить то, что не сломано."""
+        out = self._compile([
+            {"op": "create_wall", "id": "W1", "p0_mm": [0, 0],
+             "p1_mm": [4000, 0],
+             "level": {"by": "name", "value": "Этаж 1"},
+             "type": {"by": "name", "value": "ЖБ 200"}},
+            {"op": "create_floor_by_contour", "id": "F1",
+             "level": {"by": "name", "value": "Этаж 1"},
+             "contour": {"outer": {
+                 "shape": "rect",
+                 "origin": {"at_element": {"by": "ref", "value": "W1"},
+                            "point": "start"},
+                 "size_mm": [4000, 3000]}}}])
+        self.assertFalse(out.ok)
+        self.assertIn("контур опускается в рёбра",
+                      " ".join(d.message_ru for d in out.diagnostics))
+
+    def test_the_grid_resolver_stays_total(self):
+        """`resolve_address` принимает адрес от осей; отданный ему адрес от
+        элемента обязан быть ТИПИЗИРОВАННЫМ отказом, а не KeyError, — иначе
+        отказ снова подменится «внутренней ошибкой компилятора»."""
+        diags: list = []
+        point = relate.resolve_address(
+            {"at_element": {"by": "ref", "value": "C1"}, "point": "center"},
+            _orthogonal_pool(), "op1", "xy", diags, dims=2)
+        self.assertIsNone(point)
+        self.assertEqual([d.code for d in diags], ["KIR-T001"])
+
+    def test_the_element_resolver_stays_total(self):
+        """Симметричный шов: грид-адрес, отданный резолверу элемента,
+        обязан отказать типизированно, а не упасть на `at_element`."""
+        diags: list = []
+        point = relate.resolve_element_address(
+            {"at_grid": ["А", "1"]}, {}, [], "op1", "xy", diags, dims=2)
+        self.assertIsNone(point)
+        self.assertEqual([d.code for d in diags], ["KIR-T001"])
+
+
+class ElementAddressRegistriesAreClosed(unittest.TestCase):
+    """Замки на сами реестры. Реестр, который перестал сверяться с кодом,
+    превращает закрытую грамматику в список благих намерений."""
+
+    def test_every_rejected_op_carries_a_reason(self):
+        for name, why in relate.ELEMENT_REJECTED.items():
+            self.assertTrue(isinstance(why, str) and len(why) > 40,
+                            f"{name}: причина отказа пуста или формальна")
+
+    def test_allowed_and_rejected_do_not_overlap(self):
+        self.assertFalse(
+            set(relate.ELEMENT_GEOMETRY) & set(relate.ELEMENT_REJECTED))
+
+    def test_every_addressable_source_is_decided_one_way_or_the_other(self):
+        """Оп, у которого есть точечный параметр, ОБЯЗАН быть либо адресуемым,
+        либо названным в отвергнутых. Молчаливая третья корзина — это ровно
+        та «пустая строка таблицы», из-за которой автор гадает."""
+        from kukai.ir import spec
+        undecided = sorted(
+            name for name in spec.OPS
+            if relate.addressable_params(name)
+            and name not in relate.ELEMENT_GEOMETRY
+            and name not in relate.ELEMENT_REJECTED)
+        self.assertEqual(undecided, [])
+
+    def test_non_geometric_point_fields_are_rejected_by_name(self):
+        """Три новых точечных рода — trace/axis/direction, не координаты
+        тела. Они обязаны оставаться в явной корзине отказа, иначе следующий
+        registry wave снова предложит их как адресуемую геометрию."""
+        cases = {
+            "create_extrusion_roof": "СЛЕД РАБОЧЕЙ ПЛОСКОСТИ",
+            "create_solid_revolve": "ОСЬ ВРАЩЕНИЯ",
+            "create_face_wall": "НАПРАВЛЕНИЕ",
+        }
+        for name, evidence in cases.items():
+            self.assertIn(name, relate.ELEMENT_REJECTED)
+            self.assertIn(evidence, relate.ELEMENT_REJECTED[name])
+
+            diags: list = []
+            point = relate.resolve_element_address(
+                {"at_element": {"by": "ref", "value": "X"},
+                 "point": "center"},
+                {"X": {"op": name}}, [], "follow", "xy", diags, dims=2)
+            self.assertIsNone(point)
+            self.assertEqual([d.code for d in diags],
+                             [relate.ELEMENT_NOT_ADDRESSABLE])
+            self.assertIn(evidence, diags[0].message_ru)
+
+    def test_the_grammar_has_no_binary_node(self):
+        """Композиции нет и здесь: у узла РОВНО ОДИН селектор, поэтому
+        «середина между А и Б» невыразима по построению, а не по запрету."""
+        for keys in relate.ELEMENT_ADDRESS_FORMS:
+            self.assertEqual(
+                sum(1 for k in keys if k == "at_element"), 1)
+            self.assertFalse({"at_grid", "between", "plus"} & set(keys))
 
 
 if __name__ == "__main__":

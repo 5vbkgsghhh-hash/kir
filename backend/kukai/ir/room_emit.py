@@ -1,13 +1,15 @@
-"""room_emit — эмиссия create_room_separator (парный файл к ops_room.py).
+"""room_emit — эмиссия опов ops_room.py (парный файл к нему).
 
 Своя зона волны: этот модуль не трогает ни один другой ops_*.py и ни один
 чужой *_emit.py. authoring.py получает аддитивно импорт-обёртку и одну строку
 в _EMITTERS — тот же минимальный шов, которым подключились волны каркаса,
 потолков и мешей.
 
-Переиспользовано из authoring_emit_support.py БЕЗ ИЗМЕНЕНИЙ: _gid,
-_eid, _cs, _safe, _level_expr, _stamp_block, _stamp_readback. Подчёркнутые
-имена пока сохраняют исторический контракт, но имеют одного владельца.
+Переиспользовано из authoring.py БЕЗ ИЗМЕНЕНИЙ (импортом, не копией): _gid,
+_eid, _cs, _safe, _level_expr, _stamp_block, _stamp_readback. Тот же список и
+та же оговорка, что в шапке arch_emit.py: часть имён приватные, и будущий
+чистый шов лечится их повышением до публичных в authoring.py, а не
+копированием тел сюда.
 
 ═══ ЧТО ЗДЕСЬ ВИДНО В КОДЕ (обоснование формы — в шапке ops_room.py) ═══
 
@@ -49,6 +51,14 @@ _eid, _cs, _safe, _level_expr, _stamp_block, _stamp_readback. Подчёркну
   безопасно ровно одно: сравнить `.Category.Id` с
   `new ElementId(BuiltInCategory.OST_RoomSeparationLines)` по строке.
 
+* ВТОРАЯ ОПЕРАЦИЯ ЭТОГО ФАЙЛА — `create_space` (10.08.2026), и она
+  устроена ИНАЧЕ, чем разделитель: одна личность вместо многих,
+  `doc.Create.NewSpace(Level, UV)` вместо `NewRoomBoundaryLines`, вида
+  не требует вовсе. Обоснование формы и весь замер API — в шапке
+  ops_room.py; здесь только то, что видно в коде. Отдельно стоит
+  прочитать разбор ДВУХ РАЗНЫХ плохих исходов (не размещено против
+  не замкнуто) — от него зависит, что здесь отказ, а что нарушение.
+
 * ОБЪЯВЛЕНИЯ — ВО ВНЕШНЕЙ ОБЛАСТИ. При isolation="per_op" блок создания и
   блок постусловий попадают в РАЗНЫЕ области видимости, и переменная,
   объявленная внутри create, свидетелю не видна (живые грабли волны
@@ -57,7 +67,7 @@ _eid, _cs, _safe, _level_expr, _stamp_block, _stamp_readback. Подчёркну
 """
 from __future__ import annotations
 
-from kukai.ir.authoring_emit_support import (
+from kukai.ir.authoring import (
     _gid, _eid, _cs, _safe, _level_expr, _stamp_block, _stamp_readback,
 )
 from kukai.ir.emit_model import WitnessCheck, tolerance
@@ -280,5 +290,194 @@ def emit_room_separator(op: dict, ver: str, stamp: str,
         f"    try {{ __rb[\"view_name\"] = __rsv_{s}.Name; }} catch {{ }}\n"
         f"    __rb[\"view_candidates\"] = __rsvn_{s};\n"
         + _stamp_readback(f"__segs_{s}[0]") +
+        f"    __results[{_cs(oid)}] = __rb;\n}}")
+    return decl, create, checks, readback
+
+
+#: Порог «площадь равна нулю» в ВНУТРЕННИХ единицах Revit (кв. футы).
+#: Это ПРОВЕРКА НА НОЛЬ, а не порог размера: пространство без замыкающей
+#: геометрии Revit отдаёт ровно 0.0, и вопрос стоит «есть площадь или нет»,
+#: а не «достаточно ли её». Литерал тот же, что у create_room
+#: (`authoring._emit_room`), и это НАМЕРЕННО: два числа на один вопрос —
+#: два судьи о том, что такое «не замкнуто». Число ASSIGNED, не измерено;
+#: названо здесь именно потому, что голый литерал в сравнении — тот род
+#: границы, который перепись bounds_audit находит только глазами.
+_SPACE_ZERO_AREA_FT2 = 1e-6
+
+
+def emit_space(op: dict, ver: str, stamp: str,
+               isolation: str = "atomic") -> tuple[str, str, list, str]:
+    """Пространство ОВК в точке на уровне.
+
+    ``Autodesk.Revit.Creation.Document.NewSpace(Level, UV) -> Space`` —
+    замерено 10.08.2026 ДВУМЯ приборами: рефлексией по шести ``RevitAPI.dll``
+    (``data/api_surface/api_signatures_*.json``) и живой компиляцией на
+    :52412 по отдельному прогону на каждую из шести версий. Возвращаемый тип
+    доказан ошибкой компилятора (CS0029 называет
+    ``Autodesk.Revit.DB.Mechanical.Space``), а не прозой документации.
+
+    ОСИ ВЕРСИЙ НЕТ — см. шапку ops_room.py. Эмиттер поэтому не ветвится:
+    ветка по версии здесь была бы кодом, недостижимым ни на одной цели.
+    """
+    oid = op["id"]
+    s = _safe(oid)
+    x, y = op["xy"][0], op["xy"][1]
+    lv_res, lv_idexpr = _level_expr(op, s, ver, oid, isolation)
+
+    # Тип пишется ПОЛНЫМ ИМЕНЕМ ровно как у create_room с его
+    # `Autodesk.Revit.DB.Architecture.Room`: обёртка живого пути тянет
+    # `using Autodesk.Revit.DB.Mechanical`, но эмиттер не вправе опираться на
+    # чужой список using — он и так однажды менялся.
+    decl = f"Autodesk.Revit.DB.Mechanical.Space __el_{s} = null;"
+
+    create = (
+        f"// create_space {cs_line_comment_fragment(oid)}\n"
+        f"{lv_res}\n"
+        f"try {{ __el_{s} = doc.Create.NewSpace("
+        f"__lv_{s}, new UV(U({x}), U({y}))); }}\n"
+        f"catch (Exception __ex_{s}) {{ "
+        + refuse_stmt(oid, f'"NewSpace: " + __ex_{s}.Message', isolation)
+        + " }\n"
+        f"if (__el_{s} == null) {{ "
+        + refuse_stmt(oid, _cs("NewSpace вернул null"), isolation)
+        + " }\n"
+        # ═══ НЕРАЗМЕЩЁННОЕ ПРОСТРАНСТВО — ТИПИЗИРОВАННЫЙ ОТКАЗ ═══
+        #
+        # Отказ, а не нарушение постусловия, и это разделение НАМЕРЕННОЕ
+        # (разбор — в шапке ops_room.py). У неразмещённого пространства
+        # проверять НЕЧЕГО: ни уровня, ни точки, ни площади у него нет, и
+        # свидетель, который «не нашёл расхождений», подписал бы зелёное над
+        # элементом, которого нигде нет. Молчаливый откат тоже исключён:
+        # причина названа словами и уезжает пользователю.
+        #
+        # ЧЕСТНО О ТОМ, ЧЕГО ЗДЕСЬ НЕ ЗАМЕРЕНО: может ли перегрузка
+        # «уровень + точка» вообще вернуть неразмещённое пространство —
+        # офлайн не решается, живого Revit у этой волны не было. Проверка
+        # стоит по принципу fail-closed и стоит ноль, а НЕ потому, что путь
+        # доказан живым; выдавать её за замеренный сценарий нельзя.
+        # Обратного хода у неё нет: `Space.Unplace()` не существует ни на
+        # одной из шести версий (CS1061), в отличие от `Room.Unplace()`.
+        f"if ((__el_{s}.Location as LocationPoint) == null) {{ "
+        + refuse_stmt(
+            oid,
+            _cs("пространство создано, но НЕ РАЗМЕЩЕНО (Location == null): "
+                "точка не попала ни в одну область заданного уровня — "
+                "проверьте xy и level"),
+            isolation)
+        + " }\n"
+        + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
+
+    tol = tolerance("create_space", "location_mm")
+    checks: list[WitnessCheck] = [
+        # ГДЕ — уровень. Element.LevelId, то же первое звено, которым уровень
+        # читает сторона извлечения: один вопрос, один судья.
+        WitnessCheck(
+            obligation_key="level_binding",
+            reader_cs="",
+            verdict_cs=(
+                f"    if (__el_{s}.LevelId == null\n"
+                f"        || __el_{s}.LevelId == ElementId.InvalidElementId\n"
+                f"        || __el_{s}.LevelId.ToString() != {lv_idexpr})\n"
+                f"        __post.Add({_cs(oid + ': level binding mismatch (topology)')});\n"),
+            message="level binding mismatch (topology)", style="guard"),
+        # ГДЕ — точка. Читается Location, которую СЧИТАЕТ REVIT, а не
+        # параметр, который писали мы: под §18.3 подпись «(geometry)»
+        # законна ровно при таком читателе.
+        #
+        # Z НЕ СВЕРЯЕТСЯ, и это не пропуск: `SpatialElement.Location`
+        # документирован как «Z location should be the elevation of the level
+        # and NOT CHANGEABLE» — требовать от Revit то, чем распоряжается он
+        # сам, значит писать свидетеля, который однажды завернёт верную
+        # постройку. Ровно так же поступает create_room.
+        WitnessCheck(
+            obligation_key="location",
+            reader_cs=f"    var __sloc_{s} = __el_{s}.Location as LocationPoint;\n",
+            verdict_cs=(
+                f"    if (__sloc_{s} == null\n"
+                f"        || Math.Abs(MM(__sloc_{s}.Point.X) - {x}) > {tol}\n"
+                f"        || Math.Abs(MM(__sloc_{s}.Point.Y) - {y}) > {tol})\n"
+                f"        __post.Add({_cs(oid + ': space placement mismatch (geometry)')});\n"),
+            message="space placement mismatch (geometry)",
+            tol=tol, style="guard"),
+        # ЗАМКНУТО ЛИ — ВЕЛИЧИНА. Area считает Revit по ограничивающей
+        # геометрии; ноль означает, что замыкать было нечем. Подпись
+        # «(geometry)» — по тому, что ЧИТАЕТСЯ: площадь есть геометрическая
+        # величина, и называть её топологией значило бы подписать ось,
+        # которой этот читатель не касался.
+        #
+        # ОБЪЁМ НЕ СВЕРЯЕТСЯ СОЗНАТЕЛЬНО. `Space.Volume` существует 6/6, но
+        # его значение зависит от НАСТРОЙКИ ДОКУМЕНТА (расчёт объёмов), а не
+        # от построенного элемента; свидетель на нём проверял бы галочку в
+        # настройках проекта. Замера, подтверждающего обратное, у этой волны
+        # нет — значит и обязательства нет.
+        WitnessCheck(
+            obligation_key="area",
+            reader_cs="",
+            verdict_cs=(
+                f"    if (__el_{s}.Area <= {_SPACE_ZERO_AREA_FT2})\n"
+                f"        __post.Add({_cs(oid + ': space is not enclosed: zero area (geometry)')});\n"),
+            message="space is not enclosed: zero area (geometry)",
+            style="guard"),
+        # ЗАМКНУТО ЛИ — ОТНОШЕНИЕ. Вторая проверка НЕ дублирует первую:
+        # площадь — это СКОЛЬКО, а петли границы — это ЧЕМ. Топологическую
+        # ось разряжает только вторая, потому что только она читает
+        # отношение пространства к ограничивающим элементам. Подписать
+        # «(topology)» под чтением площади было бы ровно тем дефектом,
+        # ради которого написан test_witness_axis_honesty.
+        #
+        # ОШИБКА ЧТЕНИЯ НЕ МОЛЧИТ: у неё своё сообщение, а не общее с
+        # «границ нет» — «прибор не сработал» и «границы отсутствуют» суть
+        # разные факты, и сливать их в одну строку значит потерять причину.
+        WitnessCheck(
+            obligation_key="boundary",
+            reader_cs=(
+                f"    int __bl_{s} = 0;\n"
+                f"    bool __bread_{s} = true;\n"
+                f"    try\n"
+                f"    {{\n"
+                f"        var __bopt_{s} = new SpatialElementBoundaryOptions();\n"
+                f"        IList<IList<BoundarySegment>> __bsegs_{s} = "
+                f"__el_{s}.GetBoundarySegments(__bopt_{s});\n"
+                f"        if (__bsegs_{s} != null)\n"
+                f"            foreach (var __bloop_{s} in __bsegs_{s})\n"
+                f"                if (__bloop_{s} != null && __bloop_{s}.Count > 0) "
+                f"__bl_{s}++;\n"
+                f"    }}\n"
+                f"    catch {{ __bread_{s} = false; }}\n"),
+            verdict_cs=(
+                f"    if (!__bread_{s})\n"
+                f"        __post.Add({_cs(oid + ': space boundary unreadable (topology)')});\n"
+                f"    else if (__bl_{s} == 0)\n"
+                f"        __post.Add({_cs(oid + ': space has no bounding loop (topology)')});\n"),
+            message="space has no bounding loop (topology)",
+            style="plain"),
+    ]
+
+    # Квитанция СВОЯ, а не _readback_block: тот читает LocationCurve, которой
+    # у пространственного элемента нет вовсе.
+    #
+    # ИМЯ И НОМЕР ЕДУТ В КВИТАНЦИЮ, НО НЕ В СВИДЕТЕЛЯ, и ключи разные. `name`
+    # — то, что отдаёт `Space.Name`, а он у Room замерен как СКЛЕЙКА имени с
+    # номером (04.08, живой Revit 2026), поэтому ключ назван
+    # `name_and_number`: человеку полезно, сверять по нему нельзя. Оп имени
+    # не задаёт вовсе (см. шапку ops_room.py), так что сверять и нечего —
+    # это чтение построенного, а не проверка обещания.
+    readback = (
+        f"// witness {cs_line_comment_fragment(oid)}\n{{\n"
+        f"    var __rb = new Dictionary<string, object>();\n"
+        f"    __rb[\"id\"] = __el_{s}.Id.ToString();\n"
+        f"    try {{ __rb[\"name_and_number\"] = __el_{s}.Name; }} catch {{ }}\n"
+        f"    try {{ __rb[\"number\"] = __el_{s}.Number; }} catch {{ }}\n"
+        f"    try {{ __rb[\"level_id\"] = __el_{s}.LevelId.ToString(); }} catch {{ }}\n"
+        f"    try {{ __rb[\"area_m2\"] = Math.Round("
+        f"UnitUtils.ConvertFromInternalUnits(__el_{s}.Area, "
+        f"UnitTypeId.SquareMeters), 2); }} catch {{ }}\n"
+        f"    try {{ __rb[\"volume_m3\"] = Math.Round("
+        f"UnitUtils.ConvertFromInternalUnits(__el_{s}.Volume, "
+        f"UnitTypeId.CubicMeters), 3); }} catch {{ }}\n"
+        f"    try {{ var __rbc_{s} = __el_{s}.Category;\n"
+        f"        __rb[\"category_id\"] = __rbc_{s} == null ? null : "
+        f"__rbc_{s}.Id.ToString(); }} catch {{ }}\n"
+        + _stamp_readback(f"__el_{s}") +
         f"    __results[{_cs(oid)}] = __rb;\n}}")
     return decl, create, checks, readback

@@ -1585,13 +1585,139 @@ def _components(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class RoomAdjacencyCensus:
+    """Скольких дверей КОСНУЛСЯ предикат `_semantic_fold`, и что с ними стало.
+
+    Закон тот же, что у переписи CLASH и у графа: ответ «смежности нет» ничего
+    не значит, пока не сказано, скольких дверей поиск коснулся. До 10.08.2026
+    82.6 % дверей `демо-v3` выпадали из этого предиката молча — не потому, что
+    кто-то их скрывал, а потому, что ветка `len(adjacent) == 2` не имела
+    альтернативы, и «не подошло» было неотличимо от «не смотрели».
+
+    `by_degree` — сколько дверей у скольких ограниченных хозяином комнат.
+    Ключ 2 есть ЕДИНСТВЕННЫЙ, дающий ребро; все прочие ключи суть названный
+    исход, а не тишина.
+    """
+
+    doors_seen: int
+    doors_without_host: int
+    by_degree: Mapping[int, int]
+
+    @property
+    def edges_built(self) -> int:
+        return self.by_degree.get(2, 0)
+
+    @property
+    def doors_with_host(self) -> int:
+        return sum(self.by_degree.values())
+
+    @property
+    def refuted(self) -> int:
+        """Двери с хозяином, чей хозяин ограничивает НЕ две комнаты."""
+        return self.doors_with_host - self.edges_built
+
+    def assert_balanced(self) -> None:
+        total = self.doors_with_host + self.doors_without_host
+        if total != self.doors_seen:
+            raise FoldError(
+                f"перепись смежности не сходится: дверей {self.doors_seen}, "
+                f"с хозяином {self.doors_with_host}, без хозяина "
+                f"{self.doors_without_host}")
+
+
+def room_adjacency_census(
+    nodes: Sequence[L1Node],
+    rooms: Sequence[RoomInfo],
+    elements_by_id: Mapping[str, L0Element],
+) -> RoomAdjacencyCensus:
+    """Перепись предиката `_semantic_fold` БЕЗ участия в построении дерева.
+
+    Чистая функция над теми же входами, что у `_semantic_fold`, и намеренно
+    отдельная от неё: перепись, которая меняла бы форму фолда, стоила бы
+    каждого сохранённого merkle-индекса (см. шапку `_semantic_fold`). Здесь
+    считается ровно то, о чём фолд молчал, и не двигается ничего.
+    """
+    boundary_to_rooms: dict[str, set[str]] = defaultdict(set)
+    for room in rooms:
+        for element_id in room.bounding_element_ids:
+            boundary_to_rooms[element_id].add(room.id)
+
+    seen = 0
+    without_host = 0
+    by_degree: Counter[int] = Counter()
+    for node in nodes:
+        source_id = node["source_element_id"]
+        element = elements_by_id.get(source_id)
+        if element is None or element.category != "OST_Doors":
+            continue
+        seen += 1
+        if not element.host_id:
+            without_host += 1
+            continue
+        by_degree[len(boundary_to_rooms.get(element.host_id, ()))] += 1
+
+    census = RoomAdjacencyCensus(doors_seen=seen,
+                                 doors_without_host=without_host,
+                                 by_degree=dict(sorted(by_degree.items())))
+    census.assert_balanced()
+    return census
+
+
 def _semantic_fold(
     nodes: Sequence[L1Node],
     rooms: Sequence[RoomInfo],
     elements_by_id: Mapping[str, L0Element],
     group_boundaries: Mapping[str, str] | None,
 ) -> tuple[list[TreeNode], list[L1Node]]:
-    """Return proven semantic containers plus leaves that remain floor-loose."""
+    """Return proven semantic containers plus leaves that remain floor-loose.
+
+    ПРЕДИКАТ СМЕЖНОСТИ ЗДЕСЬ НАЗЫВАЕТСЯ ТОЧНО, и это не педантизм: под именем
+    «смежность комнат» в пакете живут ДВА РАЗНЫХ предиката, и до 10.08.2026 они
+    носили одно слово.
+
+    Тот, что строится ниже, утверждает НЕ «между этими комнатами можно пройти»,
+    а **«ХОЗЯИН ЭТОЙ ДВЕРИ ОГРАНИЧИВАЕТ РОВНО ДВЕ КОМНАТЫ»** — факт об
+    ОБЪЯВЛЕНИИ Revit (расчёт границ помещения), а не об измеренной геометрии
+    двери. Второй предикат, `design_check._openings`, спрашивает, каких
+    полигонов КАСАЕТСЯ точка проёма, и это факт об измерении. Замер их
+    согласия (Жаккар): 0.288 на `демо`, 0.649 на `13A-RD-AR-K2_v33`, 0.324 на
+    `Snowdon …Architectural`, 0.287 на `SOB6.2…AR_R23` — расхождение
+    ДВУСТОРОННЕЕ на каждом здании, значит ни один не есть огрубление другого.
+
+    СКОЛЬКО ДВЕРЕЙ ЭТОТ ПРЕДИКАТ НЕ ОБСЛУЖИВАЕТ (замер 10.08, распределение
+    числа комнат, ограниченных хозяином двери):
+
+        `демо-v3`      5 941 дверь: {0: 2816, 1: 154, **2: 1036**, 3: 966,
+                       4: 648, 5: 50, 6: 76, 7: 25, 8: 55, 9: 113, 30: 1, 34: 1}
+                       -> ребро получают 1 036 дверей, **17.4 %**
+        `k2_ar_rd_v7`  2 096 дверей: {0: 66, 1: 449, **2: 1054**, 3: 326,
+                       4: 125, 5: 25, 8: 8, 9: 1} -> **50.3 %**
+        `sob62_r23_v5`   153 двери: {0: 15, 1: 79, **2: 47**, 3: 12}
+
+    Дверь в стене, ограничивающей три комнаты, — НЕ ошибка данных, это реальная
+    конфигурация, и раньше она исчезала здесь молча.
+
+    ПОЧЕМУ ИСХОД ДЛЯ ОСТАЛЬНЫХ ЖИВЁТ НЕ ЗДЕСЬ. Дать им ребро в этой функции
+    нельзя, не сдвинув всё, что стоит на форме дерева, и цена названа замером
+    по коду, а не опасением: `merkle._build_merkle_node` хеширует узел как
+    `_hash_parts(content_json, edges)`, где `edges` — хеши ДЕТЕЙ, поэтому иная
+    раскладка комнат по контейнерам меняет хеш каждого узла выше листьев и
+    обесценивает СОХРАНЁННЫЕ индексы: дедуп (×9.96 на Snowdon Plumbing) и
+    отсечение диффом (33 617 поддеревьев на паре `k2_ar_rd_v7`→`v8`).
+    Что при этом НЕ пострадало бы — `BuildingState`: он есть мультимножество
+    `canon_op` ЛИСТЬЕВ, а листья сохраняются законом (`assert_preservation`),
+    поэтому воспроизведение журнала (18/18, 5/5, 3/3, 2/2) и `merge3` к форме
+    контейнеров нечувствительны. Различие между этими двумя половинами и есть
+    ответ на вопрос «что стоит менять форму фолда».
+
+    Поэтому исход ТИПИЗИРОВАН И ПОСЧИТАН в двух местах, ни одно из которых не
+    трогает дерево: :func:`room_adjacency_census` ниже (число, по каждому
+    зданию) и `building_graph.Relation.BOUNDED_BY_SAME_WALL`, где дверь со
+    степенью != 2 даёт ребро `Modality.REFUTED` с именем правила
+    `host_does_not_separate_exactly_two_rooms`. «Не нашли» стало отличимо от
+    «не искали», не сдвинув ни одного дайджеста.
+    """
 
     room_by_id = {room.id: room for room in rooms}
     room_ids = set(room_by_id)
@@ -1620,7 +1746,11 @@ def _semantic_fold(
         for room in rooms
     }
 
-    door_edges: list[tuple[str, str, str]] = []
+    # ИМЯ ГОВОРИТ, ЧТО УТВЕРЖДАЕТСЯ: не «двери, соединяющие комнаты», а двери,
+    # ЧЕЙ ХОЗЯИН ОГРАНИЧИВАЕТ РОВНО ДВЕ КОМНАТЫ. Остальные (82.6 % на `демо-v3`)
+    # считает `room_adjacency_census`, а типизированный исход им даёт
+    # `building_graph` — см. шапку функции.
+    doors_whose_host_separates_two_rooms: list[tuple[str, str, str]] = []
     for source_id in sorted(node_by_source):
         element = elements_by_id.get(source_id)
         if (element is None or element.category != "OST_Doors"
@@ -1628,13 +1758,14 @@ def _semantic_fold(
             continue
         adjacent = sorted(boundary_to_rooms.get(element.host_id, ()))
         if len(adjacent) == 2:
-            door_edges.append((source_id, adjacent[0], adjacent[1]))
+            doors_whose_host_separates_two_rooms.append(
+                (source_id, adjacent[0], adjacent[1]))
 
     non_mop_ids = sorted(room_id for room_id in room_ids if not is_mop[room_id])
     mop_ids = sorted(room_id for room_id in room_ids if is_mop[room_id])
     non_mop_uf = _UnionFind(non_mop_ids)
     mop_uf = _UnionFind(mop_ids)
-    for _door_id, left, right in door_edges:
+    for _door_id, left, right in doors_whose_host_separates_two_rooms:
         if not is_mop[left] and not is_mop[right]:
             non_mop_uf.union(left, right)
         elif is_mop[left] and is_mop[right]:
@@ -1643,7 +1774,7 @@ def _semantic_fold(
     non_mop_components = _components(non_mop_uf, non_mop_ids)
     mop_components = _components(mop_uf, mop_ids)
     entry_doors: dict[str, set[str]] = defaultdict(set)
-    for door_id, left, right in door_edges:
+    for door_id, left, right in doors_whose_host_separates_two_rooms:
         if is_mop[left] == is_mop[right]:
             continue
         non_mop_room = right if is_mop[left] else left
@@ -2079,6 +2210,8 @@ def fold_l1(
 
 
 __all__ = [
+    "RoomAdjacencyCensus",
+    "room_adjacency_census",
     "FIDELITY_CANON_VERSION",
     "FidelityCanon",
     "FoldError",

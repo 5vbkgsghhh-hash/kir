@@ -72,6 +72,31 @@ _CATEGORY_SPECS):
   ни на одной версии — замерено. Параметра, которого нет в API, в опе тоже
   нет; лифтер обязан отказать на ограждении со смещением, а не обнулить его.
   Смещение потолка, наоборот, ЕСТЬ: CEILING_HEIGHTABOVELEVEL_PARAM, 6/6.
+
+CONTOUR У ПОТОЛКА (09.08.2026). У create_ceiling появился ВТОРОЙ вход формы —
+необязательный `contour` рода `region`, то есть весь язык эскиза из
+contour.py (rect/l/poly с малыми дугами, до 8 отверстий, точки-пересечения
+осей). Три вещи, которые здесь важны и каждая проверена, а не предположена:
+
+1. `outline`/`holes` ОСТАЛИСЬ и не изменились ни на байт. Обратный ход
+   (decompile/lift.py::_lift_ceiling -> materialize) эмитирует именно их;
+   замена разомкнула бы круг на каждом потолке каждого разобранного здания.
+   Взаимное исключение — типизированный KIR-P007 в компиляторе, ровно как у
+   place_family; схема «одно из двух» не выражает.
+2. ДУГА — НЕ УКРАШЕНИЕ. Ломаная `outline` не может выразить закруглённый
+   край: она даёт ДРУГУЮ форму, а не приближение. Это тот же класс, что
+   «плоский потолок вместо наклонного» абзацем выше.
+3. ОСЬ ВЕРСИЙ У КОНТУРНОЙ ВЕТКИ ТА ЖЕ, ЧТО У ПРЯМОЙ, И ЭТО ПЕРЕПРОВЕРЕНО
+   09.08 по эталонным сборкам, а не по памяти: в
+   revit_all_main_versions_api_x64/2021.0.0/.../RevitAPI.xml тип
+   `T:Autodesk.Revit.DB.Ceiling` ЕСТЬ, а членов `M:...Ceiling.*` — НОЛЬ
+   (в 2022 и 2026 там обе перегрузки `Ceiling.Create`); строки `NewCeiling`
+   нет ни в одном из XML и ни в одном из RevitAPI.dll 2021/2022/2026.
+   Значит у потолка на 2021 нет ни `IList<CurveLoop>`-пути, ни legacy-пути
+   `CurveArray` — В ОТЛИЧИЕ от create_floor_by_contour, который на 2021
+   уходит на doc.Create.NewFloor(CurveArray, ...). Поэтому контурная ветка
+   потолка НЕ получает `emit_curvearray_cs`: на 2021 отказывает вся
+   операция целиком (KIR-E003), до всякого разбора формы.
 """
 from __future__ import annotations
 
@@ -83,10 +108,10 @@ from kukai.ir.registry_base import *  # noqa: F401,F403 (OpSpec/ParamSpec/...)
 #: члена, потому что замер даёт ровно два: .Left/.Right/.Landing/.Run/.None/
 #: .Center не компилируются ни на одной из шести версий, хотя «левое/правое»
 #: — первое, что приходит в голову и что написал бы человек по памяти.
-RAILING_PLACEMENT_MEMBERS = freeze_registry_mapping({
+RAILING_PLACEMENT_MEMBERS = {
     "treads": "Treads",
     "stringer": "Stringer",
-})
+}
 
 OPS = [
     OpSpec(
@@ -95,8 +120,32 @@ OPS = [
             result=RESULT_ELEMENT,
             family="authoring",
             params=(
-                ParamSpec("outline", "pts", required=True),   # >=3 [x,y] мм
+                # РОВНО ОДНО ИЗ ДВУХ: `outline` (прямая ломаная) ЛИБО
+                # `contour` (типизированный эскиз CONTOUR). Поэтому `outline`
+                # перестал быть required НА УРОВНЕ СХЕМЫ: обязательность
+                # стала ВЗАИМНОЙ, а взаимную схема выразить не может — она
+                # живёт в компиляторе типизированным KIR-P007, тем же приёмом
+                # и по той же причине, что у place_family (xyz против
+                # p0_mm/p1_mm). Оба поля сразу неоднозначны («какое из двух
+                # описаний формы истинно?»), ни одного — операция без формы;
+                # угадать за автора значит построить не тот потолок молча.
+                #
+                # ЗАМЕНЫ НЕ ПРОИЗОШЛО, И ЭТО РЕШЕНИЕ, А НЕ ОСТОРОЖНОСТЬ:
+                # обратный ход (decompile/materialize.py) эмитирует
+                # `outline`/`holes`, и если бы прямые точки исчезли, круг
+                # разомкнулся бы на каждом потолке каждого разобранного
+                # здания.
+                ParamSpec("outline", "pts"),   # >=3 [x,y] мм
                 ParamSpec("holes", "pts_list"),
+                # CONTOUR (v2.0, 17.07): rect/l/poly с малыми дугами, до 8
+                # отверстий, точки — литералы или пересечения осей. Дуга в
+                # плане потолка прямыми точками невыразима ВООБЩЕ: `outline`
+                # — ломаная, и закруглённый край подвесного потолка под ней
+                # становится многоугольником, то есть ДРУГОЙ формой, а не
+                # приближением. Отверстия у региона свои, поэтому `holes`
+                # вместе с `contour` — тоже KIR-P007: два описания проёмов
+                # означали бы, что одно из них молча выброшено.
+                ParamSpec("contour", "region"),
                 ParamSpec("level", "sel", required=True,
                           ref_kinds=(ReferenceKind.LEVEL,)),
                 ParamSpec("type", "sel"),
@@ -117,7 +166,8 @@ OPS = [
                   "по построению — типизированный отказ KIR-E003, пути "
                   "создания потолка в API нет ни на одной версии); "
                   "level binding == resolved level (topology); "
-                  "bbox XY extents == outline extents (±50mm); "
+                  "bbox XY extents == outline or contour extents (±50mm, arc "
+                  "extremes included, computed at compile time); "
                   "height offset param == height_offset_mm when given (±1mm)"),
             writes_model=True,
             grounded=(("level", "levels", True),

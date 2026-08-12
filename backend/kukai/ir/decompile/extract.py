@@ -20,7 +20,7 @@ from typing import Any, Awaitable, Callable, Iterator, Mapping
 
 from kukai.ir.revit_read_helpers import ELEMENT_LEVEL_HELPERS_CS
 
-from .census_contract import NO_CATEGORY_KEY
+from .census import NO_CATEGORY_KEY
 from .geometry_store import GEOMETRY_HELPER_CS, parse_geometry
 from .schema import (
     EXTRACT_BATCH,
@@ -35,6 +35,7 @@ from .schema import (
     CategoryStatus,
     L0Dialect,
     L0Document,
+    HostSource,
     L0Element,
     L0SchemaError,
     LinkSummary,
@@ -990,7 +991,17 @@ foreach (Autodesk.Revit.DB.Architecture.Room __room in __roomPage)
 {
     var __roomRow = new Dictionary<string, object>();
     __roomRow["id"] = __room.Id.ToString();
-    __roomRow["name"] = __room.Name ?? "";
+    // Room.Name is a display composite (name + number), not ROOM_NAME.
+    // Read the two independent built-in parameters so reverse compilation
+    // never bakes a display label back into the authored name.
+    Parameter __roomName = __room.get_Parameter(BuiltInParameter.ROOM_NAME);
+    Parameter __roomNumber = __room.get_Parameter(BuiltInParameter.ROOM_NUMBER);
+    if (__roomName == null || __roomNumber == null)
+        throw new InvalidOperationException(
+            "Room " + __room.Id.ToString() +
+            " has no ROOM_NAME/ROOM_NUMBER parameter");
+    __roomRow["name"] = __roomName.AsString() ?? "";
+    __roomRow["number"] = __roomNumber.AsString() ?? "";
     __roomRow["level_id"] = null;
     __roomRow["level_name"] = null;
     try
@@ -1401,6 +1412,123 @@ def _csharp_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
+@dataclass(frozen=True, slots=True)
+class _HostReader:
+    """Одна ветка чтения хозяина. Таблица — ОДИН механизм, а не список случаев.
+
+    ``id_expr`` — выражение от переменной ``__h`` (элемент, уже приведённый к
+    ``cs_type``), дающее ``ElementId``. Всё остальное — рамка, общая для всех
+    веток и написанная ОДИН раз в :func:`_host_readers_cs`: приведение, отсев
+    невалидного id, запись пары ``host_id``/``host_source``, глушение
+    исключения. Добавить класс — значит добавить СТРОКУ, а не ветку.
+
+    Имя класса пишется ПОЛНОСТЬЮ. Тело извлечения оборачивают разные
+    обёртки (ворота — `wrap_user_code`, живой ход — обёртка моста), и
+    полагаться на то, что в каждой из них объявлен `using
+    Autodesk.Revit.DB.Architecture`, значит поставить компиляцию в
+    зависимость от файла, которого этот генератор не видит.
+    """
+
+    source: HostSource
+    cs_type: str
+    id_expr: str
+
+
+# ЗАМЕР, А НЕ ПАМЯТЬ (09.08, компиляция на :52412 против настоящих сборок
+# 2021-2026 — арбитр здесь компилятор, а не RevitAPI.xml). Кандидаты добыты
+# переписью всех шести RevitAPI.xml по членам с «Host» в имени; ниже — те, чей
+# класс НЕ наследует `FamilyInstance` (то есть старая ветка их не видела) и
+# чья категория входит в `EXTRACT_CATEGORIES`:
+#
+#   WallFoundation.WallId                → 6/6   OST_StructuralFoundation
+#   Railing.HostId (+ HasHost)           → 6/6   OST_StairsRailing
+#   Opening.Host                         → 6/6   OST_SWallRectOpening,
+#                                                OST_FloorOpening,
+#                                                OST_RoofOpening,
+#                                                OST_ShaftOpening
+#   InsulationLiningBase.HostElementId   → 6/6   OST_PipeInsulations,
+#                                                OST_DuctInsulations,
+#                                                OST_DuctLinings
+#     (PipeInsulation/DuctInsulation/DuctLining наследуют этот базовый класс —
+#      проверено компиляцией 6/6, поэтому ОДНА строка закрывает три категории)
+#
+# ЧТО ЗАМЕРЕНО И НАМЕРЕННО НЕ ВЗЯТО:
+#   * `Panel` и `Mullion` наследуют `FamilyInstance` 6/6 — витражи читались
+#     верно и до волны (в корпусе OST_CurtainWallMullions: 119 573 элемента,
+#     0 пустых host_id). Отдельная ветка была бы мёртвой.
+#   * `Stairs.MultistoryStairsId` 6/6 — но это ВЛАДЕЛЕЦ-сборка, а не хозяин:
+#     лестница не «висит на» многоэтажной лестнице, она в неё ВХОДИТ. Класть
+#     это в `host_id` значило бы поселить в одном поле два разных отношения —
+#     ровно то, от чего поле и лечится. Отдельное поле — отдельная волна.
+#   * `Wall` в роли витражной панели хозяина НЕ ИМЕЕТ ВОВСЕ: `__w.Host` даёт
+#     CS1061 на всех шести версиях. Это ЗАМЕРЕННОЕ ОТСУТСТВИЕ, а не пробел
+#     нашего чтения, и оно объясняет 14 251 панель с пустым host_id в корпусе.
+#   * `WallSweep.GetHostIds`, `Rebar/AreaReinforcement/PathReinforcement`,
+#     `LoadBase`, `BuildingPad`, `FabricArea/FabricSheet`, `Toposolid` (3/6,
+#     2024+) читаемого хозяина имеют, но их категорий нет в
+#     `EXTRACT_CATEGORIES` — там пробел ЧТЕНИЯ, а не пробел этой таблицы.
+_HOST_READERS: tuple[_HostReader, ...] = (
+    # FamilyInstance стоит ПЕРВЫМ и на общих правах. До волны он был
+    # единственным и потому неявным; строка в таблице делает его источник
+    # НАЗВАННЫМ — иначе `host_source` у двери означал бы «не мерили».
+    _HostReader(
+        HostSource.FAMILY_INSTANCE, "Autodesk.Revit.DB.FamilyInstance",
+        "__h.Host == null ? ElementId.InvalidElementId : __h.Host.Id"),
+    _HostReader(
+        HostSource.WALL_FOUNDATION, "Autodesk.Revit.DB.WallFoundation",
+        "__h.WallId"),
+    # `HasHost` спрошен ПЕРЕД `HostId` не для красоты: у свободно стоящего
+    # ограждения `HostId` возвращает InvalidElementId, и без отсева ниже поле
+    # получило бы строку "-1" — ЛОЖНОГО хозяина, что хуже пустого поля.
+    _HostReader(
+        HostSource.RAILING, "Autodesk.Revit.DB.Architecture.Railing",
+        "__h.HasHost ? __h.HostId : ElementId.InvalidElementId"),
+    _HostReader(
+        HostSource.OPENING, "Autodesk.Revit.DB.Opening",
+        "__h.Host == null ? ElementId.InvalidElementId : __h.Host.Id"),
+    _HostReader(
+        HostSource.INSULATION_LINING,
+        "Autodesk.Revit.DB.InsulationLiningBase", "__h.HostElementId"),
+)
+
+
+def _indent(block: str, spaces: int) -> str:
+    pad = " " * spaces
+    return "\n".join(
+        pad + line if line.strip() else line for line in block.split("\n"))
+
+
+def _host_readers_cs() -> str:
+    """Собрать блок чтения хозяина — общий для ВСЕХ 77 категорий.
+
+    Блок не зависит от категории намеренно, и это же условие держат ворота:
+    они компилируют извлечение на трёх категориях на том основании, что от
+    категории зависит только КОЛЛЕКТОР. Читатель, поставленный по категориям,
+    вывел бы остальные 74 из-под ворот.
+    """
+
+    lines = ['__row["host_id"] = null;', '__row["host_source"] = null;']
+    for reader in _HOST_READERS:
+        lines.append(f"""if (__row["host_id"] == null)
+{{
+    try
+    {{
+        var __h = __element as {reader.cs_type};
+        if (__h != null)
+        {{
+            var __hid = {reader.id_expr};
+            if (__hid != null && __hid != ElementId.InvalidElementId)
+            {{
+                __row["host_id"] = __hid.ToString();
+                __row["host_source"] = {_csharp_string(reader.source.value)};
+            }}
+        }}
+    }}
+    catch {{ }}
+}}""")
+    return "\n".join(lines)
+
+
 def build_category_batch_cs(
     category: str,
     *,
@@ -1466,14 +1594,7 @@ foreach (var __element in __page)
         __row["level_id"] = __level.Id.ToString();
         __row["level_name"] = __level.Name ?? "";
     }}
-    __row["host_id"] = null;
-    try
-    {{
-        var __familyInstance = __element as FamilyInstance;
-        if (__familyInstance != null && __familyInstance.Host != null)
-            __row["host_id"] = __familyInstance.Host.Id.ToString();
-    }}
-    catch {{ }}
+{_indent(_host_readers_cs(), 4)}
     __PutParams(__element, __row);
     __PutGroupingState(__element, __row);
     __PutGeometry(__element, __row);
@@ -1963,7 +2084,9 @@ def _parse_probe(value: Any) -> tuple[int, tuple[_Scope, ...]]:
     return total, tuple(parsed)
 
 
-#: Одиннадцать параметров сечения, читаемых с квитанцией. Список ЗАКРЫТ:
+#: Шестнадцать параметров сечения, читаемых с квитанцией (было написано
+#: «одиннадцать» — комментарий отстал от кортежа на пять имён, пересчитано
+#: 11.08.2026 прямо по нему). Список ЗАКРЫТ:
 #: страница, не приславшая строку по каждому из них, отвергается — иначе
 #: «сечения нет» снова станет неотличимо от «перестали спрашивать».
 SECTION_PARAM_NAMES: tuple[str, ...] = (

@@ -19,8 +19,10 @@ L0, разбор 18 МБ бокового индекса, лифт, свёртк
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from kukai.ir.decompile import pipeline as pipe
@@ -39,6 +41,7 @@ class LoopNotStarvedTests(unittest.TestCase):
         "name_document": "именование",
         "verify_document": "verify",
         "build_passport": "паспорт",
+        "_persist_core_artifacts": "сериализация артефактов",
         "build_dependency_manifest": "манифест зависимостей",
         "reconcile_census": "перепись",
     }
@@ -97,55 +100,131 @@ class LoopNotStarvedTests(unittest.TestCase):
         self.assertNotIn(threading.main_thread().name, seen)
 
     def test_the_loop_keeps_ticking_while_a_heavy_step_blocks(self) -> None:
-        """Прямая проверка смысла: цикл жив, пока тяжёлый шаг занят.
+        """Цикл причинно освобождает тяжёлый шаг, а не просто успевает рядом.
 
-        Тяжёлый шаг подменяется на заведомо блокирующий (полсекунды сна в
-        ПОТОКЕ, не await). Часовой тикает каждые 10 мс. Если шаг поедет по
-        циклу событий, часовой не тикнет ни разу.
+        Подменённая свёртка ждёт сигнал, который может выставить ТОЛЬКО
+        часовой в event loop после нескольких своих тиков. Если свёртка
+        случайно вернётся в loop thread, часовой не сможет её освободить и
+        сработает аварийный таймаут worker-а. Это проверяет тот же инвариант,
+        но не делает состояние системного планировщика частью контракта.
         """
         original = pipe.fold_document
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_timed_out = threading.Event()
+        worker_threads: list[int] = []
 
         def slow(*args, **kwargs):
-            threading.Event().wait(0.5)
+            worker_threads.append(threading.get_ident())
+            worker_started.set()
+            if not release_worker.wait(2.0):
+                worker_timed_out.set()
             return original(*args, **kwargs)
 
-        marks: list[float] = []
+        ticks_while_worker_waited: list[int] = []
 
         async def scenario():
             stop = asyncio.Event()
+            loop_thread = threading.get_ident()
 
             async def sentry():
-                loop = asyncio.get_running_loop()
                 while not stop.is_set():
-                    await asyncio.sleep(0.01)
-                    marks.append(loop.time())
+                    await asyncio.sleep(0)
+                    if (worker_started.is_set()
+                            and not release_worker.is_set()):
+                        ticks_while_worker_waited.append(
+                            threading.get_ident())
+                        if len(ticks_while_worker_waited) >= 10:
+                            release_worker.set()
 
             watch = asyncio.ensure_future(sentry())
             try:
                 with TemporaryDirectory() as tmp:
-                    return await pipe.run_decompile(
+                    result = await pipe.run_decompile(
                         FakePipelineBridge(), out_dir=tmp,
                         change_stamp="pipeline-mini-v1")
+                    return result, loop_thread
             finally:
                 stop.set()
+                # Не оставлять worker до собственного таймаута, даже если
+                # pipeline завершился исключением до причинного сигнала.
+                release_worker.set()
                 await watch
 
         pipe.fold_document = slow
         try:
-            result = asyncio.run(scenario())
+            result, loop_thread = asyncio.run(scenario())
         finally:
             pipe.fold_document = original
 
         self.assertTrue(result.ok, msg=result.to_dict())
-        self.assertGreater(len(marks), 5, "часовой не тикнул почти ни разу")
-        # Мерится САМАЯ ДЛИННАЯ пауза между тиками, а не их число: сумма тиков
-        # растёт за счёт спокойных участков прогона и прячет ровно то, что
-        # ищем — один длинный провал. Шаг подменён на блокирующие 0.5 с;
-        # порог 0.3 с ловит его и не срабатывает на дрожании планировщика.
-        gaps = [b - a for a, b in zip(marks, marks[1:])]
-        self.assertLess(
-            max(gaps), 0.3,
-            f"цикл событий стоял {max(gaps):.2f} с, пока тяжёлый шаг работал")
+        self.assertTrue(worker_threads, "свёртка не вызвалась")
+        self.assertNotEqual(worker_threads[0], loop_thread)
+        self.assertFalse(
+            worker_timed_out.is_set(),
+            "event loop не освободил блокирующую свёртку")
+        self.assertEqual(len(ticks_while_worker_waited), 10)
+        self.assertEqual(set(ticks_while_worker_waited), {loop_thread})
+
+    def test_core_artifact_offload_preserves_exact_bytes_and_names(self) -> None:
+        passport = {
+            "doc_name": "мини-здание",
+            "revit_version": "2023",
+            "change_stamp": "stable-v1",
+            "gestalt": "mixed",
+            "stats": {
+                "elements_total": 2,
+                "ops_lifted": 1,
+                "atoms": 1,
+                "floors": 1,
+                "rooms": 0,
+                "apartments": 0,
+            },
+            "verify_summary": {"failed_count": 0, "reversible": True},
+        }
+        tree = {
+            "kind": "building",
+            "name": "Корпус А",
+            "children": [{"kind": "floor", "name": "Этаж 1"}],
+        }
+        named_tree = {
+            "kind": "building",
+            "name": "Именованный корпус",
+            "children": [],
+        }
+
+        def atomic_json_bytes(value):
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            passport_md = pipe._persist_core_artifacts(
+                out, passport, tree, {"tree": named_tree})
+
+            self.assertEqual(
+                {path.name for path in out.iterdir()},
+                {"passport.json", "passport.md", "tree.json", "named.json"},
+            )
+            self.assertEqual(
+                (out / "passport.json").read_bytes(),
+                pipe.passport_bytes(passport),
+            )
+            self.assertEqual(
+                (out / "passport.md").read_bytes(),
+                pipe._passport_markdown(passport).encode("utf-8"),
+            )
+            self.assertEqual(
+                (out / "tree.json").read_bytes(), atomic_json_bytes(tree))
+            self.assertEqual(
+                (out / "named.json").read_bytes(),
+                atomic_json_bytes(named_tree),
+            )
+            self.assertEqual(passport_md, out / "passport.md")
 
 
 if __name__ == "__main__":

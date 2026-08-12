@@ -1235,8 +1235,12 @@ def _program_shape(
                                 (Poly((rect,), role="solid"),),
                                 approx=(ApproxReason.FOOTPRINT_FROM_BBOX,)), None
 
+        # wave/mep-electrical: заготовки рисуются той же линией, что труба и
+        # воздуховод — на плане они и есть трасса; бит `IsPlaceholder` в
+        # чертёж не превращается.
         if name in ("create_beam", "create_pipe", "create_duct",
-                    "create_cable_tray", "create_conduit"):
+                    "create_cable_tray", "create_conduit",
+                    "create_pipe_placeholder", "create_duct_placeholder"):
             p0 = _pt(op["p0_mm"])
             p1 = _pt(op["p1_mm"])
             if math.dist(p0, p1) < MIN_EDGE_MM:
@@ -1244,6 +1248,17 @@ def _program_shape(
             layer = Layer.MEP if name != "create_beam" else Layer.LINE
             return DrawnElement(oid, name, layer,
                                 (Path((p0, p1), role="thin"),)), None
+
+        # Гибкий участок — ЛОМАНАЯ, а не отрезок. Рисовать его концами значило
+        # бы показать на плане трассу, которой в модели нет: ровно та подмена,
+        # из-за которой у операции свой род параметра.
+        if name in ("create_flex_duct", "create_flex_pipe"):
+            pts = tuple(_pt(point) for point in op["path"])
+            if all(math.dist(pts[k], pts[k + 1]) < MIN_EDGE_MM
+                   for k in range(len(pts) - 1)):
+                return None, OmitReason.DEGENERATE
+            return DrawnElement(oid, name, Layer.MEP,
+                                (Path(pts, role="thin"),)), None
 
         if name == "place_family":
             if "xyz" in op and op["xyz"] is not None:
@@ -1260,6 +1275,22 @@ def _program_shape(
             return None, OmitReason.NO_GEOMETRY
 
         if name == "create_stairs":
+            # Винтовой марш (09.08): у него нет отрезка ВООБЩЕ, и рисовать
+            # его прямой линией значило бы показать не ту лестницу. Дуга
+            # выбирается точками той же функцией, что и дуговая стена, — и
+            # так же честно помечается ARC_SAMPLED.
+            spiral = op.get("spiral")
+            if isinstance(spiral, Mapping):
+                a0 = math.radians(float(spiral["start_angle_deg"]))
+                span = math.radians(float(spiral["included_angle_deg"]))
+                a1 = a0 - span if spiral.get("clockwise") else a0 + span
+                pts = _sample_arc(
+                    (float(spiral["center_mm"][0]),
+                     float(spiral["center_mm"][1])),
+                    float(spiral["radius_mm"]), (1.0, 0.0), (0.0, 1.0), a0, a1)
+                return DrawnElement(
+                    oid, name, Layer.STAIR, (Path(pts, role="line"),),
+                    approx=(ApproxReason.ARC_SAMPLED,)), None
             p0 = _pt(op["p0_mm"])
             p1 = _pt(op["p1_mm"])
             if math.dist(p0, p1) < MIN_EDGE_MM:

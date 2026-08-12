@@ -421,7 +421,7 @@ class NegativeGraph(unittest.TestCase):
         segs = [{"from": "N1", "to": "N2"}, {"from": "N3", "to": "N4"}]
         out = compile_program(_sys(nodes, segs), snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
-        d = [x for x in out.diagnostics if x.code == "KIR-T003"][0]
+        d = [x for x in out.diagnostics if x.code == "KIR-T004"][0]
         self.assertIn("несвязная", d.message_ru)
 
     def test_zero_segment_refused(self):
@@ -444,7 +444,7 @@ class NegativeGraph(unittest.TestCase):
         segs = [{"from": "H", "to": f"L{k}"} for k in range(4)]
         out = compile_program(_sys(nodes, segs), snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
-        self.assertIn("KIR-T003", [d.code for d in out.diagnostics])
+        self.assertIn("KIR-T004", [d.code for d in out.diagnostics])
 
     def test_duplicate_edge_and_self_loop(self):
         nodes = [{"id": "N1", "xyz_mm": [0, 0, 0]}, {"id": "N2", "xyz_mm": [1000, 0, 0]}]

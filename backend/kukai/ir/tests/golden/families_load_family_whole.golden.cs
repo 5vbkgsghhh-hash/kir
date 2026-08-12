@@ -40,8 +40,11 @@ using (Transaction __t = new Transaction(doc, "KIR: загрузить семе�
             catch (Exception __ex_F1) { __t.RollBack(); return __Refuse("F1", "LoadFamily: " + __ex_F1.Message); }
             if (!__loaded_F1 || __fam_F1 == null) { __t.RollBack(); return __Refuse("F1", "LoadFamily не загрузил семейство"); }
         }
-        __el_F1 = __fam_F1.GetFamilySymbolIds().Select(__id => doc.GetElement(__id) as FamilySymbol)
-            .Where(__x => __x != null).OrderBy(__x => __x.Name, StringComparer.Ordinal)
+        __el_F1 = new FilteredElementCollector(doc).OfClass(typeof(FamilySymbol))
+            .Cast<FamilySymbol>()
+            .Where(__x => __x != null && __x.Family != null
+                          && __x.Family.Id.ToString() == __fam_F1.Id.ToString())
+            .OrderBy(__x => __x.Name, StringComparer.Ordinal)
             .ThenBy(__x => __x.Id.ToString(), StringComparer.Ordinal).FirstOrDefault();
         if (__el_F1 == null) { __t.RollBack(); return __Refuse("F1", "семейство не содержит ни одного типоразмера, который резолвится"); }
         if (!__el_F1.IsActive) { __el_F1.Activate(); doc.Regenerate(); }

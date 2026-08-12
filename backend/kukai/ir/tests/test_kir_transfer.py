@@ -543,7 +543,7 @@ class RoundTripTests(_Base):
         async def fake_send(ws, payload):
             sent.append(payload)
 
-        async def fake_door(args, llm_client, bridge, query_id=""):
+        async def fake_door(args, llm_client, bridge, query_id="", **_identity):
             handed.append(args["program"]["ops"])
             return {"ok": True, "created": len(args["program"]["ops"])}
 

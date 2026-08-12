@@ -121,8 +121,20 @@ _ALLOWED_PARAMETER_GEOMETRY = {
 
 
 def _checks_of(program: dict) -> list[tuple[str, WitnessCheck]]:
-    """[(имя опа, WitnessCheck)] для всех опов программы."""
+    """[(имя опа, WitnessCheck)] для всех опов программы.
 
+    Программа, чьи опы на VERSION типизированно ОТКАЗЫВАЮТ, свидетелей на этой
+    версии не даёт вовсе — и это не пробел, а правильный ответ операции. До
+    09.08 корпус знал только нижнюю границу версии (`__min_ver__`, потолок с
+    2022); волна нагрузок принесла верхнюю (`__max_ver__`: свободная нагрузка
+    убрана Autodesk из API в 2024), и без её учёта отказ прилетал бы сюда
+    исключением, то есть выглядел бы как поломка правила честности осей.
+    """
+
+    if program.get("__min_ver__", "0000") > VERSION:
+        return []
+    if program.get("__max_ver__", "9999") < VERSION:
+        return []
     prog = {k: v for k, v in program.items() if not k.startswith("__")}
     grounded = ground_mod.ground(_parse_and_check(prog), GROUND_SNAPSHOT)
     out: list[tuple[str, WitnessCheck]] = []

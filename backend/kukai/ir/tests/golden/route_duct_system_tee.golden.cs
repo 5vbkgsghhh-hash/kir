@@ -158,15 +158,21 @@ using (Transaction __t = new Transaction(doc, "KIR: тройник ОВ прит
                     __d1 > 5 || __t1 < -5 || __t1 > (5.0))
                   __post.Add("SYS1: segment 2 endpoints (geometry)"); } }
             { try { var __dp = __seg_SYS1_0.get_Parameter(BuiltInParameter.RBS_CURVE_DIAMETER_PARAM);
-                if (__dp == null || Math.Abs(MM(__dp.AsDouble())-(250.0))>0.5)
+                if (__dp == null)
+                  __post.Add("SYS1: segment 0 diameter mismatch — у элемента нет параметра диаметра: сечение не круглое, а диаметр применим только к круглому (semantic)");
+                else if (Math.Abs(MM(__dp.AsDouble())-(250.0))>0.5)
                   __post.Add("SYS1: segment 0 diameter (semantic)"); }
               catch { __post.Add("SYS1: segment 0 diameter unreadable (semantic)"); } }
             { try { var __dp = __seg_SYS1_1.get_Parameter(BuiltInParameter.RBS_CURVE_DIAMETER_PARAM);
-                if (__dp == null || Math.Abs(MM(__dp.AsDouble())-(250.0))>0.5)
+                if (__dp == null)
+                  __post.Add("SYS1: segment 1 diameter mismatch — у элемента нет параметра диаметра: сечение не круглое, а диаметр применим только к круглому (semantic)");
+                else if (Math.Abs(MM(__dp.AsDouble())-(250.0))>0.5)
                   __post.Add("SYS1: segment 1 diameter (semantic)"); }
               catch { __post.Add("SYS1: segment 1 diameter unreadable (semantic)"); } }
             { try { var __dp = __seg_SYS1_2.get_Parameter(BuiltInParameter.RBS_CURVE_DIAMETER_PARAM);
-                if (__dp == null || Math.Abs(MM(__dp.AsDouble())-(250.0))>0.5)
+                if (__dp == null)
+                  __post.Add("SYS1: segment 2 diameter mismatch — у элемента нет параметра диаметра: сечение не круглое, а диаметр применим только к круглому (semantic)");
+                else if (Math.Abs(MM(__dp.AsDouble())-(250.0))>0.5)
                   __post.Add("SYS1: segment 2 diameter (semantic)"); }
               catch { __post.Add("SYS1: segment 2 diameter unreadable (semantic)"); } }
         // connectivity witness SYS1
@@ -200,6 +206,18 @@ using (Transaction __t = new Transaction(doc, "KIR: тройник ОВ прит
             if (__reachedSegs < 3)
                 __post.Add("SYS1: network not fully connected (topology)");
         }
+            { var __lvp = __seg_SYS1_0.get_Parameter(BuiltInParameter.RBS_START_LEVEL_PARAM);
+              if (__lvp == null || __lvp.AsElementId() == null
+                  || __lvp.AsElementId().ToString() != "42")
+                __post.Add("SYS1: segment 0 level binding (topology)"); }
+            { var __lvp = __seg_SYS1_1.get_Parameter(BuiltInParameter.RBS_START_LEVEL_PARAM);
+              if (__lvp == null || __lvp.AsElementId() == null
+                  || __lvp.AsElementId().ToString() != "42")
+                __post.Add("SYS1: segment 1 level binding (topology)"); }
+            { var __lvp = __seg_SYS1_2.get_Parameter(BuiltInParameter.RBS_START_LEVEL_PARAM);
+              if (__lvp == null || __lvp.AsElementId() == null
+                  || __lvp.AsElementId().ToString() != "42")
+                __post.Add("SYS1: segment 2 level binding (topology)"); }
         if (__post.Count > 0)
         {
             __t.RollBack();

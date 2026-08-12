@@ -46,12 +46,60 @@ from typing import Any, Optional
 from kukai.ir import relate
 from kukai.ir.diag import Diagnostic, TYPE_BAD_TYPE, TYPE_BOUNDS, TYPE_GEOM_RELATION
 from kukai.ir.emit_utils import is_finite_number
-from kukai.ir.geom import _dist, _seg_intersect, check_holes_relation
+from kukai.ir.geom import (
+    MAX_HOLES,
+    MAX_RING_POINTS,
+    MIN_RING_AREA_MM2,
+    MIN_RING_POINTS,
+    _dist,
+    _seg_intersect,
+    check_holes_relation,
+)
 
 _EDGE_TOL = 1.0
-_MAX_BULGE = 1.5
-_MIN_AREA = 1e4
-_ARC_SAMPLES = 8
+
+#: Верхняя граница языка для DXF bulge. Публичное имя читает и обратный ход:
+#: приватная копия здесь позволяла лифтеру принять дугу, которую forward затем
+#: отвергал бы. Значение сохранено; его происхождение пока назначенное, а не
+#: измеренное ограничение Revit.
+MAX_ARC_BULGE = 1.5
+ARC_SAMPLES = 8
+
+#: ГРАНИЦА ЯЗЫКА между прямым ребром и дугой, безразмерная (bulge =
+#: 2·стрелка/хорда). Ниже неё дуга НЕ ВЫРАЖАЕТСЯ: прямой ход отвергает
+#: авторский bulge (`_validate_shape`), обратный не записывает дугу
+#: (`lift._bulge_from_midpoint`). Один вопрос — один ответ; до 10.08.2026
+#: число стояло голым литералом по обе стороны хода, и разъехавшись они дали
+#: бы лифтеру право сочинить программу, которую компилятор тут же отвергнет.
+#: НАЗНАЧЕНО, не замерено. Замер рядом есть, но он про другое и это важно не
+#: спутать: 28.07 сверка 3051 дуги двух разборов дала худшую невязку
+#: обратного хода 2.4e-8 мм (`lift._ARC_BULGE_TOL_MM`) — то есть точность
+#: пересчёта, а не порог, с которого дуга считается дугой.
+MIN_ARC_BULGE = 1e-6
+
+#: ЗАЩИТНАЯ СЕТКА ЭМИССИИ, не граница языка. Отвечает на вопрос «рисовать
+#: `Line.CreateBound` или `Arc.Create`» и стоит на три порядка ниже
+#: `MIN_ARC_BULGE` НАМЕРЕННО: полоса (1e-9, 1e-6) недостижима с обеих сторон
+#: — прямой ход её отвергает, обратный туда не пишет, — поэтому сетка ловит
+#: только вычисленный изнутри bulge (макро-преобразование, тело вращения).
+#: Ставить её на уровень границы языка значило бы делить на почти-ноль в
+#: `_arc_geometry`. Семь копий этого числа в трёх модулях (contour,
+#: opening_emit, struct_emit) решали, ПРЯМУЮ или ДУГУ построит Revit; с
+#: 10.08.2026 копия одна.
+STRAIGHT_BULGE_EPS = 1e-9
+
+#: Сколько знаков после запятой печатают `emit_loop_cs`/`emit_curvearray_cs`.
+#: Число стояло литералом `round(..., 2)` в шести местах и было НЕНАХОДИМО:
+#: волна тел выводит из него собственную погрешность границы, а вывод из
+#: числа, у которого нет имени, разъезжается с оригиналом на первой правке
+#: (ровно 103 «голых литерала в сравнении» насчитал bounds_audit 31.07).
+_EMIT_DECIMALS = 2
+
+#: КВАНТ ЭМИССИИ КООРДИНАТЫ, мм. Полное следствие `_EMIT_DECIMALS`: точка,
+#: напечатанная с двумя знаками, отстоит от идеальной не дальше половины
+#: кванта по каждой оси. Волна тел складывает его с `VertexTolerance` Revit,
+#: получая ПОЛНУЮ погрешность границы построенного тела.
+EMIT_COORD_QUANTUM_MM = 10.0 ** (-_EMIT_DECIMALS)
 
 #: `KIR-G105` (`GRID_ANCHOR_UNRESOLVED`) ВЫВЕДЕН ИЗ УПОТРЕБЛЕНИЯ 04.08.2026.
 #:
@@ -90,6 +138,22 @@ def resolve_anchor(a, grids_pool: list, oid, field: str, diags: list) -> Optiona
     """
     if anchor_is_literal(a):
         return [float(a[0]), float(a[1])]
+    # ВТОРОЕ СЕМЕЙСТВО УЗЛОВ ЗДЕСЬ НЕ ПРИНИМАЕТСЯ, И ПРИЧИНА НАЗВАНА (09.08).
+    # Адрес от элемента читает не снапшот, а уже заземлённые опы программы, а
+    # регион опускается в рёбра из `validate_region`, которому программу не
+    # передают. Сказать «неизвестная форма точки» значило бы послать автора
+    # чинить синтаксис вместо того, чтобы объяснить границу: сегодня форма
+    # верная, а слот — нет.
+    if relate.is_element_address(a):
+        diags.append(Diagnostic(
+            code=TYPE_BAD_TYPE, op_id=oid, field_name=field, got=a,
+            message_ru=(
+                f"{field}: адрес от элемента ({{at_element: ...}}) в углу "
+                f"контура не принимается — контур опускается в рёбра ДО того, "
+                f"как программа заземлена, и числа адресуемого опа здесь ещё "
+                f"неизвестны. Годятся [x,y] мм и адрес от осей "
+                f"{{at_grid:[имя,имя]}}")))
+        return None
     if not isinstance(a, dict) or "at_grid" not in a:
         diags.append(Diagnostic(
             code=TYPE_BAD_TYPE, op_id=oid, field_name=field, got=a,
@@ -146,12 +210,12 @@ def _arc_geometry(p0, p1, bulge: float) -> tuple:
 
 def _sample_arc(p0, p1, bulge: float) -> list:
     """8-chord deterministic approximation for intersection/containment laws."""
-    if abs(bulge) < 1e-9:
+    if abs(bulge) < STRAIGHT_BULGE_EPS:
         return [list(p0), list(p1)]
     (cx, cy), r, a0, sweep = _arc_geometry(p0, p1, bulge)
     pts = []
-    for k in range(_ARC_SAMPLES + 1):
-        a = a0 + sweep * k / _ARC_SAMPLES
+    for k in range(ARC_SAMPLES + 1):
+        a = a0 + sweep * k / ARC_SAMPLES
         pts.append([cx + r * math.cos(a), cy + r * math.sin(a)])
     pts[0], pts[-1] = list(p0), list(p1)   # exact endpoints
     return pts
@@ -172,7 +236,7 @@ def edges_bbox(edges: list) -> tuple:
     tau = 2.0 * math.pi
     for p0, p1, bulge in edges:
         points.extend((p0, p1))
-        if abs(bulge) < 1e-9:
+        if abs(bulge) < STRAIGHT_BULGE_EPS:
             continue
         (cx, cy), radius, start, sweep = _arc_geometry(p0, p1, bulge)
         for angle in (0.0, math.pi / 2.0, math.pi, 3.0 * math.pi / 2.0):
@@ -283,10 +347,16 @@ def _validate_shape(shape: Any, grids_pool, oid, field: str, diags: list) -> Opt
             message_ru=f"{field}: неизвестные поля формы"))
         return None
     raw_pts = shape.get("points_mm")
-    if not isinstance(raw_pts, list) or not (3 <= len(raw_pts) <= 64):
+    # Тот же закон профиля, что у прямого `pts` и у лифтера (объявлен в geom).
+    # КОНТУР написал его своей копией 17.07 («v2 invention») — третий ответ на
+    # один вопрос; с 10.08 ответ один.
+    if not isinstance(raw_pts, list) or not (
+            MIN_RING_POINTS <= len(raw_pts) <= MAX_RING_POINTS):
         diags.append(Diagnostic(
             code=TYPE_BAD_TYPE, op_id=oid, field_name=f"{field}.points_mm",
-            got=raw_pts, message_ru=f"{field}: points_mm — 3..64 точек"))
+            got=raw_pts,
+            message_ru=(f"{field}: points_mm — {MIN_RING_POINTS}.."
+                        f"{MAX_RING_POINTS} точек")))
         return None
     pts = []
     for pi, a in enumerate(raw_pts):
@@ -294,10 +364,12 @@ def _validate_shape(shape: Any, grids_pool, oid, field: str, diags: list) -> Opt
         if r is None:
             return None
         pts.append(r)
-    if len(pts) >= 4 and _dist(pts[0], pts[-1]) < _EDGE_TOL:
+    # Кольцо ПЛЮС повторённая первая точка — то же правило, что в
+    # geom.ring_normalize, и оно обязано быть тем же числом.
+    if len(pts) >= MIN_RING_POINTS + 1 and _dist(pts[0], pts[-1]) < _EDGE_TOL:
         pts = pts[:-1]                       # closure normalization (v1.1 law)
     n = len(pts)
-    if n < 3:
+    if n < MIN_RING_POINTS:
         diags.append(Diagnostic(code=TYPE_BOUNDS, op_id=oid, field_name=field,
                                 message_ru=f"{field}: после нормализации <3 точек"))
         return None
@@ -335,11 +407,11 @@ def _validate_shape(shape: Any, grids_pool, oid, field: str, diags: list) -> Opt
             return None
         if has_bulge:
             b = arc["bulge"]
-            if (not is_finite_number(b) or not (abs(b) <= _MAX_BULGE)
-                    or abs(b) < 1e-6):
+            if (not is_finite_number(b) or not (abs(b) <= MAX_ARC_BULGE)
+                    or abs(b) < MIN_ARC_BULGE):
                 diags.append(Diagnostic(
                     code=TYPE_BOUNDS, op_id=oid, field_name=f"{field}.arcs[{ai}].bulge",
-                    got=b, expected=f"0<|b|<={_MAX_BULGE}",
+                    got=b, expected=f"0<|b|<={MAX_ARC_BULGE}",
                     message_ru=f"{field}: bulge вне диапазона"))
                 return None
             bulges[e] = float(b)
@@ -368,7 +440,7 @@ def _validate_shape(shape: Any, grids_pool, oid, field: str, diags: list) -> Opt
                 message_ru=f"{field}: нулевое ребро {k} (ShortCurveTolerance статически)"))
             return None
     sampled = edges_to_sample_poly(edges)
-    if _shoelace(sampled) < _MIN_AREA:
+    if _shoelace(sampled) < MIN_RING_AREA_MM2:
         diags.append(Diagnostic(code=TYPE_BOUNDS, op_id=oid, field_name=field,
                                 message_ru=f"{field}: вырожденный контур (<0.01 м²)"))
         return None
@@ -398,10 +470,10 @@ def validate_region(region: Any, grids_pool, oid, field: str, diags: list) -> Op
     if outer is None:
         return None
     holes_raw = region.get("holes", [])
-    if not isinstance(holes_raw, list) or len(holes_raw) > 8:
+    if not isinstance(holes_raw, list) or len(holes_raw) > MAX_HOLES:
         diags.append(Diagnostic(code=TYPE_BAD_TYPE, op_id=oid,
                                 field_name=f"{field}.holes",
-                                message_ru=f"{field}: holes — до 8 форм"))
+                                message_ru=f"{field}: holes — до {MAX_HOLES} форм"))
         return None
     holes = []
     for hi, h in enumerate(holes_raw):
@@ -421,38 +493,287 @@ def validate_region(region: Any, grids_pool, oid, field: str, diags: list) -> Op
     return {"outer": outer, "holes": holes}
 
 
+# ── МЕРЫ КАНОНИЧЕСКОГО КОНТУРА (замкнутые формы, всё на компиляции) ──────────
+#
+# ЗАЧЕМ ЗДЕСЬ, А НЕ У ВОЛНЫ ТЕЛ. Дуговая арифметика в пакете живёт ровно в
+# одном месте — `_arc_geometry` выше, — и `edges_bbox` уже показывает форму:
+# мера канонического рёберного списка есть свойство CONTOUR, а не того, кто
+# его потребляет. Второй дом для той же тригонометрии означал бы два ответа на
+# один вопрос ровно в тот день, когда один из них поправят.
+#
+# Каждая мера — ИНТЕГРАЛ ПО ГРАНИЦЕ (Грин), а не сумма по выборке: выборка
+# внесла бы в свидетеля собственную ошибку, которую пришлось бы закладывать в
+# допуск, а закладывать в допуск свою же неаккуратность — это и есть тот
+# «прибор на часть диапазона», который здесь уже стоил дефекта.
+#
+# СВЕРКА (замер 09.08, tests/test_solid.py::ClosedFormsAgreeWithSampling): все
+# четыре меры на восьми формах (включая обход по часовой и две дуги разного
+# знака) сверены с полигональной выборкой в 4000 хорд на дугу. Худшее
+# относительное расхождение 3.15e-8 при СОБСТВЕННОЙ ошибке выборки
+# O(1/N²) = 6.25e-8 — то есть замкнутая форма точнее прибора, которым её
+# проверяли, и наблюдаемое расхождение целиком объясняется прибором.
+
+
+def edge_measures(p0, p1, bulge: float) -> tuple:
+    """Меры ОДНОГО канонического ребра: (площадь, момент, длина, ∫x·ds).
+
+    * ``area``   — вклад ребра в ``(1/2)∮(x dy − y dx)``, ЗНАКОВЫЙ (обход);
+    * ``moment`` — вклад в ``∮ (x²/2) dy = ∬ x dA``, знаковый так же;
+    * ``length`` — длина ребра (для дуги r·|sweep|), всегда >= 0;
+    * ``x_ds``   — ``∫ x ds`` вдоль ребра; для профиля тела вращения это
+      ровно вторая теорема Паппа (боковая поверхность = θ·∫x ds).
+    """
+    if abs(bulge) < STRAIGHT_BULGE_EPS:
+        ax, ay = p0
+        bx, by = p1
+        length = math.hypot(bx - ax, by - ay)
+        return (0.5 * (ax * by - ay * bx),
+                # ∫(x²/2)dy по отрезку: x линеен по t, dy постоянна ⇒
+                # (By−Ay)/2 · ∫₀¹(Ax + t·dx)² dt = (By−Ay)(Ax²+AxBx+Bx²)/6.
+                (by - ay) * (ax * ax + ax * bx + bx * bx) / 6.0,
+                length,
+                length * (ax + bx) / 2.0)
+    (cx, cy), r, a0, sweep = _arc_geometry(p0, p1, bulge)
+    a1 = a0 + sweep
+    s0, s1, c0, c1 = math.sin(a0), math.sin(a1), math.cos(a0), math.cos(a1)
+    # x = cx + r·cos a, y = cy + r·sin a ⇒ x dy − y dx = (cx·r·cos a +
+    # cy·r·sin a + r²) da.
+    area = 0.5 * (r * cx * (s1 - s0) - r * cy * (c1 - c0) + r * r * sweep)
+    # ∫(x²/2)dy = (1/2)∫(cx + r cos a)²·r cos a da, расписано по трём
+    # первообразным: ∫cos = sin, ∫cos² = a/2 + sin2a/4, ∫cos³ = sin − sin³/3.
+    i_cos = s1 - s0
+    i_cos2 = (a1 / 2.0 + math.sin(2.0 * a1) / 4.0) - (a0 / 2.0 + math.sin(2.0 * a0) / 4.0)
+    i_cos3 = (s1 - s1 ** 3 / 3.0) - (s0 - s0 ** 3 / 3.0)
+    moment = 0.5 * (r * cx * cx * i_cos + 2.0 * cx * r * r * i_cos2 + r ** 3 * i_cos3)
+    # ds = r·|da| — по ДЛИНЕ дуги, поэтому пределы упорядочиваются: знак
+    # обхода не должен делать длину отрицательной.
+    alo, ahi = (a0, a1) if a1 >= a0 else (a1, a0)
+    x_ds = r * (cx * (ahi - alo) + r * (math.sin(ahi) - math.sin(alo)))
+    return area, moment, r * abs(sweep), x_ds
+
+
+def loop_measures(edges: list) -> tuple:
+    """Суммы :func:`edge_measures` по замкнутому кольцу."""
+    area = moment = length = x_ds = 0.0
+    for p0, p1, bulge in edges:
+        a, m, l, x = edge_measures(p0, p1, bulge)
+        area += a
+        moment += m
+        length += l
+        x_ds += x
+    return area, moment, length, x_ds
+
+
+def region_measures(region: dict) -> dict:
+    """Меры региона {outer, holes} — площадь, момент, периметр, ∫x·ds.
+
+    Кольцо нормализуется ПО ЗНАКУ СВОЕЙ ПЛОЩАДИ, а не по объявленному
+    порядку точек: CONTOUR принимает обе ориентации (`poly_cw` в сверке —
+    ровно такой случай), и знак площади — единственный факт об обходе,
+    который у нас есть. Проёмы вычитаются; их строгая внутренность и
+    попарная непересекаемость уже доказаны `check_holes_relation`, поэтому
+    вычитание точное, а не приблизительное.
+
+    ``perimeter_mm`` — ПОЛНАЯ длина границы (наружное кольцо + все проёмы):
+    именно она даёт боковую поверхность призмы, а не длина одного кольца.
+
+    ``min_area_mm2`` — площадь самого мелкого ОБЪЯВЛЕННОГО элемента профиля
+    (сам профиль либо мельчайший проём). Это не украшение: свидетель, чей
+    допуск не меньше этой величины, не заметил бы исчезновения этого
+    элемента, и эмиссия обязана на таком отказать, а не подписать.
+    """
+    a_out, m_out, l_out, x_out = loop_measures(region["outer"])
+    sign = 1.0 if a_out >= 0.0 else -1.0
+    area = abs(a_out)
+    moment = m_out * sign
+    perimeter = l_out
+    x_ds = x_out
+    hole_areas = []
+    hole_moments = []
+    for hole in region.get("holes", ()):
+        a_h, m_h, l_h, x_h = loop_measures(hole)
+        s_h = 1.0 if a_h >= 0.0 else -1.0
+        area -= abs(a_h)
+        moment -= m_h * s_h
+        perimeter += l_h
+        x_ds += x_h
+        hole_areas.append(abs(a_h))
+        hole_moments.append(abs(m_h))
+    return {
+        "area_mm2": area,
+        "moment_x_mm3": moment,
+        "perimeter_mm": perimeter,
+        "x_ds_mm2": x_ds,
+        "hole_areas_mm2": hole_areas,
+        "min_area_mm2": min([area] + hole_areas),
+        # Момент самой мелкой объявленной части — та же роль, что у
+        # `min_area_mm2`, но для тела вращения: там объём части есть θ·(её
+        # момент), и брать вместо момента «площадь × габаритный радиус» было
+        # бы оценкой СВЕРХУ, то есть завышенным порогом вакуумности, то есть
+        # пропущенным свидетелем, который не может провалиться.
+        "min_moment_x_mm3": min([abs(moment)] + hole_moments),
+    }
+
+
+def region_bbox(region: dict) -> tuple:
+    """Габарит региона = габарит НАРУЖНОГО кольца (проёмы строго внутри)."""
+    return edges_bbox(region["outer"])
+
+
+def region_has_arc(region: dict) -> bool:
+    """Есть ли в регионе хоть одна дуга (решает судьбу свидетеля площади)."""
+    loops = [region["outer"], *region.get("holes", ())]
+    return any(abs(b) > STRAIGHT_BULGE_EPS
+               for edges in loops for _p0, _p1, b in edges)
+
+
 # ── emit helper (THE template Sonnet waves clone for new sketch-ops) ─────────
 
-def emit_loop_cs(edges: list, var: str, indent: str = "") -> str:
+def _model_pt_cs(x: float, y: float, z: str = "0") -> str:
+    """Точка МОДЕЛЬНОГО пространства: плоскость XY плюс отметка.
+
+    Знаки — `_EMIT_DECIMALS` (слияние 09.08): волна тел вывела из этой же
+    константы `EMIT_COORD_QUANTUM_MM`, которым её свидетель считает
+    погрешность границы, а волна детализации завела этот форматтер против
+    своей базы, где имени ещё не было. Голый `2` здесь означал бы, что вывод
+    одной волны опирается на число, которого в месте печати больше нет.
+    """
+    return f"P({round(x, _EMIT_DECIMALS)}, {round(y, _EMIT_DECIMALS)}, {z})"
+
+
+def _edge_curve_cs(p0, p1, b: float, z: str = "0", pt=None) -> str:
+    """ОДНО ребро канонической формы -> ОДНО выражение Revit-кривой.
+
+    Три сборщика ниже (CurveLoop / CurveArray / List<Curve>) расходятся ровно
+    контейнером и ничем больше: точки у них обязаны быть теми же самыми.
+    Пока тело ребра стояло переписанным в каждом, «те же самые» держалось
+    авторской дисциплиной — а два расхождения из трёх были бы невидимы
+    (габаритный свидетель считает по питоновским рёбрам, то есть согласился
+    бы с любой из копий). Байты обеих прежних функций сохранены: при z="0"
+    строка совпадает посимвольно.
+
+    СЛИЯНИЕ 09.08: число знаков берётся из `_EMIT_DECIMALS`, а не литералом, и
+    обе руки СЛОЖЕНЫ, а не выбрана одна. Этот рефактор свёл тело ребра в одно
+    место; волна тел в тот же день ДАЛА ЧИСЛУ ИМЯ и вывела из него
+    `EMIT_COORD_QUANTUM_MM`, которым её свидетель считает погрешность границы
+    построенного тела. Оставить здесь голый `2` значило бы, что вывод волны
+    опирается на константу, которой в единственном месте печати больше нет, —
+    и разъехались бы они МОЛЧА, потому что C# компилируется одинаково.
+
+    ``pt`` (09.08.2026) — ФОРМАТТЕР ТОЧКИ, ``(x, y) -> C#-выражение``. Заведён
+    не для симметрии: у заливки контур лежит не в плоскости XY модели, а в
+    ПЛОСКОСТИ ВИДА, и Revit отвергает петлю, не параллельную собственной
+    эскизной плоскости вида (RevitAPI.xml, ``FilledRegion.Create``). То есть
+    третьего сборщика с другим ``z`` тут мало — меняется вся система координат,
+    а не отметка. При этом ДУГОВАЯ АРИФМЕТИКА остаётся компиляционной ровно как
+    была (канон CONTOUR, пункт 1): наружу по-прежнему уходят три точки на дугу,
+    просто выражены они через базис вида. Умолчание — прежняя модельная форма,
+    поэтому все существующие вызовы байт-в-байт те же.
+    """
+    fmt = pt if pt is not None else (lambda x, y: _model_pt_cs(x, y, z))
+    if abs(b) < STRAIGHT_BULGE_EPS:
+        return (f"Line.CreateBound("
+                f"{fmt(p0[0], p0[1])}, "
+                f"{fmt(p1[0], p1[1])})")
+    m = bulge_midpoint(p0, p1, b)
+    return (f"Arc.Create("
+            f"{fmt(p0[0], p0[1])}, "
+            f"{fmt(p1[0], p1[1])}, "
+            f"{fmt(m[0], m[1])})")
+
+
+def emit_loop_cs(edges: list, var: str, indent: str = "", pt=None) -> str:
     """CurveLoop assembly from canonical edges: Line for bulge==0,
-    Arc.Create(start, end, mid-on-arc) otherwise — all points precomputed."""
+    Arc.Create(start, end, mid-on-arc) otherwise — all points precomputed.
+
+    ``pt`` — тот же форматтер точки, что у :func:`_edge_curve_cs`; без него
+    петля собирается в плоскости XY модели, как и раньше."""
     out = [f"{indent}CurveLoop {var} = new CurveLoop();"]
     for p0, p1, b in edges:
-        if abs(b) < 1e-9:
-            out.append(f"{indent}{var}.Append(Line.CreateBound("
-                       f"P({round(p0[0], 2)}, {round(p0[1], 2)}, 0), "
-                       f"P({round(p1[0], 2)}, {round(p1[1], 2)}, 0)));")
-        else:
-            m = bulge_midpoint(p0, p1, b)
-            out.append(f"{indent}{var}.Append(Arc.Create("
-                       f"P({round(p0[0], 2)}, {round(p0[1], 2)}, 0), "
-                       f"P({round(p1[0], 2)}, {round(p1[1], 2)}, 0), "
-                       f"P({round(m[0], 2)}, {round(m[1], 2)}, 0)));")
+        out.append(f"{indent}{var}.Append({_edge_curve_cs(p0, p1, b, pt=pt)});")
     return "\n".join(out)
 
 
-def emit_curvearray_cs(edges: list, var: str, indent: str = "") -> str:
-    """2021 legacy path (CurveArray for NewFloor) — same canon, same points."""
+def edge_witness_triples(edges: list) -> list:
+    """Каждое ребро как ``(p0, mid, p1)`` — форма, которую свидетель СРАВНИВАЕТ.
+
+    Почему тройка, а не пара концов: концы одни и те же у прямой и у любой дуги
+    между ними, то есть свидетель по концам не отличил бы построенную дугу от
+    построенной хорды — и стрелка дуги осталась бы недоказанной. Середина
+    считается ТЕМ ЖЕ :func:`bulge_midpoint`, которым дуга и эмитируется (при
+    ``bulge == 0`` он вырождается ровно в середину хорды), а с обратной стороны
+    ей отвечает ``Curve.Evaluate(0.5, true)`` — параметрическая середина и
+    прямой, и дуги окружности. Обе стороны сравнения обязаны считаться по
+    одному закону; здесь закон — «концы плюс середина».
+    """
+    return [(list(p0), bulge_midpoint(p0, p1, b), list(p1))
+            for p0, p1, b in edges]
+
+
+def emit_curvearray_cs(edges: list, var: str, indent: str = "",
+                       z: str = "0") -> str:
+    """2021 legacy path (CurveArray for NewFloor) — same canon, same points.
+
+    ``z`` — C#-ВЫРАЖЕНИЕ отметки плоскости эскиза В МИЛЛИМЕТРАХ, а не число.
+    Понадобилось второму потребителю CurveArray — проёму
+    (``NewOpening(Element, CurveArray, bool)``), чей профиль обязан лежать НА
+    ПЛОСКОСТИ НОСИТЕЛЯ: отметку даёт сам носитель, прочитанный живьём, а ноль
+    был бы тихой неправдой (перекрытие 17-го этажа стоит не там, и профиль
+    просто не пересёк бы его).
+
+    ЕДИНИЦЫ НАЗВАНЫ ЗДЕСЬ НАРОЧНО, И ЭТО СЛЕД СЛИЯНИЯ 09.08.2026. Две ветки
+    пришли к этому помощнику с РАЗНЫМИ конвенциями: каркас клал
+    ``MM(__lv.Elevation)`` (миллиметры, дальше через ``P()``), а проём —
+    ``(__hbb.Min.Z + __hbb.Max.Z) / 2.0`` (внутренние футы, в обход ``U()``).
+    Каждая была верна у себя и обе стали бы неверны здесь: ``P`` прогнал бы
+    футы через ``U()`` вторым разом и посадил бы профиль на высоту порядка
+    отметки, умноженной на 304.8. Дефект был бы НЕВИДИМ офлайн — C#
+    компилируется одинаково, — и вылез бы только на живой модели, на этаже
+    выше нулевого. Поэтому конвенция здесь ОДНА и она миллиметровая, как во
+    всём языке; приводит к ней вызывающий (``MM(...)`` на стороне проёма).
+
+    ``z="0"`` — прежний путь БАЙТ В БАЙТ: ветка 2021 у
+    ``create_floor_by_contour``, единственного потребителя до этого дня.
+    """
     out = [f"{indent}CurveArray {var} = new CurveArray();"]
     for p0, p1, b in edges:
-        if abs(b) < 1e-9:
-            out.append(f"{indent}{var}.Append(Line.CreateBound("
-                       f"P({round(p0[0], 2)}, {round(p0[1], 2)}, 0), "
-                       f"P({round(p1[0], 2)}, {round(p1[1], 2)}, 0)));")
-        else:
-            m = bulge_midpoint(p0, p1, b)
-            out.append(f"{indent}{var}.Append(Arc.Create("
-                       f"P({round(p0[0], 2)}, {round(p0[1], 2)}, 0), "
-                       f"P({round(p1[0], 2)}, {round(p1[1], 2)}, 0), "
-                       f"P({round(m[0], 2)}, {round(m[1], 2)}, 0)));")
+        out.append(f"{indent}{var}.Append({_edge_curve_cs(p0, p1, b, z)});")
     return "\n".join(out)
+
+
+def emit_curve_list_cs(edges: list, var: str, z: str = "0",
+                       indent: str = "") -> str:
+    """``IList<Curve>`` из тех же канонических рёбер — третий контейнер.
+
+    Заведён не для симметрии: ``BeamSystem.Create`` принимает профиль ИМЕННО
+    как ``IList<Curve>`` (замер компиляцией 09.08 на всех шести версиях;
+    ``CurveLoop`` туда не приводится — CS0266 6/6, ``IList<Curve> x =
+    bs.Profile`` тоже), поэтому обойтись двумя прежними сборщиками нельзя.
+
+    ``z`` — C#-ВЫРАЖЕНИЕ, а не число, и это тоже не украшение: у балочной
+    системы профиль обязан лежать в плоскости своего уровня, а отметка уровня
+    известна только в рантайме (``MM(__lv.Elevation)``). Та же подпись, что у
+    ``authoring._loop_pts(pts, name, z="0")``, и то же умолчание — прежние
+    вызовы остаются байт-в-байт.
+    """
+    out = [f"{indent}IList<Curve> {var} = new List<Curve>();"]
+    for p0, p1, b in edges:
+        out.append(f"{indent}{var}.Add({_edge_curve_cs(p0, p1, b, z)});")
+    return "\n".join(out)
+
+
+def edges_vertex_bbox(edges: list) -> tuple:
+    """Габарит ТОЛЬКО по вершинам — сознательно слабее :func:`edges_bbox`.
+
+    Нужен там, где свидетель читает профиль ОБРАТНО ИЗ REVIT покривлённо:
+    ``BeamSystem.Profile`` отдаёт кривые, у которых в C# без тесселяции
+    доступны ровно концы (``GetEndPoint(0/1)``), то есть вершины. Сверять
+    прочитанные вершины с :func:`edges_bbox`, который добавляет кардинальные
+    экстремумы дуг, значило бы обвинять правильно построенную систему ровно
+    на стрелку дуги — тот самый ложный отказ, каким `create_beam` разворачивал
+    верные балки по опорному уровню. Обе стороны сравнения обязаны считаться
+    по одному закону; здесь закон — вершины.
+    """
+    xs = [p[0] for edge in edges for p in (edge[0], edge[1])]
+    ys = [p[1] for edge in edges for p in (edge[0], edge[1])]
+    return min(xs), min(ys), max(xs), max(ys)

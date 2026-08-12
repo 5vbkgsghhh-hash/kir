@@ -111,8 +111,14 @@ class Nahodka1OkOverError(unittest.TestCase):
 
     def test_stale_and_duplicate_and_unclassified(self):
         for payload, want in (
+                # X009, а не X003: подписи «после grounding» здесь нет, значит
+                # дрейф ничем не доказан. Один код на дрейф и на отказ рантайма
+                # разведён 09.08 — см. `test_refusal_identity.OneCodeIsOneWorld`.
                 ({"error": "stale_or_failed", "op_id": "F1",
-                  "message": "тип перекрытия не найден"}, "KIR-X003"),
+                  "message": "тип перекрытия не найден"}, "KIR-X009"),
+                ({"error": "stale_or_failed", "op_id": "F1",
+                  "message": "уровень не найден (модель изменилась после "
+                             "grounding)"}, "KIR-X003"),
                 ({"error": True, "message": "Name is already in use"}, "KIR-X006"),
                 ({"error": True, "message": "неведомая фигня"}, "KIR-X999")):
             res = self._handle(payload)
@@ -122,9 +128,13 @@ class Nahodka1OkOverError(unittest.TestCase):
     def test_success_carries_witness_triple(self):
         res = self._handle({"result": {"ok": True, "F1": {"id": "1001"}}})
         self.assertTrue(res["ok"])
-        self.assertEqual(res["witness"],
-                         {"geometry_ok": True, "semantic_ok": True,
-                          "topology_ok": True})
+        # ТРОЙКА ПРОВЕРЯЕТСЯ ПОИМЁННО, А НЕ РАВЕНСТВОМ СЛОВАРЯ. 10.08 к
+        # свидетелю добавилось `unwitnessed_axes` (какие оси никто не обещал
+        # мерить), и точное равенство сломалось бы на ЛЮБОМ добавочном поле —
+        # хотя тест называется «carries witness triple» и про тройку.
+        for axis in ("geometry_ok", "semantic_ok", "topology_ok"):
+            self.assertIs(res["witness"][axis], True, axis)
+        self.assertIn("unwitnessed_axes", res["witness"])
 
     def test_query_witness_read_only(self):
         async def fake_exec(llm, bridge, code, op, timeout_ms):
@@ -166,7 +176,7 @@ class StaticGeometryLaw(unittest.TestCase):
             {"op": "create_floor", "id": "F1", "outline": crossing, "level": LVL}]},
             snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
-        self.assertIn("KIR-T003", [d.code for d in out.diagnostics])
+        self.assertIn("KIR-T004", [d.code for d in out.diagnostics])
         bowtie = [[0, 0], [8000, 6000], [8000, 0], [0, 6000]]
         out2 = compile_program({"ir_version": "1.0", "ops": [
             {"op": "create_floor", "id": "F1", "outline": bowtie, "level": LVL}]},
@@ -181,7 +191,7 @@ class StaticGeometryLaw(unittest.TestCase):
             {"op": "create_floor", "id": "F1", "outline": touching,
              "level": LVL}]}, snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
-        self.assertIn("KIR-T003", [d.code for d in out.diagnostics])
+        self.assertIn("KIR-T004", [d.code for d in out.diagnostics])
 
     def test_iter2_hole_touching_boundary_refused(self):
         touching = [[0, 0], [3000, 0], [3000, 6000], [0, 6000]]  # shares x=0 edge
@@ -189,7 +199,7 @@ class StaticGeometryLaw(unittest.TestCase):
             {"op": "create_floor", "id": "F1", "outline": OUTLINE,
              "holes": [touching], "level": LVL}]}, snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out.ok)
-        d = [x for x in out.diagnostics if x.code == "KIR-T003"][0]
+        d = [x for x in out.diagnostics if x.code == "KIR-T004"][0]
         self.assertIn("касание", d.message_ru)
 
     def test_iter2_human_fix_compiles(self):
@@ -211,7 +221,7 @@ class StaticGeometryLaw(unittest.TestCase):
             {"op": "create_floor", "id": "F1", "outline": OUTLINE,
              "holes": [h1, h2], "level": LVL}]}, snapshot=GROUND_SNAPSHOT)
         self.assertFalse(out2.ok)
-        self.assertIn("KIR-T003", [d.code for d in out2.diagnostics])
+        self.assertIn("KIR-T004", [d.code for d in out2.diagnostics])
 
 
 if __name__ == "__main__":

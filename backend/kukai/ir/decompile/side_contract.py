@@ -126,6 +126,31 @@ class SideFailureReason(str, Enum):
     # намеренно самокритичен (см. SideFailureKind), и спорное кладётся в срез.
     TAG_TARGET_NOT_LOCAL = "tag_target_not_local"
 
+    # ── Волна РАЗМЕРОВ. ──────────────────────────────────────────────────
+    #
+    # ЗАМЕР, ради которого причины заведены (k2_ar_rd_v8, переподъём текущим
+    # лифтом): 13 905 размеров = 13 905 атомов source_contract_gap, то есть
+    # ВСЕ до единого. Стадии не было вовсе, а операция create_dimension в
+    # реестре есть с 28.07.
+    #
+    # Размер СВЯЗАН со ссылками (``Dimension.References`` ->
+    # ``ReferenceArray``, тип замерен компилятором на 2021/2023/2026, лежит в
+    # RevitAPI.dll — ловушки ``System.dll``, убившей стадию марок 04.08,
+    # здесь нет). Ссылка может указывать на элемент СВЯЗАННОГО файла или на
+    # то, чего в этом документе не адресовать: тогда ``refs`` опа собрать
+    # нечем. Класс CUT, а не DETERMINATION, по тому же правилу, что и
+    # ``TAG_TARGET_NOT_LOCAL``: наш ``refs`` адресует элементы ЭТОГО
+    # документа, значит ограничение НАШЕ.
+    DIMENSION_REF_NOT_LOCAL = "dimension_ref_not_local"
+    # Точку НА ЛИНИИ размера прочитать не удалось: ``Dimension.Origin`` не
+    # ответил и ``Dimension.Curve`` не дал начала. Без точки ``line_at`` опа
+    # не собрать, а подставить любую — выдумать источник.
+    #
+    # ОТДЕЛЬНАЯ ПРИЧИНА, А НЕ ``ASPECT_NOT_PRESENT``: у размера линия ЕСТЬ по
+    # определению (он ею и нарисован), значит это НАШЕ непрочтение, а не
+    # факт о модели. Класс CUT.
+    DIMENSION_LINE_UNREADABLE = "dimension_line_unreadable"
+
 
 class SideFailureKind(str, Enum):
     """Класс квитанции: «не досмотрели» против «посмотрели, аспекта нет».
@@ -173,6 +198,8 @@ SIDE_FAILURE_KINDS: dict["SideFailureReason", SideFailureKind] = {
     SideFailureReason.PROFILE_NOT_SINGLE_CLOSED: SideFailureKind.CUT,
     SideFailureReason.DEPENDENT_SKETCH_AMBIGUOUS: SideFailureKind.CUT,
     SideFailureReason.TAG_TARGET_NOT_LOCAL: SideFailureKind.CUT,
+    SideFailureReason.DIMENSION_REF_NOT_LOCAL: SideFailureKind.CUT,
+    SideFailureReason.DIMENSION_LINE_UNREADABLE: SideFailureKind.CUT,
     # Обе причины ниже — факты о модели. ``ELEMENT_KIND_MISMATCH`` переехал
     # сюда из срезов: его собственный докстринг с самого начала называл его
     # «ЧЕСТНЫЙ факт о модели, а не сбой», но считался он вместе со срезами.

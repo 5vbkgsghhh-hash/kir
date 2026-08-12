@@ -321,6 +321,37 @@ class LocationCurveKind(str, Enum):
     OTHER = "other"
 
 
+class HostSource(str, Enum):
+    """ЧЕМ элемент оказался, когда у него нашёлся хозяин (волна захвата 09.08).
+
+    До этой волны ``host_id`` заполнялся ЕДИНСТВЕННЫМ способом — приведением
+    ``__element as FamilyInstance``. Системный элемент под него не подходит,
+    поэтому у ленточного фундамента, ограждения, проёма и изоляции поле было
+    пустым ВСЕГДА, а ``L0Element`` не несёт ни одного поля с КЛАССОМ элемента:
+    у ленточного фундамента и у столбчатого башмака одна ``category``
+    (``OST_StructuralFoundation``), и различить их можно было только по
+    ``type_name`` — сопоставлением по голому имени, которое канон запрещает.
+
+    Значение называет ВЕТКУ ЧТЕНИЯ, которая ответила, а это ровно факт о
+    классе: ``as WallFoundation`` не мог дать ненулевой результат ни на чём
+    другом. Тот же приём, что ``default_panel_source`` у витражей: читать
+    несколько источников и записывать, КОТОРЫЙ ответил, чтобы одно значение
+    не означало три разные правды.
+
+    ``None`` (поля нет в строке) — ОТДЕЛЬНОЕ состояние: «не мерили». Так
+    выглядит весь замороженный L0. Трактовать его как ``family_instance``
+    нельзя, хотя в старых строках это и было бы верно: пустое поле и
+    неизмеренное поле — разные факты, и именно на их смешении этот дом уже
+    обжигался (§18.2, молчание боковой стадии).
+    """
+
+    FAMILY_INSTANCE = "family_instance"
+    WALL_FOUNDATION = "wall_foundation"
+    RAILING = "railing"
+    OPENING = "opening"
+    INSULATION_LINING = "insulation_lining"
+
+
 class CategoryState(str, Enum):
     COMPLETE = "complete"
     PARTIAL = "partial"
@@ -506,11 +537,17 @@ class RoomInfo:
     boundary_mm: tuple[Vec2, ...]
     boundary_loops_mm: tuple[tuple[Vec2, ...], ...]
     bounding_element_ids: tuple[str, ...]
+    # Additive L0 field.  None means an older record did not measure the room
+    # number; an empty string is a measured empty ROOM_NUMBER and must not be
+    # collapsed into that legacy state.
+    number: str | None = None
 
     def __post_init__(self) -> None:
         _nonempty_string(self.id, "RoomInfo.id")
         if not isinstance(self.name, str):
             raise L0SchemaError("RoomInfo.name must be a string")
+        if self.number is not None:
+            _string(self.number, "RoomInfo.number")
         _optional_string(self.level_id, "RoomInfo.level_id")
         _optional_string(self.level_name, "RoomInfo.level_name")
         if _finite_number(self.area_m2, "RoomInfo.area_m2") < 0:
@@ -526,7 +563,7 @@ class RoomInfo:
                 element_id, f"RoomInfo.bounding_element_ids[{index}]")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        row = {
             "id": self.id,
             "name": self.name,
             "level_id": self.level_id,
@@ -538,6 +575,11 @@ class RoomInfo:
             ],
             "bounding_element_ids": list(self.bounding_element_ids),
         }
+        # Preserve the frozen byte shape of legacy RoomInfo rows.  Fresh
+        # extraction always carries this key, including number="".
+        if self.number is not None:
+            row["number"] = self.number
+        return row
 
     @classmethod
     def from_dict(cls, value: Any) -> "RoomInfo":
@@ -574,6 +616,8 @@ class RoomInfo:
                 _nonempty_string(element_id,
                                  f"room.bounding_element_ids[{index}]")
                 for index, element_id in enumerate(ids)),
+            number=(None if row.get("number") is None else
+                    _string(row.get("number"), "room.number")),
         )
 
 
@@ -634,6 +678,13 @@ class L0Element:
     # его строки поля не содержат, и отсутствие означает «не мерили», а не
     # «прямая» (см. :class:`LocationCurveKind`).
     curve_kind: "LocationCurveKind | None" = None
+    # Волна захвата хозяина (09.08). Поле дописано В ХВОСТ по тому же закону,
+    # что и `curve_kind` двумя строками выше: порядок полей над ним —
+    # позиционный контракт уже написанного кода, а значение по умолчанию
+    # оставляет замороженный L0 1.0 разбираемым запись в запись. Версию
+    # диалекта это не двигает: диалект называет поколение ТАБЛИЦЫ КАТЕГОРИЙ,
+    # а не набор полей записи (см. «ЗАКОН ДОПИСИ В ХВОСТ» в шапке файла).
+    host_source: "HostSource | None" = None
 
     def __post_init__(self) -> None:
         _nonempty_string(self.element_id, "L0Element.element_id")
@@ -671,6 +722,19 @@ class L0Element:
                 raise L0SchemaError(
                     "curve_kind describes a LocationCurve and cannot accompany "
                     f"{self.geom_kind.value} geometry")
+        if self.host_source is not None:
+            if not isinstance(self.host_source, HostSource):
+                raise L0SchemaError(
+                    "L0Element.host_source must be a HostSource or null")
+            # Источник без самого хозяина — противоречие, а не бедная строка:
+            # захват пишет оба поля одним присваиванием либо ни одного, и
+            # рассогласование означает испорченный поток, а не «мы прочли
+            # класс, но не id». Отказ поимённый, как требует шапка файла от
+            # любого УЖЕСТОЧЕНИЯ.
+            if self.host_id is None:
+                raise L0SchemaError(
+                    "L0Element.host_source without host_id: the reader that "
+                    "answered must have produced a host id")
         if self.geom_kind is GeometryKind.CURVE:
             if self.p0_mm is None or self.p1_mm is None:
                 raise L0SchemaError("curve geometry requires p0_mm and p1_mm")
@@ -716,6 +780,9 @@ class L0Element:
             "workset": self.workset.to_dict() if self.workset else None,
             "curve_kind": (
                 self.curve_kind.value if self.curve_kind is not None else None),
+            "host_source": (
+                self.host_source.value
+                if self.host_source is not None else None),
         }
 
     @classmethod
@@ -769,6 +836,8 @@ class L0Element:
                 if row.get("workset") is not None else None),
             curve_kind=_optional_enum(
                 LocationCurveKind, row.get("curve_kind"), "element.curve_kind"),
+            host_source=_optional_enum(
+                HostSource, row.get("host_source"), "element.host_source"),
         )
 
 

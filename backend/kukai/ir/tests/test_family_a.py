@@ -240,7 +240,17 @@ class RoomOrderingRule(unittest.TestCase):
         self.assertTrue(out.ok)
         self.assertIn("room placement mismatch (geometry)", out.csharp)
         self.assertIn("room is not enclosed (semantic)", out.csharp)
-        self.assertIn('__el_R1.Name != "Кухня"', out.csharp)
+        # ИМЯ СВЕРЯЕТСЯ ПАРАМЕТРОМ, А НЕ `Room.Name` — и это утверждение
+        # двустороннее нарочно. Замер 04.08 («Проект1», Revit 2026): сеттер
+        # `Room.Name` кладёт только имя, а геттер склеивает его с НОМЕРОМ
+        # помещения, поэтому постусловие на геттере не выполнялось НИКОГДА и
+        # живая матрица откатывала ИСПРАВНЫЕ помещения (`f570aee2`). Эмиттер
+        # починили в тот же день, а это утверждение осталось на старой форме и
+        # держало набор красным пять дней. Вторая половина — храповик: если
+        # `Room.Name` вернётся в свидетеля, тест обязан упасть здесь, а не на
+        # живой модели пользователя.
+        self.assertIn('__rnm_R1.AsString() != "Кухня"', out.csharp)
+        self.assertNotIn('__el_R1.Name != "Кухня"', out.csharp)
 
 
 class SymbolsAndPlacement(unittest.TestCase):

@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import sys
@@ -93,7 +94,9 @@ from dataclasses import dataclass, field
 
 BASE = "http://127.0.0.1:52411"
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
-ARTIFACTS = pathlib.Path("/home/claude/kir-night/artifacts")
+ARTIFACTS = pathlib.Path(
+    os.environ.get("KIR_LIVE_ARTIFACTS", str(BACKEND / "artifacts"))
+)
 
 # Записи только со сдвигом: разрешение оператора — писать в рабочую модель
 # ТОЛЬКО на +200 м от оригинала (тот же Δ, что в прогоне идемпотентности A5).

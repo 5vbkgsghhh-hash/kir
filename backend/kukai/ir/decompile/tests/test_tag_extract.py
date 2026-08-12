@@ -219,17 +219,22 @@ class VersionSeamTests(unittest.TestCase):
     """ШЕСТЬ целей — шесть тел. Один текст здесь был бы выдуманным отказом."""
 
     #: Обращение к СВОЙСТВУ и к МЕТОДУ проверяются полными выражениями:
-    #: «GetTaggedLocalElementIds» содержит «TaggedLocalElementId» подстрокой,
+    #: «GetTaggedLocalElements» содержит «TaggedLocalElement» подстрокой,
     #: и наивная проверка вхождения объявила бы шов несуществующим.
+    #:
+    #: МЕТОД — именно ...Element*S*, а не ...ElementIds: последний возвращает
+    #: ``ISet<>`` из ``System.dll``, которой нет у развёрнутого плагина
+    #: (CS0012 живьём 04.08). Строка ниже — та, что это удерживает.
     PROPERTY_CALL = "__tgInd.TaggedLocalElementId"
-    METHOD_CALL = "__tgInd.GetTaggedLocalElementIds()"
+    METHOD_CALL = "__tgInd.GetTaggedLocalElements()"
+    FORBIDDEN_CALL = "__tgInd.GetTaggedLocalElementIds()"
 
     def test_2021_uses_the_property_that_exists_only_there(self) -> None:
         code = build_tag_extract_cs(["1"], revit_version="2021")
         self.assertIn(self.PROPERTY_CALL, code)
         self.assertNotIn(
             self.METHOD_CALL, code,
-            "GetTaggedLocalElementIds НЕТ в 2021 — CS1061 на живой сборке")
+            "GetTaggedLocalElements НЕТ в 2021 — CS1061 на живой сборке")
 
     def test_2022_and_later_use_the_method(self) -> None:
         for version in ("2022", "2023", "2024", "2025", "2026"):
@@ -239,6 +244,19 @@ class VersionSeamTests(unittest.TestCase):
                 self.assertNotIn(
                     self.PROPERTY_CALL, code,
                     "TaggedLocalElementId УДАЛЁН после 2022 — CS1061 на 2023+")
+
+    def test_no_version_reaches_for_the_iset_member(self) -> None:
+        """Ни одна цель не зовёт член, чей ВОЗВРАТ вне замыкания клиента.
+
+        ``GetTaggedLocalElementIds`` компилируется у нас и НЕ компилируется
+        у пользователя: его ``ISet<ElementId>`` на net48 объявлен в
+        ``System.dll``, которой развёрнутый плагин не ссылается. Живое
+        падение 04.08 17:22:39 на 13A-RD-AR-K2_v33, отпечаток 5f48cd823928.
+        """
+        for version in TAG_SUPPORTED_VERSIONS:
+            with self.subTest(version=version):
+                code = build_tag_extract_cs(["1"], revit_version=version)
+                self.assertNotIn(self.FORBIDDEN_CALL, code)
 
     def test_no_body_ever_carries_both_calls(self) -> None:
         """Два вызова в одном теле не собираются НИ НА ОДНОЙ версии."""

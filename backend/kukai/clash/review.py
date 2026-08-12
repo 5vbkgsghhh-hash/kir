@@ -32,6 +32,8 @@ from __future__ import annotations
 import collections
 from typing import Any
 
+from kukai.clash import detect as D
+
 REVIEW_SCHEMA = "clash-review/1"
 
 #: Русское имя КЛАССА элемента (не типа и не семейства!). Ключ — `label` из
@@ -94,14 +96,26 @@ def severity_of(finding: dict) -> str:
 
 def phrase(finding: dict) -> str:
     """Строка, которую читает прораб. «Лоток 123 стоит внутри лотка 456»
-    вместо «pair 123/456 overlap 141mm»."""
+    вместо «pair 123/456 overlap 141mm».
+
+    Совет не бывает увереннее улики. «Удалить одну из них» — указание
+    РАЗРУШИТЕЛЬНОЕ, и оно печатается только там, где совпадение доказано
+    геометрией (`detect.duplicate_claim_is_proven`). У пары, про которую
+    известен один габаритный бокс, тот же бокс дают и две диагонали квадрата,
+    поэтому строка называет ровно то, что совпало, и посылает смотреть модель.
+    """
     a, b = finding["a"], finding["b"]
     an, bn = _ru(a.get("label")), _ru(b.get("label"))
     ai, bi = a["source_element_id"], b["source_element_id"]
     depth = float(finding.get("hull_overlap_depth_mm") or 0.0)
     if finding.get("pair_kind") == "coincident_duplicate":
-        return (f"{an.capitalize()} {ai} и {bn} {bi} стоят НА ОДНОМ МЕСТЕ — "
-                f"похоже на дубликат, чинится удалением одного из них")
+        if D.duplicate_claim_is_proven(finding):
+            return (f"{an.capitalize()} {ai} и {bn} {bi} стоят НА ОДНОМ МЕСТЕ — "
+                    f"похоже на дубликат, чинится удалением одного из них")
+        return (f"{an.capitalize()} {ai} и {bn} {bi} совпадают ГАБАРИТАМИ — "
+                f"возможно, дубликат. Форма обоих известна только габаритным "
+                f"боксом, такой же бокс дают и два разных элемента: сверить в "
+                f"модели")
     if finding.get("hull_relation") == "contact":
         return f"{an.capitalize()} {ai} касается {bn} {bi} вплотную"
     certainty = ("габариты пересекаются" if finding.get("hull_grade") == "coarse"
@@ -194,7 +208,11 @@ def build_review(report: dict, *, top: int = 50, max_per_element: int = 20,
         "summary": {
             "total": len(rows),
             "duplicates": dup,
-            "duplicates_hint": "чинится удалением одного из пары",
+            # Тот же закон, что и в `phrase`: над счётчиком, куда попадают и
+            # недоказанные пары, не смеет стоять одно разрушительное указание.
+            "duplicates_hint": ("совпали геометрией — чинится удалением одного "
+                                "из пары; совпали только габаритами — сначала "
+                                "сверить в модели"),
             "overlaps": overlaps,
             "overlaps_hint": "элементы входят друг в друга — нужна правка",
             "touches": touches,

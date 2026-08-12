@@ -47,6 +47,7 @@ from kukai.ir.decompile.family_placement_extract import (
 )
 from kukai.ir.decompile.l1_schema import AtomReason, FidelityReason
 from kukai.ir.decompile.lift import (
+    _L0_ALREADY_CARRIES,
     _L0_HAS_NO_SOURCE_FOR,
     _OPS_WITHOUT_L0_INPUTS,
     LIFTER_TABLE,
@@ -180,6 +181,13 @@ class TheRefusalsPremiseIsChecked(unittest.TestCase):
         и примечание уехали оттуда в таблицу лифтеров (у них появились
         стадии чтения), но ТОТ ЖЕ текст отказа собирается для них, когда
         индекса нет, — значит карта обязана держать и их входы.
+
+        09.08 ТАБЛИЦЫ СТАЛО ДВЕ, и требование от этого не ослабло, а стало
+        точнее: вход обязан стоять РОВНО В ОДНОЙ из них. Гибкий участок —
+        первый частичный разрыв захвата (`level` в строке L0 есть, `path`
+        нет), и без положительного объявления «этот вход мы уже несём» текст
+        отказа умел бы молча потерять новый недостающий вход: он называет
+        только то, чего не хватает.
         """
 
         collected = set(_OPS_WITHOUT_L0_INPUTS.values())
@@ -189,10 +197,18 @@ class TheRefusalsPremiseIsChecked(unittest.TestCase):
                 if not param.required:
                     continue
                 with self.subTest(op=op_name, param=param.name):
-                    self.assertIn(
-                        param.name, _L0_HAS_NO_SOURCE_FOR,
-                        f"{op_name}.{param.name} обязателен, но карта не "
-                        "говорит, какой член API пришлось бы снимать")
+                    missing = param.name in _L0_HAS_NO_SOURCE_FOR
+                    carried = param.name in _L0_ALREADY_CARRIES
+                    self.assertTrue(
+                        missing or carried,
+                        f"{op_name}.{param.name} обязателен, но ни одна из "
+                        "таблиц не говорит, читаем мы его или какой член API "
+                        "пришлось бы начать снимать")
+                    self.assertFalse(
+                        missing and carried,
+                        f"{op_name}.{param.name} объявлен и читаемым, и "
+                        "нечитаемым сразу — отказ про него не может быть "
+                        "верным ни в одну из сторон")
 
 
 class AnnotationsRefuseByTheirOwnName(unittest.TestCase):

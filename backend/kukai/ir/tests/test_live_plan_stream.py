@@ -218,19 +218,45 @@ class SingleCraneTests(unittest.TestCase):
         self.assertEqual(len(sites), 1, f"кранов больше одного: {sites}")
         self.assertEqual(sites[0][0], "kukai/ir/serving.py", sites)
 
-    def test_all_doors_funnel_through_the_injection_point(self):
-        """Обе живые двери сходятся в тело, где стоит врезка."""
-        source = (BACKEND / "kukai/ir/serving.py").read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        callers = set()
+    @staticmethod
+    def _callers_of(tree, name: str) -> set:
+        found = set()
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for inner in ast.walk(node):
                     if (isinstance(inner, ast.Call)
                             and isinstance(inner.func, ast.Name)
-                            and inner.func.id == "_handle_revit_ir_inner"):
-                        callers.add(node.name)
-        self.assertEqual(callers, {"handle_revit_ir", "handle_revit_ir_bulk"})
+                            and inner.func.id == name):
+                        found.add(node.name)
+        return found
+
+    def test_all_doors_funnel_through_the_injection_point(self):
+        """Обе живые двери сходятся в тело, где стоит врезка.
+
+        09.08н: ПЛАН СТРОИТЕЛЬСТВА ДОБАВИЛ ТРЕТЬЕГО ВЫЗЫВАЮЩЕГО, и это НЕ
+        третья дверь. `_run_plan` режет программу с фазами на пачку и ведёт
+        звенья ПО ОДНОМУ через то же самое тело — то есть он цикл ВНУТРИ
+        двери, а не обход её. Разница существенна ровно тем, чего боится
+        соседний тест про один кран: политика не может разъехаться, потому
+        что политика по-прежнему живёт в одном теле и исполняется на каждом
+        звене.
+
+        Поэтому список расширен, но страж НЕ ослаблен: рядом стоит второе
+        утверждение — у `_run_plan` не должно появиться собственного входа.
+        Если завтра его позовут из маршрута напрямую, это и будет третья
+        дверь, и вот тогда тест обязан покраснеть. Расширять список молча,
+        когда он в очередной раз пожалуется, — способ, которым такие стражи
+        умирают.
+        """
+        source = (BACKEND / "kukai/ir/serving.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertEqual(
+            self._callers_of(tree, "_handle_revit_ir_inner"),
+            {"handle_revit_ir", "handle_revit_ir_bulk", "_run_plan"})
+        # ВОТ ЭТО и делает расширение безопасным: у ведущего план нет
+        # собственного входа — он достижим ровно из чат-двери.
+        self.assertEqual(self._callers_of(tree, "_run_plan"),
+                         {"handle_revit_ir"})
 
     def test_injection_is_write_only(self):
         """Врезка спрашивает семью программы у мидэнда, а не у себя.

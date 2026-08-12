@@ -30,6 +30,11 @@ from kukai.ir.decompile.annotation_extract import (
     TextNoteRecord,
 )
 from kukai.ir.decompile.curtain_extract import CurtainExtraction
+from kukai.ir.decompile.dimension_extract import (
+    DimensionExtraction,
+    DimensionFailure,
+    DimensionRecord,
+)
 from kukai.ir.decompile.curve_extract import CurveExtraction
 from kukai.ir.decompile.family_placement_extract import (
     FamilyPlacementExtraction,
@@ -56,6 +61,7 @@ STAGE_RESULT_TYPES = {
     "annotation": AnnotationExtraction,
     "mep_system": MepSystemExtraction,
     "tag": TagExtraction,
+    "dimension": DimensionExtraction,
     "geometry": GeometryExtraction,
 }
 

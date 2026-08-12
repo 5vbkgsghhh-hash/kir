@@ -52,7 +52,8 @@ os.environ.setdefault(
 
 from kukai.ir import ground as ground_mod                      # noqa: E402
 from kukai.ir import spec                                      # noqa: E402
-from kukai.ir.authoring import _EMITTERS, emit_stairs_program  # noqa: E402
+from kukai.ir import contour as contour_mod  # noqa: E402
+from kukai.ir.authoring import _EMITTERS, _SOLO_PROGRAMS  # noqa: E402
 from kukai.ir.compiler import _parse_and_check                 # noqa: E402
 from kukai.ir.emit_model import (                              # noqa: E402
     BarePost,
@@ -62,9 +63,6 @@ from kukai.ir.emit_model import (                              # noqa: E402
     tolerance,
 )
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT            # noqa: E402
-from kukai.ir.tests.registry_variants import (                 # noqa: E402
-    perturbed_tolerance,
-)
 from kukai.ir.tests.test_emitter_scope_contract import (       # noqa: E402
     PROGRAMS,
     VERSIONS,
@@ -78,13 +76,30 @@ WRITE_OPS = sorted(
 # Корпус
 # ---------------------------------------------------------------------------
 
-# create_stairs владеет своим шаблоном программы и не лежит в _EMITTERS.
+# Опы, владеющие СВОИМ шаблоном программы, не лежат в `_EMITTERS`, поэтому
+# корпус подаёт их отдельно.  С 10.08.2026 их ДВА, и подаются оба: прибор,
+# видящий одну половину класса, опаснее отсутствующего — площадка прошла бы
+# мимо и вакуумного обхода, и провенанса допусков молча.
 _STAIRS_OP = {
     "op": "create_stairs", "id": "ST1", "p0_mm": [0, 0], "p1_mm": [3000, 0],
     "base_level": {"__grounded__": {"via": "id", "id": 42}},
     "top_level": {"__grounded__": {"via": "id", "id": 43}},
     "width_mm": 1200,
 }
+
+_LANDING_OP = {
+    "op": "create_stairs_landing", "id": "LG1",
+    "stairs": {"by": "element_id", "value": 4242},
+    "elevation_mm": 1500.0,
+    "contour": {"outer": {"shape": "rect", "origin": [5000.0, 0.0],
+                          "size_mm": [2400.0, 1200.0]}},
+    "__region__": contour_mod.validate_region(
+        {"outer": {"shape": "rect", "origin": [5000.0, 0.0],
+                   "size_mm": [2400.0, 1200.0]}}, [], "LG1", "contour", []),
+}
+
+_SOLO_INSTANCES = {"create_stairs": _STAIRS_OP,
+                   "create_stairs_landing": _LANDING_OP}
 
 # Условные поля, открывающие ветку с допуском.
 _FORCE = {"base_offset_mm": 150, "top_offset_mm": -250,
@@ -97,13 +112,20 @@ def _shipped_instances():
     out = []
     for _pname, prog in PROGRAMS.items():
         min_ver = prog.get("__min_ver__", "2021")
-        prog = {k: v for k, v in prog.items() if k != "__min_ver__"}
+        # Верхняя граница версии — та же симметрия, что в самом корпусе
+        # (см. его шапку): волна нагрузок отказывает ТИПИЗИРОВАННО на
+        # 2024-2026, и требовать от неё эмиссии там значило бы требовать
+        # молча построить что-нибудь другое.
+        max_ver = prog.get("__max_ver__", VERSIONS[-1])
+        prog = {k: v for k, v in prog.items()
+                if k not in ("__min_ver__", "__max_ver__")}
         grounded = ground_mod.ground(_parse_and_check(prog), GROUND_SNAPSHOT)
-        for ver in [v for v in VERSIONS if v >= min_ver]:
+        for ver in [v for v in VERSIONS if min_ver <= v <= max_ver]:
             for op in grounded:
                 out.append((op["op"], op, ver))
     for ver in VERSIONS:
-        out.append(("create_stairs", _STAIRS_OP, ver))
+        for name, solo_op in _SOLO_INSTANCES.items():
+            out.append((name, solo_op, ver))
     return out
 
 
@@ -112,7 +134,7 @@ def _full_instances():
 
     out = list(_shipped_instances())
     for name, op, ver in list(out):
-        if name == "create_stairs":
+        if name in spec.SOLO_OPS:
             continue
         forced = dict(op)
         for field, value in _FORCE.items():
@@ -128,7 +150,7 @@ FULL = _full_instances()
 def _checks(name, op, ver):
     """Объекты WitnessCheck, которые оп эмитирует ([] у строкового жанра)."""
 
-    if name == "create_stairs":
+    if name in spec.SOLO_OPS:
         return []
     _decl, _create, post, _rb = _EMITTERS[name](op, ver, "kir:tolprov")
     if isinstance(post, BarePost):
@@ -139,8 +161,8 @@ def _checks(name, op, ver):
 def _rendered(name, op, ver):
     """Всё, что оп эмитирует, одной строкой (для диффа возмущений)."""
 
-    if name == "create_stairs":
-        return emit_stairs_program(op, ver)
+    if name in spec.SOLO_OPS:
+        return _SOLO_PROGRAMS[name](op, ver)
     decl, create, post, rb = _EMITTERS[name](op, ver, "kir:tolprov")
     if isinstance(post, BarePost):
         post = list(post.checks)
@@ -299,13 +321,15 @@ class L3_DeclaredProvenanceIsReal(unittest.TestCase):
                     for c in _checks(n, o, v) if c.tol_key == key]
                 if not claimants:
                     continue
-                with perturbed_tolerance(
-                        name, key, float(value) * 1000.0 + 7.77):
+                tolerances[key] = float(value) * 1000.0 + 7.77
+                try:
                     moved = any(
                         next((x for x in _checks(n, o, v)
                               if x.obligation_key == c.obligation_key),
                              None) != c
                         for n, o, v, c in claimants)
+                finally:
+                    tolerances[key] = value
                 if not moved:
                     offenders.append(
                         f"{name}.{key}: witnesses declare tol_key={key!r} but "
@@ -331,11 +355,13 @@ class L4_NoDeadRegistryNumber(unittest.TestCase):
         for name in WRITE_OPS:
             tolerances = spec.OPS[name].tolerances
             for key, value in list(tolerances.items()):
-                with perturbed_tolerance(
-                        name, key, float(value) * 1000.0 + 7.77):
+                tolerances[key] = float(value) * 1000.0 + 7.77
+                try:
                     moved = any(
                         _rendered(*FULL[i]) != baseline[i]
                         for i in range(len(FULL)) if FULL[i][0] == name)
+                finally:
+                    tolerances[key] = value
                 if not moved:
                     offenders.append(
                         f"{name}.tolerances[{key!r}] = {value} — ничего из "
@@ -361,11 +387,13 @@ class L5_CorpusReachesEveryTolerance(unittest.TestCase):
         for name in WRITE_OPS:
             tolerances = spec.OPS[name].tolerances
             for key, value in list(tolerances.items()):
-                with perturbed_tolerance(
-                        name, key, float(value) * 1000.0 + 7.77):
+                tolerances[key] = float(value) * 1000.0 + 7.77
+                try:
                     moved = any(
                         _rendered(*SHIPPED[i]) != baseline[i]
                         for i in range(len(SHIPPED)) if SHIPPED[i][0] == name)
+                finally:
+                    tolerances[key] = value
                 if not moved:
                     unreached.append(f"{name}.{key}")
         self.assertEqual(
@@ -389,6 +417,13 @@ _UNPROMISED_WITNESSES = {
     ("create_group", "member_1"):
         "перепроверка участника; его собственный post это уже обещает",
 }
+
+#: Заглушка на место единственного вырезанного свидетеля. ЖИВАЯ намеренно:
+#: см. длинный комментарий в месте её подстановки.
+_LIVE_STUB = WitnessCheck(
+    obligation_key="__excised__", reader_cs="",
+    verdict_cs='    if (__post == null) __post.Add("");\n',
+    message="excised", style="guard")
 
 
 class L6_EveryWitnessIsCertified(unittest.TestCase):
@@ -419,7 +454,7 @@ class L6_EveryWitnessIsCertified(unittest.TestCase):
 
     def _corpus(self):
         for name, op, ver in FULL:
-            if name != "create_stairs":
+            if name not in spec.SOLO_OPS:
                 yield name, op, ver
         for raw in self._SLOPED:
             grounded = ground_mod.ground(
@@ -427,6 +462,17 @@ class L6_EveryWitnessIsCertified(unittest.TestCase):
                                   "ops": [raw]}), GROUND_SNAPSHOT)[0]
             for ver in VERSIONS:
                 yield raw["op"], grounded, ver
+
+    def test_the_stub_itself_is_not_vacuous(self) -> None:
+        # Иначе оракул ниже проходил бы по НЕВЕРНОЙ причине на шести опах с
+        # единственным свидетелем: падал бы не вырезанный ключ, а сама
+        # заглушка. Guard the guard.
+        from kukai.ir import translation_cert as cert_mod
+
+        findings, partial = cert_mod.analyze_witness_cs(
+            cert_mod._code(_LIVE_STUB.render()))
+        self.assertEqual(findings, ())
+        self.assertFalse(partial)
 
     def test_excising_a_witness_flips_the_certificate(self) -> None:
         from kukai.ir import translation_cert as cert_mod
@@ -448,12 +494,22 @@ class L6_EveryWitnessIsCertified(unittest.TestCase):
                     kept = [x for x in checks if x.obligation_key != _k]
                     if not kept:
                         # Пустой post неконструируем (render_post отказывает),
-                        # поэтому подставляется инертная заглушка: блок
-                        # остаётся правильной формы, а КЛЮЧ под тестом исчез.
-                        kept = [WitnessCheck(
-                            obligation_key="__excised__", reader_cs="",
-                            verdict_cs='    if (false) __post.Add("");\n',
-                            message="excised", style="guard")]
+                        # поэтому подставляется заглушка: блок остаётся
+                        # правильной формы, а КЛЮЧ под тестом исчез.
+                        #
+                        # ЗАГЛУШКА ОБЯЗАНА БЫТЬ ЖИВОЙ (09.08). Раньше здесь
+                        # стояло `if (false) __post.Add("")`. С тех пор как
+                        # сертификат ловит ВАКУУМНОГО свидетеля (проверку, чей
+                        # __post.Add недостижим), такая заглушка САМА роняла
+                        # `proven` — и этот оракул проходил бы, даже если бы
+                        # сертификат вырезанный КЛЮЧ вовсе не смотрел. Шесть
+                        # опов несут ровно один свидетель (change_type,
+                        # create_railing, create_type, delete, load_family,
+                        # set_param), то есть ветка живая и подмена была бы не
+                        # теоретической. `__post == null` статически
+                        # неразрешимо -> находки нет -> оракул снова зависит
+                        # ТОЛЬКО от отсутствия ключа.
+                        kept = [_LIVE_STUB]
                     return d, c, (BarePost(tuple(kept)) if bare else kept), rb
 
                 _EMITTERS[name] = excised

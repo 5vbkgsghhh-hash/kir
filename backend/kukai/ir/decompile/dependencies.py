@@ -9,10 +9,11 @@ remain explicit unresolved records until a later extractor supplies evidence.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from kukai.ir.decompile.l1_schema import FidelityReason
 from kukai.ir.decompile.schema import L0Document, NamedReference
@@ -21,6 +22,139 @@ from kukai.ir.decompile.schema import L0Document, NamedReference
 DEPENDENCY_MANIFEST_SCHEMA_VERSION = "1.0"
 FAMILY_IDENTITY_NOTE = "family_name_unavailable_l0_1_0"
 LINK_IDENTITY_NOTE = "link_path_and_fingerprint_unavailable_l0_1_0"
+TYPE_FINGERPRINT_SCHEMA_VERSION = "type-fingerprint/1"
+
+TYPE_FINGERPRINT_SCOPE = (
+    "document_local: the digest separates definitions INSIDE this snapshot "
+    "along the named axes and nothing more.  It is not a content fingerprint "
+    "of the Revit definition, so it can never certify that a same-named type "
+    "in a target document is the same definition."
+)
+
+# Blind reasons are a CLOSED vocabulary.  Every one was measured over the 67
+# stored decompiles in `backend/backend/data/decompile` on 2026-08-11; none was
+# reasoned into existence.
+FINGERPRINT_BLIND_NO_TYPE_ID = "l0_element_carries_no_type_id"
+FINGERPRINT_BLIND_NO_NAME = "type_name_empty_and_no_family_evidence"
+FINGERPRINT_BLIND_INDEX_ABSENT = "family_placement_index_absent"
+FINGERPRINT_BLIND_INDEX_REJECTED = (
+    "family_placement_index_symbol_id_disagrees_with_l0_type_id")
+FINGERPRINT_BLIND_FAMILY_UNSTABLE = "family_name_disagrees_across_instances"
+FINGERPRINT_BLIND_NO_ROW = "no_family_placement_row_for_this_type"
+FINGERPRINT_BLIND_REASONS = frozenset({
+    FINGERPRINT_BLIND_NO_TYPE_ID,
+    FINGERPRINT_BLIND_NO_NAME,
+    FINGERPRINT_BLIND_INDEX_ABSENT,
+    FINGERPRINT_BLIND_INDEX_REJECTED,
+    FINGERPRINT_BLIND_FAMILY_UNSTABLE,
+    FINGERPRINT_BLIND_NO_ROW,
+})
+
+
+class TypeIdentityState(str, Enum):
+    """THREE outcomes of identifying a type, not two.
+
+    A fingerprint that matches the WRONG type is worse than an absent one, so
+    'not identified, for a named reason' and 'identified ambiguously, with the
+    rival candidates listed' are separate states rather than shades of one
+    refusal.
+    """
+
+    IDENTIFIED = "identified"
+    AMBIGUOUS = "ambiguous"
+    UNIDENTIFIED = "unidentified"
+
+
+@dataclass(frozen=True, slots=True)
+class TypeFingerprint:
+    """A type fingerprint: the digest PLUS the axes it stands on.
+
+    The axes travel beside the digest on purpose.  A bare hash cannot be
+    refuted -- a reader cannot see what went into it, and 'the fingerprints
+    differ' is indistinguishable from 'we compared different things'.  Here
+    every axis is named, so a mismatch always points at one axis.
+    """
+
+    schema_version: str
+    state: TypeIdentityState
+    digest: str | None
+    axes: tuple[tuple[str, str], ...]
+    scope: str
+    candidates: tuple[str, ...] = ()
+    blind_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != TYPE_FINGERPRINT_SCHEMA_VERSION:
+            raise DependencyManifestError(
+                "unsupported type fingerprint schema_version")
+        if not isinstance(self.state, TypeIdentityState):
+            raise DependencyManifestError(
+                "type fingerprint state must be typed")
+        if not isinstance(self.scope, str) or not self.scope:
+            raise DependencyManifestError(
+                "type fingerprint scope must be named")
+        if not isinstance(self.axes, tuple) or any(
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or not isinstance(pair[0], str) or not pair[0]
+                or not isinstance(pair[1], str)
+                for pair in self.axes):
+            raise DependencyManifestError(
+                "type fingerprint axes must be (name, value) string pairs")
+        names = tuple(pair[0] for pair in self.axes)
+        if len(set(names)) != len(names):
+            raise DependencyManifestError(
+                "type fingerprint axes must be unique")
+        if not isinstance(self.candidates, tuple) or any(
+                not isinstance(value, str) or not value
+                for value in self.candidates):
+            raise DependencyManifestError(
+                "type fingerprint candidates must be non-empty strings")
+        if tuple(sorted(set(self.candidates))) != self.candidates:
+            raise DependencyManifestError(
+                "type fingerprint candidates must be sorted and unique")
+        if (self.blind_reason is not None
+                and self.blind_reason not in FINGERPRINT_BLIND_REASONS):
+            raise DependencyManifestError(
+                f"unknown fingerprint blind reason: {self.blind_reason!r}")
+        if self.state is TypeIdentityState.UNIDENTIFIED:
+            # NOT IDENTIFIED must say WHY: a silent refusal is
+            # indistinguishable from a broken instrument.
+            if self.digest is not None:
+                raise DependencyManifestError(
+                    "an unidentified type cannot carry a digest")
+            if self.candidates:
+                raise DependencyManifestError(
+                    "an unidentified type cannot list candidates")
+            if self.blind_reason is None:
+                raise DependencyManifestError(
+                    "an unidentified type must name its blind reason")
+            return
+        if not isinstance(self.digest, str) or not self.digest:
+            raise DependencyManifestError(
+                "an identified/ambiguous type requires a digest")
+        if not self.axes:
+            raise DependencyManifestError(
+                "a digest without axes is unfalsifiable")
+        if self.state is TypeIdentityState.AMBIGUOUS and not self.candidates:
+            # AMBIGUOUS without the rival list is exactly .FirstOrDefault()
+            # with a better reputation: the reader cannot see the choice.
+            raise DependencyManifestError(
+                "an ambiguous type must list its rival definition keys")
+        if self.state is TypeIdentityState.IDENTIFIED and self.candidates:
+            raise DependencyManifestError(
+                "an identified type cannot have rival candidates")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "state": self.state.value,
+            "digest": self.digest,
+            "axes": [list(pair) for pair in self.axes],
+            "scope": self.scope,
+            "candidates": list(self.candidates),
+            "blind_reason": self.blind_reason,
+        }
 
 
 class DependencyManifestError(ValueError):
@@ -91,6 +225,11 @@ class DependencyDefinition:
     artifact_uri: str | None = None
     artifact_hash: str | None = None
     embedded_store_ref: str | None = None
+    # APPEND-AT-THE-TAIL LAW (the same one L0Element.curve_kind follows):
+    # the fields above are a positional contract of code already written,
+    # and the defaults keep older manifests readable record for record.
+    source_type_id: str = ""
+    type_identity: "TypeFingerprint | None" = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, str) or not self.key:
@@ -144,6 +283,25 @@ class DependencyDefinition:
                 and (self.artifact_uri is None or self.artifact_hash is None)):
             raise DependencyManifestError(
                 "artifact_uri dependency requires URI and artifact_hash")
+        if not isinstance(self.source_type_id, str):
+            raise DependencyManifestError(
+                "dependency source_type_id must be a string")
+        if self.type_identity is not None and not isinstance(
+                self.type_identity, TypeFingerprint):
+            raise DependencyManifestError(
+                "dependency type_identity must be a TypeFingerprint or null")
+        if (self.type_identity is not None
+                and self.type_identity.state is TypeIdentityState.IDENTIFIED
+                and self.fingerprint is None
+                and self.resolved):
+            # A forbidden state, stated out loud: "identified in the SOURCE"
+            # is not "resolved in the TARGET".  Resolution still demands a
+            # digest of the definition itself, which frozen L0 1.0 does not
+            # carry.  Without this line the first reader of the report will
+            # read identified as ok.
+            raise DependencyManifestError(
+                "an identified type fingerprint does not resolve a "
+                "dependency: a target inspection is still missing")
 
     @property
     def resolved(self) -> bool:
@@ -162,6 +320,10 @@ class DependencyDefinition:
             "artifact_uri": self.artifact_uri,
             "artifact_hash": self.artifact_hash,
             "embedded_store_ref": self.embedded_store_ref,
+            "source_type_id": self.source_type_id,
+            "type_identity": (
+                None if self.type_identity is None
+                else self.type_identity.to_dict()),
         }
 
 
@@ -453,6 +615,23 @@ class DependencyManifest:
     def unresolved_count(self) -> int:
         return len(self.unresolved)
 
+    @property
+    def type_identity_counts(self) -> dict[str, int]:
+        """How many definitions land in each of the THREE outcomes.
+
+        A manifest whose every record repeats one sentence tells a reader
+        nothing about which types are actually in trouble; measured
+        2026-08-11, all 569 unresolved records of `k2_ar_rd_v7` carried
+        the identical detail string.  These counts are the smallest thing
+        that makes the difference visible without opening the array.
+        """
+
+        counts = {state.value: 0 for state in TypeIdentityState}
+        for definition in self.definitions:
+            if definition.type_identity is not None:
+                counts[definition.type_identity.state.value] += 1
+        return counts
+
     def dependency_resolved_for(self, source_element_id: str) -> bool:
         """Return true only when every recorded requirement has evidence.
 
@@ -505,6 +684,7 @@ class DependencyManifest:
             "external_resources": [
                 value.to_dict() for value in self.external_resources],
             "unresolved": [value.to_dict() for value in self.unresolved],
+            "type_identity_counts": self.type_identity_counts,
         }
 
 
@@ -518,12 +698,22 @@ def _dependency_kind(_category: str) -> DependencyKind:
 def _definition_key(
     kind: DependencyKind,
     identity: DependencyIdentity,
+    source_type_id: str,
 ) -> str:
     # This is a readable stable key, not a content fingerprint.
+    #
+    # ``source_type_id`` joined the key on 2026-08-11 because the key WITHOUT
+    # it is not unique per definition, and the manifest silently merged real
+    # definitions.  Measured over the 67 stored decompiles: 8700 distinct
+    # ElementType ids collapsed into 7945 records, i.e. 755 definitions were
+    # LOST; the worst single cell is `k2_ar_rd_v15`, where 18 different
+    # in-place wall types all named "Pilastre" became one record claiming all
+    # 18 elements.  Grounding that record picks ONE type for eighteen.
     encoded = json.dumps(
         {
             "category": identity.category,
             "kind": kind.value,
+            "source_type_id": source_type_id,
             "type_name": identity.type_name,
         },
         ensure_ascii=False,
@@ -531,6 +721,83 @@ def _definition_key(
         separators=(",", ":"),
     )
     return f"definition:{encoded}"
+
+
+def _fingerprint_digest(axes: tuple[tuple[str, str], ...]) -> str:
+    encoded = json.dumps(
+        [list(pair) for pair in axes],
+        ensure_ascii=False,
+        sort_keys=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _family_axis_by_type(
+    document: L0Document,
+    family_placement: Mapping[str, Any] | None,
+) -> tuple[dict[str, str], frozenset[str], int, str | None]:
+    """type_id -> family name, unstable ids, rejected rows, document reason.
+
+    PROVENANCE IS CHECKED, NEVER ASSUMED.  The side index is keyed by
+    element id, and an element id means nothing outside the document it came
+    from.  Measured 2026-08-11 over the 58 stored runs that carry this index:
+    242 040 rows, and ``symbol_id`` equals the L0 ``type_id`` of the same
+    element in 242 020 of them.  All 20 disagreements sit in ONE run --
+    `snowdon_elec_v1`, whose stage reported 1837 `element_unresolved`
+    failures and returned 20 rows belonging to a DIFFERENT model: an
+    OST_LightingFixtures element carrying the family "Round Elbow", an
+    OST_ElectricalFixtures element carrying "Bend - PVC - Sch 40 - DWV".
+    Those rows would have attached plumbing families to electrical fixtures
+    -- a fingerprint matching the WRONG type, which is worse than none.
+
+    A single disagreeing row therefore rejects the WHOLE index as type
+    evidence, and the reason travels to every definition.  Rejecting only the
+    offending row would keep the surviving rows of a demonstrably foreign
+    index, and there is nothing in the snapshot that tells the two apart.
+    """
+
+    if family_placement is None:
+        return {}, frozenset(), 0, FINGERPRINT_BLIND_INDEX_ABSENT
+    if not isinstance(family_placement, Mapping):
+        raise DependencyManifestError(
+            "family_placement must be a mapping of element_id to row or null")
+    if not family_placement:
+        # An EMPTY index and an ABSENT index are different facts, but neither
+        # supplies an axis; the reason is the same word to the reader and the
+        # difference stays visible in the side manifest.
+        return {}, frozenset(), 0, FINGERPRINT_BLIND_INDEX_ABSENT
+    type_by_element = {
+        element.element_id: element.type_id for element in document.elements}
+    observed: dict[str, set[str]] = {}
+    rejected = 0
+    for element_id, row in family_placement.items():
+        if not isinstance(row, Mapping):
+            raise DependencyManifestError(
+                f"family placement row {element_id!r} must be a mapping")
+        type_id = type_by_element.get(str(element_id))
+        if not type_id:
+            # A row about an element this L0 does not carry, or about an
+            # element with no ElementType.  Silence here is correct: that is
+            # a fact for the side-stage receipt, not evidence about a type.
+            continue
+        symbol_id = row.get("symbol_id")
+        if symbol_id is None or str(symbol_id) != type_id:
+            rejected += 1
+            continue
+        family_name = row.get("family_name")
+        if not isinstance(family_name, str) or not family_name:
+            continue
+        observed.setdefault(type_id, set()).add(family_name)
+    if rejected:
+        return {}, frozenset(), rejected, FINGERPRINT_BLIND_INDEX_REJECTED
+    stable = {
+        type_id: next(iter(names))
+        for type_id, names in observed.items() if len(names) == 1
+    }
+    unstable = frozenset(
+        type_id for type_id, names in observed.items() if len(names) > 1)
+    return stable, unstable, 0, None
 
 
 def _resource_key(source_element_id: str) -> str:
@@ -569,24 +836,44 @@ def build_dependency_manifest(
     document: L0Document,
     *,
     target_contract: TargetContract | str = TargetContract.SAME_ENVIRONMENT,
+    family_placement: Mapping[str, Any] | None = None,
 ) -> DependencyManifest:
     """Build the strongest honest manifest available from current L0 1.0.
 
-    Every distinct category/type pair is recorded conservatively because an
-    opaque atom can still depend on its source definition.  No category is
-    silently treated as portable merely because its current L1 op omits a type
+    Every distinct ElementType is recorded conservatively because an opaque
+    atom can still depend on its source definition.  No category is silently
+    treated as portable merely because its current L1 op omits a type
     parameter.
+
+    ``family_placement`` is the parsed FamilyInstance placement side index
+    (``parse_family_placement_index``); ``None`` means the caller has none and
+    the family axis is simply absent, named as such rather than guessed.
+
+    THE SCOPE OF WHAT THIS PRODUCES, stated before anything reads it as more.
+    The fingerprint is DOCUMENT-LOCAL and PARTIAL.  Measured 2026-08-11 over
+    the 67 stored decompiles (1 139 477 elements, 8700 distinct ElementType
+    ids): 275 (category, type_name) cells hold more than one ElementType --
+    i.e. a type name is not unique even INSIDE one document -- covering 1029
+    ids; the family axis separates 115 of those cells completely and 0
+    partially.  What it cannot separate is measured too: 692 ids stay
+    ambiguous, 216 of them OST_Walls, and their heart is the in-place family,
+    where Revit mints one type per instance and the snapshot carries no field
+    that differs.  Nothing here claims a match in a TARGET document: L0 1.0
+    holds no content digest of a Revit definition, so ``resolution`` stays
+    TARGET_MATCH and ``fingerprint`` stays None even for an identified type.
     """
 
     if not isinstance(document, L0Document):
         raise DependencyManifestError("document must be an L0Document")
     contract = _coerce_target_contract(target_contract)
-    grouped: dict[tuple[DependencyKind, str, str], list[str]] = {}
+    family_axis, unstable_types, rejected_rows, index_reason = (
+        _family_axis_by_type(document, family_placement))
+    grouped: dict[tuple[DependencyKind, str, str, str], list[str]] = {}
     for element in document.elements:
         kind = _dependency_kind(element.category)
         grouped.setdefault(
-            (kind, element.category, element.type_name), []).append(
-                element.element_id)
+            (kind, element.category, element.type_name, element.type_id),
+            []).append(element.element_id)
 
     definitions: list[DependencyDefinition] = []
     all_source_ids = tuple(sorted(
@@ -611,30 +898,136 @@ def build_dependency_manifest(
             affected_source_ids=all_source_ids,
         ),
     ]
-    for kind, category, type_name in sorted(
-            grouped, key=lambda item: (item[0].value, item[1], item[2])):
-        identity = DependencyIdentity(category=category, type_name=type_name)
-        key = _definition_key(kind, identity)
-        required_by = tuple(sorted(set(grouped[(kind, category, type_name)])))
-        identity_note = FAMILY_IDENTITY_NOTE
-        definitions.append(DependencyDefinition(
-            key=key,
-            kind=kind,
-            identity=identity,
-            fingerprint=None,
-            required_by=required_by,
-            requires=(),
-            resolution=DependencyResolution.TARGET_MATCH,
-            identity_note=identity_note,
-        ))
+    if rejected_rows:
+        # A NEW unresolved FACT, not a louder version of an old one: the type
+        # evidence we do hold has been proven to come from another document.
         unresolved.append(UnresolvedDependency(
-            key=key,
+            key="family_placement_index:provenance",
             reason=FidelityReason.DEPENDENCY_UNRESOLVED,
             detail=(
-                "target name match is unverified and frozen L0 1.0 carries "
-                "no definition fingerprint"
+                f"family placement side index refused as type evidence: "
+                f"{rejected_rows} row(s) carry a symbol_id that disagrees "
+                f"with the L0 type_id of the same element, which proves the "
+                f"index was not read from this document"
             ),
-            affected_source_ids=required_by,
+            affected_source_ids=(),
+        ))
+
+    # FIRST PASS -- axes only.  "Unique" is a property of a PAIR of
+    # definitions, so no record can be given its state before every record of
+    # the document exists.
+    drafts: list[dict[str, Any]] = []
+    for kind, category, type_name, type_id in sorted(
+            grouped,
+            key=lambda item: (item[0].value, item[1], item[2], item[3])):
+        identity = DependencyIdentity(category=category, type_name=type_name)
+        key = _definition_key(kind, identity, type_id)
+        required_by = tuple(sorted(set(
+            grouped[(kind, category, type_name, type_id)])))
+        axes: list[tuple[str, str]] = [("category", category)]
+        if type_name:
+            axes.append(("type_name", type_name))
+        family_name = family_axis.get(type_id) if type_id else None
+        blind: str | None
+        if family_name:
+            axes.append(("family_name", family_name))
+            blind = None
+        elif not type_id:
+            blind = FINGERPRINT_BLIND_NO_TYPE_ID
+        elif index_reason is not None:
+            blind = index_reason
+        elif type_id in unstable_types:
+            blind = FINGERPRINT_BLIND_FAMILY_UNSTABLE
+        else:
+            blind = FINGERPRINT_BLIND_NO_ROW
+        if not type_id:
+            # An element with no ElementType at all.  Measured 2026-08-11:
+            # 123 758 of 1 139 477 elements -- rooms, lines, curtain grids,
+            # room separation lines.  There is nothing to identify, and
+            # dressing the category up as a type name would INVENT a
+            # dependency that the document does not have.
+            digest = None
+            blind = FINGERPRINT_BLIND_NO_TYPE_ID
+        elif not type_name and family_name is None:
+            digest = None
+            blind = FINGERPRINT_BLIND_NO_NAME
+        else:
+            digest = _fingerprint_digest(tuple(axes))
+        drafts.append({
+            "key": key,
+            "kind": kind,
+            "identity": identity,
+            "type_id": type_id,
+            "required_by": required_by,
+            "axes": tuple(axes),
+            "digest": digest,
+            "blind": blind,
+        })
+
+    shared: dict[str, list[str]] = {}
+    for draft in drafts:
+        if draft["digest"] is not None:
+            shared.setdefault(draft["digest"], []).append(draft["key"])
+
+    # SECOND PASS -- state, and the detail that names the cause.  Before this
+    # change every unresolved record of a document carried one identical
+    # sentence (569 of them on `k2_ar_rd_v7`, measured 2026-08-11), so a
+    # reader could not tell a type we can point at from a type we cannot.
+    for draft in drafts:
+        digest = draft["digest"]
+        axis_names = ", ".join(name for name, _ in draft["axes"])
+        if digest is None:
+            state = TypeIdentityState.UNIDENTIFIED
+            candidates: tuple[str, ...] = ()
+            detail = (
+                "the source snapshot carries no axis able to identify this "
+                f"definition: {draft['blind']}"
+            )
+        else:
+            rivals = tuple(sorted(
+                other for other in shared[digest] if other != draft["key"]))
+            if rivals:
+                state = TypeIdentityState.AMBIGUOUS
+                candidates = rivals
+                detail = (
+                    f"the source snapshot does not separate this definition "
+                    f"from {len(rivals)} rival definition(s) sharing "
+                    f"({axis_names}); missing axis: {draft['blind']}"
+                )
+            else:
+                state = TypeIdentityState.IDENTIFIED
+                candidates = ()
+                detail = (
+                    "target name match is unverified and frozen L0 1.0 "
+                    "carries no definition fingerprint; inside the source "
+                    f"snapshot this definition is separated by ({axis_names})"
+                )
+        type_identity = TypeFingerprint(
+            schema_version=TYPE_FINGERPRINT_SCHEMA_VERSION,
+            state=state,
+            digest=digest,
+            axes=draft["axes"],
+            scope=TYPE_FINGERPRINT_SCOPE,
+            candidates=candidates,
+            blind_reason=draft["blind"],
+        )
+        definitions.append(DependencyDefinition(
+            key=draft["key"],
+            kind=draft["kind"],
+            identity=draft["identity"],
+            fingerprint=None,
+            required_by=draft["required_by"],
+            requires=(),
+            resolution=DependencyResolution.TARGET_MATCH,
+            identity_note=FAMILY_IDENTITY_NOTE,
+            source_type_id=draft["type_id"],
+            type_identity=type_identity,
+        ))
+        unresolved.append(UnresolvedDependency(
+            key=draft["key"],
+            reason=FidelityReason.DEPENDENCY_UNRESOLVED,
+            detail=detail,
+            affected_source_ids=draft["required_by"],
         ))
 
     resources: list[ExternalResource] = []
@@ -696,9 +1089,20 @@ __all__ = [
     "ExternalResource",
     "FAMILY_IDENTITY_NOTE",
     "LINK_IDENTITY_NOTE",
+    "FINGERPRINT_BLIND_FAMILY_UNSTABLE",
+    "FINGERPRINT_BLIND_INDEX_ABSENT",
+    "FINGERPRINT_BLIND_INDEX_REJECTED",
+    "FINGERPRINT_BLIND_NO_NAME",
+    "FINGERPRINT_BLIND_NO_ROW",
+    "FINGERPRINT_BLIND_NO_TYPE_ID",
+    "FINGERPRINT_BLIND_REASONS",
     "SourceEnvironment",
     "StateReference",
+    "TYPE_FINGERPRINT_SCHEMA_VERSION",
+    "TYPE_FINGERPRINT_SCOPE",
     "TargetContract",
+    "TypeFingerprint",
+    "TypeIdentityState",
     "UnresolvedDependency",
     "build_dependency_manifest",
 ]

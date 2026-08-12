@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import pathlib
 import statistics
 import subprocess
@@ -26,8 +27,11 @@ import time
 from kukai.clash import hulls as H
 from kukai.clash.hulls import _valid_box
 
-ROOT = pathlib.Path(__file__).resolve().parents[3] / "backend" / "data" / "decompile"
-ART = pathlib.Path("/home/claude/kir-night/artifacts")
+BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[3]
+ROOT = BACKEND_ROOT / "data" / "decompile"
+ART = pathlib.Path(
+    os.environ.get("KIR_CLASH_ARTIFACTS", str(BACKEND_ROOT / "artifacts"))
+)
 
 
 def _git(*a: str) -> str:

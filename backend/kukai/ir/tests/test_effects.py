@@ -43,8 +43,10 @@ from kukai.ir.effects import (  # noqa: E402
 
 
 def _grounded(program_name: str):
+    # Границы версии (`__min_ver__`/`__max_ver__`) — метаданные корпуса, а не
+    # поля конверта программы: планировщик эффектов версий не знает вовсе.
     prog = {k: v for k, v in PROGRAMS[program_name].items()
-            if k != "__min_ver__"}
+            if k not in ("__min_ver__", "__max_ver__")}
     return ground_mod.ground(_parse_and_check(prog), GROUND_SNAPSHOT)
 
 
@@ -81,6 +83,19 @@ class Dependencies(unittest.TestCase):
         _sigs, deps = build_dependency_graph(g)
         self.assertIn(
             Dependency(before="W1", after="Win1", reason="reads_write"), deps)
+
+    def test_element_address_receipt_preserves_dependency(self) -> None:
+        # GROUND replaces at_element with a literal point.  The compiler-owned
+        # receipt is therefore the sole surviving evidence that B1 reads C1.
+        g = [
+            {"op": "create_column", "id": "C1"},
+            {"op": "create_beam", "id": "B1", "p0_mm": [0, 0, 0],
+             "__address__": [{"element": {"of": "C1", "point": "center"}}]},
+        ]
+        sigs, deps = build_dependency_graph(g)
+        self.assertEqual(sigs["B1"].reads, frozenset({"C1"}))
+        self.assertIn(
+            Dependency(before="C1", after="B1", reason="reads_write"), deps)
 
     def test_e6_walls_parallel_then_windows(self) -> None:
         g = _grounded("full_house")
@@ -182,6 +197,35 @@ class FailClosed(unittest.TestCase):
         ]
         with self.assertRaises(WriteWriteConflict):
             schedule(g)
+
+    def test_write_write_is_dominated_by_the_id_check(self) -> None:
+        """The race guard cannot fire, and this test says WHY, not that it can.
+
+        REFUTING TEST for a check that could not fail. Until 10.08.2026 both
+        the duplicate-id refusal and the write-write scan raised one type, so
+        test_e7 above passed on the FIRST and nobody could tell the second had
+        never run. writes is exactly {op_id}, so two ops share a written id
+        only by sharing their op id -- which the earlier check refuses. The
+        assertion below is on the NARROW type: the day writes stops being a
+        singleton, this fails and forces the race guard to be re-thought
+        instead of silently returning to duty or being deleted as dead.
+        """
+        from kukai.ir.effects import DuplicateOpId
+        from kukai.ir import effects as _eff
+
+        g = [
+            {"op": "create_level", "id": "L1", "elev_mm": 0, "name": "A"},
+            {"op": "create_level", "id": "L1", "elev_mm": 3000, "name": "B"},
+        ]
+        with self.assertRaises(DuplicateOpId):
+            schedule(g)
+
+        # And the domination itself, stated as a property rather than a story:
+        # every signature writes its own id and nothing else.
+        ok = _eff.effect_signature(
+            {"op": "create_level", "id": "L9", "elev_mm": 0, "name": "A"},
+            frozenset({"L9"}))
+        self.assertEqual(set(ok.writes), {"L9"})
 
     def test_e10_malformed_op_fails_closed(self) -> None:
         with self.assertRaises(EffectError):

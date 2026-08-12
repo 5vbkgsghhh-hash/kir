@@ -567,6 +567,102 @@ _COMPILER_CHOICE_RULES = frozenset({
     "doc_default",
 })
 
+#: Кто отвечает на вопрос «какой тип», когда компилятор передал его документу.
+#: Это НЕ «мы не знаем», а «знает Revit, и знает он это только в момент
+#: постройки»: `doc.GetDefaultElementTypeId(ElementTypeGroup.*)` спрашивают у
+#: открытого документа внутри транзакции (см. `IN_EMIT_DEFAULT` и, например,
+#: `authoring._emit_wall`).
+DEFERRED_TO_REVIT = "revit"
+
+#: Ключ, под которым эмиссия кладёт ИМЯ ТИПА построенного элемента в квитанцию
+#: исполнения. Один на все опы с документным умолчанием — замер 10.08.2026 по
+#: эмиссии всех восьми таких опов; замок держит `test_choice_showcase.
+#: test_every_document_default_op_reads_its_type_name_back`, потому что
+#: указатель на несуществующее поле хуже отсутствия указателя.
+RUNTIME_TYPE_NAME_KEY = "type_name"
+
+
+#: Единственный параметр, чьё отложенное имя эмиссия читает обратно. Сегодня
+#: `IN_EMIT_DEFAULT` ставится ТОЛЬКО на `type` (обе площадки в `ground()`), и
+#: указатель верен ровно поэтому. Если документное умолчание когда-нибудь
+#: заведут на другом параметре, строка честно останется без адреса, а не
+#: пошлёт читателя в поле `type_name`, которое к нему не относится.
+_DEFERRED_PARAM_WITH_READBACK = "type"
+
+
+def _deferred_chosen(op_id: Any, param: Any) -> dict:
+    """Строка выбора, который компилятор ОТЛОЖИЛ документу.
+
+    ПОЧЕМУ ЭТО НЕ «ЗАПОЛНИТЬ ПУСТОЕ ПОЛЕ». Живой ход 10.08.2026 (модель
+    оператора, Revit 2023, стена без `type`) прошёл зелёным насквозь и вернул
+    `chosen: {"id": null, "name": null}`, тогда как построенная стена получила
+    вполне конкретный «111_Кирпич 380». Имени на стадии заземления НЕ
+    СУЩЕСТВУЕТ — и это не наш недосмотр, а устройство правила: тип выбирает сам
+    документ уже внутри эмиссии. Придумать имя было бы худшим из ответов
+    (выдуманное имя типа хуже пустого), убрать строку — вторым худшим (молчание
+    о сделанном выборе и есть исходный дефект).
+
+    Поэтому строка меняет не содержимое, а СМЫСЛ: пустая пара «id/name»
+    читается как «выбор не сделан», а `resolved_at` + `read_from` говорят
+    ровно то, что верно, — выбор сделан, сделал его документ, имя появится в
+    квитанции исполнения вот по этому адресу. После исполнения имя туда и
+    доезжает (`attach_runtime_choices`), так что указатель живёт недолго и
+    нужен там, где исполнения ещё (или уже) не было: сухая компиляция, отказ
+    до эффекта, разбор программы без Revit.
+    """
+    chosen = {"id": None, "name": None, "resolved_at": DEFERRED_TO_REVIT}
+    if param == _DEFERRED_PARAM_WITH_READBACK:
+        chosen["read_from"] = f"result.{op_id}.{RUNTIME_TYPE_NAME_KEY}"
+    return chosen
+
+
+def attach_runtime_choices(report: list[dict], payload: Any) -> list[dict]:
+    """Дописать в квитанцию имена, которые знал только Revit.
+
+    Из двух честных ответов на отложенный выбор — «скажи, где прочесть» и
+    «прочти и скажи» — взяты ОБА, и порядок неслучаен. Указатель обязателен:
+    он верен всегда, в том числе когда исполнения не было. Но останавливаться
+    на нём нельзя, и причина не в удобстве: ответ УЖЕ ЛЕЖИТ В ТОМ ЖЕ JSON, а
+    эмиттер, который тип применил, он же его и прочитал обратно с
+    `GetTypeId()` построенного элемента. Оставить соединение читателю значило
+    бы отдать модели работу, которую мы можем сделать один раз и точно, — и
+    оставить её в состоянии «правило названо, результат неизвестен», то есть
+    ровно там, откуда механизм начинался.
+
+    Это ЗАМЕР, а не заполнение правдоподобным: имя берётся из построенного
+    элемента и ниоткуда больше. Нет строки в квитанции, нет поля, пустая
+    строка — выбор остаётся неразрешённым, а указатель на месте. Провенанс
+    называется (`source: readback`), потому что имя из снапшота и имя из
+    построенного элемента — разные факты, и склеивать их молча нельзя.
+
+    Возвращает НОВЫЙ список: `CompileOutput` живёт дольше хода и попадает в
+    кэш компиляции, а квитанция — не черновик.
+    """
+    if not report:
+        return report
+    filled: list[dict] = []
+    for row in report:
+        chosen = row.get("chosen") if isinstance(row, dict) else None
+        if (not isinstance(chosen, dict)
+                or chosen.get("resolved_at") != DEFERRED_TO_REVIT
+                or chosen.get("name") is not None
+                # Без адреса читать неоткуда: строка без `read_from` — это
+                # честное «мы не знаем, где это лежит», и угадывать поле здесь
+                # значило бы вернуть догадку под видом замера.
+                or not chosen.get("read_from")):
+            filled.append(row)
+            continue
+        readback = (payload.get(row.get("op_id"))
+                    if isinstance(payload, dict) else None)
+        name = (readback.get(RUNTIME_TYPE_NAME_KEY)
+                if isinstance(readback, dict) else None)
+        if not isinstance(name, str) or not name.strip():
+            filled.append(row)
+            continue
+        filled.append({**row, "chosen": {**chosen, "name": name.strip(),
+                                         "source": "readback"}})
+    return filled
+
 
 def compiler_choices(grounded_ops: list[dict]) -> list[dict]:
     """Квитанция: что выбрал компилятор там, где автор промолчал.
@@ -582,16 +678,18 @@ def compiler_choices(grounded_ops: list[dict]) -> list[dict]:
             continue
         # RELATE: адрес — это НЕ умолчание (автор сказал «А/3» вслух), но
         # ВЫВОД компилятора из сказанного, и предъявлять его надо по той же
-        # причине. Отдельное правило `at_grid`, а не подмешивание в
-        # `_COMPILER_CHOICE_RULES`: смешать «я выбрал за тебя» и «я вывел из
+        # причине. Отдельные правила `at_grid`/`at_element`, а не подмешивание
+        # в `_COMPILER_CHOICE_RULES`: смешать «я выбрал за тебя» и «я вывел из
         # твоих слов» значило бы соврать про происхождение обоих.
-        for row in op.get("__grid_address__") or ():
+        for row in op.get("__address__") or ():
             report.append({
                 "op_id": op.get("id"), "op": op.get("op"),
-                "param": row.get("param"), "rule": "at_grid",
+                "param": row.get("param"),
+                "rule": "at_element" if row.get("element") else "at_grid",
                 "chosen": {"point_mm": row.get("point_mm")},
                 "rule_detail": {"lines": row.get("lines"),
-                                "angle_deg": row.get("angle_deg")},
+                                "angle_deg": row.get("angle_deg"),
+                                "element": row.get("element")},
             })
         for param, sel in op.items():
             if not isinstance(sel, dict):
@@ -602,12 +700,19 @@ def compiler_choices(grounded_ops: list[dict]) -> list[dict]:
             via = res.get("via")
             if via not in _COMPILER_CHOICE_RULES:
                 continue
+            # Форма строки решается МЕТКОЙ ЭМИССИИ, а не именем правила:
+            # `in_emit` — то самое, что заставляет эмиттер спросить документ,
+            # и привязка к нему не даёт витрине разъехаться с эмиссией, если
+            # правило когда-нибудь переименуют или заведут второе такое же.
+            chosen = (_deferred_chosen(op.get("id"), param)
+                      if res.get("in_emit") == IN_EMIT_DEFAULT
+                      else {"id": res.get("id"), "name": res.get("name")})
             row = {
                 "op_id": op.get("id"),
                 "op": op.get("op"),
                 "param": param,
                 "rule": via,
-                "chosen": {"id": res.get("id"), "name": res.get("name")},
+                "chosen": chosen,
             }
             if isinstance(res.get("rule_detail"), dict):
                 row["rule_detail"] = res["rule_detail"]
@@ -636,7 +741,7 @@ def describe_choices_ru(report: list[dict]) -> str:
     parts: list[str] = []
     addresses: list[str] = []
     for row in report:
-        if row.get("rule") == "at_grid":
+        if row.get("rule") in ("at_grid", "at_element"):
             # Квитанция адреса печатается ВСЕГДА: она отвечает на вопрос
             # «что компилятор вывел из «А/3»», а не «чем он заполнил
             # молчание». Без неё выбор оси неотличим от угадывания.
@@ -645,14 +750,34 @@ def describe_choices_ru(report: list[dict]) -> str:
                 "op_id": row.get("op_id"), "param": row.get("param"),
                 "point_mm": (row.get("chosen") or {}).get("point_mm"),
                 "lines": detail.get("lines") or (),
+                "element": detail.get("element"),
             }]))
             continue
         rule = _RULE_NAMES_RU.get(row.get("rule", ""), row.get("rule", ""))
-        name = (row.get("chosen") or {}).get("name")
+        chosen = row.get("chosen") or {}
+        name = chosen.get("name")
         detail = row.get("rule_detail") or {}
-        # «Единственный в модели» и «дефолт документа» не нуждаются в защите:
-        # выбора там не было. Предъявлять надо там, где кандидатов много —
-        # именно этот случай неотличим от `.FirstOrDefault()` без объяснения.
+        if chosen.get("resolved_at") == DEFERRED_TO_REVIT:
+            # ОТЛОЖЕННЫЙ ВЫБОР ПЕЧАТАЕТСЯ ВСЕГДА, И ЭТО ПОПРАВКА 10.08.2026.
+            # Раньше строка выпадала здесь же, где `sole_entry`, по одному и
+            # тому же условию «нет кандидатов», — и живой ход вернул пустое
+            # примечание при построенной стене «111_Кирпич 380». Условие было
+            # верным для `sole_entry` (кандидат один, выбирать не из чего) и
+            # неверным для документного умолчания: типов стен у настоящего
+            # проекта десятки, выбор среди них СДЕЛАН — просто не нами, и
+            # именно поэтому его надо назвать вслух.
+            parts.append(
+                f"{row.get('param')}: «{name}» ({rule}, прочитано в "
+                f"построенном элементе)"
+                if name else
+                f"{row.get('param')}: выбирает документ ({rule}); имя типа "
+                f"известно только после постройки"
+                + (f" — {chosen['read_from']}" if chosen.get("read_from")
+                   else ""))
+            continue
+        # «Единственный в модели» не нуждается в защите: выбора там не было.
+        # Предъявлять надо там, где кандидатов много — именно этот случай
+        # неотличим от `.FirstOrDefault()` без объяснения.
         if not detail.get("candidates"):
             continue
         runner_up = detail.get("runner_up")
@@ -665,7 +790,7 @@ def describe_choices_ru(report: list[dict]) -> str:
             f"из {detail.get('candidates')} кандидатов{gap})")
     lines: list[str] = []
     if addresses:
-        lines.append("адрес от осей — " + "; ".join(addresses))
+        lines.append("адрес — " + "; ".join(addresses))
     if parts:
         lines.append("выбрано по умолчанию — " + "; ".join(parts))
     return "\n".join(lines)
@@ -750,6 +875,13 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
                     # цикле разрешения ниже — нерелевантный пропущенный
                     # параметр не должен ТРЕБОВАТЬ снапшот.
                     continue
+                if (ospec.name == "create_area_reinforcement"
+                        and param == "hook_type"):
+                    # wave/reinforcement: зеркало пропуска из основного цикла
+                    # разрешения ниже. Пропущенный крюк — это НАЗВАННОЕ «без
+                    # крюков», а не «разреши из пула», поэтому и снапшота он
+                    # требовать не должен.
+                    continue
                 if param == "top_level":
                     # audit F6 (generalized, P1 2026-07-21): omitted top_level
                     # = no top attach for ANY op (wall unconnected height,
@@ -771,7 +903,16 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
         # надо по РЕАЛЬНЫМ значениям реальных параметров, а не по `repr`:
         # подстрока «at_grid» в имени типа больше не может ни включить чтение
         # пула, ни (что хуже) остаться незамеченной там, где адрес есть.
-        if "at_grid" in repr(op.get("contour")):
+        #
+        # 09.08.2026 — ОСТАТОК ТОЙ ЖЕ ПОЧИНКИ, ДОБИТЫЙ ВОЛНОЙ ТЕЛ. Строка
+        # выше переехала на роды, а ЭТА осталась с зашитым ИМЕНЕМ параметра
+        # `contour` — и работала ровно потому, что оба тогдашних региона так и
+        # звались. Профиль тела зовётся `profile`, и с зашитым именем адрес от
+        # осей внутри него не потребовал бы снапшота: пул `grids` пришёл бы
+        # пустым, а отказ назвал бы «оси не найдены» вместо «снапшота нет» —
+        # ремонт не туда. Правило адресуется РОДОМ, как и соседнее.
+        if any("at_grid" in repr(op.get(p.name))
+               for p in ospec.params if p.kind == "region"):
             return True
         if relate.program_uses_address(op):
             return True
@@ -797,6 +938,11 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
 
     out = []
     address_receipt: list[dict] = []
+    #: Заземлённые опы, СТОЯЩИЕ ВЫШЕ текущего, по id — единственный источник
+    #: чисел для адреса от элемента. Наполняется в конце итерации, поэтому
+    #: ссылка вперёд не находится ПО ПОСТРОЕНИЮ, а не по проверке, которую
+    #: можно забыть добавить (тот же приём, что у `created` в `plan_program`).
+    by_id_so_far: dict[str, dict] = {}
     for i, op in enumerate(normed_ops):
         ospec = spec.OPS[op["op"]]
         g = dict(op)
@@ -809,10 +955,21 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
             value = op.get(param)
             if not relate.is_address(value):
                 continue
-            point = relate.resolve_address(
-                value, snapshot_pool("grids"), op["id"], param, diags,
-                dims=dims, truncated=pool_truncated("grids"),
-                receipt=op_receipt)
+            if relate.is_element_address(value):
+                # АДРЕС ОТ ЭЛЕМЕНТА читает не снапшот, а САМУ ПРОГРАММУ —
+                # уже заземлённые опы, стоящие ВЫШЕ (`by_id_so_far`). Отсюда
+                # же и ответ на «а если элемент создаётся этой же программой»:
+                # это ЕДИНСТВЕННЫЙ случай, который здесь и выражается, ровно
+                # обратной стороной того, чем `at_grid` отказывает на оси из
+                # той же программы. Пул `levels` нужен только отметке.
+                point = relate.resolve_element_address(
+                    value, by_id_so_far, snapshot_pool("levels"),
+                    op["id"], param, diags, dims=dims, receipt=op_receipt)
+            else:
+                point = relate.resolve_address(
+                    value, snapshot_pool("grids"), op["id"], param, diags,
+                    dims=dims, truncated=pool_truncated("grids"),
+                    receipt=op_receipt)
             if point is not None:
                 g[param] = point
         if op_receipt:
@@ -821,18 +978,33 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
             # итоговая точка). Выбор, который некому предъявить, неотличим
             # от `.FirstOrDefault()` в костюме — тот же закон, что у
             # НАЗВАННОГО УМОЛЧАНИЯ.
-            g["__grid_address__"] = op_receipt
+            g["__address__"] = op_receipt
             address_receipt.extend(op_receipt)
         diameter_spec = next((p for p in ospec.params if p.name == "diameter_mm"), None)
         diameter_bounds = ((diameter_spec.min_val, diameter_spec.max_val)
                            if diameter_spec is not None else None)
-        if ospec.name == "create_floor_by_contour":
+        # CONTOUR: регион опускается в канонические рёбра ЗДЕСЬ, потому что
+        # его точки могут быть адресами осей, а оси живут в снапшоте.
+        #
+        # Правило адресуется РОДОМ ПАРАМЕТРА, а не именем опа (09.08.2026).
+        # До этого дня здесь стояло `if ospec.name == "create_floor_by_contour"`,
+        # и второй оп с эскизом (create_ceiling) молча получил бы `contour`
+        # без единого закона: анкеры неразрешёнными, дуги неопущенными, а
+        # эмиттер — KeyError вместо формы. Род `region` в реестре ровно один
+        # и означает ровно это, поэтому связывать надо с ним.
+        for region_spec in [p for p in ospec.params if p.kind == "region"]:
+            raw_region = op.get(region_spec.name)
+            if raw_region is None:
+                # Необязательный эскиз (у create_ceiling он альтернатива
+                # `outline`). Обязательный отсутствующий уже назван раньше:
+                # authoring_validation отказывает по роду, а взаимную
+                # обязательность держит план (KIR-P007).
+                continue
             from kukai.ir import contour as contour_mod
             grids = (snapshot_pool("grids")
-                     if "at_grid" in repr(op.get("contour")) else [])
+                     if "at_grid" in repr(raw_region) else [])
             region = contour_mod.validate_region(
-                op.get("contour"), grids,
-                op["id"], "contour", diags)
+                raw_region, grids, op["id"], region_spec.name, diags)
             if region is not None:
                 g["__region__"] = region
         if ospec.name == "create_group" and isinstance(op.get("members"), list):
@@ -859,6 +1031,63 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
                     g["__slope_reqs__"] = slope_reqs
         for param, pool_name, required in ospec.grounded:
             sel = op.get(param)
+            pspec = next((pp for pp in ospec.params if pp.name == param), None)
+            if pspec is not None and pspec.kind == "sel_list":
+                # МНОЖЕСТВЕННОЕ ЧИСЛО РОДА `sel` (wave/datums).  Каждый
+                # селектор списка резолвится ТЕМ ЖЕ `_resolve_one` и против
+                # ТОГО ЖЕ пула, что одиночный: правило отбора, написанное
+                # здесь второй раз, разошлось бы с одиночным на первом же
+                # `disambiguate_by`.  Результат — СПИСОК `{"__grounded__":
+                # ...}`, то есть та же форма, что у одиночного, поэлементно;
+                # читает его только эмиттер своего опа.
+                #
+                # ВЕТКИ `by: ref` ЗДЕСЬ НЕТ, И ЭТО НЕ ПРОПУСК.  Сегодня ни
+                # один параметр рода `sel_list` не объявляет `ref_kinds`
+                # (см. `create_multistory_stairs.levels`: причина записана
+                # там), поэтому validate отклоняет такую ссылку раньше — а
+                # ветка, до которой нельзя дойти, это мёртвый код, который
+                # со временем начинает выглядеть как работающая функция.
+                # День, когда `ref_kinds` у списка появится, начинается с
+                # обучения графа зависимостей в `compiler.plan_program`, и
+                # ветка пишется ТОГДА, вместе с ним.
+                if sel is None:
+                    if required:
+                        diags.append(Diagnostic(
+                            code=GROUND_BAD_SELECTOR, op_index=i,
+                            op_id=op["id"], field_name=param,
+                            message_ru=(f"{param}: обязательный список "
+                                        "селекторов отсутствует")))
+                    continue
+                resolved: list = []
+                for one in sel:
+                    res = _resolve_one(
+                        one, pool_name, snapshot_pool(pool_name),
+                        i, op["id"], param, ospec.name, diags,
+                        truncated=pool_truncated(pool_name))
+                    if res:
+                        resolved.append({"__grounded__": res})
+                if len(resolved) == len(sel):
+                    # ОДНО И ТО ЖЕ ИМЯ ДВАЖДЫ — И РАЗНЫЕ ИМЕНА, ВЕДУЩИЕ К
+                    # ОДНОМУ id, — ОДИН И ТОТ ЖЕ ДЕФЕКТ.  validate ловит
+                    # только текстовый повтор; повтор ПО РЕЗУЛЬТАТУ виден
+                    # лишь здесь, и пропустить его значило бы отдать
+                    # ConnectLevels множество меньшей мощности, чем просили,
+                    # — при равенстве множеств свидетель этого НЕ заметит.
+                    ids = [r["__grounded__"].get("id") for r in resolved
+                           if r["__grounded__"].get("id") is not None]
+                    dup = next((x for k, x in enumerate(ids)
+                                if x in ids[:k]), None)
+                    if dup is not None:
+                        diags.append(Diagnostic(
+                            code=GROUND_BAD_SELECTOR, op_index=i,
+                            op_id=op["id"], field_name=param, got=dup,
+                            message_ru=(f"{param}: два селектора разрешились "
+                                        f"в ОДИН элемент (id {dup}) — "
+                                        "множество вышло меньше, чем "
+                                        "названо")))
+                    else:
+                        g[param] = resolved
+                continue
             if isinstance(sel, dict) and sel.get("by") == "ref":
                 # intra-program DAG reference: resolved by the plan stage, not
                 # against the snapshot (validity checked by the DAG walk).
@@ -891,6 +1120,35 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
                 elif ospec.name == "create_foundation" and (
                         (param == "symbol" and op.get("variety") != "isolated") or
                         (param == "type" and op.get("variety") != "slab")):
+                    pass
+                elif (ospec.name == "create_topography"
+                        and op.get("variety") != "toposolid"):
+                    # wave/site: тот же шов, что у create_foundation и
+                    # create_railing выше, и та же причина в её самой резкой
+                    # форме. У ПОВЕРХНОСТИ рельефа уровня НЕ СУЩЕСТВУЕТ в
+                    # API вовсе — TopographySurface.Create его не принимает,
+                    # отметка живёт в Z каждой точки. Типа у неё тоже нет.
+                    # Без этой ветки общее правило «единственный в пуле»
+                    # подставило бы поверхности привязку к этажу, которой у
+                    # неё быть не может, и свидетель начал бы проверять
+                    # выдуманное; в проекте с двумя уровнями (то есть в
+                    # любом настоящем) оно просто отказало бы KIR-G102,
+                    # потеряв рельеф ни за что. Ветка накрывает ОБА
+                    # необязательных селектора этого опа — и `level`, и
+                    # `type`, — потому что оба принадлежат толще.
+                    pass
+                elif (ospec.name == "create_area_reinforcement"
+                        and param == "hook_type"):
+                    # wave/reinforcement (10.08): ПРОПУЩЕННЫЙ КРЮК ЗНАЧИТ «БЕЗ
+                    # КРЮКОВ», и это значение САМОГО API, а не наша подстановка:
+                    # «If this parameter is InvalidElementId, it means to create
+                    # a rebar with no hooks» (RevitAPI.xml, AreaReinforcement.
+                    # Create). Общее правило «единственный в пуле» здесь
+                    # ВРАЛО БЫ дважды: в документе с одним типом крюка оно
+                    # молча заанкерило бы арматуру, которую автор просил без
+                    # анкеровки, а в документе с несколькими просто отказало бы
+                    # KIR-G102 — потеряв армирование ни за что. Тот же шов и та
+                    # же причина, что у create_topography.level ниже.
                     pass
                 elif (ospec.name == "create_railing" and param == "level"
                         and op.get("variety") != "path"):
@@ -926,7 +1184,55 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
                     # Skip: no diagnostic, no __grounded__ key; the emitter's
                     # absent-branch is the byte-stable historical emission.
                     pass
-                elif ospec.name in ("create_wall", "create_floor", "create_roof", "create_floor_by_contour") and param == "type":
+                elif ospec.name in ("create_wall", "create_floor", "create_roof",
+                                    "create_floor_by_contour",
+                                    # wave/wall-foundation (09.08): у
+                                    # ленточного фундамента документный тип по
+                                    # умолчанию СУЩЕСТВУЕТ —
+                                    # ElementTypeGroup.WallFoundationType
+                                    # компилируется на всех шести версиях
+                                    # (замер), в отличие от двери, окна и
+                                    # ограждения, где спросить документ нельзя
+                                    # по построению. Подмена не молчалива:
+                                    # свидетель semantic сверяет построенный
+                                    # тип с тем самым id, который сюда попал.
+                                    "create_wall_foundation",
+                                    # wave/datums (09.08): выдавленная кровля
+                                    # берёт тип у документа ровно как
+                                    # контурная — `ElementTypeGroup.RoofType`
+                                    # собирается на всех шести (замер :52412).
+                                    # Без этой строки опущенный `type` уходил
+                                    # бы в общее правило и отказывал
+                                    # KIR-G104 на модели без пула, где
+                                    # контурная кровля строится.
+                                    "create_extrusion_roof",
+                                    # wave/detail (09.08): у заливки
+                                    # документный тип по умолчанию
+                                    # СУЩЕСТВУЕТ — ElementTypeGroup.
+                                    # FilledRegionType компилируется на всех
+                                    # шести (замер). Общее правило
+                                    # «единственный в пуле» здесь было бы
+                                    # ХУЖЕ ВСЕГО: типов заливки у настоящего
+                                    # проекта десятки, то есть опущенный
+                                    # `type` отказывал бы KIR-G102 всегда, а
+                                    # на пустом проекте — молча брал
+                                    # единственный. Подмена не молчалива:
+                                    # свидетель semantic сверяет
+                                    # GetTypeId() с тем самым id.
+                                    # wave/reinforcement (10.08): у армирования
+                                    # по области документный тип по умолчанию
+                                    # СУЩЕСТВУЕТ — ElementTypeGroup.
+                                    # AreaReinforcementType компилируется на
+                                    # всех шести (замер). Общее правило
+                                    # «единственный в пуле» здесь было бы
+                                    # ХУЖЕ ВСЕГО, как у заливки: типов
+                                    # армирования у настоящего проекта КР
+                                    # несколько, то есть опущенный `type`
+                                    # отказывал бы KIR-G102 всегда. Подмена не
+                                    # молчалива: свидетель semantic сверяет
+                                    # GetTypeId() с тем самым id.
+                                    "create_area_reinforcement",
+                                    "create_filled_region") and param == "type":
                     g[param] = {"__grounded__": {"id": None, "name": None,
                                                  "via": "doc_default",
                                                  "in_emit": IN_EMIT_DEFAULT}}
@@ -952,6 +1258,7 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
                                truncated=pool_truncated(real_pool))
             if res:
                 g[param] = {"__grounded__": res}
+        by_id_so_far[op["id"]] = g
         out.append(g)
     if address_receipt:
         _recheck_geometry_after_addresses(out, diags)
@@ -963,20 +1270,20 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
 def resolution_report(
     grounded_ops: list[dict],
 ) -> tuple["GroundingResolution", ...]:
-    """Return every explicit selector resolution, not only default choices.
+    """Return every explicit selector resolution in deterministic order.
 
-    ``compiler_choices`` intentionally powers a concise user-facing note and
-    therefore omits ordinary by-name/by-id resolutions.  Evidence cannot make
-    that trade-off: every model-dependent address must be bound to the ground
-    digest even when no choice was surprising enough to narrate.
+    ``compiler_choices`` is intentionally a concise user-facing report and
+    omits ordinary by-name/by-id resolutions.  Digest evidence cannot make
+    that trade-off: every nested ``__grounded__`` marker must be accounted,
+    including selectors inside lists and grouped member operations.
     """
     from kukai.ir.midend import GroundingResolution
 
     report: list[GroundingResolution] = []
     for op in grounded_ops:
-        op_id = op.get("id")
+        op_id = op.get("id") if isinstance(op, dict) else None
         if not isinstance(op_id, str) or not op_id:
-            continue
+            raise ValueError("grounded operation needs an id")
         report.extend(GroundingResolution.collect(op_id=op_id, payload=op))
     return tuple(report)
 
@@ -985,7 +1292,12 @@ def ground_program(
     planned: "PlannedProgram",
     snapshot: Any,
 ) -> "GroundedProgram":
-    """Typed, immutable adapter around the legacy list-based grounder."""
+    """Freeze the unchanged list grounder's exact output.
+
+    The current snapshot has no authoritative identity/revision digest, so
+    this adapter intentionally binds resolved output only.  Callers must not
+    treat ``ground_digest`` as proof of which ContextSnapshot was read.
+    """
     from kukai.ir.midend import GroundedProgram, PlannedProgram
 
     if not isinstance(planned, PlannedProgram):
@@ -1008,16 +1320,32 @@ def _recheck_geometry_after_addresses(grounded: list[dict],
     на этой части диапазона (прибор на часть диапазона опаснее отсутствующего).
 
     Обе функции ИМПОРТИРУЮТСЯ, а не переписываются: `authoring_validation.
-    reject_zero_length` и `hosted_geometry.hosted_offset_check` остаются
+    reject_zero_length` и `compiler.hosted_offset_check` остаются
     единственными владельцами своих правил.
+
+    ЗАКОН ЧИТАЕТ ТОЛЬКО РАЗРЕШЁННЫЕ ЧИСЛА, и это ОПРОВЕРГАЮЩИЙ ЗАМЕР, а не
+    предосторожность (найдено 09.08.2026 на базе `2bfbec0a`, до всякой правки).
+    Программа `create_wall` с адресом на НЕСУЩЕСТВУЮЩУЮ ось в `p0_mm` и
+    верным адресом в `p1_mm` доходила сюда с квитанцией (второй адрес
+    разрешился, значит `__address__` есть) и НЕразрешённым первым — то есть с
+    объектом-адресом там, где закон ждёт список. `reject_zero_length` брал
+    `p0_mm[0]` и получал `KeyError`, а вся программа отвечала
+    «KIR-P000 внутренняя ошибка компилятора» ВМЕСТО честного KIR-G108
+    «оси нет в модели», который в этот момент уже лежал в `diags`. Худший из
+    возможных обменов: типизированный отказ с названным следующим ходом
+    подменялся сообщением, которое посылает автора чинить компилятор.
     """
     from kukai.ir.authoring_validation import reject_zero_length
-    from kukai.ir.hosted_geometry import hosted_offset_check
+    from kukai.ir.compiler import hosted_offset_check
 
-    addressed = {op["id"] for op in grounded if "__grid_address__" in op}
+    def _resolved(op: dict) -> bool:
+        return all(isinstance(op.get(key), list)
+                   for key in ("p0_mm", "p1_mm"))
+
+    addressed = {op["id"] for op in grounded if "__address__" in op}
     by_id = {op["id"]: op for op in grounded}
     for index, op in enumerate(grounded):
-        if op["id"] in addressed and "p0_mm" in op and "p1_mm" in op:
+        if op["id"] in addressed and _resolved(op):
             reject_zero_length(op["p0_mm"], op["p1_mm"], op["op"], index,
                                op["id"], diags)
         if op["op"] not in ("create_window", "create_door"):
@@ -1025,7 +1353,6 @@ def _recheck_geometry_after_addresses(grounded: list[dict],
         host = op.get("host") or {}
         wall = by_id.get(host.get("value"))
         if (wall is None or wall.get("op") != "create_wall"
-                or wall["id"] not in addressed
-                or "p0_mm" not in wall or "p1_mm" not in wall):
+                or wall["id"] not in addressed or not _resolved(wall)):
             continue
         hosted_offset_check(op, wall, str(host.get("value")), index, diags)

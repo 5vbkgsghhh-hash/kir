@@ -6,6 +6,7 @@ import json
 import unittest
 
 from kukai.ir.contracts import RevisionProof
+from kukai.ir.compiler import _TYPE_POOL_COLLECTOR_CS
 from kukai.ir.open_model import (
     GROUND_SNAPSHOT_CS,
     OpenModelProfile,
@@ -74,7 +75,64 @@ class OpenModelProfileContractTests(unittest.TestCase):
         # (create_ceiling / create_railing). Число держится руками намеренно —
         # новый пул тянет за собой сборщик в GROUND_SNAPSHOT_CS, и молча
         # выросшая цифра означала бы пул, который никто не собирает.
-        self.assertEqual(len(pools), 19)
+        # 19 -> 20: wave/wall-foundation добавила wall_foundation_types
+        # (create_wall_foundation), собирается OfClass(WallFoundationType).
+        # 20 -> 23: wave/mep-electrical добавила conduit_types,
+        # flex_duct_types и flex_pipe_types (create_conduit /
+        # create_flex_duct / create_flex_pipe). ЧИСЛО ПЕРЕСНЯТО ПРИБОРОМ ПОСЛЕ
+        # СЛИЯНИЯ (open_model.required_grounding_pools()), а не сложено из
+        # двух веток: каждая из них считала от своего 19, и любая из их цифр,
+        # взятая как есть, потеряла бы пулы другой волны.
+        # 23 -> 27: wave/analysis добавила load_cases, point_load_types,
+        # line_load_types и area_load_types (create_point_load /
+        # create_line_load / create_area_load). Три из них — типы, собираемые
+        # OfClass, четвёртый — пул ЭКЗЕМПЛЯРОВ (случаи загружения), и он
+        # обязателен у всех трёх нагрузок. Пула природ нагрузки (LoadNature)
+        # здесь НЕТ намеренно: им никто не заземляется, а этот список — ровно
+        # то, чем заземляются селекторы реестра.
+        # 27 -> 28: wave/framing добавила truss_types (create_truss).
+        # Живой Revit отвергает OfClass(TrussType), хотя он компилируется;
+        # поэтому пул собирает FamilySymbol + OST_Truss. ОДИН пул на ДВЕ
+        # операции — у
+        # create_beam_system своего пула нет: её `symbol` грунтуется тем же
+        # beam_types, что и create_beam, вместе с его фильтром по типу
+        # размещения.
+        # И СНОВА ПЕРЕСНЯТО ПРИБОРОМ, А НЕ СЛОЖЕНО: обе волны считали от 23
+        # (27 и 24), и любая их цифра, взятая как есть, потеряла бы пулы
+        # другой. 28 — это `len(required_grounding_pools())` после слияния.
+        # 28 -> 30: wave/site добавила toposolid_types и building_pad_types
+        # (create_topography(toposolid) / create_building_pad). Сборщик толщи
+        # ОСОБЫЙ — по имени типа CLR у HostObjAttributes, потому что класса
+        # ToposolidType на 2021-2023 не существует, а тело снапшота одно на
+        # все шесть версий (см. комментарий в open_model.py).
+        # ПЕРЕСНЯТО В ТРЕТИЙ РАЗ ЗА ОДНО СЛИЯНИЕ: три волны назвали 27, 24 и
+        # 21, считая каждая от своего среза. Ни одна цифра не годится.
+        # 30 -> 32 (09.08): wave/sweep добавила wall_sweep_types и
+        # slab_edge_types. Сборщик карнизов ОСОБЫЙ — по ДВУМ КАТЕГОРИЯМ, а не
+        # по классу, и это единственно возможный способ: класса
+        # `WallSweepType`-как-ElementType в API не существует вовсе
+        # (`WallSweepType` — перечисление {Sweep, Reveal}, замерено
+        # компиляцией на шести версиях), а тип профиля живёт обычным
+        # ElementType в OST_Cornices либо OST_Reveals.
+        # ПЕРЕСНЯТО `len(required_grounding_pools())` НА ЭТОМ ДЕРЕВЕ.
+        # 32 -> 33: wave/detail добавила filled_region_types
+        # (create_filled_region), собирается OfClass(FilledRegionType).
+        # Категорийный сборщик здесь был бы неверен по существу:
+        # OST_FilledRegion держит и сами заливки, и их типы (см. комментарий
+        # в open_model.py). Число переснято `len(required_grounding_pools())`
+        # на ЭТОМ дереве, а не сложено с чужой ветки — ровно то, о чём
+        # предупреждают три строки выше.
+        # 33 -> 36 (10.08): wave/reinforcement добавила area_reinforcement_types,
+        # rebar_bar_types и rebar_hook_types (create_area_reinforcement). ТРИ, а
+        # не один: `AreaReinforcement.Create` проверяет КАЖДЫЙ из трёх
+        # аргументов на свой класс отдельно и бросает ArgumentException на
+        # чужом id, то есть общий «пул арматурных типов» заменил бы
+        # типизированный отказ рантайм-исключением внутри транзакции. Все три
+        # собираются OfClass — категорийный сборщик здесь неверен по существу
+        # ровно как у заливки: OST_Rebar держит и стержни, и их типы, а
+        # OST_AreaRein — и системы, и типы. Число переснято
+        # `len(required_grounding_pools())` на ЭТОМ дереве.
+        self.assertEqual(len(pools), 36)
         for pool in pools:
             if pool == "grids":
                 self.assertIn('__snap["grids__total"]', GROUND_SNAPSHOT_CS)
@@ -86,6 +144,29 @@ class OpenModelProfileContractTests(unittest.TestCase):
         self.assertIn(
             '__snap[__pool + "__total"] = __total', GROUND_SNAPSHOT_CS)
         self.assertNotIn("IntegerValue", GROUND_SNAPSHOT_CS)
+
+    def test_truss_pool_uses_native_family_symbols_in_both_collectors(
+            self) -> None:
+        """TrussType compiles but FilteredElementCollector rejects it live."""
+        snapshot_lines = [
+            line for line in GROUND_SNAPSHOT_CS.splitlines()
+            if line.startswith('__AddPool("truss_types", ')
+        ]
+        self.assertEqual(len(snapshot_lines), 1)
+
+        collectors = {
+            "grounding": _TYPE_POOL_COLLECTOR_CS["truss_types"],
+            "open_model": snapshot_lines[0],
+        }
+        for owner, collector in collectors.items():
+            with self.subTest(owner=owner):
+                self.assertIn("OfClass(typeof(FamilySymbol))", collector)
+                self.assertIn(
+                    "OfCategory(BuiltInCategory.OST_Truss)", collector)
+                self.assertNotIn("OfClass(typeof(TrussType))", collector)
+                self.assertNotIn(
+                    "OfClass(typeof(Autodesk.Revit.DB.Structure.TrussType))",
+                    collector)
 
     def test_live_profile_is_revision_bound_authoritative_and_round_trips(
             self) -> None:

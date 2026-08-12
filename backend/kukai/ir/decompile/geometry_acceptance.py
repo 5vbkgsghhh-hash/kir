@@ -72,19 +72,22 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
-def _digest(payload: Any) -> str:
+def _canonical_json(payload: Any) -> str:
     try:
-        encoded = json.dumps(
+        return json.dumps(
             payload,
             ensure_ascii=False,
             allow_nan=False,
             sort_keys=True,
             separators=(",", ":"),
-        ).encode("utf-8")
+        )
     except (TypeError, ValueError) as exc:
         raise FormAcceptanceError(
             f"form evidence is not canonical JSON: {exc}") from exc
-    return hashlib.sha256(encoded).hexdigest()
+
+
+def _digest(payload: Any) -> str:
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 def _point_units(point: tuple[float, float, float]) -> tuple[int, int, int]:
@@ -96,8 +99,22 @@ def _point_units(point: tuple[float, float, float]) -> tuple[int, int, int]:
     )  # type: ignore[return-value]
 
 
-def mesh_surface_digest(mesh: GmMesh) -> str:
-    """Order- and winding-independent digest of a world-space mesh surface."""
+def mesh_surface_payload(mesh: GmMesh) -> str:
+    """The EXACT bytes :func:`mesh_surface_digest` hashes, as one JSON string.
+
+    Split out on 2026-08-09 for the authoring witness.  ``create_directshape``
+    must compare this predicate INSIDE its own transaction, and the emitted C#
+    cannot hash: ``System.Security.Cryptography`` is absent from the client
+    reference closure on Revit 2025/2026 (measured on :52412 — CS1069 for
+    ``SHA256`` and ``SHA256Managed``, 4/6; the same asymmetry
+    ``tests/bridge_reference_closure.py`` already recorded for ``MD5``).
+
+    So the emitter pre-registers this PREIMAGE instead of the hash and the
+    in-transaction witness compares strings.  Equality of the preimage is
+    strictly stronger than equality of the digest — no collision argument is
+    needed — and there is still exactly one canonicalisation in the codebase:
+    this function.  :func:`mesh_surface_digest` is its SHA-256 and nothing else.
+    """
 
     if not isinstance(mesh, GmMesh):
         raise FormAcceptanceError("surface digest requires a validated GmMesh")
@@ -106,11 +123,36 @@ def mesh_surface_digest(mesh: GmMesh) -> str:
         tuple(sorted((vertices[a], vertices[b], vertices[c])))
         for a, b, c in mesh.triangles
     )
-    return _digest({
+    return _canonical_json({
         "schema_version": FORM_ACCEPTANCE_SCHEMA_VERSION,
         "grid_mm": GEOM_CANON_MM,
         "triangles": triangles,
     })
+
+
+def mesh_surface_digest(mesh: GmMesh) -> str:
+    """Order- and winding-independent digest of a world-space mesh surface."""
+
+    return hashlib.sha256(
+        mesh_surface_payload(mesh).encode("utf-8")).hexdigest()
+
+
+def surface_payload_envelope() -> tuple[str, str]:
+    """The two constant halves around the triangle array of the preimage.
+
+    The in-transaction witness has no JSON library, so it concatenates the
+    triangles between these two strings.  They are DERIVED from the same
+    canonicaliser rather than typed a second time — the schema version and the
+    grid therefore cannot drift away from :func:`mesh_surface_payload`.
+    """
+
+    empty = _canonical_json({
+        "schema_version": FORM_ACCEPTANCE_SCHEMA_VERSION,
+        "grid_mm": GEOM_CANON_MM,
+        "triangles": [],
+    })
+    head, tail = empty.split("[]", 1)
+    return head + "[", "]" + tail
 
 
 def mesh_bbox_mm(mesh: GmMesh) -> tuple[float, float, float, float, float, float]:
@@ -500,4 +542,6 @@ __all__ = [
     "check_form_acceptance",
     "mesh_bbox_mm",
     "mesh_surface_digest",
+    "mesh_surface_payload",
+    "surface_payload_envelope",
 ]

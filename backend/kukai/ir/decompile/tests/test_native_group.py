@@ -63,7 +63,10 @@ from kukai.ir.decompile.tests.test_merkle import (  # noqa: E402
 )
 
 _ZERO = (0.0, 0.0, 0.0)
-_LOT31_TREE = Path("/home/claude/lot31_full/_tree_cache.pkl")
+_LOT31_TREE = Path(os.environ.get(
+    "KIR_LOT31_TREE",
+    Path.home() / "lot31_full" / "_tree_cache.pkl",
+))
 
 
 def _abs_multiset(leaves):

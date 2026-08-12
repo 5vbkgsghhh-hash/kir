@@ -6,11 +6,13 @@ connect.py, contour.py и любой другой ops_*.py. authoring.py пол�
 аддитивно импорт и две строки в _EMITTERS — тот же минимальный шов, которым
 подключилась волна каркаса.
 
-Переиспользовано из authoring_emit_support.py БЕЗ ИЗМЕНЕНИЙ: _gid,
+Переиспользовано из authoring.py БЕЗ ИЗМЕНЕНИЙ (импортом, не копией): _gid,
 _eid, _cs, _safe, _level_expr, _stamp_block, _readback_block, _loop_pts,
 EMIT_UNSUPPORTED, плюс ПУБЛИЧНЫЕ модели свидетелей level_chain_witness и
-bbox_extents_witness. Подчёркнутые имена сохранены для byte-compatible
-миграции; единственный владелец реализаций — нижележащий support-модуль.
+bbox_extents_witness. Тот же список, что у struct_emit.py, с той же оговоркой
+в его шапке: часть имён — приватные (с подчёркиванием), и если будущий проход
+захочет чистый шов, лечится это повышением их до публичных в authoring.py, а
+не копированием тел сюда.
 
 ГЛАВНОЕ ОБ ЭТОМ ФАЙЛЕ. Обе операции написаны по ЗАМЕРУ компайл-сервиса на
 шести версиях (2021-2026), а не по памяти об API. Замер и его следствия
@@ -27,7 +29,7 @@ bbox_extents_witness. Подчёркнутые имена сохранены д�
 """
 from __future__ import annotations
 
-from kukai.ir.authoring_emit_support import (
+from kukai.ir.authoring import (
     _gid, _eid, _cs, _safe, _level_expr, _stamp_block, _stamp_readback,
     _readback_block, _loop_pts, EMIT_UNSUPPORTED,
     level_chain_witness, bbox_extents_witness,
@@ -80,6 +82,26 @@ def emit_ceiling(op: dict, ver: str, stamp: str,
     Ceiling.Create(doc, IList<CurveLoop>, ElementId typeId, ElementId levelId)
     — подтверждено компиляцией на 2022/2023/2024/2025/2026 и опровергнуто на
     2021 (CS0117: 'Ceiling' does not contain a definition for 'Create').
+
+    ДВА ВХОДА ФОРМЫ, ОДНА ЭМИССИЯ (09.08.2026). Профиль приходит либо прямой
+    ломаной `outline` (+ плоские `holes`), либо опущенным эскизом CONTOUR
+    (`__region__`, положенный туда стадией ground). Ровно одно из двух —
+    план отказывает KIR-P007 и на «оба сразу», и на «ни одного», так что
+    развилка здесь ПОЛНАЯ, а не «а вдруг ни того ни другого».
+
+    Расходятся ровно две вещи: сборка ``List<CurveLoop>`` (прямые звенья
+    против Line/Arc из канонических рёбер) и число, с которым сверяется
+    габарит (крайние точки ломаной против ``contour.edges_bbox``, знающего
+    кардинальные экстремумы дуг). Всё остальное — тип, уровень, смещение,
+    штамп, свидетели, квитанция — общее, и это не экономия строк: две копии
+    этого хвоста разъезжаются, а разъехавшийся свидетель ничего не значит.
+
+    ВЕРСИЯ У ЭСКИЗА НЕ ДОБАВЛЯЕТ ВЕТКИ. У create_floor_by_contour на 2021
+    есть куда свернуть — doc.Create.NewFloor(CurveArray, ...), и потому у
+    него есть emit_curvearray_cs. У потолка сворачивать некуда (см. шапку
+    ops_arch.py, перепроверено 09.08 по RevitAPI.xml/dll 2021: членов
+    ``Ceiling.*`` ноль, строки ``NewCeiling`` нет), поэтому отказ ниже стоит
+    ДО разбора формы и накрывает обе ветки одинаково.
     """
     oid = op["id"]
     s = _safe(oid)
@@ -99,17 +121,29 @@ def emit_ceiling(op: dict, ver: str, stamp: str,
                 f"2021-2026 — замерено компиляцией. Обходного пути нет: "
                 f"перекрытие вместо потолка было бы другим элементом, "
                 f"другой категории"))])
-    holes = op.get("holes") or []
+    region = op.get("__region__")
     lv_res, lv_idexpr = _level_expr(op, s, ver, oid, isolation)
     ct = _grounded_type_cs(op, s, oid, ver, "type", "CeilingType",
                            "потолок", isolation)
-    outline = op["outline"]
     geo = [f"var __loops_{s} = new List<CurveLoop>();"]
-    geo += _loop_pts(outline, f"__ol_{s}")
-    geo.append(f"__loops_{s}.Add(__ol_{s});")
-    for hi, hole in enumerate(holes):
-        geo += _loop_pts(hole, f"__hl_{s}_{hi}")
-        geo.append(f"__loops_{s}.Add(__hl_{s}_{hi});")
+    if region is not None:
+        # Эскиз CONTOUR. Вся тригонометрия дуг уже посчитана в питоне на
+        # стадии ground: emit_loop_cs кладёт в C# три ЛИТЕРАЛЬНЫЕ точки на
+        # дугу (Arc.Create(start, end, точка-на-дуге), version-safe 2014+),
+        # то есть версии здесь не расходятся и после 2022 расходиться нечему.
+        from kukai.ir import contour as C
+        geo.append(C.emit_loop_cs(region["outer"], f"__ol_{s}"))
+        geo.append(f"__loops_{s}.Add(__ol_{s});")
+        for hi, hole in enumerate(region["holes"]):
+            geo.append(C.emit_loop_cs(hole, f"__hl_{s}_{hi}"))
+            geo.append(f"__loops_{s}.Add(__hl_{s}_{hi});")
+    else:
+        outline = op["outline"]
+        geo += _loop_pts(outline, f"__ol_{s}")
+        geo.append(f"__loops_{s}.Add(__ol_{s});")
+        for hi, hole in enumerate(op.get("holes") or []):
+            geo += _loop_pts(hole, f"__hl_{s}_{hi}")
+            geo.append(f"__loops_{s}.Add(__hl_{s}_{hi});")
     make = (f"__el_{s} = Ceiling.Create(doc, __loops_{s}, __ty_{s}.Id, "
             f"__lv_{s}.Id);")
     # Смещение от уровня. Единственная вертикальная степень свободы потолка с
@@ -134,12 +168,31 @@ def emit_ceiling(op: dict, ver: str, stamp: str,
               + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
     from kukai.ir.emit_model import tolerances
     tol = tolerances("create_ceiling")
-    xs = [pt[0] for pt in outline]
-    ys = [pt[1] for pt in outline]
+    if region is not None:
+        # ГАБАРИТ СЧИТАЕТСЯ ПО ОПУЩЕННЫМ РЁБРАМ, А НЕ ПО ВЕРШИНАМ. У дуги
+        # крайняя точка почти никогда не вершина: edges_bbox добавляет
+        # кардинальные экстремумы (0/90/180/270 градусов), попавшие внутрь
+        # развёртки. Сверять дуговой потолок по вершинам значило бы обвинять
+        # правильно построенный элемент ровно на ту стрелку дуги, ради
+        # которой эскиз и взят.
+        #
+        # Допуск НЕ НОВЫЙ и выведен не рассуждением: берётся тот же
+        # зарегистрированный ключ create_ceiling.bbox_mm = 50.0, что и у
+        # прямой ветки, и он же численно совпадает с
+        # create_floor_by_contour.bbox_mm — у контурной плиты это ровно тот
+        # же свидетель над тем же edges_bbox. Отдельного числа контурная
+        # ветка потолка не заводит: новое число здесь было бы границей,
+        # назначенной рассуждением, а не замером (класс дефекта этого дома).
+        from kukai.ir import contour as C
+        x0, y0, x1, y1 = C.edges_bbox(region["outer"])
+        bbox_args = (round(x0, 1), round(x1, 1), round(y0, 1), round(y1, 1))
+    else:
+        xs = [pt[0] for pt in op["outline"]]
+        ys = [pt[1] for pt in op["outline"]]
+        bbox_args = (min(xs), max(xs), min(ys), max(ys))
     checks: list[WitnessCheck] = [
         level_chain_witness(f"__el_{s}", oid, lv_idexpr),
-        bbox_extents_witness(f"__el_{s}", oid, min(xs), max(xs),
-                             min(ys), max(ys), tol["bbox_mm"]),
+        bbox_extents_witness(f"__el_{s}", oid, *bbox_args, tol["bbox_mm"]),
     ]
     if height_offset is not None:
         checks.append(WitnessCheck(

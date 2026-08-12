@@ -14,10 +14,38 @@ never by a name or id:
 
 Because the key is the merkle-hash (a shape's equivalence class up to
 translation / renaming / renumbering — wave 1's invariance), the same shape in
-two different buildings is one prior key: the model learns across buildings for
-free, exactly as wave-1 dedup collapses repeats.  The model answers likelihood,
+two different buildings is one prior key.  The model answers likelihood,
 expected children, and anomaly queries, and is fail-closed on an unseen shape
 (explicit "unknown", never a fabricated probability).
+
+MEASURED 2026-08-11, AND IT WITHDRAWS THE SENTENCE THAT USED TO STAND HERE:
+"the model learns across buildings for free".  Over the stored corpus
+(`backend/backend/data/decompile`, 52 `tree.json`, one run per `doc_name`,
+indexes from `build_index`, model assembled by this layer's own `fit`+`merge`)
+there are 45 448 distinct shapes and 132 649 parent->child edges across 10
+`doc_name` values.  Document frequency: 36 242 shapes in ONE building, 9 189
+in two, 17 in three, none in four or more -- 20.26% apparently shared.
+
+But TWO of those ten names are the same building saved twice
+(`13A-RD-AR-K2_v33` / `..._kuklev.d.s`, and `SKLNK_...` / a copy of it); the
+canon already named that effect for `journal`, where a save-as SPLITS a
+history, and here it runs the other way and INFLATES the corpus.  Those two
+pairs alone share 8 779 and 399 shapes -- 9 178 of the 9 206.  Collapsed onto
+the 8 genuinely different buildings, 45 shapes of 45 448 (0.099%) appear in
+more than one, and `df / n_buildings` is 1/8 for 99.9% of them.
+
+So on THIS corpus the cross-building signal is smaller than the withdrawn
+claim by a factor of about 200, and shape/child priors have almost nothing to
+discriminate.  Nothing above is broken by that -- the arithmetic is exactly
+right -- but the layer must not be wired on the withdrawn promise.  What the
+corpus DOES support is the PARAMETER priors: `create_wall.height_mm`
+p10/p50/p90 = 2250/3100/3300 over 58 172 real walls, `create_pipe.diameter_mm`
+12.7/25.4/101.6 over 15 351, `create_level.elev_mm` 5000/63 300/147 280 over
+442.  Those are observed distributions, and this tree's worst defect class is
+a bound authored by reasoning instead of measurement.
+`create_duct.diameter_mm` is the counter-example and must not be quoted: 908
+values, p10 = p50 = p90 = 101.600, because a duct type's Shape decides whether
+a diameter applies at all.
 
 Discipline (forks in PRIORS_SPEC.md):
 
@@ -239,8 +267,37 @@ class PriorModel:
         are rare relative to the corpus (frequency < ``max_frequency``).
 
         A shape unseen in the corpus is maximally anomalous (frequency 0,
-        known=False) — an explicit signal, never a fabricated small p.
+        known=False) -- an explicit signal, never a fabricated small p.
+
+        AN UNSATISFIABLE THRESHOLD IS A TYPED REFUSAL, NOT AN ANSWER
+        (2026-08-11).  The smallest non-zero frequency a corpus of N buildings
+        can express is exactly ``1 / N``, so a threshold at or below it can
+        only ever select shapes the corpus NEVER CONTAINED.  That is a
+        different question -- "unseen" -- and answering it under the name
+        "anomalies" is a check signing an axis it did not read.  Measured on
+        the stored corpus, where N = 10 and the default 0.1 is exactly 1/10:
+        36 242 shapes of 45 448 (79.7%) sit at df = 1, score 0.1000, and every
+        one of them was silently excluded, so the report could contain nothing
+        but unseen shapes.  Ask ``is_known``/``shape_frequency`` for that
+        question; this one now names the number it cannot satisfy.
         """
+
+        if not isinstance(max_frequency, (int, float)) or isinstance(
+                max_frequency, bool):
+            raise PriorSchemaError("max_frequency must be a number")
+        if self.n_buildings <= 0:
+            raise PriorSchemaError(
+                "an empty corpus has no rarity to report: fit over at least "
+                "one building, or ask is_known() for the unseen question")
+        smallest_expressible = 1.0 / self.n_buildings
+        if max_frequency <= smallest_expressible:
+            raise PriorSchemaError(
+                f"max_frequency={max_frequency} cannot select any observed "
+                f"shape: with n_buildings={self.n_buildings} the smallest "
+                f"non-zero frequency is {smallest_expressible}, so this "
+                f"threshold reports only shapes absent from the corpus. Use a "
+                f"threshold above {smallest_expressible}, or ask is_known() "
+                f"for the unseen question")
 
         seen: dict[str, str] = {}
         for shape_hash, occs in index.occurrences.items():
@@ -473,6 +530,21 @@ def fit(
 
     ``trees`` (optional, aligned by root hash) enables parameter priors from
     the exact L1 leaves; without it the model carries shape + child priors only.
+
+    NAMED LIMIT, because it cannot be guarded away.  ``n_buildings`` counts
+    the INDEXES it was handed, never the buildings that exist: nothing in a
+    ``MerkleIndex`` says which document it came from.  Two save-as copies of
+    one model are two indexes with different labels AND different root hashes
+    (their revisions differ), so they raise every shared shape's ``df`` to 2
+    and its frequency to 1.0 -- indistinguishable from a shape genuinely
+    present in two buildings.  Measured on the stored corpus: 9 178 of the
+    9 206 apparently-shared shapes come from exactly two such pairs.
+
+    Refusing a repeated ROOT HASH would not fix it and would break honest
+    corpora: merkle is rename-invariant by design, so two different buildings
+    that differ only in naming carry the same root hash, and refusing them
+    would deny the very invariance wave 1 exists to provide.  The caller owns
+    corpus identity; this layer states that it does not.
     """
 
     trees_by_root: dict[str, TreeNode] | None = None
