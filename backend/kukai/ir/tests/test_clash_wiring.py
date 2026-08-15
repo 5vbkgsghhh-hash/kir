@@ -69,11 +69,14 @@ def _finding(a_id, b_id, a_label="door", b_label="wall", *,
     return {
         "finding_id": f"{a_id}~{b_id}",
         "a": {"source_element_id": a_id, "label": a_label,
-              "category": "OST_Doors", "hull_source": a_src},
+              "category": "OST_Doors", "hull_source": a_src,
+              "hull_grade": grade},
         "b": {"source_element_id": b_id, "label": b_label,
-              "category": "OST_Walls", "hull_source": b_src},
+              "category": "OST_Walls", "hull_source": b_src,
+              "hull_grade": grade},
         "hull_relation": relation,
         "hull_grade": grade,
+        "verdict": "confirmed" if grade == "exact" else "possible",
         "hull_overlap_depth_mm": depth,
         "ranking_tol_mm": 1.0,
         "pair_kind": pair_kind,
@@ -211,19 +214,27 @@ class OpsStillProduceTheEdge(unittest.TestCase):
         self.assertEqual(out.judged[0].host_source, "program_host_ref")
 
 
-class ARefusalThatCannotFire(unittest.TestCase):
-    """`_rung` у проникания проверял `proven is not False`, а `proven=False`
-    ставится ТОЛЬКО при непустом огрублении — и `_classify` возвращает
-    `penetration` лишь ПОСЛЕ ветки `if slack: -> hull_over_approximation`.
-    Условие не могло быть ложным ни на одном входе."""
+class PenetrationNeedsBodyEvidence(unittest.TestCase):
+    """Semantic rule «трасса через ограждение — узел» не доказывает,
+    что трасса и ограждение вообще пересеклись. Для хода `agree`
+    нужна точная геометрия, а не outer-only overlap."""
 
-    def test_penetration_never_carries_disproven_evidence(self):
+    def test_outer_only_penetration_stays_possible_and_non_executable(self):
         finding = _finding("p1/pipe", "p1/w", a_label="pipe", b_label="wall")
         out = J.judge([finding], hosted={})
         row = out.judged[0]
         self.assertEqual(row.kind, "penetration")
-        self.assertIsNot(row.proven, False)
-        self.assertEqual(row.rung, "agree")
+        self.assertIs(row.proven, False)
+        self.assertEqual(row.rung, "look")
+        self.assertNotIn("create_opening", row.next_move_ru)
+
+    def test_confirmed_word_without_inner_chain_cannot_reach_agree(self):
+        finding = _finding("p1/pipe", "p1/w", a_label="pipe", b_label="wall",
+                           a_src="prism", b_src="prism", grade="exact")
+        row = J.judge([finding], hosted={}).judged[0]
+        self.assertIsNone(row.proven)
+        self.assertEqual(row.rung, "look")
+        self.assertNotIn("create_opening", row.next_move_ru)
 
     def test_bbox_penetration_drops_to_look(self):
         finding = _finding("p1/pipe", "p1/w", a_label="pipe", b_label="wall",

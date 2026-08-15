@@ -83,7 +83,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import pathlib
 import re
 import sys
@@ -94,9 +93,7 @@ from dataclasses import dataclass, field
 
 BASE = "http://127.0.0.1:52411"
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
-ARTIFACTS = pathlib.Path(
-    os.environ.get("KIR_LIVE_ARTIFACTS", str(BACKEND / "artifacts"))
-)
+ARTIFACTS = pathlib.Path.home() / "kir-night" / "artifacts"
 
 # Записи только со сдвигом: разрешение оператора — писать в рабочую модель
 # ТОЛЬКО на +200 м от оригинала (тот же Δ, что в прогоне идемпотентности A5).
@@ -900,6 +897,104 @@ def build_gap_programs() -> list[Row]:
         needs=("modify_fixture",),
         pools=("wall_types",)))
 
+    # ── 17. ЭОМ, заготовки и гибкие участки (волна 09.08) ────────────────
+    # Пять опов, которые до этой волны построить было нечем. Каждый — своя
+    # программа на СВОЁМ уровне, ровно как остальные строки пробела.
+    #
+    # ПОЧЕМУ У ЗАГОТОВОК ДВА СЕЛЕКТОРА, А У КОРОБА ОДИН: `CreatePlaceholder`
+    # берёт и систему, и тип; `Conduit.Create` — только тип (уровень и точки,
+    # система у короба не задаётся вовсе).
+    lv, elev = lvl("COND")
+    out.append(Row(
+        "create_conduit",
+        prog("create_conduit на СВОЁМ уровне", lv,
+             {"op": "create_conduit", "id": "CD",
+              "p0_mm": [x(0), gy(80_000), elev + 2_700.0],
+              "p1_mm": [x(5_000), gy(80_000), elev + 2_700.0],
+              "level": ref("LV"),
+              "conduit_type": pick("conduit_type", "conduit_types")}),
+        note="короб ЭОМ; уровень у Conduit.Create идёт ПОСЛЕДНИМ аргументом, "
+             "как у лотка. Диаметра оп не берёт намеренно: номинал короба — "
+             "торговый размер из таблицы типа (см. шапку ops_mep.py)",
+        success="CD: концы ±5мм 3D (geometry); RBS_START_LEVEL_PARAM == свой "
+                "уровень (topology); GetTypeId() == выбранный тип (semantic)",
+        pools=("conduit_types",)))
+
+    lv, elev = lvl("PPH")
+    out.append(Row(
+        "create_pipe_placeholder",
+        prog("create_pipe_placeholder на СВОЁМ уровне", lv,
+             {"op": "create_pipe_placeholder", "id": "PP",
+              "p0_mm": [x(0), gy(82_000), elev + 2_700.0],
+              "p1_mm": [x(5_000), gy(82_000), elev + 2_700.0],
+              "level": ref("LV"),
+              "system_type": pick("pipe_sys_ph", "piping_system_types"),
+              "pipe_type": pick("pipe_type_ph", "pipe_types")}),
+        note="заготовка трассы ВК ранней стадии",
+        success="PP: концы ±5мм 3D; уровень (topology); IsPlaceholder == true "
+                "(semantic — ЭТО и есть всё содержание опа сверх трубы); "
+                "GetTypeId() == выбранный тип (semantic)",
+        pools=("piping_system_types", "pipe_types")))
+
+    lv, elev = lvl("DPH")
+    out.append(Row(
+        "create_duct_placeholder",
+        prog("create_duct_placeholder на СВОЁМ уровне", lv,
+             {"op": "create_duct_placeholder", "id": "DP",
+              "p0_mm": [x(0), gy(84_000), elev + 2_700.0],
+              "p1_mm": [x(5_000), gy(84_000), elev + 2_700.0],
+              "level": ref("LV"),
+              "system_type": pick("duct_sys_ph", "duct_system_types"),
+              "duct_type": pick("duct_type_ph", "duct_types")}),
+        note="заготовка трассы ОВ. У воздуховода в SOB6.2 ТРИ типа с одним "
+             "именем «По умолчанию» — выбор обязан идти по id, и `pick` его "
+             "берёт из каталога фазы 0",
+        success="DP: концы ±5мм 3D; уровень (topology); IsPlaceholder == true "
+                "(semantic); GetTypeId() == выбранный тип (semantic)",
+        pools=("duct_system_types", "duct_types")))
+
+    # ГИБКИЕ — ЕДИНСТВЕННЫЕ ДВЕ СТРОКИ МАТРИЦЫ, ЧЕЙ ИСХОД НЕ ПРЕДСКАЗАН.
+    # Свидетель сверяет ВЕСЬ путь: число точек и каждую точку. Что Revit
+    # возвращает `Points` один-в-один — правдоподобно (Autodesk называет их
+    # «points of the flex duct, including the end points»), но ОФЛАЙН
+    # НЕПРОВЕРЯЕМО, и первый живой прогон отвечает именно на это. Поэтому
+    # путь взят ЛОМАНЫЙ (три точки со сменой высоты), а не прямой: прямой
+    # прошёл бы и при пересемплировании.
+    lv, elev = lvl("FLXD")
+    out.append(Row(
+        "create_flex_duct",
+        prog("create_flex_duct на СВОЁМ уровне", lv,
+             {"op": "create_flex_duct", "id": "FD",
+              "path": [[x(0), gy(86_000), elev + 3_000.0],
+                       [x(1_500), gy(86_000), elev + 2_800.0],
+                       [x(3_000), gy(86_500), elev + 2_600.0]],
+              "level": ref("LV"),
+              "system_type": pick("duct_sys_flex", "duct_system_types"),
+              "flex_duct_type": pick("flex_duct_type", "flex_duct_types")}),
+        note="ПЕРВЫЙ ЖИВОЙ ОТВЕТ НА ВОПРОС, который офлайн не задать: "
+             "возвращает ли Revit массив точек один-в-один. Расхождение "
+             "числа точек названо отдельным сообщением, а не общим "
+             "«geometry mismatch»",
+        success="FD: Points.Count == 3 И каждая точка ±5мм 3D (geometry); "
+                "уровень (topology); GetTypeId() == выбранный тип (semantic)",
+        pools=("duct_system_types", "flex_duct_types")))
+
+    lv, elev = lvl("FLXP")
+    out.append(Row(
+        "create_flex_pipe",
+        prog("create_flex_pipe на СВОЁМ уровне", lv,
+             {"op": "create_flex_pipe", "id": "FP",
+              "path": [[x(0), gy(88_000), elev + 3_000.0],
+                       [x(1_500), gy(88_000), elev + 2_700.0]],
+              "level": ref("LV"),
+              "system_type": pick("pipe_sys_flex", "piping_system_types"),
+              "flex_pipe_type": pick("flex_pipe_type", "flex_pipe_types")}),
+        note="двухточечный путь рядом с трёхточечным у воздуховода: если "
+             "Revit пересемплирует, короткий случай покажет это чище",
+        success="FP: Points.Count == 2 И обе точки ±5мм 3D (geometry); "
+                "уровень (topology); GetTypeId() == выбранный тип (semantic)",
+        pools=("piping_system_types", "flex_pipe_types")))
+
     return out
 
 
@@ -1117,7 +1212,11 @@ QUERY_TYPES_POOLS = frozenset({
     "piping_system_types", "duct_types", "duct_system_types",
     "cable_tray_types", "column_symbols_structural",
     "column_symbols_architectural", "window_symbols", "door_symbols",
-    "family_symbols", "beam_types", "foundation_symbols"})
+    "family_symbols", "beam_types", "foundation_symbols",
+    # Волна ЭОМ 09.08: три новых пула сразу заведены В ENUM `query_types`,
+    # поэтому фаза 0 читает их сама — оговорки «--pin или ничего», которая
+    # висит на ceiling_types/railing_types, здесь нет.
+    "conduit_types", "flex_duct_types", "flex_pipe_types"})
 
 
 def needed_pools(rows: list[Row]) -> list[str]:

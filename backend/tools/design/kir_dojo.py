@@ -43,7 +43,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 from kukai.ir import macros  # noqa: E402
 from kukai.ir.compiler import compile_program  # noqa: E402
 from kukai.ir.diag import KirRefusal  # noqa: E402
-from kukai.ir.schema_gen import program_schema  # noqa: E402
 from kukai.ir.spec import OPS  # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
 from kukai.ir.tool_doc import build_tool_description  # noqa: E402
@@ -284,6 +283,17 @@ def practice_text() -> str:
 
 
 def tool_defs() -> list[dict]:
+    """Инструмент стенда — ТОЙ ЖЕ формы, что уезжает в прод.
+
+    Стенд обязан спрашивать то же, что спрашивает продовый ход, иначе он мерит
+    другой продукт. Открытый вопрос дедупликации («читает ли модель `$defs` так
+    же хорошо, как плоскую схему») теперь разрешается ОДНОЙ переменной:
+    `KUKAI_KIR_SCHEMA_DEDUP=0` даёт плоское плечо A, `=1` — свёрнутое плечо B,
+    остальной прогон байт в байт одинаков.
+    """
+    from kukai.ir.schema_transport import program_schema_for_tool
+    program, note = program_schema_for_tool()
+    print(f"[стенд] {note}")
     return [{
         "type": "function",
         "function": {
@@ -291,7 +301,7 @@ def tool_defs() -> list[dict]:
             "description": build_tool_description(),
             "parameters": {
                 "type": "object",
-                "properties": {"program": program_schema()},
+                "properties": {"program": program},
                 "required": ["program"],
             },
         },

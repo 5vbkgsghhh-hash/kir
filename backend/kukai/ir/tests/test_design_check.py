@@ -678,3 +678,63 @@ def test_witness_counts_are_not_decoration():
     assert witness.inputs["doors_with_width"] == 0
     assert witness.inputs["windows_with_size"] == 0
     assert witness.measured_ratio == pytest.approx(1.0)
+
+
+# ---------------------------------- замкнутость БЕЗ комнат (15.08.2026)
+
+def _walls_only(*, closed: bool) -> list[dict]:
+    """Четыре стены и НИ ОДНОЙ комнаты. `closed=False` — дыра 1500 мм."""
+    nodes = [_op("create_level", "L-1", {"elev_mm": 0.0, "name": "L1"})]
+    nodes += _rect_walls("w", 0, 0, 6000, 4000)[:3]
+    last = (0, 4000), ((0, 0) if closed else (0, 1500))
+    nodes.append(_wall("w3", *last))
+    return nodes
+
+
+def test_enclosure_is_measured_where_walls_are_not_where_rooms_are():
+    """ЗАМКНУТОСТЬ — ФАКТ О СТЕНАХ, И СЧИТАЕТСЯ ТАМ, ГДЕ ЕСТЬ СТЕНЫ.
+
+    До 15.08.2026 разбиение строилось циклом по уровням, У КОТОРЫХ ЕСТЬ
+    КОМНАТЫ. Программа из четырёх стен без единой комнаты давала
+    `partition_faces == 0` независимо от того, замкнули стены контур или нет —
+    то есть ровно в том случае, в котором сломалась «полосатая стена» (три
+    стены, комнат нет), свидетель не нёс ни одного числа о сборке.
+
+    Здесь обе стороны: замкнутая коробка даёт грань, разомкнутая не даёт.
+    Второй случай — контроль-FAIL: без него тест был бы зелен и на приборе,
+    который всегда отвечает «одна грань».
+    """
+    closed, _w = spatial_model_from_program(
+        _walls_only(closed=True), building_id="закрытая")
+    opened, _w2 = spatial_model_from_program(
+        _walls_only(closed=False), building_id="открытая")
+    del closed, opened
+
+    _, w_closed = spatial_model_from_program(
+        _walls_only(closed=True), building_id="закрытая")
+    _, w_open = spatial_model_from_program(
+        _walls_only(closed=False), building_id="открытая")
+
+    assert w_closed.counts.get("walls") == 4
+    assert w_open.counts.get("walls") == 4, "стены обязаны доехать в обоих случаях"
+    assert w_closed.partition_faces == 1, "замкнутая коробка обязана дать грань"
+    assert w_open.partition_faces == 0, "дыра 1500 мм не замыкает ничего"
+    assert w_closed.rooms_total == 0 and w_open.rooms_total == 0
+
+
+def test_walls_on_a_level_nobody_declared_are_named_upstream_not_here():
+    """Стены на уровне, которого не объявил ни один `create_level`.
+
+    Ноль граней здесь НЕ молчалив, и причина названа ВЫШЕ по потоку: такая
+    стена не доходит до разбиения вовсе, её отбрасывает чтение с запиской
+    `wall_level_unresolved`. Тест держит именно это — чтобы следующая правка
+    не завела ВТОРОЕ имя тому же факту (первая редакция завела, и этот тест
+    её поймал).
+    """
+    nodes = [_op("create_level", "L-1", {"elev_mm": 0.0, "name": "L1"})]
+    nodes += [_wall("x1", (0, 0), (6000, 0), level=("L9", "L-9"))]
+    _, witness = spatial_model_from_program(nodes, building_id="сирота")
+    assert witness.partition_faces == 0
+    assert witness.counts.get("walls", 0) == 0, "стена не доехала — и это верно"
+    codes = {note.code for note in witness.notes}
+    assert "wall_level_unresolved" in codes, codes

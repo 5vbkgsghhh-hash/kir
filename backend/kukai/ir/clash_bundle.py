@@ -138,8 +138,10 @@ __all__ = (
     "SnapshotSections",
     "bundle_clash_report",
     "blind_class",
+    "body_making_ops",
     "bundle_elements",
     "category_of",
+    "op_categories",
     "FIXED_TEXT_BUDGET",
     "INTRODUCED_RULE_RU",
     "INTRODUCED_RULE_WHY",
@@ -291,16 +293,36 @@ _TEXT_CAP = 2_700
 #: Сколько находок печатать словами. Остальные считаются числом.
 _TOP = 5
 
-#: ЦЕНА ОДНОГО СУЖДЕНИЯ С ХОДОМ. Замер 09.08, подтверждён 11.08: 250…330
-#: символов; берётся верхняя граница, потому что бюджет обязан держаться на
-#: худшем случае, а не на среднем.
-COST_PER_FINDING = 330
+#: ЦЕНА ОДНОГО СУЖДЕНИЯ С ХОДОМ. Перемер 12.08.2026 на худшей пачке
+#: (`_worst_case_pack`, три суждения подряд): **388** символов, все три
+#: одинаковы. Прежнее «250…330, замер 09.08» ПРОТУХЛО — строку с тех пор
+#: удлинили грейдом, допуском грейда и разделом («грейд conservative, допуск
+#: грейда 1 мм, раздел mechanical»), и цена выросла на 58 символов.
+#:
+#: ДЕРИВАЦИЯ НЕ РАСКЛЕИЛАСЬ — ПРОТУХ ЕЁ ВХОД, и это разные ремонты. Формула
+#: ниже всё время считала верно; она честно разносила устаревшее число.
+#: Поэтому мало поправить константу: её сторожит
+#: `test_the_cost_of_a_finding_is_re_measured_not_recalled`, который берёт
+#: цену из НАСТОЯЩЕЙ отрисовки и падает, когда текст снова обгонит запись.
+COST_PER_FINDING = 388
 
 #: СКОЛЬКО СУЖДЕНИЙ ТЕКСТ ГАРАНТИРУЕТ. Отличается от `_TOP` НАМЕРЕННО и это
 #: разные обещания: `_TOP` — сколько суждений уедет В ДАННЫХ (`findings`),
 #: а это — сколько влезет СЛОВАМИ в худшем случае. До 11.08 разница была
 #: молчаливой: обещали пять, доставляли 2.1, и никто об этом не узнавал.
-GUARANTEED_FINDINGS = 4
+#:
+#: 4 → 3 (12.08.2026), И ЭТО ЗАМЕР, А НЕ УСТУПКА ТЕСТУ. При настоящей цене
+#: 388 гарантия в четыре суждения НЕ ПО КАРМАНУ на этом потолке:
+#: неснимаемая часть худшей пачки занимает 1307, четыре суждения — 1552,
+#: сумма 2859 против `_TEXT_CAP` 2700. Три помещаются с запасом:
+#: 1307 + 3×388 = 2471. Обещание в четыре было выведено из устаревшей цены
+#: 330 (2700 − 4×330 = 1380 ≥ 1307 — арифметика сходилась, доставка нет),
+#: то есть authored by reasoning, а не измерено.
+#:
+#: ПОДНЯТЬ ОБРАТНО МОЖНО ДВУМЯ ЧЕСТНЫМИ ХОДАМИ, и оба требуют замера, а не
+#: правки этой строки: сжать суждение ниже 348 символов, либо принести
+#: обоснование под подъём `_TEXT_CAP` (у него свой транспортный смысл).
+GUARANTEED_FINDINGS = 3
 
 #: БЮДЖЕТ НЕСНИМАЕМОЙ ЧАСТИ — не назначен, а ВЫВЕДЕН из двух чисел выше.
 #: Формулой, а не литералом, чтобы бюджет не мог разойтись со своей же
@@ -458,7 +480,15 @@ _REGISTRY_CATEGORIES = _spec_op_result_categories
 #:     которого компилятор не видит.
 REGISTRY_GAPS: dict[str, str] = {
     # Реестр молчит: в `OP_RESULT_CATEGORIES` строки нет вовсе.
-    "create_curtain_grid_line": "OST_CurtainGridsWall",
+    #
+    # СНЯТО 11.08.2026: `create_curtain_grid_line` -> `OST_CurtainGridsWall`.
+    # Строка объявляла ОТВЕТ, которого `category_of` не отдавала никогда:
+    # последним словом здесь стоит `hulls.KIND_TABLE`, а она этой категории
+    # ставит `eligible=False`. Замер: `category_of({"op":
+    # "create_curtain_grid_line"})` возвращала `None` и до правки, и после —
+    # то есть строка не работала, а ЧИТАЛАСЬ как работающая, и на неё уже
+    # опирался тест (`test_clash_coverage`, красный на чистом HEAD).
+    # Операция переехала в `OP_NO_BODY` с названной причиной.
     "create_wall_foundation": "OST_StructuralFoundation",
     # Реестр отдаёт ДВЕ категории, и обе `hulls.KIND_TABLE` знает. Выбор
     # назван здесь, а не сделан молча: `Floor.Create` с типом из пула
@@ -483,6 +513,22 @@ OP_NO_BODY: dict[str, str] = {
     "create_multi_segment_grid": "датум: цепь осей — разбивка, а не тело",
     "create_room": "помещение — ОБЪЁМ, а не тело (так же решает hulls.KIND_TABLE)",
     "create_room_separator": "линия разделения — датум, а не тело",
+    # ── ДВЕ ОПЕРАЦИИ, НАЙДЕННЫЕ ЗАКОНОМ ЗАКРЫТОСТИ, КОГДА ЕГО ВОСКРЕСИЛИ
+    # (11.08.2026). Обе не стояли ни здесь, ни в ответе `category_of`, то есть
+    # выпадали из закрытой таблицы МОЛЧА — ровно то, что закон и должен ловить.
+    # Поймать их было нечем: сторож читал снятую `OP_CATEGORY` и падал на
+    # `AttributeError` раньше первой проверки.
+    #
+    # Решение принято по прецеденту `create_room`, а не заново: у обеих
+    # категория ИЗВЕСТНА, и обе `hulls.KIND_TABLE` знает — и обеим ставит
+    # `eligible=False` (замер 11.08: `OST_MEPSpaces` False, `OST_CurtainGridsWall`
+    # False). Категория, которой закрытая таблица отказывает в теле, — это
+    # `no_body` со СВОИМ ИМЕНЕМ, а не пробел: так уже решено для помещения.
+    "create_space": "пространство — ОБЪЁМ, а не тело (OST_MEPSpaces у "
+                    "hulls.KIND_TABLE eligible=False, как и помещение)",
+    "create_curtain_grid_line": "линия разрезки ДЕЛИТ ячейки витража, своего "
+                                "тела у неё нет (OST_CurtainGridsWall у "
+                                "hulls.KIND_TABLE eligible=False)",
     "create_opening": "проём — ПУСТОТА в хозяине, а не тело",
     "create_group": "группа: тела её членов размножены размещениями — "
                     "программа не выражает результат раскладки",
@@ -741,6 +787,60 @@ def category_of(op: Mapping[str, Any]) -> str | None:
     except Exception:  # noqa: BLE001 — таблицы нет: отдаём как есть
         logger.debug("kind table eligibility lookup failed", exc_info=True)
     return chosen
+
+
+def op_categories(name: str) -> tuple[str, ...]:
+    """Все категории, которыми `category_of` судит тело ЭТОЙ операции.
+
+    ЗАЧЕМ ОТДЕЛЬНАЯ ФУНКЦИЯ, А НЕ ПОВТОРНЫЙ ВЫЗОВ `category_of` (11.08.2026).
+    У части опов категорию решает ЗАКРЫТОЕ ПЕРЕЧИСЛЕНИЕ самой операции
+    (`category` у `create_directshape`, `create_solid_extrusion`,
+    `create_solid_revolve`; `variety` у фундамента, проёма, рельефа), и
+    `category_of({"op": name})` без значения перечисления честно отвечает
+    `None`. Спросить «есть ли у опа тело» одним голым вызовом значит принять
+    это `None` за «тела нет» — замер 11.08: так терялись ТРИ операции из
+    тридцати, каждая с настоящим телом.
+
+    Перечисление перебирается ЦЕЛИКОМ и ответы объединяются — тем же приёмом
+    и по той же причине, что `spec.op_census_categories`: ответ модуля обязан
+    быть верен при ЛЮБОМ разрешённом значении, иначе это не ответ про оп.
+
+    ЭТО НЕ ВТОРАЯ ТАБЛИЦА. Здесь нет ни одной хранимой пары «оп -> категория»:
+    функция каждый раз СПРАШИВАЕТ `category_of`, то есть реестр и
+    `hulls.KIND_TABLE`. Снятая `OP_CATEGORY` была именно хранимой копией, и
+    разошлась она с реестром тремя способами (`test_clash_coverage`).
+    """
+    from itertools import product
+
+    from kukai.ir import spec as _spec
+
+    ospec = _spec.OPS.get(name)
+    if ospec is None:
+        return ()
+    axes = [[(p.name, choice) for choice in p.choices]
+            for p in ospec.params
+            if p.name in ("category", "variety") and p.choices]
+    found: set[str] = set()
+    for combo in (product(*axes) if axes else [()]):
+        probe: dict[str, Any] = {"op": name}
+        probe.update(dict(combo))
+        chosen = category_of(probe)
+        if chosen:
+            found.add(chosen)
+    return tuple(sorted(found))
+
+
+def body_making_ops() -> tuple[str, ...]:
+    """Операции реестра, о теле которых этот модуль ОБЯЗАН иметь ответ.
+
+    Дополнение `OP_NO_BODY` до реестра, и именно в этой форме — потому что
+    закрытость таблицы и есть утверждение «реестр = тела + названные причины
+    их отсутствия», третьей корзины нет. Перечислять их СВОИМ списком значило
+    бы завести ту самую копию реестра, снятие которой этот файл и описывает.
+    """
+    from kukai.ir import spec as _spec
+
+    return tuple(sorted(set(_spec.OPS) - set(OP_NO_BODY)))
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1066,26 +1166,25 @@ def _wall_geometry(op: Mapping[str, Any], el: dict[str, Any],
     #
     # ВОПРОС, А НЕ УТВЕРЖДЕНИЕ, И ВОТ ПОЧЕМУ. Здесь стояла КОНСТАНТА, которая
     # заявляла содержимое чужой таблицы, ни разу её не прочитав: «сегодня
-    # OST_Walls стоит на габарите». Замер 11.08.2026 говорит, что заявление
-    # пока верно (`KIND_TABLE["OST_Walls"].sources == ("bbox",)`, `build_hull`
-    # на полной призме возвращает `None`), но верно оно СЛУЧАЙНО — ровно до
-    # того дня, когда `prism` появится в `sources`. В тот день стена получит
-    # ТЕЛО, а эта строка продолжит писать её в перепись «без геометрии», и
-    # квитанция скажет «НЕ ВИДЕЛИ» про элемент, который видели: `without_body`
-    # считается по телам, а ПРИЧИНА печатается отсюда, и разъехались бы они
-    # молча. Это тот же род дефекта, что подпись непрочитанной оси у потолка
-    # тел, — поэтому теперь спрашиваем у того, кто решает.
+    # OST_Walls стоит на габарите». Заявление было верно СЛУЧАЙНО — ровно до
+    # того дня, когда `prism` появится в `sources`. В тот день стена получила
+    # бы ТЕЛО, а эта строка продолжила бы писать её в перепись «без
+    # геометрии»: `without_body` считается по телам, а ПРИЧИНА печатается
+    # отсюда, и разъехались бы они молча.
     #
-    # Сам замок стоит не зря и остаётся чужим решением: проверка на 800
-    # настоящих стенах дала 97 нарушений закона о содержании, до 2854 мм
-    # наружу. Открыть его может только `kukai/clash/hulls.py`.
+    # 14.08 тот день настал, и вопрос К ТАБЛИЦЕ оказался мал. Полоса допущена
+    # не строкой таблицы, а ПАРОЙ «строка таблицы И отсутствие габарита»
+    # (`hulls.build_hull`: замок содержания замерен против настоящего тела и
+    # остаётся закрытым везде, где это тело есть). Спрашивать половину условия
+    # значит воспроизводить тот же дефект на уровень выше — поэтому спрашиваем
+    # у САМОЙ функции, которая строит тело, и элемент к этой строке уже полон.
     try:
         from kukai.clash import hulls as _hulls
 
-        rule = _hulls.KIND_TABLE.get("OST_Walls")
-        if rule is not None and "prism" in (rule.sources or ()):
+        record, _refusal = _hulls.build_hull(el)
+        if record is not None:
             return ""
-    except Exception:  # noqa: BLE001 — таблицы нет: считаем замок закрытым
+    except Exception:  # noqa: BLE001 — оболочек нет: считаем замок закрытым
         logger.debug("wall prism gate lookup failed", exc_info=True)
     return "wall_prism_refused_by_containment_gate"
 
@@ -1278,6 +1377,105 @@ class BundleGeometry:
     #: детектором. ПУСТОЙ словарь значит «спросили, хозяев не объявлено»;
     #: «не спрашивали» на этом пути не бывает — пачка всегда есть.
     hosted: dict[str, dict[str, Any]] = dataclasses_field(default_factory=dict)
+    #: Идентификаторы операций, на которые ССЫЛАЕТСЯ кто-то ещё в этой пачке.
+    #: Нужны дубликату объявления: удалять то, что служит опорой другому опу,
+    #: нельзя. ПУСТОЕ множество значит «спросили, ссылок нет» — «не считали» на
+    #: этом пути не бывает, пачка всегда прочитана целиком.
+    referenced_op_ids: frozenset[str] = dataclasses_field(
+        default_factory=frozenset)
+
+
+#: Происхождение утверждения: ТЕКСТ ПРОГРАММЫ, а не тело и не обмер.
+#: Едет в находку, потому что «чинить» по факту о тексте и «чинить» по обмеру в
+#: Revit — разные утверждения, а ступень у них была бы одна.
+DECLARATION_PROVENANCE = "declared-program-text/v1"
+
+
+def _declaration_digest(element: Mapping[str, Any]) -> str:
+    """Отпечаток ОБЪЯВЛЕНИЯ элемента: всё, кроме адреса пачки."""
+    payload = {k: v for k, v in element.items()
+               if k not in ("element_id", "declaration_digest")}
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _referenced_op_ids(pack: Sequence[Any]) -> frozenset[str]:
+    """Идентификаторы операций, на которые ссылается кто-то ещё в пачке."""
+    found: set[str] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, Mapping):
+            if value.get("by") == "ref" and isinstance(value.get("value"), str):
+                found.add(value["value"])
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+
+    for program in (pack or ()):
+        ops = program.get("ops") if isinstance(program, Mapping) else program
+        for op in (ops or ()):
+            if isinstance(op, Mapping):
+                walk({k: v for k, v in op.items() if k != "id"})
+    return frozenset(found)
+
+
+def declared_duplicates(geometry: BundleGeometry) -> list[dict[str, Any]]:
+    """Пары элементов, объявленных ПОБАЙТНО ОДИНАКОВО, кроме адреса.
+
+    ЭТО ФАКТ О ТЕКСТЕ, И ОН ОПРЕДЕЛЁН ТОЧНО. Геометрического совпадения
+    оболочек здесь нет вовсе: не строится ни одна оболочка, не спрашивается ни
+    одно ядро доказательства, огрублять нечего. Программа сказала одно и то же
+    дважды — либо сказала, либо нет.
+
+    ПОЧЕМУ ЭТО НЕ ДУБЛИРУЕТ `detect.exact_body_equality_proof`. Тот отвечает на
+    вопрос о ТЕЛАХ («две оболочки суть одно тело») и требует грейда `exact`,
+    которого производственные источники не выдают — своими словами:
+    «destructive duplicate advice remains unreachable there». Вопрос здесь
+    другой, и запрет оттуда к нему не относится.
+
+    ОТКАЗ НАЗЫВАЕТСЯ, А НЕ УМАЛЧИВАЕТСЯ. Пара, на одну из сторон которой
+    ССЫЛАЕТСЯ другая операция, остаётся `certain=False` с причиной
+    `declaration_is_referenced`: удалять опору чужого опа нельзя, и «ссылок
+    нет» отличается от «ссылки не считали» — второе на этом пути невозможно,
+    пачка читается целиком.
+    """
+    by_digest: dict[str, list[dict[str, Any]]] = {}
+    for el in geometry.elements:
+        digest = el.get("declaration_digest")
+        if digest:
+            by_digest.setdefault(str(digest), []).append(el)
+
+    out: list[dict[str, Any]] = []
+    for digest, group in sorted(by_digest.items()):
+        if len(group) < 2:
+            continue
+        pair = [str(group[0]["element_id"]), str(group[1]["element_id"])]
+        op_ids = {
+            str((geometry.op_by_id.get(el["element_id"]) or {}).get("id") or "")
+            for el in group[:2]}
+        referenced = sorted(op_ids & set(geometry.referenced_op_ids))
+        row: dict[str, Any] = {
+            "pair": pair,
+            "declaration_digest": digest,
+            "count": len(group),
+            "provenance": DECLARATION_PROVENANCE,
+            "certain": not referenced,
+            "refused": "declaration_is_referenced" if referenced else None,
+            "referenced_op_ids": referenced,
+        }
+        row["text_ru"] = (
+            f"ОДИН И ТОТ ЖЕ ЭЛЕМЕНТ ОБЪЯВЛЕН ДВАЖДЫ: {pair[0]} и {pair[1]} — "
+            f"объявления совпадают полностью (факт о ТЕКСТЕ программы, "
+            f"происхождение `{DECLARATION_PROVENANCE}`, не обмер в Revit)"
+            if not referenced else
+            f"объявления {pair[0]} и {pair[1]} совпадают, но на "
+            f"{', '.join(referenced)} ССЫЛАЮТСЯ другие операции — удалять "
+            f"опору чужого опа нельзя")
+        out.append(row)
+    return out
 
 
 def bundle_elements(pack: Sequence[Any], *, snapshot: Any = None
@@ -1441,8 +1639,15 @@ def bundle_elements(pack: Sequence[Any], *, snapshot: Any = None
         hosted = _judgement.hosted_from_ops(op_by_id)
     except Exception:  # noqa: BLE001 — судья не поднялся: рёбер просто нет
         logger.debug("hosted index build failed", exc_info=True)
+    # ОТПЕЧАТОК ОБЪЯВЛЕНИЯ — ФАКТ О ТЕКСТЕ, А НЕ О ТЕЛАХ (11.08.2026).
+    # Адрес пачки (`p1/duct1`) — НАШ учёт, а не то, что сказал автор; войди он
+    # в отпечаток, «то же самое сказано дважды» стало бы невыразимо по
+    # построению. Всё остальное содержимое элемента и есть объявление.
+    for el in elements:
+        el["declaration_digest"] = _declaration_digest(el)
     return BundleGeometry(elements, no_body, collisions, no_geometry, profiles,
-                          slack, op_by_id, hosted)
+                          slack, op_by_id, hosted,
+                          referenced_op_ids=_referenced_op_ids(pack))
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2017,6 +2222,18 @@ def render_bundle_clash(block: Mapping[str, Any],
     return _render(block, report)[0]
 
 
+def _findings_in(lines: "list[str]") -> int:
+    """Сколько СУЖДЕНИЙ в этих строках — один ответ на один вопрос.
+
+    У находки две строки: `[СМОТРЕТЬ]` и её `ХОД`. Пока текст обрезки и
+    payload считали это порознь, они разошлись вдвое и назвали разное одним
+    словом «показано». Обе стороны спрашивают ЗДЕСЬ, поэтому разойтись больше
+    не могут; и если у находки когда-нибудь станет три строки, менять надо
+    ровно одно место.
+    """
+    return len([line for line in lines if line.startswith("  [")])
+
+
 def _render(block: Mapping[str, Any], report: Mapping[str, Any]
             ) -> tuple[str, dict[str, int]]:
     """Блок -> строки квитанции. ЗНАМЕНАТЕЛЬ ПЕРЕД УТВЕРЖДЕНИЕМ: сначала
@@ -2213,7 +2430,16 @@ def _render(block: Mapping[str, Any], report: Mapping[str, Any]
         # без единой показанной строки — это отчёт, который читатель обязан
         # выбросить, а выброшенный отчёт хуже отсутствующего.
         if index >= 2 and used + len(line) + 1 > room:
-            kept.append(f"  … список суждений обрезан, показано {len(kept)}")
+            # СЧИТАЕМ СУЖДЕНИЯ, А НЕ СТРОКИ, И ОДНОЙ ФУНКЦИЕЙ С PAYLOAD.
+            # Здесь стояло `len(kept)`: `kept` копит СТРОКИ, а у каждой
+            # находки их две (`[СМОТРЕТЬ]` и её `ХОД`), поэтому при трёх
+            # показанных суждениях текст писал «показано 6» — вдвое,
+            # молча, и ровно в том поле, по которому читатель решает,
+            # спрашивать ли остальное. Payload в этой же квитанции считал
+            # правильно, так что одна квитанция называла две разные
+            # величины одним именем.
+            kept.append(
+                f"  … список суждений обрезан, показано {_findings_in(kept)}")
             break
         kept.append(line)
         used += len(line) + 1
@@ -2222,6 +2448,6 @@ def _render(block: Mapping[str, Any], report: Mapping[str, Any]
     # на первой же новой строке, а замок, меряющий не то, что растёт, хуже
     # отсутствующего.
     budget = {"fixed": fixed, "cap": _TEXT_CAP, "room": room,
-              "shown": len([x for x in kept if x.startswith("  [")]),
-              "of": len([x for x in body if x.startswith("  [")])}
+              "shown": _findings_in(kept),
+              "of": _findings_in(body)}
     return "\n".join(head + kept + lines), budget

@@ -70,8 +70,9 @@ import math
 
 from kukai.ir.authoring import (
     _cs, _eid, _gid, _level_expr, _pt3, _safe, _stamp_block, _stamp_readback,
-    _target_res,
+    _target_res, EMIT_UNSUPPORTED,
 )
+from kukai.ir.diag import Diagnostic, KirRefusal
 from kukai.ir.emit_model import WitnessCheck, tolerance
 from kukai.ir.ground import IN_EMIT_DEFAULT
 from kukai.ir.emit_utils import cs_line_comment_fragment, refuse_stmt
@@ -465,6 +466,63 @@ def emit_multistory_stairs(op: dict, ver: str, stamp: str,
     """
     oid = op["id"]
     s = _safe(oid)
+
+    # ────────────────────────────────────────────────────────────────────
+    # ОТКАЗ НА net48 (Revit 2021-2024) — ЗАМЕР, А НЕ ОСТОРОЖНОСТЬ.
+    # 12.08.2026: ворота дают 6/6, а РАЗВЁРНУТЫЙ плагин это тело не соберёт.
+    # Весь API многоэтажного марша типизирован
+    # `System.Collections.Generic.ISet<ElementId>`:
+    #     ConnectLevels(ISet<ElementId>)      DisconnectLevels(ISet<ElementId>)
+    #     GetAllConnectedLevels() -> ISet     GetAllStairsIds() -> ISet
+    #     GetStairsPlacementLevels(Stairs) -> ISet
+    # (все шесть версий, замерено по индексу ловушек), и `ISet` тело называет
+    # ещё и ЛИТЕРАЛОМ в объявлении `__add_<oid>`. Обойти нечем: ISet-свободного
+    # пути к уровням у этого класса НЕТ ни одного.
+    #
+    # Причина ровно одна и она названа числом: замыкания ссылок клиента
+    # различаются РОВНО ОДНОЙ сборкой —
+    #     declared/net48  43 сборки, 3003 типа, `ISet` ЕСТЬ
+    #     deployed/net48  42 сборки, 2007 типов, `ISet` НЕТ  (нет System.dll)
+    # На net8 (2025/2026) `ISet` в замыкании есть, и там эмиссия законна.
+    #
+    # ЧИНИТЬ В ИСХОДНИКЕ НЕЧЕГО, И ЭТО ВАЖНО ДЛЯ МАРШРУТА. `CodeCompiler.cs` на
+    # HEAD уже держит `System` в `allowedExactNames`, и его собственный
+    # комментарий называет `ISet<>` первым же примером того, что даёт
+    # `System.dll`. Расхождение — между HEAD и РАЗВЁРНУТЫМ ДВОИЧНЫМ ФАЙЛОМ, то
+    # есть флот бежит на старом плагине. Профиль `deployed` — ЧЕСТНО НАЗВАННАЯ
+    # ИНФЕРЕНЦИЯ по трём живым отказам 04.08.2026 (`Regex` дважды, `Stopwatch`
+    # один раз, все с хвостом «forwarded to assembly 'System'»), а не снимок
+    # чьей-то машины.
+    #
+    # ОТКАЗ ПОЭТОМУ ШИРЕ СВОЕЙ ПРИЧИНЫ, И ЭТО ОСОЗНАННО. Обновлённый клиент на
+    # 2021-2024 `ISet` связал бы, и для него отказ ЛИШНИЙ. Но эмиттер не знает,
+    # какой двоичный файл стоит у пользователя, а хвост необновлённых у нас
+    # замерен и непуст. Выбор между «отказ кому-то лишний» и «CS0012 кому-то
+    # молча» решается кардинальным инвариантом в одну сторону: названный отказ
+    # с маршрутом, а не непонятная ошибка компиляции на чужой машине.
+    #
+    # УСЛОВИЕ СНЯТИЯ, чтобы отказ не пережил свою причину: строка уходит, когда
+    # развёрнутый плагин начнёт связывать `ISet`. Судья — не память, а
+    # `tests/bridge_reference_closure.py` (профиль `deployed`): как только
+    # `ISet` появится в его индексе типов, проверка границы в
+    # `kukai/ir/tests/test_datums_multistory_net48.py` покраснеет и потребует
+    # решения.
+    if ver < "2025":
+        raise KirRefusal([Diagnostic(
+            code=EMIT_UNSUPPORTED, op_id=oid, field_name="levels",
+            message_ru=(
+                f"create_multistory_stairs недоступен на Revit {ver}: весь API "
+                f"многоэтажного марша типизирован ISet<ElementId>, а плагин, "
+                f"развёрнутый на флоте, на net48 не связывает System.dll — "
+                f"тело не соберётся у пользователя (CS0012), хотя собирается "
+                f"у нас. МАРШРУТ, по убыванию силы: (1) обновить плагин Revit "
+                f"— текущая сборка System.dll уже ссылается, и тогда оп "
+                f"заработает на этой версии; (2) на Revit 2025/2026 оп "
+                f"работает уже сейчас; (3) без обновления марш размножается "
+                f"по этажам как отдельная программа create_stairs на каждый "
+                f"уровень (create_stairs лежит в SOLO_OPS и обязан быть "
+                f"единственным опом своей программы)"))])
+
     levels = [entry["__grounded__"] for entry in op["levels"]]
     lids = [lv["id"] for lv in levels]
 

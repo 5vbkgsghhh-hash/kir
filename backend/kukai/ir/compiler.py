@@ -19,7 +19,7 @@ import hashlib
 import logging
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Sequence
 
 from kukai.ir import faceref, relate, spec
@@ -30,13 +30,16 @@ from kukai.ir.diag import (
     PARSE_MISSING_FIELD, PARSE_DUP_ID, PARSE_EXCLUSIVE_FIELDS,
     GROUND_UNSUPPORTED_KIND, GROUND_BAD_SELECTOR,
     GROUND_MODEL_BINDING, TYPE_BAD_TYPE, TYPE_BAD_ENUM, TYPE_BOUNDS, PLAN_LIMIT,
-    PLAN_PHASE_SHAPE, PLAN_SOLO_OP,
+    PLAN_OP_CONTRACT, PLAN_PHASE_SHAPE, PLAN_SOLO_OP,
 )
 from kukai.ir.emit_utils import (ELEMENT_ID_MAX, cs_identifier_fragment,
                                  cs_line_comment_fragment, cs_string_literal)
 from kukai.ir.midend import (
+    _valid_ground_marker,
     FieldOrigin,
     GroundedProgram,
+    GroundingContext,
+    NestedOpContract,
     OperationFamily,
     OpProvenance,
     PlanEncodingError,
@@ -44,6 +47,7 @@ from kukai.ir.midend import (
     PlannedProgram,
     ProgramFamily,
 )
+from kukai.ir.op_contract import OpContractError, contract_for
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +150,26 @@ class CompileOutput:
     # `compile_program`). В `as_dict()` НЕ входит: от появления этого поля
     # квитанция не меняет ни одного байта.
     grounded_ops: list[dict] = field(default_factory=list)
+    # ИЗОЛЯЦИЯ ТРАНЗАКЦИИ РЕВИТА, под которой эмитирован `csharp`:
+    # `"atomic"` — вся программа в одной транзакции, отказ одного опа
+    # откатывает СОСЕДЕЙ; `"per_op"` — каждый оп в своей SubTransaction, и
+    # отказ стоит ровно своего опа.
+    #
+    # ИМЯ НАРОЧНО НЕ `isolation`. В этом же дереве уже есть
+    # `serving._sandbox_receipt`, читающий `isolation` у результата ПЕСОЧНИЦЫ
+    # PYTHON (`namespaces`/`filesystem`/`network_probe`) — другой предмет под
+    # тем же словом. 13.08.2026 на этом омониме едва не был сделан вывод
+    # «изоляция уже записывается». ОТСУТСТВУЮЩЕЕ ПОЛЕ МОЛЧИТ, ОМОНИМ ОТВЕЧАЕТ,
+    # и потому опаснее.
+    #
+    # ЗАЧЕМ ОНО ЕЗДИТ ДАЛЬШЕ, В СТРОКУ СВИДЕТЕЛЯ: `tools/live_op_rates.py`
+    # считает четыре корзины, и одна из них — «сопутствующий» (чужое нарушение
+    # откатило транзакцию). **Под `per_op` сопутствующего не бывает ПО
+    # ПОСТРОЕНИЮ.** Пока изоляция не записана, корпус смешивает две популяции
+    # с разной семантикой корзины, и разделить их нечем. Поле нужно не для
+    # любопытства: без него главный прибор по-оповых ставок интерпретируем
+    # только для `atomic`-строк, а какие из них `atomic` — неизвестно.
+    txn_isolation: str = "atomic"
 
     def as_dict(self) -> dict:
         d = {"ok": self.ok, "csharp": self.csharp,
@@ -155,6 +179,11 @@ class CompileOutput:
         if (self.ok and self.grounded is not None
                 and self.grounded.planned.family is ProgramFamily.WRITE):
             d["ground_digest"] = self.grounded.ground_digest
+            d["context_digest"] = self.grounded.context.context_digest
+            d["context_execution_bound"] = (
+                self.grounded.context.execution_bound)
+            d["context_authoritative"] = (
+                self.grounded.context.authoritative)
         if self.handoff:
             d["handoff"] = self.handoff
         if self.grounding_report:
@@ -301,6 +330,14 @@ def _validate_op(op: Any, i: int, diags: list) -> Optional[dict]:
         _fail(diags, code=PARSE_UNKNOWN_OP, op_index=i, op_id=oid, got=name,
               candidates=sorted(spec.OPS), message_ru=f"неизвестный op {name!r}")
         return None
+    # Синтетические поля СНИМАЮТСЯ, а не принимаются: см. spec.SYNTHETIC_FIELDS
+    # (там же — почему именно снимаются, и почему молчание здесь ничего не
+    # прячет). Снимаем ТОЛЬКО у опов-владельцев: `__host_wall__` на
+    # `create_wall` не принадлежит никому, и отказ ему по-прежнему верен.
+    stripped = {k for k, owners in spec.SYNTHETIC_FIELDS.items()
+                if k in op and name in owners}
+    if stripped:
+        op = {k: v for k, v in op.items() if k not in stripped}
     known = {"op", "id"} | {p.name for p in spec.OPS[name].params}
     for k in op:
         if k not in known:
@@ -512,7 +549,18 @@ def hosted_offset_check(hosted: dict, wall: dict, host_id: str,
     host_shape = {"p0_mm": wall["p0_mm"], "p1_mm": wall["p1_mm"]}
     if isinstance(arc, dict):
         host_shape["arc"] = arc
-    hosted["__host_wall__"] = host_shape
+    # Имя берётся у ВЛАСТИ: писатель и четверо читателей обязаны говорить об
+    # одном поле, и единственный способ это обеспечить — не давать никому
+    # писать его имя от себя.
+    #
+    # Согласие «кто сюда доходит» и «кто объявлен владельцем» держит ТЕСТ
+    # (`tests/test_synthetic_fields_have_one_authority.py`), а не `assert`
+    # здесь. Пробовал `assert` — и он показал ровно свою негодность: под
+    # `python -O` он исчезает, то есть инвариант пропал бы первым там, где
+    # дороже всего; а до того он приезжает НЕ отказом, а ПАНИКОЙ компилятора
+    # (incident_id, stage=plan) — то есть на путь, где отказывать нечему,
+    # и вызывающий читает аварию вместо диагноза.
+    hosted[spec.SYNTHETIC_HOST_WALL] = host_shape
     return True
 
 
@@ -526,11 +574,187 @@ class _OpPlanTrace:
     defaulted_fields: tuple[str, ...]
 
 
+_GROUND_ID_RULES = frozenset({
+    "element_id", "name", "name+disambiguate_by", "family_type",
+    "sole_entry", "sole_entry+disambiguate_by", "most_used",
+    "most_used+disambiguate_by",
+})
+
+
+def _authored_selector_from_grounded(value: Any) -> Any:
+    """Turn a legacy internal selector into a fully validated public form.
+
+    Native-group producers historically embedded grounder output directly in
+    ``members``.  Accepting that object as-is skipped every member validator.
+    We retain wire compatibility by reducing a *strictly valid* marker to an
+    equivalent explicit selector and then sending it through ``plan_program``.
+    Thus the marker is never a shortcut around type/bounds/op contracts.
+    """
+
+    if isinstance(value, list):
+        return [_authored_selector_from_grounded(item) for item in value]
+    if not _valid_ground_marker(value):
+        return value
+    detail = value.get("__grounded__")
+    assert isinstance(detail, dict)
+    via = detail.get("via")
+    if via == "doc_default":
+        if (set(detail) != {"id", "name", "via", "in_emit"}
+                or detail.get("id") is not None
+                or detail.get("name") is not None
+                or detail.get("in_emit") != "__doc_default__"):
+            return value
+        return {"by": "default"}
+    identifier = detail.get("id")
+    if (via not in _GROUND_ID_RULES
+            or isinstance(identifier, bool)
+            or not isinstance(identifier, int)
+            or not (1 <= identifier <= ELEMENT_ID_MAX)):
+        return value
+    name = detail.get("name")
+    if name is not None and not isinstance(name, str):
+        return value
+    return {"by": "element_id", "value": identifier}
+
+
+def _member_for_validation(member: dict[str, Any]) -> dict[str, Any]:
+    """Detach a group member and decode only declared grounded selectors."""
+
+    candidate = {key: value for key, value in member.items()}
+    op_spec = spec.OPS.get(candidate.get("op"))
+    if op_spec is None:
+        return candidate
+    for field_name, _pool, _required in op_spec.grounded:
+        if field_name in candidate:
+            candidate[field_name] = _authored_selector_from_grounded(
+                candidate[field_name])
+    return candidate
+
+
+def _group_member_diagnostic(
+    diagnostic: Diagnostic,
+    *,
+    group_id: str,
+    group_index: int,
+    member_id: str,
+    member_index: int,
+) -> Diagnostic:
+    suffix = diagnostic.field_name
+    member_path = f"members[{member_id or member_index}]"
+    return replace(
+        diagnostic,
+        op_index=group_index,
+        op_id=group_id,
+        field_name=(f"{member_path}.{suffix}" if suffix else member_path),
+    )
+
+
+def _plan_group_members(
+    members: list[dict[str, Any]],
+    *,
+    group_id: str,
+    group_index: int,
+) -> tuple[PlannedOp, ...]:
+    """Fully plan every group member as an independent create operation."""
+
+    planned: list[PlannedOp] = []
+    diagnostics: list[Diagnostic] = []
+    candidates: list[tuple[int, str, dict[str, Any]]] = []
+    for member_index, raw_member in enumerate(members):
+        member_id = (
+            raw_member.get("id")
+            if isinstance(raw_member.get("id"), str) else str(member_index)
+        )
+        op_name = raw_member.get("op")
+        op_spec = spec.OPS.get(op_name) if isinstance(op_name, str) else None
+        supported = bool(
+            op_spec is not None
+            and op_spec.family == "authoring"
+            and op_spec.effect.value == "create"
+            and op_spec.result.identity_cardinality.value == "one"
+            and op_name != "create_group"
+            and op_name not in spec.SOLO_OPS
+        )
+        if not supported:
+            diagnostics.append(Diagnostic(
+                code=TYPE_BAD_TYPE,
+                op_index=group_index,
+                op_id=group_id,
+                field_name=f"members[{member_id}].op",
+                got=op_name,
+                message_ru=(
+                    "член группы должен быть одиночным create-authoring op, "
+                    "который материализует один Element; query, modify/delete, "
+                    "собственная транзакция и вложенная create_group запрещены"
+                ),
+            ))
+            continue
+        candidates.append((member_index, member_id, _member_for_validation(raw_member)))
+
+    # ГРУППА — ЭТО МАЛЕНЬКАЯ ПРОГРАММА В СВОЁМ ПРОСТРАНСТВЕ ИМЁН.
+    #
+    # Раньше каждый член планировался ОТДЕЛЬНОЙ программой из одного опа
+    # (`"ops": [candidate]`), и это делало ссылку на соседа по группе
+    # невыразимой ПО ПОСТРОЕНИЮ: во вложенной программе стоял ровно один оп,
+    # так что `ref` не мог указать никуда. Дверь адресует свою стену только
+    # через `ref` — значит этаж со стенами И дверьми группой не собирался.
+    #
+    # **Цена этого, замерена 12.08.2026:** 41.1% элементов настоящей 59-этажной
+    # башни живут внутри групп (стены 94.9%, несущие колонны 100%, панели
+    # витража 99.3%, двери 91.4%), потому что человек моделирует ОДИН этаж и
+    # ставит его группой. Единственной доступной нам формой оставалось
+    # перечисление, а оно упирается в потолок 300 при медиане настоящего этажа
+    # 796 опов — отсюда 151 программа на здание, которые модель резала вручную.
+    #
+    # Планируем всех членов ОДНОЙ вложенной программой. Тогда порядок, роды
+    # ссылок и KIR-L003/L004 работают ровно теми же правилами, что и в обычной
+    # программе, без единого исключения: «более ранний оп» внутри группы
+    # означает «член, объявленный выше». Ничего специального про `ref` знать не
+    # нужно — нужно лишь дать членам общую программу, которой у них не было.
+    if candidates:
+        try:
+            nested = plan_program({
+                "ir_version": spec.IR_VERSION,
+                "intent": f"members of {group_id}",
+                "ops": [candidate for _, _, candidate in candidates],
+            })
+        except KirRefusal as refusal:
+            by_index = {index: (mid, midx)
+                        for midx, (index, mid, _) in enumerate(candidates)}
+            for item in refusal.diagnostics:
+                position = item.op_index if item.op_index is not None else 0
+                member_id, member_index = by_index.get(
+                    position, (str(position), position))
+                diagnostics.append(_group_member_diagnostic(
+                    item,
+                    group_id=group_id,
+                    group_index=group_index,
+                    member_id=member_id,
+                    member_index=member_index,
+                ))
+        else:
+            if (nested.family is not ProgramFamily.WRITE
+                    or len(nested.ops) != len(candidates)
+                    or any(planned_op.op_id != mid
+                           for planned_op, (_, mid, _) in zip(nested.ops,
+                                                              candidates))):
+                raise RuntimeError(
+                    "group member planner violated member identity")
+            planned.extend(nested.ops)
+    if diagnostics:
+        raise KirRefusal(diagnostics)
+    return tuple(planned)
+
+
 def _parse_and_check_internal(
     program: Any,
     *,
     bulk: bool = False,
-) -> tuple[list[dict], tuple[_OpPlanTrace, ...]]:
+) -> tuple[
+    list[dict],
+    tuple[_OpPlanTrace, ...],
+    tuple[tuple[PlannedOp, ...], ...],
+]:
     diags: list[Diagnostic] = []
     if not isinstance(program, dict):
         raise KirRefusal([Diagnostic(code=PARSE_NOT_OBJECT,
@@ -646,6 +870,7 @@ def _parse_and_check_internal(
     seen_ids: set[str] = set()
     normed = []
     plan_traces: list[_OpPlanTrace] = []
+    nested_member_plans: list[tuple[PlannedOp, ...]] = []
     for i, op in enumerate(ops):
         n = _validate_op(op, i, diags)
         if n:
@@ -653,7 +878,16 @@ def _parse_and_check_internal(
                 diags.append(Diagnostic(code=PARSE_DUP_ID, op_index=i, op_id=n["id"],
                                         field_name="id", message_ru="дубликат id"))
             seen_ids.add(n["id"])
+            member_plans: tuple[PlannedOp, ...] = ()
+            if n["op"] == "create_group" and isinstance(n.get("members"), list):
+                try:
+                    member_plans = _plan_group_members(
+                        n["members"], group_id=n["id"], group_index=i)
+                    n["members"] = [item.to_dict() for item in member_plans]
+                except KirRefusal as refusal:
+                    diags.extend(refusal.diagnostics)
             normed.append(n)
+            nested_member_plans.append(member_plans)
             origin = expansion_origins[i]
             plan_traces.append(_OpPlanTrace(
                 source_index=origin.source_index,
@@ -1001,7 +1235,7 @@ def _parse_and_check_internal(
             message_ru="delete требует allow_destructive=true в конверте программы"))
     if diags:
         raise KirRefusal(diags)
-    return normed, tuple(plan_traces)
+    return normed, tuple(plan_traces), tuple(nested_member_plans)
 
 
 def plan_program(program: Any, *, bulk: bool = False) -> PlannedProgram:
@@ -1024,11 +1258,12 @@ def plan_program(program: Any, *, bulk: bool = False) -> PlannedProgram:
             )])
         return program
 
-    normed, traces = _parse_and_check_internal(program, bulk=bulk)
-    if len(normed) != len(traces):
+    normed, traces, nested_plans = _parse_and_check_internal(
+        program, bulk=bulk)
+    if len(normed) != len(traces) or len(normed) != len(nested_plans):
         raise RuntimeError("normalised operations lost their planning trace")
     planned_ops: list[PlannedOp] = []
-    for payload, trace in zip(normed, traces):
+    for payload, trace, member_plans in zip(normed, traces, nested_plans):
         ospec = spec.OPS[payload["op"]]
         registry_defaults = {
             param.name for param in ospec.params
@@ -1057,13 +1292,36 @@ def plan_program(program: Any, *, bulk: bool = False) -> PlannedProgram:
             field_origins=tuple(origins),
         )
         try:
+            op_contract = contract_for(ospec.name)
             planned_ops.append(PlannedOp.from_dict(
                 payload,
                 family=OperationFamily(ospec.family),
                 effect=ospec.effect,
                 result=ospec.result,
+                contract_digest=op_contract.digest,
                 provenance=provenance,
+                nested_contracts=tuple(
+                    NestedOpContract.from_planned_op(item)
+                    for item in member_plans
+                ),
             ))
+        except OpContractError as exc:
+            # A write without a complete lowering/refinement contract is not
+            # an unexpected compiler panic and is never safe to execute.  It
+            # is a named pre-effect planning refusal: no snapshot read or
+            # Bridge dispatch is needed to prove that the compiler cannot
+            # bind this operation to its promised witnesses.
+            raise KirRefusal([Diagnostic(
+                code=PLAN_OP_CONTRACT,
+                op_index=trace.source_index,
+                op_id=payload.get("id"),
+                field_name="op",
+                expected="complete canonical operation contract",
+                got=ospec.name,
+                message_ru=(
+                    "операция не имеет полного канонического контракта "
+                    "понижения и поэтому не может быть исполнена"),
+            )]) from exc
         except PlanEncodingError as exc:
             # A nested NaN historically slipped through a few deep validators
             # and failed later as an internal compiler panic. The typed plan is
@@ -1480,6 +1738,30 @@ _TYPE_POOL_COLLECTOR_CS: dict[str, str] = {
     # типы, то есть категорийный каталог показал бы модели строки, которые
     # `FilledRegion.Create` отвергнет.
     "filled_region_types": ".OfClass(typeof(FilledRegionType))",
+    # ═══ 12.08.2026. Восемь пулов, в которые компилятор УМЕЛ ПИСАТЬ, не умея
+    # ЧИТАТЬ. Идиома каждого не сочинена здесь, а взята ДОСЛОВНО у второго
+    # носителя того же закона — `open_model.GROUND_SNAPSHOT_CS`, где эти пулы
+    # снимок собирает УЖЕ (`__AddPool(...)`). Две таблицы намеренно ведут
+    # порознь и обе компилирует гейт, так что расхождение видно, а не тихо —
+    # это записанное решение файла, и оно здесь соблюдено, а не обойдено.
+    "ceiling_types": ".OfClass(typeof(CeilingType))",
+    "railing_types": (".OfClass(typeof("
+                      "Autodesk.Revit.DB.Architecture.RailingType))"),
+    # Толща рельефа: своего типа у неё в API нет на всех шести версиях,
+    # поэтому отбор идёт по ИМЕНИ типа среди HostObjAttributes — ровно тем же
+    # выражением, каким его собирает снимок.
+    "toposolid_types": (".OfClass(typeof(HostObjAttributes)).Cast<Element>()"
+                        ".Where(__tse => { try { return __tse.GetType().Name"
+                        " == \"ToposolidType\"; } catch { return false; } })"),
+    "building_pad_types": ".OfClass(typeof(BuildingPadType))",
+    "wall_foundation_types": ".OfClass(typeof(WallFoundationType))",
+    "area_reinforcement_types": (".OfClass(typeof("
+                                 "Autodesk.Revit.DB.Structure."
+                                 "AreaReinforcementType))"),
+    "rebar_bar_types": (".OfClass(typeof("
+                        "Autodesk.Revit.DB.Structure.RebarBarType))"),
+    "rebar_hook_types": (".OfClass(typeof("
+                         "Autodesk.Revit.DB.Structure.RebarHookType))"),
 }
 
 
@@ -1646,6 +1928,7 @@ def compile_program(program: Any, revit_version: str = "2026",
                     expected_identities: Sequence[
                         ElementIdentityProof] | None = None,
                     open_model_profile: Any = None,
+                    ground_context: GroundingContext | None = None,
                     turn_id: str = "",
                     action_id: str = "",
                     query_fingerprint: str = "",
@@ -1683,27 +1966,150 @@ def compile_program(program: Any, revit_version: str = "2026",
                                          expected=list(spec.REVIT_VERSIONS),
                                          got=revit_version,
                                          message_ru="неизвестная версия Revit")])
+        # ВЕРСИЯ ОБЪЯСНЯЕТ ПУСТОЙ ПУЛ, ПОЭТОМУ ОТВЕЧАЕТ ПЕРВОЙ (13.08.2026).
+        #
+        # Стоит ИМЕННО ЗДЕСЬ — после нормализации, до заземления. Пока
+        # проверка жила только в эмиссии, автор на Revit 2023 получал
+        # «toposolid_types: пусто в модели» и уходил заводить тип толщи
+        # рельефа на версии, где толщ рельефа не бывает: заземление бежит
+        # раньше, и побеждал отказ, сработавший первым.
+        #
+        # Список адресный, а не механизм: замерено, что версионно заперт РОВНО
+        # ОДИН пул из 36 (`ToposolidType` отсутствует в эталонных сборках
+        # 2021-2023). Таблица «способность -> версия» стала бы третьей копией
+        # знания, живущего в эмиттерах, и разошлась бы с ними.
+        from kukai.ir.ops_site import toposolid_version_refusal
+        _version_refusals = [
+            d for d in (toposolid_version_refusal(op, revit_version)
+                        for op in normed) if d is not None]
+        if _version_refusals:
+            raise KirRefusal(_version_refusals)
         if normed and spec.OPS[normed[0]["op"]].family in spec.WRITE_FAMILIES:
             from kukai.ir import authoring, ground as ground_mod
             stage = "ground"
-            grounded_program = ground_mod.ground_program(planned, snapshot)
-            grounded = grounded_program.to_ops()
-            guarded_identities = expected_identities
+            typed_open_model = None
             if open_model_profile is not None:
                 from kukai.ir.open_model import (
                     OpenModelProfile,
-                    preflight_programs,
+                    OpenModelProfileError,
                 )
+
                 if not isinstance(open_model_profile, OpenModelProfile):
                     raise KirRefusal([Diagnostic(
                         code=GROUND_MODEL_BINDING,
                         message_ru=(
                             "профиль открытой модели имеет неверный тип"),
                     )])
+                typed_open_model = open_model_profile
+                try:
+                    observed_profile = OpenModelProfile.from_ground_snapshot(
+                        snapshot,
+                        revision_proof=typed_open_model.revision_proof,
+                        required_pools=typed_open_model.required_pools,
+                    )
+                except (OpenModelProfileError, TypeError, ValueError) as exc:
+                    raise KirRefusal([Diagnostic(
+                        code=GROUND_MODEL_BINDING,
+                        message_ru=(
+                            "снапшот и профиль открытой модели невозможно "
+                            "связать одним контрактом"),
+                    )]) from exc
+                if observed_profile.digest != typed_open_model.digest:
+                    raise KirRefusal([Diagnostic(
+                        code=GROUND_MODEL_BINDING,
+                        message_ru=(
+                            "снапшот принадлежит другому профилю открытой "
+                            "модели"),
+                    )])
+            if ground_context is None:
+                ground_context = GroundingContext.from_snapshot(
+                    snapshot,
+                    source="compiler_argument",
+                    trusted_source=False,
+                    profile_digest=(
+                        typed_open_model.digest
+                        if typed_open_model is not None else None),
+                    profile_authoritative=(
+                        typed_open_model.authoritative
+                        if typed_open_model is not None else False),
+                    revision_proof=(
+                        typed_open_model.revision_proof
+                        if typed_open_model is not None else None),
+                )
+            else:
+                if not isinstance(ground_context, GroundingContext):
+                    raise KirRefusal([Diagnostic(
+                        code=GROUND_MODEL_BINDING,
+                        message_ru=(
+                            "контекст заземления имеет неверный тип"),
+                    )])
+                # A caller-supplied context is evidence, not authority to
+                # rewrite what snapshot/profile it belongs to.  Reconstruct
+                # every content-derived axis here and compare it before the
+                # grounder can resolve even one selector.  In particular, a
+                # valid snapshot digest must not be allowed to travel with a
+                # profile/revision digest copied from another live read.
+                expected_context = GroundingContext.from_snapshot(
+                    snapshot,
+                    source="compiler_context_recheck",
+                    trusted_source=False,
+                    profile_digest=(
+                        typed_open_model.digest
+                        if typed_open_model is not None else None),
+                    profile_authoritative=(
+                        typed_open_model.authoritative
+                        if typed_open_model is not None else False),
+                    revision_proof=(
+                        typed_open_model.revision_proof
+                        if typed_open_model is not None else None),
+                )
+                supplied_binding = (
+                    ground_context.snapshot_digest,
+                    ground_context.document_digest,
+                    ground_context.profile_digest,
+                    ground_context.profile_authoritative,
+                    ground_context.revision_digest,
+                )
+                expected_binding = (
+                    expected_context.snapshot_digest,
+                    expected_context.document_digest,
+                    expected_context.profile_digest,
+                    expected_context.profile_authoritative,
+                    expected_context.revision_digest,
+                )
+                if supplied_binding != expected_binding:
+                    raise KirRefusal([Diagnostic(
+                        code=GROUND_MODEL_BINDING,
+                        message_ru=(
+                            "контекст заземления не принадлежит точному "
+                            "снимку и профилю открытой модели"),
+                    )])
+            try:
+                grounded_program = ground_mod.ground_program(
+                    planned, snapshot, context=ground_context)
+            except ValueError as exc:
+                # Do not relabel unrelated canonicalisation/grounding defects
+                # as a model-binding refusal.  Only the two explicit context
+                # recheck failures owned by ``ground_program`` belong here.
+                if not str(exc).startswith(
+                        "grounding context is bound to another "):
+                    raise
+                raise KirRefusal([Diagnostic(
+                    code=GROUND_MODEL_BINDING,
+                    message_ru=(
+                        "контекст заземления не прошёл повторную привязку "
+                        "к снимку открытой модели"),
+                )]) from exc
+            grounded = grounded_program.to_ops()
+            guarded_identities = expected_identities
+            if typed_open_model is not None:
+                from kukai.ir.open_model import (
+                    preflight_programs,
+                )
                 stage = "open_model_preflight"
                 binding_report = preflight_programs(
                     {"ops": grounded},
-                    open_model_profile,
+                    typed_open_model,
                     require_exact_identity=True,
                 )
                 if not binding_report.ready:
@@ -1739,10 +2145,12 @@ def compile_program(program: Any, revit_version: str = "2026",
                 ok=True, csharp=cs, planned=planned,
                 grounded=grounded_program,
                 grounding_report=ground_mod.compiler_choices(grounded),
-                grounded_ops=grounded)
+                grounded_ops=grounded,
+                txn_isolation=isolation)
         stage = "emit_query"
         cs = emit_for_version(normed, revit_version)
-        return CompileOutput(ok=True, csharp=cs, planned=planned)
+        return CompileOutput(ok=True, csharp=cs, planned=planned,
+                             txn_isolation=isolation)
     except KirRefusal as r:
         out = CompileOutput(ok=False, diagnostics=r.diagnostics)
         raw_ops = (program.to_ops() if isinstance(program, PlannedProgram)
@@ -1798,6 +2206,7 @@ def compile_rebuild_chunk(program: Any, revit_version: str = "2026",
                           expected_identities: Sequence[
                               ElementIdentityProof] | None = None,
                           open_model_profile: Any = None,
+                          ground_context: GroundingContext | None = None,
                           snapshot: Any = None,
                           turn_id: str = "",
                           action_id: str = "",
@@ -1838,6 +2247,7 @@ def compile_rebuild_chunk(program: Any, revit_version: str = "2026",
                            expected_document=expected_document,
                            expected_identities=expected_identities,
                            open_model_profile=open_model_profile,
+                           ground_context=ground_context,
                            turn_id=turn_id,
                            action_id=action_id,
                            query_fingerprint=query_fingerprint,

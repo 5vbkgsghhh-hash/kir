@@ -48,6 +48,7 @@ from kukai.ir.tests.acceptance_fakes import PassingAcceptanceBridge  # noqa: E40
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
 from kukai.live import journal as J  # noqa: E402
 from kukai.live import plan_stream as S  # noqa: E402
+from kukai.ir.tests.gate_fixture import enter_kir_mode
 
 BACKEND = Path(__file__).resolve().parents[3]
 
@@ -128,6 +129,8 @@ class _Door(unittest.TestCase):
         self._prev_feed = os.environ.get("KIR_WITNESS_PATH")
         os.environ["KIR_WITNESS_PATH"] = os.path.join(self._feed.name, "w.jsonl")
         J.reset()
+        # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08): режим КИР ставится ЯВНО.
+        enter_kir_mode(self)
 
     def tearDown(self) -> None:
         self._device.stop()

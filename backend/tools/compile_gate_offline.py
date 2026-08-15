@@ -5,11 +5,12 @@ compiler -> Roslyn against the real Revit reference assemblies. No Revit, no
 bridge, no live document. It answers the question the round trip never did —
 would the rebuild of this building even compile, for every customer we ship to.
 
-Grounding no longer needs a live snapshot either: the type pools are recovered
-from L0's own type_id/type_name distribution, so a frozen decompile directory
-is self-sufficient.
+Grounding no longer needs a live snapshot either: a frozen decompile directory
+is self-sufficient. It carries the catalogue of the source model
+(``open_model.profile.json``) captured by the same run, and that catalogue —
+never a reconstruction — is what the gate grounds against.
 
-Two things this learned the hard way, both worth keeping:
+Three things this learned the hard way, all worth keeping:
 
 * Materialized chunks are multi-op programs and the compiler refuses those
   unless ``bulk=True``. Without it every single program is rejected KIR-L001,
@@ -19,9 +20,19 @@ Two things this learned the hard way, both worth keeping:
   failures of ``Floor.Create`` on 2021 — the exact API divergence the emitter
   already handles correctly at authoring.py's ``if ver >= "2022"``. A gate that
   does not traverse the version branches is testing one surface six times.
+* Гейт обязан кормить лифт ТЕМ ЖЕ набором боковых индексов, что живой ход, и
+  заземлять ЗАХВАЧЕННЫМ каталогом, а не собственной реконструкцией. Пока он
+  делал ни то, ни другое (до 10.08.2026), любое инженерное здание отказывало
+  целиком, и отказ выглядел дефектом языка. Замер: ``snowdon_plumb_v3`` —
+  тот самый образец Autodesk, что 30.07 живьём собрался 318 программами из
+  318, — давал **0 из 156** программо-версий, все 26 программ с ``KIR-G104
+  piping_system_types: пусто в модели`` на каждой версии. Подробности и
+  опровергающий тест: ``kukai/ir/decompile/tests/test_offline_gate_grounding.py``.
 
 First clean run over демо-v3 (LOT31, 90 758 elements, 51 676 lifted ops):
 207 programs, 1 242 program-versions emitted, 1 242 Roslyn checks, 0 failures.
+(демо-v3 каталога НЕ несёт — единственное здание корпуса без него, что и
+объясняет, почему реконструкция из L0 так долго выглядела достаточной.)
 
     python tools/compile_gate_offline.py backend/data/decompile/демо-v3
 """
@@ -29,6 +40,7 @@ First clean run over демо-v3 (LOT31, 90 758 elements, 51 676 lifted ops):
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import asyncio
 import collections
 import dataclasses
@@ -72,6 +84,46 @@ def snapshot_from_l0(document, elements) -> dict[str, list[dict[str, Any]]]:
     return snapshot
 
 
+def gate_snapshot(
+    directory: pathlib.Path,
+    document=None,
+    elements=None,
+) -> tuple[dict[str, list[dict[str, Any]]], str]:
+    """Снимок заземления и ИМЯ его источника.
+
+    Каталог модели-источника читает ОБЩАЯ функция
+    ``serving.source_catalogue_snapshot`` — та самая, что заведена 28.07
+    (``0bdb0cef``) против этого же класса дефекта в двух других местах:
+    «сухой гейт rebuild и живые бегуны компилировали БЕЗ снимка модели и
+    отказывали целыми чанками с KIR-G103 — сообщая о собственной слепоте, а
+    не о программе» (замер тогда: 43 компилируемых опа из 543 против 543).
+    Здесь она заводилась в ТРЕТИЙ раз, потому что у гейта была своя копия
+    знания, и копия была слабее оригинала: системный тип НЕ ЯВЛЯЕТСЯ
+    элементом L0, поэтому пул ``piping_system_types`` из L0 не собрать в
+    принципе — сколько бы категорий ни дописали в ``_POOL_BY_CATEGORY``.
+
+    Реконструкция из L0 остаётся ЗАПАСНЫМ путём и обязана быть НАЗВАНА:
+    ``демо-v3`` каталога не имеет вовсе, а молчаливая подмена сделала бы
+    число гейта несравнимым между зданиями — «207 программ без отказов» на
+    здании с каталогом и на здании без него означают разное.
+    """
+    from kukai.ir.serving import source_catalogue_snapshot
+
+    catalogue = source_catalogue_snapshot(str(directory))
+    if not catalogue:
+        if document is None or elements is None:
+            document, elements = load_document(directory)
+        return snapshot_from_l0(document, elements), "L0 (каталога нет)"
+    # Оси лежат в ШАПКЕ L0, а не в каталоге пулов, и это тоже захваченные
+    # байты, а не догадка: заземление CONTOUR по осям без них отказало бы.
+    if "grids" not in catalogue:
+        if document is None:
+            document, elements = load_document(directory)
+        catalogue["grids"] = [
+            {"id": int(g.id), "name": g.name} for g in document.grids]
+    return catalogue, "open_model.profile.json"
+
+
 def emit_all(
     directory: pathlib.Path,
     chunk: int,
@@ -90,17 +142,35 @@ def emit_all(
     from kukai.ir.compiler import compile_rebuild_chunk
 
     document, elements = load_document(directory)
+    # ВСЕ семь боковых индексов, ровно как их передаёт `relift_offline.relift`
+    # и живой конвейер. Список обязан двигаться вместе с ними: индекс,
+    # забытый здесь, не роняет гейт, а ТИХО опускает его на деградированное
+    # представление — замер 10.08 на `snowdon_plumb_v3`: без индекса систем
+    # 6 343 опа и ни одного с `system_type`, с ним 6 369 и 3 236 с системным
+    # типом по имени.
+    #
+    # `family_placement` читается КОНВЕРТОМ, а не голым словарём: голый терял
+    # `failures`, и лифт не мог назвать причину среза из квитанции — все
+    # срезанные элементы получали одинаковое «absent from the family
+    # placement side index» (та же причина записана в `relift_offline`).
+    family_payload = _load_envelope(directory, "family_placement.index.json")
+    if family_payload is None:
+        family_payload = _load_side_index(
+            directory, "family_placement.index.json",
+            "family_placement_index")
     result = lift.lift_document_detailed(
         dataclasses.replace(document, elements=elements),
         _load_side_index(directory, "sketch.index.json", "sketch_index"),
-        _load_side_index(
-            directory, "family_placement.index.json", "family_placement_index"),
+        family_payload,
         wall_curve_index=_load_side_index(
             directory, "curve.index.json", "curve_index"),
         curtain_index=_load_envelope(directory, "curtain.index.json"),
+        annotation_index=_load_envelope(directory, "annotation.index.json"),
+        tag_index=_load_envelope(directory, "tag.index.json"),
+        mep_system_index=_load_envelope(directory, "mep_system.index.json"),
     )
     leaves = [n for n in result.nodes if isinstance(n, dict)]
-    snapshot = snapshot_from_l0(document, elements)
+    snapshot, snapshot_source = gate_snapshot(directory, document, elements)
     materialize_kwargs: dict[str, Any] = {"chunk_target": chunk}
     if atom_escrow:
         from kukai.ir.decompile.geom_extract import GeometryExtraction
@@ -126,6 +196,38 @@ def emit_all(
 
     emitted: list[tuple[int, str, str]] = []
     refused: collections.Counter = collections.Counter()
+    #: ОТКАЗ — ЭТО ИНТЕРФЕЙС, И ПРИБОР ОБЯЗАН ЕГО СОХРАНЯТЬ (11.08.2026).
+    #: Здесь собирался ТОЛЬКО `d.code`, и `field_name`/`message_ru`/`candidates`
+    #: — вычисленные компилятором и несущие СЛЕДУЮЩИЙ ХОД — выбрасывались.
+    #: На своде из 55 зданий разница между «где-то отказывают» и «отказывают
+    #: ЗДЕСЬ и вот почему» есть вся ценность свода; без неё каждую находку
+    #: приходится добывать заново отдельным зондом. Замер, стоивший двух
+    #: прогонов: `sob62_r23_v6` печатал `('2021', ('KIR-G102',))`, а
+    #: компилятор в тот же миг говорил «piping_system_types: несколько
+    #: вариантов … уточните через {"by": "element_id", …}» с пятью кандидатами.
+    diagnosed: list[tuple[str, Any]] = []
+    # СОСТАВ ПРОГРАММЫ, А НЕ ТОЛЬКО ЕЁ НОМЕР. Отказ эмиссии роняет ПРОГРАММУ
+    # целиком, а не виновный оп: замерено 13.08.2026 на `k2_ar_rd_v7` — три
+    # опа, невыразимых на Revit 2021 (отверстия в перекрытии, потолок), уронили
+    # 11 программ из 150. Без состава цена этого считается СРЕДНИМ по
+    # программам («порядка 7% здания»), а среднее читается как замер и им не
+    # является. С составом она читается точно, и тем же числом доказывается
+    # выигрыш, если версионно-хрупкий оп вынести соло (закон Д5, прецедент
+    # `create_stairs`).
+    def _op_count(prog: Any) -> int:
+        """Сколько опов в программе. Спрашиваем ПРОГРАММУ, а не считаем по
+        среднему: форма её не гарантирована, поэтому пробуем известные и
+        честно возвращаем 0, если не узнали — ноль виден в отчёте, среднее нет."""
+        for attr in ("ops", "operations"):
+            value = getattr(prog, attr, None)
+            if value is not None:
+                return len(value)
+        if isinstance(prog, dict):
+            return len(prog.get("ops") or ())
+        return 0
+
+    program_ops = [_op_count(prog) for prog in programs]
+    lost_ops: Counter[str] = Counter()
     for index, program in enumerate(programs):
         compile_input = retained_plans[index] or program
         for version in VERSIONS:
@@ -136,9 +238,19 @@ def emit_all(
             else:
                 refused[(version, tuple(sorted(
                     {d.code for d in out.diagnostics}))[:2])] += 1
+                diagnosed.extend((version, d) for d in out.diagnostics)
+                lost_ops[version] += program_ops[index]
     return emitted, {
         "ops": sum(leaf.get("kind") == "op" for leaf in leaves),
         "atoms": sum(leaf.get("kind") == "atom" for leaf in leaves),
+        # Число, ради которого забытый индекс перестаёт быть тихим: оп с
+        # системным типом ПО ИМЕНИ — единственное, что отличает инженерное
+        # здание, которое можно собрать, от того, которое отказывает
+        # KIR-G102/G104 целиком.
+        "named_system_type_ops": sum(
+            "system_type" in (leaf.get("params") or {})
+            for leaf in leaves if leaf.get("kind") == "op"),
+        "snapshot_source": snapshot_source,
         "atoms_escrowed": materialized.stats.atoms_escrowed,
         "materialize_mode": (
             "escrow" if atom_escrow else "same_document"),
@@ -149,7 +261,47 @@ def emit_all(
         "plan_digests": [
             check.plan_digest for check in materialized.plan_checks],
         "refused": {str(key): value for key, value in refused.items()},
+        # ЦЕНА ОТКАЗА В ЭЛЕМЕНТАХ, ПО ВЕРСИЯМ. Решение принимается в опах, а не
+        # в программах: одиннадцать программ звучат мелко ровно до тех пор,
+        # пока не сказано, сколько опов в них лежало.
+        "ops_lost_by_version": dict(lost_ops),
+        "ops_per_program": program_ops,
+        "refusal_rows": refusal_rows(diagnosed),
     }
+
+
+def refusal_rows(diagnosed: "list[tuple[str, Any]]") -> list[dict]:
+    """Отказы, сведённые ПО ПРИЧИНЕ, с сохранённым следующим ходом.
+
+    Ключ — (код, поле, сообщение), а НЕ (версия, код): один и тот же отказ на
+    шести версиях есть ОДНА причина, и шесть строк читались бы как шесть
+    находок, раздувая любой рейтинг. Версии при этом не теряются — они едут
+    списком, потому что отказ на 2021 и молчание на остальных пяти есть факт о
+    ПОКРЫТИИ ВЕРСИЙ (`KIR-E003` на фасаде), а не шум.
+
+    `candidates` сводится к ЧИСЛУ намеренно: их содержимое принадлежит
+    конкретному зданию, а строка рейтинга принадлежит причине. Число говорит
+    читателю, есть ли у отказа выбор, который может сделать человек.
+    """
+    rows: dict[tuple, dict] = {}
+    for version, diagnostic in diagnosed:
+        message = str(getattr(diagnostic, "message_ru", "") or "")
+        key = (str(getattr(diagnostic, "code", "")),
+               getattr(diagnostic, "field_name", None), message)
+        row = rows.get(key)
+        if row is None:
+            row = rows[key] = {
+                "code": key[0], "field": key[1], "message": message,
+                "candidates": len(getattr(diagnostic, "candidates", None) or ()),
+                "op_id": getattr(diagnostic, "op_id", None),
+                "versions": [], "count": 0,
+            }
+        row["count"] += 1
+        if version not in row["versions"]:
+            row["versions"].append(str(version))
+    for row in rows.values():
+        row["versions"].sort()
+    return sorted(rows.values(), key=lambda r: (-r["count"], r["code"]))
 
 
 async def check_all(emitted: list) -> collections.Counter:
@@ -193,8 +345,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"опов: {stats['ops']}  программ: {stats['programs']}")
     print(f"эмиссия: {len(emitted)}/{stats['programs'] * len(VERSIONS)} "
           "(программа×версия)")
-    for key, count in stats["refused"].items():
-        print(f"   отказ эмиссии {count:>5}  {key}")
+    for row in stats["refusal_rows"]:
+        versions = ",".join(row["versions"])
+        versions = "все 6" if len(row["versions"]) == len(VERSIONS) else versions
+        where = f" поле {row['field']}" if row["field"] else ""
+        who = f" оп {row['op_id']}" if row["op_id"] else ""
+        cands = (f" кандидатов {row['candidates']}"
+                 if row["candidates"] else "")
+        print(f"   отказ эмиссии {row['count']:>4}  {row['code']} "
+              f"[{versions}]{where}{who}{cands}")
+        if row["message"]:
+            print(f"        {row['message'][:300]}")
 
     started = time.time()
     failures = asyncio.run(check_all(emitted))

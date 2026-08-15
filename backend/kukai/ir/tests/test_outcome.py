@@ -25,6 +25,7 @@ from kukai.ir.outcome import (  # noqa: E402
 )
 from kukai.ir.tests.acceptance_fakes import PassingAcceptanceBridge  # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
+from kukai.ir.tests.gate_fixture import enter_kir_mode
 
 
 WRITE_PROGRAM = {"ir_version": "1.0", "ops": [{
@@ -78,6 +79,8 @@ class ServingOutcomeContract(unittest.TestCase):
         self._prev_acceptance_dir = os.environ.get(
             "KIR_ACCEPTANCE_EVIDENCE_DIR")
         os.environ["KIR_ACCEPTANCE_EVIDENCE_DIR"] = self._acceptance_dir.name
+        # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08): режим КИР ставится ЯВНО.
+        enter_kir_mode(self)
 
     def tearDown(self) -> None:
         self._device.stop()

@@ -321,16 +321,29 @@ class DimensionExtraction:
 
     @property
     def dimension_index(self) -> dict[str, dict[str, Any]]:
-        """id -> строка. Адрес лифта: он спрашивает по element_id."""
+        """id -> строка. Адрес лифта: он спрашивает по element_id.
+
+        **СТРОИТ ВЕСЬ СЛОВАРЬ НА КАЖДОЕ ОБРАЩЕНИЕ — O(n), а не поле.**
+        Читать РОВНО ОДИН РАЗ в локальную переменную; обращение изнутри
+        включения или цикла делает работу квадратичной. Живьём 2026-08-12:
+        `to_dict` читал это свойство на каждый ключ, и на 13 905 размерах
+        башни стадия сериализовалась 20+ минут, не дойдя до записи файла
+        (`tools`-стек: `to_dict → dimension_index → to_dict → _persist_json`).
+        Замер: n=500 0.21 с, 1000 1.06, 2000 4.62, 4000 21.26 — ×4.6 на
+        удвоение. Голдены гоняют 2–5 записей, где квадрат неотличим от
+        линии, поэтому офлайн его увидеть не мог.
+        """
         return {record.element_id: record.to_dict()
                 for record in self.dimensions}
 
     def to_dict(self) -> dict[str, Any]:
+        # ОДНО обращение к свойству; см. его докстроку — оно O(n).
+        index = self.dimension_index
         return {
             "schema_version": DIMENSION_INDEX_SCHEMA_VERSION,
             "dimension_index": {
-                key: self.dimension_index[key]
-                for key in sorted(self.dimension_index, key=_element_id_key)},
+                key: index[key]
+                for key in sorted(index, key=_element_id_key)},
             "failures": [failure.to_dict()
                          for failure in sorted(
                              self.failures,

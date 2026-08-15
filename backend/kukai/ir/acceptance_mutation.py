@@ -151,7 +151,7 @@ class MutationClaim:
             if not isinstance(self.parameter_name, str) or not self.parameter_name:
                 raise MutationAcceptanceError(
                     "parameter claim requires a non-empty name")
-            if self.value_kind not in {"str", "mm", "int", "double"}:
+            if self.value_kind not in {"str", "mm", "int", "double", "ref", "int_ref"}:
                 raise MutationAcceptanceError(
                     "parameter claim has an unknown value kind")
             if self.value_kind == "str":

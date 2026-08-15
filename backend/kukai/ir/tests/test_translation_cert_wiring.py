@@ -20,10 +20,12 @@
     ничего, кроме ground-снимка;
   * НАБЛЮДЕНИЕ ПИШЕТ, А НЕ ЗАПРЕЩАЕТ — режим ``record`` пропускает ту же
     программу, но квитанция называет находку;
-  * МОЛЧАНИЕ ПРИБОРА — НЕ НАХОДКА — оп без ``OpRefinementSpec`` и упавший
-    сертификатор НЕ отказывают даже в режиме ``refuse``.  Это ровно граница,
-    на которой приёмка когда-то сломалась на кириллице и месяцами
-    заворачивала ВЕРНО построенные помещения.
+  * КОНТРАКТ ПРЕДШЕСТВУЕТ ПРИБОРУ — новый write-op без
+    ``OpRefinementSpec`` получает типизированный отказ плана до Bridge;
+  * МОЛЧАНИЕ OPTIONAL-ПРИБОРА — НЕ НАХОДКА — уже честно спланированную
+    программу не заворачивает ни недоступная таблица сертификатора, ни его
+    исключение. Это ровно граница, на которой приёмка когда-то сломалась на
+    кириллице и месяцами заворачивала ВЕРНО построенные помещения.
 """
 from __future__ import annotations
 
@@ -43,11 +45,16 @@ os.environ.setdefault(
 from kukai.ir import authoring                                    # noqa: E402
 from kukai.ir import serving                                      # noqa: E402
 from kukai.ir import translation_cert as tc                       # noqa: E402
+from kukai.ir.compiler import plan_program                        # noqa: E402
 from kukai.ir.emit_model import BarePost, WitnessCheck            # noqa: E402
 from kukai.ir.tests.acceptance_fakes import (                     # noqa: E402
     PassingAcceptanceBridge,
 )
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT               # noqa: E402
+from kukai.ir.tests.gate_fixture import enter_kir_mode
+
+
+
 
 _FLAG = "KUKAI_IR_TRANSLATION_CERT"
 
@@ -186,6 +193,8 @@ class _ServingHarness(unittest.TestCase):
         os.environ["KIR_ACCEPTANCE_EVIDENCE_DIR"] = self._dir.name
         self._prev_flag = os.environ.get(_FLAG)
         os.environ.pop(_FLAG, None)
+        # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08): режим КИР ставится ЯВНО.
+        enter_kir_mode(self)
 
     def tearDown(self) -> None:
         self._device.stop()
@@ -200,10 +209,10 @@ class _ServingHarness(unittest.TestCase):
             os.environ[_FLAG] = self._prev_flag
         self._dir.cleanup()
 
-    def _write(self) -> tuple[dict, list[str]]:
+    def _write(self, program=WRITE_PROGRAM) -> tuple[dict, list[str]]:
         """(результат хода, список стадий, которые ВИДЕЛ мост)."""
 
-        acceptance = PassingAcceptanceBridge(WRITE_PROGRAM)
+        acceptance = PassingAcceptanceBridge(program)
         seen: list[str] = []
 
         async def execute(_llm, _bridge, _code, op, _timeout_ms):
@@ -217,7 +226,7 @@ class _ServingHarness(unittest.TestCase):
         with mock.patch.object(
                 serving, "_run_declarative", side_effect=execute):
             result = asyncio.run(serving.handle_revit_ir(
-                {"program": copy.deepcopy(WRITE_PROGRAM)}, self.llm, None))
+                {"program": copy.deepcopy(program)}, self.llm, None))
         return result, seen
 
 
@@ -364,13 +373,42 @@ class SilenceOfTheInstrumentIsNotAFinding(_ServingHarness):
     заворачивать верно построенную программу по нашей собственной бухгалтерии.
     """
 
-    def test_an_op_without_a_refinement_spec_does_not_refuse(self) -> None:
+    def test_missing_refinement_refuses_before_any_bridge_call(self) -> None:
+        """Incomplete OpContract is a typed planning refusal, not P000."""
+
         os.environ[_FLAG] = "1"
         table = tc._ensure_table()
         previous = tc.REFINEMENT
         tc.REFINEMENT = {k: v for k, v in table.items() if k != "create_wall"}
         try:
             result, seen = self._write()
+        finally:
+            tc.REFINEMENT = previous
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["refused"])
+        self.assertEqual(seen, [], "Bridge touched before OpContract refusal")
+        self.assertEqual(result["outcome"]["execution"], "not_started")
+        self.assertEqual(len(result["diagnostics"]), 1)
+        diagnostic = result["diagnostics"][0]
+        self.assertEqual(diagnostic["code"], "KIR-L007")
+        self.assertEqual(diagnostic["op_index"], 0)
+        self.assertEqual(diagnostic["op_id"], "W1")
+        self.assertEqual(diagnostic["field_name"], "op")
+        self.assertEqual(diagnostic["got"], "create_wall")
+        self.assertNotEqual(diagnostic["code"], "KIR-P000")
+
+    def test_optional_instrument_silence_does_not_refuse_preplanned_write(
+            self) -> None:
+        """Instrument drift after an honest immutable plan is not a finding."""
+
+        os.environ[_FLAG] = "1"
+        planned = plan_program(copy.deepcopy(WRITE_PROGRAM))
+        table = tc._ensure_table()
+        previous = tc.REFINEMENT
+        tc.REFINEMENT = {k: v for k, v in table.items() if k != "create_wall"}
+        try:
+            result, seen = self._write(planned)
         finally:
             tc.REFINEMENT = previous
 

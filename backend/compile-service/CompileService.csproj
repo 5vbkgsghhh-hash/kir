@@ -4,24 +4,10 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <RoslynPackageVersion>4.9.2</RoslynPackageVersion>
-    <!-- This repository historically tracks build artifacts. Keep them out of
-         SDK default Compile globs even when CI redirects obj/bin to /tmp. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);obj/**;bin/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="$(RoslynPackageVersion)" />
-    <AssemblyMetadata Include="RoslynPackageVersion" Value="$(RoslynPackageVersion)" />
-  </ItemGroup>
-
-  <!-- The Python compiler contract and this service consume these exact bytes. -->
-  <ItemGroup>
-    <Content
-      Include="../kukai/compiler_contracts/target_profiles.v1.json"
-      Link="compiler_contracts/target_profiles.v1.json"
-      CopyToOutputDirectory="PreserveNewest"
-      CopyToPublishDirectory="PreserveNewest" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.12.0" />
   </ItemGroup>
 
   <!--
@@ -44,4 +30,11 @@
       Version="[1.0.3]" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Тесты анализаторов — ОТДЕЛЬНЫЙ проект. Без этого исключения
+         SDK-глоб затягивает их .cs в саму службу, и она перестаёт
+         собираться: проверено 13.08, 33 ошибки про xunit. -->
+    <Compile Remove="Analyzers.Tests/**" />
+    <None Remove="Analyzers.Tests/**" />
+  </ItemGroup>
 </Project>

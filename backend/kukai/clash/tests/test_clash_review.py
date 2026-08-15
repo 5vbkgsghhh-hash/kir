@@ -680,16 +680,39 @@ def test_14c_relation_axis_is_complete_and_verdict_has_no_touch():
     assert "touch" not in D.VERDICTS
 
 
-def test_14d_report_schema_is_versioned_to_2():
-    assert D.REPORT_SCHEMA == "clash-report/2"
+def test_14d_the_schema_is_versioned_and_every_past_version_still_reads():
+    """ЗАКОН — ЧИТАЕМОСТЬ ИСТОРИИ, А НЕ НОМЕР (правка 11.08.2026).
+
+    Здесь стояло `assert D.REPORT_SCHEMA == "clash-report/2"`, и тест стал
+    ОКАМЕНЕЛОСТЬЮ: схема уехала на `/3` вместе с законченной лестницей
+    миграции, а утверждение осталось от прежнего поведения. Проверять НОМЕР
+    значит требовать, чтобы формат не развивался, — то есть ронять набор на
+    каждом честном шаге вперёд и приучать чинить его переписыванием числа.
+
+    Ревью №14 требовало другого: добавив факт, канон нельзя сохранить
+    байт-в-байт — его надо ВЕРСИОНИРОВАТЬ И УМЕТЬ ЧИТАТЬ ИСТОРИЮ. Это и
+    проверяется: версия объявлена, каждая прошлая версия принимается
+    миграцией, а чужая — отвергается громко.
+    """
+    assert D.REPORT_SCHEMA.startswith("clash-report/")
+    for past in ("clash-report/1", "clash-report/2"):
+        migrated = D.migrate_report({"schema_version": past, "findings": []})
+        assert migrated["schema_version"] == D.REPORT_SCHEMA, past
+    with pytest.raises(ValueError):
+        D.migrate_report({"schema_version": "clash-report/0"})
 
 
 def test_14e_v1_golden_still_parses_under_the_migration():
     """Канон нельзя сохранить байт-в-байт, добавив факт — но старый отчёт
-    обязан остаться читаемым, иначе история измерений умирает."""
+    обязан остаться читаемым, иначе история измерений умирает.
+
+    Сверяемся с `D.REPORT_SCHEMA`, а не с литералом: литерал здесь был той же
+    окаменелостью, что и в тесте выше, и ронял этот — настоящий — закон за
+    компанию с номером.
+    """
     v1 = json.loads((FIXTURES / "golden_report_v1.json").read_text(encoding="utf-8"))
     migrated = D.migrate_report(v1)
-    assert migrated["schema_version"] == "clash-report/2"
+    assert migrated["schema_version"] == D.REPORT_SCHEMA
     for f in migrated["findings"]:
         assert f["hull_relation"] in D.HULL_RELATIONS
         assert "hull_overlap_depth_mm" in f

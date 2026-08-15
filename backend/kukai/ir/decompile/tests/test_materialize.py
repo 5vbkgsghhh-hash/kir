@@ -47,7 +47,9 @@ from kukai.ir.decompile.fold import iter_l1_leaves  # noqa: E402
 from kukai.ir.decompile.geom_extract import extract_geometry  # noqa: E402
 from kukai.ir.decompile.l1_schema import stable_l1_id, validate_l1_nodes  # noqa: E402
 from kukai.ir.decompile.materialize import (  # noqa: E402
+    MATERIALIZATION_ACCOUNTING_SCHEMA,
     MaterializeError,
+    MaterializationAccounting,
     MaterializeResult,
     ProgramPlanCheck,
     SkipRecord,
@@ -64,10 +66,7 @@ from kukai.ir.decompile.tests.test_geom_extract import (  # noqa: E402
     _translated,
 )
 
-_LOT31_TREE = Path(os.environ.get(
-    "KIR_LOT31_TREE",
-    Path.home() / "lot31_full" / "_tree_cache.pkl",
-))
+_LOT31_TREE = Path.home() / "lot31_full" / "_tree_cache.pkl"
 _DATUM_OPS = {"create_level", "create_grid"}
 
 
@@ -319,6 +318,7 @@ class TMatSynthetic(unittest.TestCase):
             skipped=skipped,
             escrowed=source.escrowed,
             stats=source.stats,
+            accounting=source.accounting,
             plans=source.plans,
             plan_checks=source.plan_checks,
         )
@@ -370,8 +370,89 @@ class TMatSynthetic(unittest.TestCase):
                 skipped=result.skipped,
                 escrowed=result.escrowed,
                 stats=result.stats,
+                accounting=result.accounting,
                 plans=result.plans,
                 plan_checks=(forged_check,),
+            )
+
+    def test_v2_accounting_has_exact_shape_and_total_unique_rows(self):
+        leaves = _hosted_chain()
+        result = leaves_to_program(leaves)
+        payload = result.accounting.as_dict()
+
+        self.assertEqual(
+            payload["schema_version"], MATERIALIZATION_ACCOUNTING_SCHEMA)
+        self.assertEqual(set(payload), {
+            "schema_version", "input_digest", "programs_digest", "counts",
+            "records", "receipt_digest",
+        })
+        self.assertEqual(payload["counts"]["input_leaves"], len(leaves))
+        self.assertEqual(payload["counts"]["emitted_semantic_ops"], 3)
+        self.assertEqual(
+            {row["source_id"] for row in payload["records"]},
+            {leaf["source_element_id"] for leaf in leaves})
+        self.assertTrue(all(set(row) == {
+            "source_id", "leaf_id", "leaf_kind", "category",
+            "disposition", "reason", "op_id", "program_index",
+            "element_id", "evidence_state",
+        } for row in payload["records"]))
+
+    def test_duplicate_source_or_l1_identity_is_refused_before_indexing(self):
+        first = _op_leaf("query_count", "9700", {"kind": "wall"})
+        repeated_source = _op_leaf(
+            "query_count", "9700", {"kind": "door"})
+        repeated_source["_id"] = "different-leaf-id"
+        with self.assertRaisesRegex(MaterializeError, "duplicate source"):
+            leaves_to_program([first, repeated_source])
+
+        repeated_leaf_id = _op_leaf(
+            "query_count", "9701", {"kind": "door"})
+        repeated_leaf_id["_id"] = first["_id"]
+        with self.assertRaisesRegex(MaterializeError, "duplicate L1"):
+            leaves_to_program([first, repeated_leaf_id])
+
+    def test_unknown_atom_reason_is_refused_not_residualized(self):
+        atom = _atom_leaf("9702")
+        atom["reason"] = {"code": "alien_reason", "detail": "forged"}
+
+        with self.assertRaisesRegex(MaterializeError, "closed AtomReason"):
+            leaves_to_program([atom])
+
+    def test_missing_accounting_row_cannot_cover_an_emitted_wire_op(self):
+        result = leaves_to_program(_hosted_chain())
+        records = result.accounting.records[:-1]
+        forged_accounting = MaterializationAccounting(
+            input_digest=result.accounting.input_digest,
+            programs_digest=result.accounting.programs_digest,
+            records=records,
+            programs_count=result.accounting.programs_count,
+            emitted_ops_count=result.accounting.emitted_ops_count - 1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "accounting.*wire"):
+            MaterializeResult(
+                programs=result.programs,
+                skipped=result.skipped,
+                escrowed=result.escrowed,
+                stats=result.stats,
+                accounting=forged_accounting,
+                plans=result.plans,
+                plan_checks=result.plan_checks,
+            )
+
+    def test_stats_cannot_disagree_with_authoritative_accounting(self):
+        result = leaves_to_program(_hosted_chain())
+        forged_stats = replace(result.stats, materialized_ops=0)
+
+        with self.assertRaisesRegex(ValueError, "stats.materialized_ops"):
+            MaterializeResult(
+                programs=result.programs,
+                skipped=result.skipped,
+                escrowed=result.escrowed,
+                stats=forged_stats,
+                accounting=result.accounting,
+                plans=result.plans,
+                plan_checks=result.plan_checks,
             )
 
 
@@ -693,6 +774,14 @@ class DatumPolicy(unittest.TestCase):
         self.assertEqual(result.stats.datums_skipped, 2)
         reasons = {s.reason for s in result.skipped}
         self.assertIn("datum_pinned_existing", reasons)
+        pins = [
+            row for row in result.accounting.records
+            if row.disposition == "datum_policy_pin"]
+        self.assertEqual(len(pins), 2)
+        self.assertTrue(all(
+            row.evidence_state == "same_document_unproven"
+            and row.element_id == int(row.source_id)
+            for row in pins))
 
     def test_datums_materialized_when_included(self):
         result = leaves_to_program(self._leaves(), include_datums=True)
@@ -700,6 +789,87 @@ class DatumPolicy(unittest.TestCase):
         self.assertIn("create_level", materialized_ops)
         self.assertIn("create_grid", materialized_ops)
         self.assertEqual(result.stats.datums_skipped, 0)
+
+    @staticmethod
+    def _dimension_between(kind):
+        if kind == "grid":
+            first = _op_leaf(
+                "create_grid", "3100",
+                {"p0_mm": [0.0, 0.0], "p1_mm": [0.0, 10000.0],
+                 "name": "A"})
+            second = _op_leaf(
+                "create_grid", "3101",
+                {"p0_mm": [5000.0, 0.0],
+                 "p1_mm": [5000.0, 10000.0], "name": "B"})
+        else:
+            first = _op_leaf(
+                "create_level", "3200",
+                {"elev_mm": 0.0, "name": "L0"})
+            second = _op_leaf(
+                "create_level", "3201",
+                {"elev_mm": 3000.0, "name": "L1"})
+        dimension = _op_leaf(
+            "create_dimension", "3300",
+            {
+                "in_view": {
+                    "by": "name", "value": "Plan", "_id": "9000"},
+                "refs": [
+                    {"ref": first["_id"]},
+                    {"ref": second["_id"]},
+                ],
+                "line_at": [1000.0, 1000.0],
+            })
+        return first, second, dimension
+
+    def test_dimension_refs_pin_existing_datums_in_same_document(self):
+        """A policy-skipped datum remains an explicit existing dependency;
+        its consumer must not become an orphan and disappear."""
+        for kind, ids in (("grid", [3100, 3101]),
+                          ("level", [3200, 3201])):
+            with self.subTest(kind=kind):
+                result = leaves_to_program(self._dimension_between(kind))
+                ops = [op for program in result.programs
+                       for op in program["ops"]]
+                self.assertEqual([op["op"] for op in ops],
+                                 ["create_dimension"])
+                self.assertEqual(
+                    ops[0]["refs"],
+                    [{"by": "element_id", "value": value}
+                     for value in ids])
+                self.assertEqual(result.stats.op_leaves, 3)
+                self.assertEqual(result.stats.materialized_ops, 1)
+                self.assertEqual(result.stats.datums_skipped, 2)
+                self.assertEqual(result.stats.semantic_ops_skipped, 0)
+                self.assertEqual(
+                    {record.reason for record in result.skipped},
+                    {"datum_pinned_existing"})
+                self.assertTrue(all(check.accepted
+                                    for check in result.plan_checks))
+
+    def test_dimension_refs_follow_materialized_datums_when_included(self):
+        """Fresh-document policy keeps the same L1 edges intra-program, so
+        topo order and the compiler DAG prove datum creation before dimension."""
+        for kind, source_ids in (("grid", ["3100", "3101"]),
+                                 ("level", ["3200", "3201"])):
+            with self.subTest(kind=kind):
+                result = leaves_to_program(
+                    self._dimension_between(kind), include_datums=True)
+                ops = [op for program in result.programs
+                       for op in program["ops"]]
+                self.assertEqual(
+                    [op["op"] for op in ops],
+                    ["create_" + kind, "create_" + kind,
+                     "create_dimension"])
+                self.assertEqual(
+                    ops[-1]["refs"],
+                    [{"by": "ref", "value": _op_id(source_id)}
+                     for source_id in source_ids])
+                self.assertEqual(result.stats.materialized_ops, 3)
+                self.assertEqual(result.stats.datums_skipped, 0)
+                self.assertEqual(result.stats.semantic_ops_skipped, 0)
+                self.assertEqual(result.skipped, [])
+                self.assertTrue(all(check.accepted
+                                    for check in result.plan_checks))
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +1075,10 @@ class AtomEscrow(unittest.TestCase):
         self.assertEqual(evidence.directshape_category, "generic_model")
         self.assertEqual(
             evidence.acceptance_state, "pending_runtime_witness")
+        accounting_row = result.accounting.records[0]
+        self.assertEqual(accounting_row.disposition, "atom_escrow")
+        self.assertEqual(
+            accounting_row.evidence_state, "pending_runtime_witness")
         self.assertEqual(evidence.program_index, 0)
         self.assertEqual(evidence.plan_digest, result.plans[0].plan_digest)
         self.assertEqual(len(evidence.form_digest), 64)
@@ -948,6 +1122,7 @@ class AtomEscrow(unittest.TestCase):
                 skipped=result.skipped,
                 escrowed=[forged],
                 stats=result.stats,
+                accounting=result.accounting,
                 plans=result.plans,
                 plan_checks=result.plan_checks,
             )
@@ -1053,7 +1228,8 @@ class AtomEscrow(unittest.TestCase):
         self.assertEqual(result.programs, [])
         self.assertEqual(result.stats.atoms_escrowed, 0)
         self.assertEqual(result.stats.atoms_skipped, 1)
-        self.assertIn("KIR-M003", result.skipped[0].reason)
+        self.assertEqual(
+            result.skipped[0].reason, "atom_escrow:mesh_refused")
 
     def test_escrow_order_and_evidence_are_input_order_independent(self):
         first = _atom_leaf("9010", "OST_Furniture")
@@ -1135,6 +1311,85 @@ class GroupBridge(unittest.TestCase):
     def test_disabled_by_default_returns_none(self):
         os.environ.pop("KUKAI_IR_NATIVE_GROUP", None)
         self.assertIsNone(component_to_group_program(self._place_op()))
+
+    def test_the_bridge_asks_the_round_trip_before_building_the_ir(self):
+        """C-RT НА МОСТУ ПОЗВАНА (13.08.2026) — КОНТРОЛЬ-FAIL.
+
+        `assert_group_matches_place_op` была написана целиком: сверяет
+        мультимножество абсолютных опов развёртки группы с поштучной В ОБЕ
+        СТОРОНЫ и отдельно требует доказанной исходной точности. Её не звал
+        НИКТО, кроме тестов, — мост собирал IR `create_group`, ни разу не
+        спросив, совпадает ли развёртка. То же, что с самим мостом, этажом
+        ниже: написано, объявлено в `__all__`, не позвано.
+
+        Портим ровно то, что портил LOT31: дельты в относительной форме
+        (`occ_origin_k − def_origin` вместо `− occ_origin_0`). До правки такой
+        оп собрался бы в IR и уехал к эмиттеру.
+        """
+        from kukai.ir.decompile import materialize as _m
+        from kukai.ir.decompile import native_group as _ng
+
+        place_op = self._place_op()
+        os.environ["KUKAI_IR_NATIVE_GROUP"] = "1"
+        _m.reset_group_refusals()
+        try:
+            good = _ng.group_op_from_place_op(place_op)
+            self.assertIsNotNone(good)
+            # ПОРЧА НЕ ЗАВИСИТ ОТ ФИКСТУРЫ. Первая редакция сдвигала дельты
+            # на начало определения — форму бага LOT31, — и на синтетической
+            # паре стен это начало НУЛЕВОЕ: порча становилась тождественной, а
+            # контроль СКИПАЛСЯ. Скип честен и бесполезен: сторож, который не
+            # выполнился, ничего не сторожит. Сдвиг на метр расходится всегда.
+            self.assertTrue(good.placement_deltas_mm,
+                            "размещений нет — расхождение невыразимо")
+            shifted = list(good.placement_deltas_mm)
+            shifted[0] = (shifted[0][0] + 1000.0, shifted[0][1], shifted[0][2])
+            bad = _ng.NativeGroupOp(
+                def_hash=good.def_hash, definition=good.definition,
+                base_origin_mm=good.base_origin_mm,
+                placement_deltas_mm=tuple(shifted),
+                label=good.label)
+            with mock.patch.object(_ng, "group_op_from_place_op",
+                                   return_value=bad):
+                program = component_to_group_program(place_op)
+            self.assertIsNone(program, "расходящаяся группа собралась в IR")
+            self.assertEqual(
+                [r["reason"] for r in _m.last_group_refusals()],
+                ["expansion_mismatch"])
+        finally:
+            os.environ.pop("KUKAI_IR_NATIVE_GROUP", None)
+            _m.reset_group_refusals()
+
+    def test_a_refusal_carries_its_reason_instead_of_a_bare_none(self):
+        """ОТКАЗЫ ПЕРЕСТАЛИ МОЛЧАТЬ.
+
+        Каждый был `return None`: вызывающий уходил на N поштучных элементов и
+        не знал, почему группы не случилось. «Группы нет» и «группа отказана по
+        названной причине» обязаны быть разными фактами — тот же класс, что
+        молчаливая отсечка списка и гашение инверсии покрытия.
+
+        Поведение НЕ меняется и меняться не должно: откат на поштучный путь —
+        правильный ответ, геометрия не теряется. Меняется то, что теперь можно
+        спросить ПОЧЕМУ.
+        """
+        from kukai.ir.decompile import materialize as _m
+
+        os.environ["KUKAI_IR_NATIVE_GROUP"] = "1"
+        _m.reset_group_refusals()
+        try:
+            # Патчим ЗАЗЕМЛЕНИЕ: оно вызывается внутри `try`, и его отказ —
+            # ровно тот путь, который до 13.08 возвращал голый None.
+            from kukai.ir import ground as _ground
+            with mock.patch.object(
+                    _ground, "ground",
+                    side_effect=RuntimeError("подложный отказ заземления")):
+                self.assertIsNone(component_to_group_program(self._place_op()))
+        finally:
+            os.environ.pop("KUKAI_IR_NATIVE_GROUP", None)
+        refusals = _m.last_group_refusals()
+        _m.reset_group_refusals()
+        self.assertEqual([r["reason"] for r in refusals],
+                         ["grounding_refused"], refusals)
 
     def test_enabled_produces_compilable_group_program(self):
         place_op = self._place_op()

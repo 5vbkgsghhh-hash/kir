@@ -68,6 +68,32 @@ OUT_OF_COVERAGE_KINDS = [
 
 
 class AnyQueryInvariant(unittest.TestCase):
+    # ОКРУЖЕНИЕ ПИННИТСЯ ПОТЕСТОВО, А НЕ ОДИН РАЗ НА ИМПОРТЕ (12.08.2026).
+    #
+    # Тесты ниже читают и пишут ИМЕННО `_QUEUE` (строки 72/118/126), но ключ
+    # выставлялся только на строке 20, при импорте модуля.  `test_shadow.py:17`
+    # присваивает тот же ключ НАПРЯМУЮ (остальные ~80 модулей делают
+    # `setdefault`, который на занятом ключе не делает ничего), а pytest
+    # импортирует ВСЕ модули на сборе, до первого теста.  Значит побеждает тот,
+    # кого импортировали последним, и это зависит от порядка аргументов:
+    #
+    #   pytest test_any_query.py test_shadow.py   -> победил shadow, модуль слеп
+    #   pytest test_shadow.py test_any_query.py   -> победил свой, всё зелено
+    #
+    # Отсюда «в одиночку проходит, в наборе ошибается»: величина утверждалась
+    # на импорте и читалась в тестах, и сойтись их не заставляло ничто.
+    # Лечится не восстановлением константы, а тем, что каждый тест сам
+    # устанавливает нужное ему состояние и возвращает НАБЛЮДЁННОЕ.
+    def setUp(self):
+        self._previous_queue = os.environ.get("KIR_REJECTIONS_PATH")
+        os.environ["KIR_REJECTIONS_PATH"] = _QUEUE
+
+    def tearDown(self):
+        if self._previous_queue is None:
+            os.environ.pop("KIR_REJECTIONS_PATH", None)
+        else:
+            os.environ["KIR_REJECTIONS_PATH"] = self._previous_queue
+
     def test_out_of_coverage_is_typed_handoff(self):
         if os.path.exists(_QUEUE):
             os.remove(_QUEUE)
@@ -138,6 +164,18 @@ class AnyQueryInvariant(unittest.TestCase):
         self.assertEqual(r1["query_id"], "join-key-2")
 
     def test_queue_failure_is_fail_open(self):
+        # ВОССТАНАВЛИВАЕМ НАБЛЮДЁННОЕ, А НЕ ЗАПОМНЕННОЕ (12.08.2026).
+        # Здесь стояло `= _QUEUE` — константа этого модуля, выставленная им на
+        # строке 20 при импорте.  Но `test_shadow.py:17` тоже присваивает этот
+        # ключ НАПРЯМУЮ (не `setdefault`, как остальные ~80 модулей), а pytest
+        # импортирует всё на сборе, до первого теста, — так что к моменту
+        # запуска здесь лежит ЧУЖОЙ путь.  `finally` возвращал свой, страж
+        # окружения ловил подмену в teardown, и в наборе это читалось как
+        # `ERROR` именно у этого теста, хотя в одиночку файл зелёный.
+        # Величина УТВЕРЖДАЛАСЬ на строке 20 и ЧИТАЛАСЬ здесь; сойтись их не
+        # заставляло ничто.  Минимальное воспроизведение — два файла:
+        #   pytest kukai/ir/tests/test_any_query.py kukai/ir/tests/test_shadow.py
+        previous = os.environ.get("KIR_REJECTIONS_PATH")
         os.environ["KIR_REJECTIONS_PATH"] = "/proc/definitely/not/writable/q.jsonl"
         try:
             out = compile_program({"ir_version": "1.0",
@@ -145,7 +183,10 @@ class AnyQueryInvariant(unittest.TestCase):
             self.assertFalse(out.ok)           # refusal still typed
             self.assertIsNotNone(out.handoff)  # route still present
         finally:
-            os.environ["KIR_REJECTIONS_PATH"] = _QUEUE
+            if previous is None:
+                os.environ.pop("KIR_REJECTIONS_PATH", None)
+            else:
+                os.environ["KIR_REJECTIONS_PATH"] = previous
 
 
 if __name__ == "__main__":

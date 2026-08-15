@@ -112,23 +112,54 @@ MEP-фитингов в порождаемые убрал бы **14 713 из 31 
 Граф, у которого перепись не сходится, врёт молча ровно так же, как врал бы
 детектор. `GraphCensus.assert_balanced()` — не отчёт, а условие построения.
 
-Инертность: модуль ничего не подключает, ничего не переписывает и не
-импортируется рабочим путём. `kukai/modeling/checker/` читается только на
-чтение и здесь не импортируется вовсе.
+ИНЕРТНОСТЬ ДЕРЖИТ ФЛАГ, А НЕ ОТСУТСТВИЕ ИМПОРТА. Прежняя редакция этого
+абзаца утверждала, что модуль «не импортируется рабочим путём». Замер
+11.08.2026 (обход импортов по AST от `kukai.main`/`kukai.__main__`, дерево
+`aecf6cff`) это опровергает: модуль ДОСТИЖИМ, его импортируют
+`kukai/viewer/scene.py:62` и `kukai/viewer/graph.py:124`. Управление сюда
+доходит и останавливается на гейте — `building_graph_enabled()`
+(`KUKAI_IR_BUILDING_GRAPH`, умолчание ВЫКЛ), который вызывающие проверяют
+ДО обращения к графу (`scene.py:141`, `graph.py:127`).
+
+Разница не косметическая: «не импортируется» читается как свойство графа
+вызовов и проверяется обходом, который его опровергает; «закрыт выключенным
+флагом» — свойство одного `os.getenv`, и оно верно. Модуль по-прежнему
+ничего не подключает и ничего не переписывает, и на живом Revit не сверялся
+ни разу — именно поэтому гейт стоит.
+
+`kukai/modeling/checker/` читается только на чтение и здесь не импортируется
+вовсе.
 """
 from __future__ import annotations
 
+import math
 import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping, Sequence
+
+from kukai.ir.decompile.identity import (
+    DefinitionIdentity,
+    DocumentIdentity,
+    FederationContext,
+    IdentityError,
+    IdentityGap,
+    IdentityStatus,
+    OccurrenceIdentity,
+    identity_context_from_l0,
+    resolve_element_identity,
+)
 
 __all__ = [
     "Authority",
     "AuthoritySource",
     "BuildingGraph",
     "Existence",
+    "DefinitionIdentity",
+    "DocumentIdentity",
+    "FederationContext",
     "graph_view",
     "NodeView",
     "GraphView",
@@ -136,9 +167,12 @@ __all__ = [
     "GraphCensus",
     "GraphEdge",
     "GraphNode",
+    "IdentityGap",
+    "IdentityStatus",
     "Modality",
     "NodeRefusal",
     "OutsideExtraction",
+    "OccurrenceIdentity",
     "Relation",
     "building_graph_enabled",
     "graph_from_l0",
@@ -148,6 +182,39 @@ __all__ = [
 
 class GraphBuildError(ValueError):
     """Типизированный отказ построения графа. Молчания здесь нет."""
+
+
+def _freeze_json(value: Any, *, path: str) -> Any:
+    """Snapshot JSON-like evidence so a built graph cannot change underneath.
+
+    Frozen dataclasses are only shallowly immutable.  Before this boundary a
+    caller could mutate ``GraphNode.section`` or ``GraphEdge.evidence`` after
+    the census and federation had accepted them.  That turns an already-issued
+    proof into different evidence.  Keep the accepted vocabulary deliberately
+    small and deterministic instead of retaining arbitrary live objects.
+    """
+
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise GraphBuildError(f"{path} contains a non-finite number")
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Mapping):
+        frozen: dict[str, Any] = {}
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            if not isinstance(key, str):
+                raise GraphBuildError(f"{path} keys must be strings")
+            frozen[key] = _freeze_json(item, path=f"{path}.{key}")
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _freeze_json(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value))
+    raise GraphBuildError(
+        f"{path} contains unsupported {type(value).__name__}")
 
 
 def building_graph_enabled() -> bool:
@@ -341,12 +408,25 @@ class Modality(str, Enum):
     UNRESOLVED_TARGET = "unresolved_target"
 
 
+_SYMMETRIC_RELATIONS = frozenset({
+    Relation.BOUNDED_BY_SAME_WALL,
+    Relation.OPENING_POINT_TOUCHES_ROOM,
+})
+
+
 # ═══════════════════════════════════ УЗЕЛ И РЕБРО
 
 
 @dataclass(frozen=True, slots=True)
 class GraphNode:
-    """Узел графа. Адрес — `element_id` из L0 (биекция замерена 52/52)."""
+    """Узел графа with a legacy local alias and federated identities.
+
+    ``node_id`` remains the L0 ``ElementId`` string for compatibility with
+    existing local edges and queries.  It is not authoritative outside one
+    document.  ``definition_identity`` and ``occurrence_identity`` are the
+    collision-free semantic addresses; legacy rows name their gaps instead
+    of silently promoting ``ElementId`` to a global identity.
+    """
 
     node_id: str
     category: str
@@ -370,6 +450,20 @@ class GraphNode:
     #: (530 труб). Наружный есть функция ТИПА, а не номинала; совпадают они
     #: лишь у 20 труб из 15 342.
     section: Mapping[str, Any] = field(default_factory=dict)
+    definition_identity: DefinitionIdentity | None = None
+    occurrence_identity: OccurrenceIdentity | None = None
+    identity_status: IdentityStatus = IdentityStatus.INCOMPLETE
+    identity_gaps: tuple[IdentityGap, ...] = (
+        IdentityGap.LEGACY_CONTEXT_ABSENT,)
+
+    @property
+    def local_element_id(self) -> str:
+        """Compatibility alias; never use as a cross-document identity."""
+        return self.node_id
+
+    @property
+    def identity_authoritative(self) -> bool:
+        return self.identity_status is IdentityStatus.AUTHORITATIVE
 
     def __post_init__(self) -> None:
         if not isinstance(self.node_id, str) or not self.node_id:
@@ -384,6 +478,43 @@ class GraphNode:
                 "значение `authority` без названного свидетеля запрещено")
         if not isinstance(self.existence, Existence):
             raise GraphBuildError("GraphNode.existence must be an Existence")
+        if not isinstance(self.section, Mapping):
+            raise GraphBuildError("GraphNode.section must be a mapping")
+        object.__setattr__(
+            self, "section", _freeze_json(self.section, path="GraphNode.section"))
+        if not isinstance(self.identity_status, IdentityStatus):
+            raise GraphBuildError("GraphNode.identity_status must be typed")
+        if isinstance(self.identity_gaps, str):
+            raise GraphBuildError("GraphNode.identity_gaps must be a sequence")
+        gaps = tuple(self.identity_gaps)
+        if any(not isinstance(gap, IdentityGap) for gap in gaps):
+            raise GraphBuildError("GraphNode.identity_gaps must contain IdentityGap")
+        if len(gaps) != len(set(gaps)):
+            raise GraphBuildError("GraphNode.identity_gaps must be unique")
+        object.__setattr__(self, "identity_gaps", gaps)
+        if (self.definition_identity is not None
+                and not isinstance(self.definition_identity, DefinitionIdentity)):
+            raise GraphBuildError("GraphNode.definition_identity must be typed")
+        if (self.occurrence_identity is not None
+                and not isinstance(self.occurrence_identity, OccurrenceIdentity)):
+            raise GraphBuildError("GraphNode.occurrence_identity must be typed")
+        if (self.occurrence_identity is not None
+                and self.occurrence_identity.definition != self.definition_identity):
+            raise GraphBuildError(
+                "occurrence identity must reference the node definition identity")
+        if self.identity_status is IdentityStatus.AUTHORITATIVE:
+            if (self.definition_identity is None
+                    or self.occurrence_identity is None or gaps):
+                raise GraphBuildError(
+                    "authoritative identity requires definition, occurrence, "
+                    "and zero gaps")
+        else:
+            if self.occurrence_identity is not None:
+                raise GraphBuildError(
+                    "an occurrence identity cannot be marked incomplete")
+            if not gaps:
+                raise GraphBuildError(
+                    "incomplete identity must name at least one gap")
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,17 +544,26 @@ class GraphEdge:
             if not isinstance(value, str) or not value:
                 raise GraphBuildError(f"GraphEdge.{name} must be a non-empty string")
         if self.modality is Modality.REFUTED:
-            if not self.refuted_by:
+            if (not isinstance(self.refuted_by, str)
+                    or not self.refuted_by.strip()):
                 raise GraphBuildError(
                     "REFUTED без `refuted_by` неотличим от «не искали» — "
                     "правило, снявшее ребро, обязано назваться")
-        elif self.refuted_by:
+        elif self.refuted_by is not None:
             raise GraphBuildError(
                 "`refuted_by` при модальности, отличной от REFUTED, — ложный след")
+        if not isinstance(self.evidence, Mapping):
+            raise GraphBuildError("GraphEdge.evidence must be a mapping")
+        object.__setattr__(
+            self, "evidence",
+            _freeze_json(self.evidence, path="GraphEdge.evidence"))
 
     @property
     def key(self) -> tuple[str, str, str]:
-        return (self.relation.value, self.src, self.dst)
+        src, dst = self.src, self.dst
+        if self.relation in _SYMMETRIC_RELATIONS:
+            src, dst = sorted((src, dst))
+        return (self.relation.value, src, dst)
 
 
 # ═══════════════════════════════════ ПЕРЕПИСЬ
@@ -436,10 +576,83 @@ class GraphCensus:
     rows_seen: int
     nodes: int
     refusals: Mapping[str, int]
+    identity_authoritative_nodes: int = 0
+    identity_incomplete_nodes: int | None = None
+    identity_gaps: Mapping[str, int] = field(default_factory=dict)
+    identity_context_authoritative: bool = False
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("rows_seen", self.rows_seen),
+            ("nodes", self.nodes),
+            ("identity_authoritative_nodes",
+             self.identity_authoritative_nodes),
+        ):
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0):
+                raise GraphBuildError(
+                    f"GraphCensus.{name} must be a non-negative int")
+        if not isinstance(self.identity_context_authoritative, bool):
+            raise GraphBuildError(
+                "GraphCensus.identity_context_authoritative must be boolean")
+        incomplete = self.identity_incomplete_nodes
+        if incomplete is None:
+            incomplete = self.nodes - self.identity_authoritative_nodes
+            object.__setattr__(self, "identity_incomplete_nodes", incomplete)
+        if (isinstance(incomplete, bool) or not isinstance(incomplete, int)
+                or incomplete < 0):
+            raise GraphBuildError(
+                "GraphCensus.identity_incomplete_nodes must be a "
+                "non-negative int or null")
+
+        if not isinstance(self.refusals, Mapping):
+            raise GraphBuildError("GraphCensus.refusals must be a mapping")
+        refusals: dict[str, int] = {}
+        for name, count in self.refusals.items():
+            if not isinstance(name, str) or not name.strip():
+                raise GraphBuildError(
+                    "GraphCensus refusal keys must be non-empty strings")
+            if (isinstance(count, bool) or not isinstance(count, int)
+                    or count < 0):
+                raise GraphBuildError(
+                    "GraphCensus refusal counts must be non-negative ints")
+            if count:
+                refusals[name] = count
+
+        if not isinstance(self.identity_gaps, Mapping):
+            raise GraphBuildError(
+                "GraphCensus.identity_gaps must be a mapping")
+        gaps: dict[str, int] = {}
+        for name, count in self.identity_gaps.items():
+            if not isinstance(name, str) or not name.strip():
+                raise GraphBuildError(
+                    "identity gap census keys must be non-empty strings")
+            if (isinstance(count, bool) or not isinstance(count, int)
+                    or count < 0):
+                raise GraphBuildError(
+                    "identity gap census counts must be non-negative ints")
+            if count:
+                gaps[name] = count
+        if incomplete and not gaps:
+            # Compatibility for direct v1 GraphCensus construction.  It is
+            # explicit and red, never silently treated as authoritative.
+            gaps = {IdentityGap.LEGACY_CONTEXT_ABSENT.value: incomplete}
+        object.__setattr__(
+            self, "refusals", MappingProxyType(dict(sorted(refusals.items()))))
+        object.__setattr__(
+            self, "identity_gaps", MappingProxyType(dict(sorted(gaps.items()))))
+        self.assert_balanced()
 
     @property
     def refused(self) -> int:
         return sum(self.refusals.values())
+
+    @property
+    def identity_authoritative(self) -> bool:
+        return (self.identity_context_authoritative
+                and self.identity_authoritative_nodes == self.nodes
+                and self.identity_incomplete_nodes == 0
+                and not self.identity_gaps)
 
     def assert_balanced(self) -> None:
         if self.nodes + self.refused != self.rows_seen:
@@ -448,6 +661,18 @@ class GraphCensus:
                 f"узлов {self.nodes}, названных отказов {self.refused} "
                 f"(молчаливое выпадение "
                 f"{self.rows_seen - self.nodes - self.refused})")
+        if (self.identity_authoritative_nodes
+                + (self.identity_incomplete_nodes or 0) != self.nodes):
+            raise GraphBuildError(
+                "перепись identity не сходится: "
+                f"узлов {self.nodes}, authoritative "
+                f"{self.identity_authoritative_nodes}, incomplete "
+                f"{self.identity_incomplete_nodes}")
+        if ((self.identity_incomplete_nodes or 0) > 0
+                and sum(self.identity_gaps.values())
+                < (self.identity_incomplete_nodes or 0)):
+            raise GraphBuildError(
+                "не каждый identity-incomplete узел назвал причину")
 
 
 # ═══════════════════════════════════ ГРАФ
@@ -462,8 +687,11 @@ class BuildingGraph:
     ОБЛАСТЬЮ — см. `graph_clash_query.py`.
     """
 
-    __slots__ = ("doc_name", "_nodes", "_edges", "census",
-                 "_out", "_in", "_by_relation")
+    __slots__ = (
+        "doc_name", "document_identity", "federation_context",
+        "_nodes", "_edges", "census", "_out", "_in", "_by_relation",
+        "_by_definition", "_by_occurrence",
+    )
 
     def __init__(
         self,
@@ -472,25 +700,111 @@ class BuildingGraph:
         nodes: Iterable[GraphNode],
         edges: Iterable[GraphEdge],
         census: GraphCensus,
+        document_identity: DocumentIdentity | None = None,
+        federation_context: FederationContext | None = None,
     ) -> None:
+        if (document_identity is not None
+                and not isinstance(document_identity, DocumentIdentity)):
+            raise GraphBuildError("document_identity must be typed")
+        if (federation_context is not None
+                and not isinstance(federation_context, FederationContext)):
+            raise GraphBuildError("federation_context must be typed")
         self.doc_name = doc_name
-        self._nodes: dict[str, GraphNode] = {}
+        self.document_identity = document_identity
+        self.federation_context = federation_context
+        mutable_nodes: dict[str, GraphNode] = {}
+        by_definition: dict[DefinitionIdentity, list[GraphNode]] = defaultdict(list)
+        by_occurrence: dict[OccurrenceIdentity, GraphNode] = {}
+        identity_authoritative_nodes = 0
+        identity_incomplete_nodes = 0
+        identity_gaps: Counter[str] = Counter()
         for node in nodes:
-            if node.node_id in self._nodes:
+            if not isinstance(node, GraphNode):
+                raise GraphBuildError("BuildingGraph nodes must be GraphNode")
+            if node.node_id in mutable_nodes:
                 raise GraphBuildError(
                     f"повтор адреса узла {node.node_id!r}")
-            self._nodes[node.node_id] = node
-        self._edges: tuple[GraphEdge, ...] = tuple(edges)
+            mutable_nodes[node.node_id] = node
+            if node.definition_identity is not None:
+                by_definition[node.definition_identity].append(node)
+            if node.occurrence_identity is not None:
+                if node.occurrence_identity in by_occurrence:
+                    raise GraphBuildError(
+                        "повтор authoritative occurrence identity "
+                        f"{node.occurrence_identity.key}")
+                by_occurrence[node.occurrence_identity] = node
+            if node.identity_authoritative:
+                identity_authoritative_nodes += 1
+            else:
+                identity_incomplete_nodes += 1
+                identity_gaps.update(gap.value for gap in node.identity_gaps)
+        edge_rows = tuple(edges)
+        if any(not isinstance(edge, GraphEdge) for edge in edge_rows):
+            raise GraphBuildError("BuildingGraph edges must be GraphEdge")
+        edge_keys = [edge.key for edge in edge_rows]
+        if len(edge_keys) != len(set(edge_keys)):
+            raise GraphBuildError(
+                "duplicate relation/src/dst edge truth is forbidden")
+        self._edges = edge_rows
         self.census = census
+        if not isinstance(census, GraphCensus):
+            raise GraphBuildError("BuildingGraph census must be GraphCensus")
         census.assert_balanced()
+        if (census.identity_authoritative_nodes != identity_authoritative_nodes
+                or census.identity_incomplete_nodes != identity_incomplete_nodes
+                or dict(census.identity_gaps) != dict(identity_gaps)):
+            raise GraphBuildError(
+                "identity census does not match GraphNode identity states")
+        context_authoritative = (
+            document_identity is not None and federation_context is not None)
+        if census.identity_context_authoritative != context_authoritative:
+            raise GraphBuildError(
+                "identity context census disagrees with graph context")
 
-        self._out: dict[str, list[GraphEdge]] = defaultdict(list)
-        self._in: dict[str, list[GraphEdge]] = defaultdict(list)
-        self._by_relation: dict[Relation, list[GraphEdge]] = defaultdict(list)
+        out: dict[str, list[GraphEdge]] = defaultdict(list)
+        incoming: dict[str, list[GraphEdge]] = defaultdict(list)
+        by_relation: dict[Relation, list[GraphEdge]] = defaultdict(list)
         for edge in self._edges:
-            self._out[edge.src].append(edge)
-            self._in[edge.dst].append(edge)
-            self._by_relation[edge.relation].append(edge)
+            src_local = edge.src in mutable_nodes
+            dst_local = edge.dst in mutable_nodes
+            if edge.modality is Modality.UNRESOLVED_TARGET:
+                if src_local == dst_local:
+                    raise GraphBuildError(
+                        "UNRESOLVED_TARGET requires exactly one local endpoint "
+                        "and one external endpoint")
+                why = edge.evidence.get("why")
+                if why not in {item.value for item in OutsideExtraction}:
+                    raise GraphBuildError(
+                        "UNRESOLVED_TARGET requires a typed evidence.why")
+            elif (edge.relation is Relation.HOSTED_IN_LINK
+                  and edge.modality is Modality.PROVEN):
+                if not src_local:
+                    raise GraphBuildError(
+                        "HOSTED_IN_LINK requires a local source node")
+                if (edge.evidence.get("why")
+                        != OutsideExtraction.RESOLVED_TO_LINK.value):
+                    raise GraphBuildError(
+                        "HOSTED_IN_LINK requires exact resolved_to_link evidence")
+                # The link row is a typed L0 external reference.  Its exact id
+                # may also be represented locally by a future graph revision;
+                # both cases remain unambiguous under this relation tag.
+            elif not src_local or not dst_local:
+                raise GraphBuildError(
+                    "ordinary graph edges require two assembled local nodes")
+            out[edge.src].append(edge)
+            incoming[edge.dst].append(edge)
+            by_relation[edge.relation].append(edge)
+
+        self._nodes = MappingProxyType(mutable_nodes)
+        self._by_definition = MappingProxyType({
+            identity: tuple(rows) for identity, rows in by_definition.items()})
+        self._by_occurrence = MappingProxyType(by_occurrence)
+        self._out = MappingProxyType({
+            node_id: tuple(rows) for node_id, rows in out.items()})
+        self._in = MappingProxyType({
+            node_id: tuple(rows) for node_id, rows in incoming.items()})
+        self._by_relation = MappingProxyType({
+            relation: tuple(rows) for relation, rows in by_relation.items()})
 
     # --- доступ ---------------------------------------------------------
 
@@ -507,6 +821,25 @@ class BuildingGraph:
     @property
     def edges(self) -> tuple[GraphEdge, ...]:
         return self._edges
+
+    @property
+    def identity_authoritative(self) -> bool:
+        return self.census.identity_authoritative
+
+    def nodes_for_definition(
+            self, identity: DefinitionIdentity) -> tuple[GraphNode, ...]:
+        if not isinstance(identity, DefinitionIdentity):
+            raise GraphBuildError("definition lookup requires DefinitionIdentity")
+        return tuple(self._by_definition.get(identity, ()))
+
+    def node_for_occurrence(self, identity: OccurrenceIdentity) -> GraphNode:
+        if not isinstance(identity, OccurrenceIdentity):
+            raise GraphBuildError("occurrence lookup requires OccurrenceIdentity")
+        try:
+            return self._by_occurrence[identity]
+        except KeyError:
+            raise GraphBuildError(
+                f"occurrence {identity.key!r} is not in the graph") from None
 
     def node(self, node_id: str) -> GraphNode:
         try:
@@ -632,6 +965,8 @@ def graph_from_l0(
     header: Mapping[str, Any],
     elements: Iterable[Mapping[str, Any]],
     *,
+    document_identity: DocumentIdentity | None = None,
+    federation_context: FederationContext | None = None,
     generator_child_ids: Iterable[str] = (),
     link_ids: Iterable[str] = (),
     bodiless_target_ids: Iterable[str] = (),
@@ -639,17 +974,37 @@ def graph_from_l0(
 ) -> BuildingGraph:
     """Построить граф из СЫРОГО L0 (заголовок + строки элементов).
 
+    ``document_identity`` and ``federation_context`` are explicit trusted
+    overrides.  Missing values are recovered only from the typed identity
+    facts captured in the L0 header; they are never inferred from ``doc_name``,
+    paths, or local ElementId values. With complete context, each row still
+    needs its Revit ``unique_id``; otherwise the node remains readable through
+    ``node_id`` but is identity-incomplete and the graph cannot claim authority.
+
     `generator_child_ids` — единственный вход, которым узел получает
     `DERIVED_BY_REVIT`, и он ЯВНЫЙ. Категорийная таблица сюда не подаётся и
     подаваться не может: приор не знает, кто элемент создаёт, и ровно на нём
     строилась отозванная заявка про 14 713 фитингов.
     """
     header = _as_mapping(header, "header")
+    try:
+        identity_context = identity_context_from_l0(
+            header,
+            document_identity=document_identity,
+            federation_context=federation_context,
+        )
+    except IdentityError as exc:
+        raise GraphBuildError(f"invalid federated identity context: {exc}") from exc
+    document_identity = identity_context.document_identity
+    federation_context = identity_context.federation_context
     doc_name = str(header.get("doc_name") or "")
     derived = set(generator_child_ids)
 
     rows = 0
     refusals: Counter[str] = Counter()
+    identity_authoritative_nodes = 0
+    identity_incomplete_nodes = 0
+    identity_gaps: Counter[str] = Counter()
     nodes: dict[str, GraphNode] = {}
     raw: dict[str, Mapping[str, Any]] = {}
 
@@ -663,6 +1018,15 @@ def graph_from_l0(
         if node_id in nodes:
             refusals[NodeRefusal.DUPLICATE_ADDRESS.value] += 1
             continue
+        try:
+            identity = resolve_element_identity(
+                element_unique_id=element.get("unique_id"),
+                document_identity=document_identity,
+                federation_context=federation_context,
+                context_gaps=identity_context.gaps,
+            )
+        except IdentityError as exc:
+            raise GraphBuildError(f"invalid federated identity context: {exc}") from exc
         is_derived = node_id in derived
         nodes[node_id] = GraphNode(
             node_id=node_id,
@@ -678,11 +1042,27 @@ def graph_from_l0(
             type_name=element.get("type_name"),
             host_source=element.get("host_source"),
             section=_section_of(element),
+            definition_identity=identity.definition,
+            occurrence_identity=identity.occurrence,
+            identity_status=identity.status,
+            identity_gaps=identity.gaps,
         )
+        if identity.authoritative:
+            identity_authoritative_nodes += 1
+        else:
+            identity_incomplete_nodes += 1
+            identity_gaps.update(gap.value for gap in identity.gaps)
         raw[node_id] = element
 
     census = GraphCensus(rows_seen=rows, nodes=len(nodes),
-                         refusals=dict(refusals))
+                         refusals=dict(refusals),
+                         identity_authoritative_nodes=(
+                             identity_authoritative_nodes),
+                         identity_incomplete_nodes=identity_incomplete_nodes,
+                         identity_gaps=dict(identity_gaps),
+                         identity_context_authoritative=(
+                             document_identity is not None
+                             and federation_context is not None))
 
     links = frozenset(link_ids)
     bodiless = frozenset(bodiless_target_ids)
@@ -692,8 +1072,11 @@ def graph_from_l0(
     edges.extend(_room_boundary_edges(header, nodes, links))
     edges.extend(_bounded_by_same_wall_edges(header, nodes, raw))
 
-    return BuildingGraph(doc_name=doc_name, nodes=nodes.values(),
-                         edges=edges, census=census)
+    return BuildingGraph(
+        doc_name=doc_name, nodes=nodes.values(), edges=edges, census=census,
+        document_identity=document_identity,
+        federation_context=federation_context,
+    )
 
 
 #: Классы хозяина, каждый со СВОИМ ответом. Ключи — значения `host_class` из
@@ -918,6 +1301,20 @@ def _bounded_by_same_wall_edges(
         host = raw[node_id].get("host_id")
         if not isinstance(host, str) or not host:
             continue
+        if host not in nodes:
+            # The room predicate was not evaluated: its host lives beyond this
+            # local graph.  Calling this REFUTED would turn extraction blindness
+            # into a negative fact about the building.
+            yield GraphEdge(
+                relation=Relation.BOUNDED_BY_SAME_WALL,
+                src=node_id, dst=host,
+                modality=Modality.UNRESOLVED_TARGET,
+                evidence={
+                    "source": "fold._semantic_fold predicate",
+                    "why": OutsideExtraction.TARGET_NOT_IN_SNAPSHOT.value,
+                    "predicate_status": "host_outside_local_graph",
+                })
+            continue
         adjacent = sorted(boundary_to_rooms.get(host, ()))
         if len(adjacent) == 2:
             pair = (adjacent[0], adjacent[1])
@@ -977,6 +1374,11 @@ class NodeView:
     #: Наружный размер и ЧЕМ измерен, либо None. Номинал сюда не попадает
     #: никогда — см. `outer_size_mm`.
     outer_mm: tuple[float, str] | None
+    #: Stable semantic keys. ``node_id`` above remains the local legacy alias.
+    definition_identity: str | None
+    occurrence_identity: str | None
+    identity_authoritative: bool
+    identity_gaps: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1004,6 +1406,10 @@ class GraphView:
     #: Перепись графа: узлов = оценённых + названных отказов.
     census_rows: int
     census_refusals: Mapping[str, int]
+    identity_authoritative: bool
+    identity_authoritative_nodes: int
+    identity_incomplete_nodes: int
+    identity_gaps: Mapping[str, int]
 
 
 def graph_view(
@@ -1027,6 +1433,14 @@ def graph_view(
             level_id=node.level_id,
             section=node.section,
             outer_mm=outer_size_mm(node),
+            definition_identity=(
+                node.definition_identity.key
+                if node.definition_identity is not None else None),
+            occurrence_identity=(
+                node.occurrence_identity.key
+                if node.occurrence_identity is not None else None),
+            identity_authoritative=node.identity_authoritative,
+            identity_gaps=tuple(gap.value for gap in node.identity_gaps),
         )
         for node in sorted(graph.nodes.values(), key=lambda n: n.node_id)
     )
@@ -1049,4 +1463,8 @@ def graph_view(
         without_l1=without_l1,
         census_rows=graph.census.rows_seen,
         census_refusals=dict(graph.census.refusals),
+        identity_authoritative=graph.identity_authoritative,
+        identity_authoritative_nodes=graph.census.identity_authoritative_nodes,
+        identity_incomplete_nodes=graph.census.identity_incomplete_nodes or 0,
+        identity_gaps=dict(graph.census.identity_gaps),
     )

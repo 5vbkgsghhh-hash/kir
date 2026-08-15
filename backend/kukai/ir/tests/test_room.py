@@ -87,9 +87,24 @@ class RegistryShape(unittest.TestCase):
         self.assertEqual(spec.OPS[OP].family, "authoring")
 
     def test_it_lives_in_its_own_registry_module(self):
-        """Волны добавляют опы ПАРАЛЛЕЛЬНО, не трогая чужой ops_*.py."""
+        """Волны добавляют опы ПАРАЛЛЕЛЬНО, не трогая чужой ops_*.py.
+
+        ПРОВЕРЯЕТСЯ ИНВАРИАНТ, А НЕ ОПИСЬ. Здесь стояло
+        `assertEqual([op.name for op in ops_room.OPS], [OP])`, то есть КОПИЯ
+        содержимого модуля, и она протухла в тот день, когда рядом законно
+        поселился `create_space` (тоже пространственный, тоже свой модуль).
+        Опись чужого модуля запрещает соседу существовать — ровно то, что
+        волновая модель разрешает; а настоящее требование докстроки другое:
+        оп живёт РОВНО В ОДНОМ `ops_*.py`. Его и спрашиваем, у самого
+        реестра.
+        """
         from kukai.ir import ops_room
-        self.assertEqual([op.name for op in ops_room.OPS], [OP])
+        owners = [m.__name__.rsplit(".", 1)[-1]
+                  for m in spec._REGISTRY_MODULES
+                  if any(op.name == OP for op in m.OPS)]
+        self.assertEqual(owners, ["ops_room"],
+                         "оп обязан жить ровно в одном ops_*.py")
+        self.assertIn(OP, [op.name for op in ops_room.OPS])
 
     def test_the_result_carries_many_identities_not_one(self):
         """Ломаная из n точек создаёт n-1 ModelCurve. Объявить ОДНУ личность

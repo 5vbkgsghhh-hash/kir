@@ -20,7 +20,7 @@ from typing import Any, Awaitable, Callable, Iterator, Mapping
 
 from kukai.ir.revit_read_helpers import ELEMENT_LEVEL_HELPERS_CS
 
-from .census import NO_CATEGORY_KEY
+from .census import CATEGORY_READ_FAILED_KEY, NO_CATEGORY_KEY
 from .geometry_store import GEOMETRY_HELPER_CS, parse_geometry
 from .schema import (
     EXTRACT_BATCH,
@@ -33,6 +33,8 @@ from .schema import (
     SECTION_RECEIPT_OUTCOMES,
     CategoryState,
     CategoryStatus,
+    FederationTransformEvidence,
+    FederationTransformSubject,
     L0Dialect,
     L0Document,
     HostSource,
@@ -753,16 +755,16 @@ Action<Element, Dictionary<string, object>> __PutParams = (__e, __row) =>
 {
     var __params = new Dictionary<string, object>();
     __PutLengthParam(__e, BuiltInParameter.WALL_USER_HEIGHT_PARAM,
-                     "WALL_USER_HEIGHT_PARAM", __params);
+                     nameof(BuiltInParameter.WALL_USER_HEIGHT_PARAM), __params);
     // audit F6: vertical wall attributes.  WALL_BASE_OFFSET (length, mm) and
     // WALL_HEIGHT_TYPE (the attached top-constraint level's id; __PutIdParam
     // skips InvalidElementId, so an unconnected wall carries neither key).
     // Additive: params is the open per-element dictionary, frozen L0 1.0
     // schema untouched.
     __PutLengthParam(__e, BuiltInParameter.WALL_BASE_OFFSET,
-                     "WALL_BASE_OFFSET", __params);
+                     nameof(BuiltInParameter.WALL_BASE_OFFSET), __params);
     __PutIdParam(__e, BuiltInParameter.WALL_HEIGHT_TYPE,
-                 "WALL_HEIGHT_TYPE", __params);
+                 nameof(BuiltInParameter.WALL_HEIGHT_TYPE), __params);
     // Wall-fidelity (live A5 evidence 2026-07-21): WALL_TOP_OFFSET is a
     // DEFINING degree of freedom of an attached wall.  Unread, the rebuild
     // derives height as the full base->top span (emitter forced offset 0) and
@@ -770,7 +772,7 @@ Action<Element, Dictionary<string, object>> __PutParams = (__e, __row) =>
     // -300/-400/-2100mm on «демо»).  Additive length param, same discipline
     // as WALL_BASE_OFFSET.
     __PutLengthParam(__e, BuiltInParameter.WALL_TOP_OFFSET,
-                     "WALL_TOP_OFFSET", __params);
+                     nameof(BuiltInParameter.WALL_TOP_OFFSET), __params);
     // P1 DOF-completeness (fidelity audit 2026-07-21, Находка B): vertical
     // defining DOF of columns / floors / beams — the same class the wall's
     // top_offset belonged to.  Pull-only (lift ignores unread keys): this is
@@ -778,15 +780,15 @@ Action<Element, Dictionary<string, object>> __PutParams = (__e, __row) =>
     // chains are material.  All Put* helpers skip absent params, so every
     // category stays byte-compatible.
     __PutIdParam(__e, BuiltInParameter.FAMILY_BASE_LEVEL_PARAM,
-                 "FAMILY_BASE_LEVEL_PARAM", __params);
+                 nameof(BuiltInParameter.FAMILY_BASE_LEVEL_PARAM), __params);
     __PutIdParam(__e, BuiltInParameter.FAMILY_TOP_LEVEL_PARAM,
-                 "FAMILY_TOP_LEVEL_PARAM", __params);
+                 nameof(BuiltInParameter.FAMILY_TOP_LEVEL_PARAM), __params);
     __PutLengthParam(__e, BuiltInParameter.FAMILY_BASE_LEVEL_OFFSET_PARAM,
-                     "FAMILY_BASE_LEVEL_OFFSET_PARAM", __params);
+                     nameof(BuiltInParameter.FAMILY_BASE_LEVEL_OFFSET_PARAM), __params);
     __PutLengthParam(__e, BuiltInParameter.FAMILY_TOP_LEVEL_OFFSET_PARAM,
-                     "FAMILY_TOP_LEVEL_OFFSET_PARAM", __params);
+                     nameof(BuiltInParameter.FAMILY_TOP_LEVEL_OFFSET_PARAM), __params);
     __PutIntParam(__e, BuiltInParameter.SLANTED_COLUMN_TYPE_PARAM,
-                  "SLANTED_COLUMN_TYPE_PARAM", __params);
+                  nameof(BuiltInParameter.SLANTED_COLUMN_TYPE_PARAM), __params);
     // A wall is a location CURVE plus the rule saying which plane of the wall
     // that curve is (centreline, core centreline, or one of four faces).  Two
     // walls with identical endpoints and identical types occupy DIFFERENT
@@ -797,9 +799,9 @@ Action<Element, Dictionary<string, object>> __PutParams = (__e, __row) =>
     // favour.  An enum ordinal, so Int and never Length -- reading it as a
     // length would unit-convert it into a plausible wrong number.
     __PutIntParam(__e, BuiltInParameter.WALL_KEY_REF_PARAM,
-                  "WALL_KEY_REF_PARAM", __params);
+                  nameof(BuiltInParameter.WALL_KEY_REF_PARAM), __params);
     __PutLengthParam(__e, BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM,
-                     "FLOOR_HEIGHTABOVELEVEL_PARAM", __params);
+                     nameof(BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM), __params);
     // Потолочное смещение — СВОЁ имя, а не floor-овское: имя параметра здесь
     // часть тождества категории. `_lift_ceiling` (lift.py:1787) читало
     // CEILING_HEIGHTABOVELEVEL_PARAM, которого захват не клал НИКОГДА, и
@@ -808,17 +810,17 @@ Action<Element, Dictionary<string, object>> __PutParams = (__e, __row) =>
     // род расхождения, что стоил 2153 помещений: производитель поля и его
     // потребитель договорились комментарием, а не контрактом.
     __PutLengthParam(__e, BuiltInParameter.CEILING_HEIGHTABOVELEVEL_PARAM,
-                     "CEILING_HEIGHTABOVELEVEL_PARAM", __params);
+                     nameof(BuiltInParameter.CEILING_HEIGHTABOVELEVEL_PARAM), __params);
     __PutIntParam(__e, BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL,
-                  "FLOOR_PARAM_IS_STRUCTURAL", __params);
+                  nameof(BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL), __params);
     __PutLengthParam(__e, BuiltInParameter.STRUCTURAL_BEAM_END0_ELEVATION,
-                     "STRUCTURAL_BEAM_END0_ELEVATION", __params);
+                     nameof(BuiltInParameter.STRUCTURAL_BEAM_END0_ELEVATION), __params);
     __PutLengthParam(__e, BuiltInParameter.STRUCTURAL_BEAM_END1_ELEVATION,
-                     "STRUCTURAL_BEAM_END1_ELEVATION", __params);
+                     nameof(BuiltInParameter.STRUCTURAL_BEAM_END1_ELEVATION), __params);
     __PutIntParam(__e, BuiltInParameter.Z_JUSTIFICATION,
-                  "Z_JUSTIFICATION", __params);
+                  nameof(BuiltInParameter.Z_JUSTIFICATION), __params);
     __PutLengthParam(__e, BuiltInParameter.Z_OFFSET_VALUE,
-                     "Z_OFFSET_VALUE", __params);
+                     nameof(BuiltInParameter.Z_OFFSET_VALUE), __params);
     // СЕЧЕНИЯ — все одиннадцать через __PutSectionParam, который сам падает
     // на ТИП элемента (толщина стены живёт на WallType, а не на стене) и
     // ОСТАВЛЯЕТ КВИТАНЦИЮ о причине пропуска (ревью кодекса №12). Имена
@@ -832,56 +834,56 @@ Action<Element, Dictionary<string, object>> __PutParams = (__e, __row) =>
     // отдельный параметр, и снимать надо ОБА: номинал остаётся квитанцией
     // «наружного не нашлось», а не молчаливой заменой ему.
     __PutSectionParam(__e, BuiltInParameter.RBS_PIPE_DIAMETER_PARAM,
-                     "RBS_PIPE_DIAMETER_PARAM", __params);
+                     nameof(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM), __params);
     __PutSectionParam(__e, BuiltInParameter.RBS_PIPE_OUTER_DIAMETER,
-                     "RBS_PIPE_OUTER_DIAMETER", __params);
+                     nameof(BuiltInParameter.RBS_PIPE_OUTER_DIAMETER), __params);
     __PutSectionParam(__e, BuiltInParameter.RBS_CURVE_DIAMETER_PARAM,
-                     "RBS_CURVE_DIAMETER_PARAM", __params);
+                     nameof(BuiltInParameter.RBS_CURVE_DIAMETER_PARAM), __params);
     __PutSectionParam(__e, BuiltInParameter.RBS_CURVE_WIDTH_PARAM,
-                     "RBS_CURVE_WIDTH_PARAM", __params);
+                     nameof(BuiltInParameter.RBS_CURVE_WIDTH_PARAM), __params);
     __PutSectionParam(__e, BuiltInParameter.RBS_CURVE_HEIGHT_PARAM,
-                     "RBS_CURVE_HEIGHT_PARAM", __params);
+                     nameof(BuiltInParameter.RBS_CURVE_HEIGHT_PARAM), __params);
     __PutSectionParam(__e, BuiltInParameter.WALL_ATTR_WIDTH_PARAM,
-                     "WALL_ATTR_WIDTH_PARAM", __params);
+                     nameof(BuiltInParameter.WALL_ATTR_WIDTH_PARAM), __params);
     // Замер v18: WALL_CROSS_SECTION не снят НИ У ОДНОЙ из 2360 стен, и
     // именно поэтому призма по одной толщине остаётся запрещённой (ревью
     // №10): отличить vertical от slanted/tapered нечем.
     __PutSectionIntParam(__e, BuiltInParameter.WALL_CROSS_SECTION,
-                     "WALL_CROSS_SECTION", __params);
+                     nameof(BuiltInParameter.WALL_CROSS_SECTION), __params);
     // ПРИСОЕДИНЕНИЕ верха/низа стены. Замер v19: у присоединённой стены
     // реальная высота НЕ равна WALL_USER_HEIGHT_PARAM (8234565: параметр
     // 7970 мм при настоящих 9755 мм), а присоединение к КРЫШЕ не описывается
     // даже отметкой верхнего уровня. Признак структурный и универсальный —
     // никаких имён типов и семейств. Квитанция ОБЩАЯ с сечениями.
     __PutSectionIntParam(__e, BuiltInParameter.WALL_TOP_IS_ATTACHED,
-                     "WALL_TOP_IS_ATTACHED", __params);
+                     nameof(BuiltInParameter.WALL_TOP_IS_ATTACHED), __params);
     __PutSectionIntParam(__e, BuiltInParameter.WALL_BOTTOM_IS_ATTACHED,
-                     "WALL_BOTTOM_IS_ATTACHED", __params);
+                     nameof(BuiltInParameter.WALL_BOTTOM_IS_ATTACHED), __params);
     __PutSectionParam(__e, BuiltInParameter.RBS_CABLETRAY_WIDTH_PARAM,
-                     "RBS_CABLETRAY_WIDTH_PARAM", __params);
+                     nameof(BuiltInParameter.RBS_CABLETRAY_WIDTH_PARAM), __params);
     __PutSectionParam(__e, BuiltInParameter.RBS_CABLETRAY_HEIGHT_PARAM,
-                     "RBS_CABLETRAY_HEIGHT_PARAM", __params);
+                     nameof(BuiltInParameter.RBS_CABLETRAY_HEIGHT_PARAM), __params);
     // "Diameter(Trade Size)" — номинал прямым текстом в API.
     __PutSectionParam(__e, BuiltInParameter.RBS_CONDUIT_DIAMETER_PARAM,
-                     "RBS_CONDUIT_DIAMETER_PARAM", __params);
+                     nameof(BuiltInParameter.RBS_CONDUIT_DIAMETER_PARAM), __params);
     __PutSectionParam(__e, BuiltInParameter.RBS_CONDUIT_OUTER_DIAM_PARAM,
-                     "RBS_CONDUIT_OUTER_DIAM_PARAM", __params);
+                     nameof(BuiltInParameter.RBS_CONDUIT_OUTER_DIAM_PARAM), __params);
     __PutSectionParam(__e, BuiltInParameter.STRUCTURAL_SECTION_COMMON_WIDTH,
-                     "STRUCTURAL_SECTION_COMMON_WIDTH", __params);
+                     nameof(BuiltInParameter.STRUCTURAL_SECTION_COMMON_WIDTH), __params);
     __PutSectionParam(__e, BuiltInParameter.STRUCTURAL_SECTION_COMMON_HEIGHT,
-                     "STRUCTURAL_SECTION_COMMON_HEIGHT", __params);
+                     nameof(BuiltInParameter.STRUCTURAL_SECTION_COMMON_HEIGHT), __params);
     __PutSectionParam(__e, BuiltInParameter.STRUCTURAL_SECTION_COMMON_DIAMETER,
-                     "STRUCTURAL_SECTION_COMMON_DIAMETER", __params);
+                     nameof(BuiltInParameter.STRUCTURAL_SECTION_COMMON_DIAMETER), __params);
     __PutLengthParam(__e, BuiltInParameter.FAMILY_WIDTH_PARAM,
-                     "FAMILY_WIDTH_PARAM", __params);
+                     nameof(BuiltInParameter.FAMILY_WIDTH_PARAM), __params);
     __PutLengthParam(__e, BuiltInParameter.FAMILY_HEIGHT_PARAM,
-                     "FAMILY_HEIGHT_PARAM", __params);
+                     nameof(BuiltInParameter.FAMILY_HEIGHT_PARAM), __params);
     __PutLengthParam(__e, BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM,
-                     "INSTANCE_SILL_HEIGHT_PARAM", __params);
+                     nameof(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM), __params);
     __PutIdParam(__e, BuiltInParameter.STAIRS_BASE_LEVEL_PARAM,
-                 "STAIRS_BASE_LEVEL_PARAM", __params);
+                 nameof(BuiltInParameter.STAIRS_BASE_LEVEL_PARAM), __params);
     __PutIdParam(__e, BuiltInParameter.STAIRS_TOP_LEVEL_PARAM,
-                 "STAIRS_TOP_LEVEL_PARAM", __params);
+                 nameof(BuiltInParameter.STAIRS_TOP_LEVEL_PARAM), __params);
     __row["params"] = __params;
 };
 Action<Element, Dictionary<string, object>> __PutGroupingState = (__e, __row) =>
@@ -934,12 +936,220 @@ long __RoomAfter = __ROOM_AFTER__;
 Func<XYZ, double[]> __VecMM = (__p) => new double[] {
     __MM(__p.X), __MM(__p.Y), __MM(__p.Z)
 };
+Func<double, bool> __Finite = (__value) =>
+    !Double.IsNaN(__value) && !Double.IsInfinity(__value);
+Func<Transform, string, Dictionary<string, object>> __TransformEvidence =
+    (__transform, __targetFrame) =>
+{
+    var __transformGaps = new List<object>();
+    object __matrix = null;
+    if (__transform == null)
+    {
+        __transformGaps.Add("transform_unavailable");
+    }
+    else
+    {
+        try
+        {
+            XYZ __bx = __transform.BasisX;
+            XYZ __by = __transform.BasisY;
+            XYZ __bz = __transform.BasisZ;
+            XYZ __origin = __transform.Origin;
+            double __ox = __MM(__origin.X);
+            double __oy = __MM(__origin.Y);
+            double __oz = __MM(__origin.Z);
+            double __nxx = __bx.DotProduct(__bx);
+            double __nyy = __by.DotProduct(__by);
+            double __nzz = __bz.DotProduct(__bz);
+            double __nxy = __bx.DotProduct(__by);
+            double __nxz = __bx.DotProduct(__bz);
+            double __nyz = __by.DotProduct(__bz);
+            double __det = __bx.X * (__by.Y * __bz.Z - __by.Z * __bz.Y)
+                - __by.X * (__bx.Y * __bz.Z - __bx.Z * __bz.Y)
+                + __bz.X * (__bx.Y * __by.Z - __bx.Z * __by.Y);
+            const double __transformTolerance = 1e-8;
+            bool __valid =
+                __Finite(__bx.X) && __Finite(__bx.Y) && __Finite(__bx.Z) &&
+                __Finite(__by.X) && __Finite(__by.Y) && __Finite(__by.Z) &&
+                __Finite(__bz.X) && __Finite(__bz.Y) && __Finite(__bz.Z) &&
+                __Finite(__ox) && __Finite(__oy) && __Finite(__oz) &&
+                Math.Abs(__nxx - 1.0) <= __transformTolerance &&
+                Math.Abs(__nyy - 1.0) <= __transformTolerance &&
+                Math.Abs(__nzz - 1.0) <= __transformTolerance &&
+                Math.Abs(__nxy) <= __transformTolerance &&
+                Math.Abs(__nxz) <= __transformTolerance &&
+                Math.Abs(__nyz) <= __transformTolerance &&
+                Math.Abs(Math.Abs(__det) - 1.0) <= __transformTolerance;
+            if (__valid)
+            {
+                // Row-major affine source -> parent. Basis is dimensionless;
+                // only Origin crosses the Revit feet -> L0 millimetres seam.
+                __matrix = new double[] {
+                    __bx.X, __by.X, __bz.X, __ox,
+                    __bx.Y, __by.Y, __bz.Y, __oy,
+                    __bx.Z, __by.Z, __bz.Z, __oz,
+                    0.0, 0.0, 0.0, 1.0
+                };
+            }
+            else
+            {
+                __transformGaps.Add("transform_invalid");
+            }
+        }
+        catch
+        {
+            __transformGaps.Add("transform_unavailable");
+        }
+    }
+    return new Dictionary<string, object> {
+        {"matrix", __matrix},
+        {"status", __matrix == null ? "incomplete" : "authoritative"},
+        {"gaps", __transformGaps},
+        {"target_frame", __targetFrame}
+    };
+};
 Func<string, object> __Text = (__value) =>
     String.IsNullOrWhiteSpace(__value) ? null : (object)__value;
 var __result = new Dictionary<string, object>();
 __result["doc_name"] = String.IsNullOrWhiteSpace(__src.Title) ? "(untitled)" : __src.Title;
 __result["revit_version"] = __src.Application.VersionNumber;
 __result["units"] = "mm";
+
+// Document identity is a Revit-owned fact, not a filename and never a local
+// ElementId promoted to global scope. Cloud project/model GUIDs and the Revit
+// Server central GUID identify logical models. ProjectInformation.UniqueId is
+// retained only as lineage evidence: Autodesk contracts Element.UniqueId as
+// unique *within* one document, so Save As/copies cannot be disambiguated by
+// it. The element revision GUID is deliberately absent: it is a revision
+// witness, not identity, and would split one document after edits.
+Func<Document, Dictionary<string, object>> __DocumentIdentityFact =
+    (__document) =>
+{
+    try
+    {
+        if (__document.IsModelInCloud)
+        {
+            var __cloudPath = __document.GetCloudModelPath();
+            if (__cloudPath != null)
+            {
+                var __projectGuid = __cloudPath.GetProjectGUID();
+                var __modelGuid = __cloudPath.GetModelGUID();
+                if (__projectGuid != Guid.Empty && __modelGuid != Guid.Empty)
+                {
+                    return new Dictionary<string, object> {
+                        {"source", "cloud_project_model_guid"},
+                        {"value", __projectGuid.ToString("D") + "/" +
+                                  __modelGuid.ToString("D")}
+                    };
+                }
+            }
+        }
+    }
+    catch { }
+    try
+    {
+        if (__document.IsWorkshared)
+        {
+            var __centralPath = __document.GetWorksharingCentralModelPath();
+            var __serverPath = __centralPath as ServerPath;
+            if (__serverPath != null)
+            {
+                var __centralGuid =
+                    __document.Application.GetWorksharingCentralGUID(
+                        __serverPath);
+                if (__centralGuid != Guid.Empty)
+                {
+                    return new Dictionary<string, object> {
+                        {"source", "revit_server_central_guid"},
+                        {"value", __centralGuid.ToString("D")}
+                    };
+                }
+            }
+        }
+    }
+    catch { }
+    string __projectUniqueId = null;
+    try
+    {
+        var __projectInformation = __document.ProjectInformation;
+        if (__projectInformation != null &&
+            !String.IsNullOrWhiteSpace(__projectInformation.UniqueId))
+            __projectUniqueId = __projectInformation.UniqueId;
+    }
+    catch { }
+    if (String.IsNullOrWhiteSpace(__projectUniqueId)) return null;
+    return new Dictionary<string, object> {
+        {"source", "project_information_unique_id"},
+        {"value", __projectUniqueId}
+    };
+};
+Func<Dictionary<string, object>, bool> __DocumentIdentityAuthoritative =
+    (__fact) =>
+{
+    if (__fact == null || !__fact.ContainsKey("source")) return false;
+    string __source = __fact["source"] as string;
+    return __source == "cloud_project_model_guid" ||
+           __source == "revit_server_central_guid";
+};
+var __sourceDocumentIdentity = __DocumentIdentityFact(__src);
+var __federationRootIdentity = __DocumentIdentityFact(__federationRoot);
+var __sourceIdentityGaps = new List<object>();
+var __sourceLinkChain = new List<object>();
+if (__sourceDocumentIdentity == null)
+    __sourceIdentityGaps.Add("source_document_identity_unavailable");
+else if (!__DocumentIdentityAuthoritative(__sourceDocumentIdentity))
+    __sourceIdentityGaps.Add("source_document_identity_not_authoritative");
+if (__federationRootIdentity == null)
+    __sourceIdentityGaps.Add("federation_root_identity_unavailable");
+else if (!__DocumentIdentityAuthoritative(__federationRootIdentity))
+    __sourceIdentityGaps.Add("federation_root_identity_not_authoritative");
+if (__sourceLinkInstance != null)
+{
+    string __sourceLinkUniqueId = null;
+    try
+    {
+        if (!String.IsNullOrWhiteSpace(__sourceLinkInstance.UniqueId))
+            __sourceLinkUniqueId = __sourceLinkInstance.UniqueId;
+    }
+    catch { }
+    if (__sourceLinkUniqueId == null)
+        __sourceIdentityGaps.Add("link_instance_unique_id_unavailable");
+    else
+        __sourceLinkChain.Add(__sourceLinkUniqueId);
+}
+bool __sourceIdentityAuthoritative =
+    __DocumentIdentityAuthoritative(__sourceDocumentIdentity) &&
+    __DocumentIdentityAuthoritative(__federationRootIdentity) &&
+    (__sourceLinkInstance == null || __sourceLinkChain.Count > 0) &&
+    __sourceIdentityGaps.Count == 0;
+__result["identity"] = new Dictionary<string, object> {
+    {"schema_version", "kir-l0-revit-identity/1"},
+    {"source_kind", __sourceLinkInstance == null ? "root" : "link"},
+    {"document_identity", __sourceDocumentIdentity},
+    {"federation_root_identity", __federationRootIdentity},
+    {"link_instance_chain", __sourceLinkChain},
+    {"status", __sourceIdentityAuthoritative
+        ? "authoritative" : "incomplete"},
+    {"gaps", __sourceIdentityGaps}
+};
+if (__sourceLinkInstance == null)
+{
+    __result["federation_transform"] = __TransformEvidence(
+        Transform.Identity, "federation_root");
+}
+else
+{
+    try
+    {
+        __result["federation_transform"] = __TransformEvidence(
+            __sourceLinkInstance.GetTotalTransform(), "federation_root");
+    }
+    catch
+    {
+        __result["federation_transform"] = __TransformEvidence(
+            null, "federation_root");
+    }
+}
 
 var __levels = new List<object>();
 foreach (Level __level in new FilteredElementCollector(__src)
@@ -1195,6 +1405,47 @@ foreach (RevitLinkInstance __link in new FilteredElementCollector(__src)
         }
         catch { }
     }
+    string __linkInstanceUniqueId = null;
+    try
+    {
+        if (!String.IsNullOrWhiteSpace(__link.UniqueId))
+            __linkInstanceUniqueId = __link.UniqueId;
+    }
+    catch { }
+    var __linkedDocumentIdentity = (__linkedDocument == null
+        ? null : __DocumentIdentityFact(__linkedDocument));
+    var __linkIdentityGaps = new List<object>();
+    if (__linkInstanceUniqueId == null)
+        __linkIdentityGaps.Add("link_instance_unique_id_unavailable");
+    if (__linkedDocument == null)
+        __linkIdentityGaps.Add("linked_document_unavailable");
+    else if (__linkedDocumentIdentity == null)
+        __linkIdentityGaps.Add("linked_document_identity_unavailable");
+    else if (!__DocumentIdentityAuthoritative(__linkedDocumentIdentity))
+        __linkIdentityGaps.Add(
+            "linked_document_identity_not_authoritative");
+    bool __linkIdentityAuthoritative =
+        __linkInstanceUniqueId != null &&
+        __DocumentIdentityAuthoritative(__linkedDocumentIdentity) &&
+        __linkIdentityGaps.Count == 0;
+    __linkRow["identity"] = new Dictionary<string, object> {
+        {"schema_version", "kir-l0-revit-identity/1"},
+        {"instance_unique_id", __linkInstanceUniqueId},
+        {"linked_document_identity", __linkedDocumentIdentity},
+        {"status", __linkIdentityAuthoritative
+            ? "authoritative" : "incomplete"},
+        {"gaps", __linkIdentityGaps}
+    };
+    try
+    {
+        __linkRow["transform"] = __TransformEvidence(
+            __link.GetTotalTransform(), "parent_source");
+    }
+    catch
+    {
+        __linkRow["transform"] = __TransformEvidence(
+            null, "parent_source");
+    }
     try
     {
         var __bbox = __link.get_BoundingBox(null);
@@ -1247,8 +1498,18 @@ if (__censusWanted)
         }
         else
         {
+            // Отказ ОБРАЩЕНИЯ и отсутствие категории — разные факты, и до
+            // 12.08.2026 `catch { }` сливал их в один ключ: отказ прибора
+            // становился измерением о модели (форма 3 канона) на 17.35%
+            // документа. Флаг ставится ТОЛЬКО в catch, поэтому на прогоне,
+            // где ничего не бросает, эмиссия ведёт себя как прежде.
             Category __anyCat = null;
-            try { __anyCat = __any.Category; } catch { }
+            bool __anyCatThrew = false;
+            try { __anyCat = __any.Category; } catch { __anyCatThrew = true; }
+            if (__anyCat == null && __anyCatThrew)
+            {
+                __key = "__CENSUS_CATEGORY_THREW__";
+            }
             if (__anyCat != null)
             {
                 string __catId = __anyCat.Id.ToString();
@@ -1305,7 +1566,10 @@ return __result;
 """.strip()
 
 
-def _source_binding_cs(link_title: str | None) -> str:
+def _source_binding_cs(
+    link_title: str | None,
+    link_instance_unique_id: str | None = None,
+) -> str:
     """Чей документ мы читаем: хозяин или его СВЯЗЬ.
 
     Связанные документы уже открыты в сессии (замер 30.07 на Snowdon:
@@ -1316,9 +1580,10 @@ def _source_binding_cs(link_title: str | None) -> str:
     изнутри обработчика события (документировано Autodesk, проверено живьём:
     вызов вернул null, не бросив исключения).
 
-    Каждая связь снимается СВОИМ слепком со своим штампом, поэтому ни
-    составные ключи, ни федеративная перепись не нужны: для всего, что ниже,
-    это просто ещё один документ.
+    Каждая связь снимается СВОИМ слепком со своим штампом. Это даёт ей
+    локальный поток, но НЕ глобальное адресное пространство: production-header
+    дополнительно несёт identity документа, корня федерации и UniqueId точной
+    link-instance. Числовой ElementId остаётся только локальным адресом.
 
     ОГОВОРКА, КОТОРУЮ НЕЛЬЗЯ ПРЯТАТЬ: ревизионный страж отпечатывает документ
     ХОЗЯИНА. Правка внутри связи хозяйскую ревизию не меняет, значит на чтении
@@ -1332,7 +1597,7 @@ def _source_binding_cs(link_title: str | None) -> str:
     документ читается, а закон «одно тело — один документ» проверяется по
     ТЕКСТУ эмиссии: копии разошлись бы молча и оставили проверку зелёной.
     """
-    return source_binding_cs(link_title)
+    return source_binding_cs(link_title, link_instance_unique_id)
 
 
 def _collector_cs(spec: CategorySpec, variable: str = "__query") -> str:
@@ -1350,7 +1615,8 @@ def _collector_cs(spec: CategorySpec, variable: str = "__query") -> str:
 
 
 def build_metadata_cs(*, after_room_id: int | None = None,
-                      link_title: str | None = None) -> str:
+                      link_title: str | None = None,
+                      link_instance_unique_id: str | None = None) -> str:
     """Return one version-safe document-metadata/room-boundary page.
 
     §18.1: перепись документа едет в ЭТОМ же теле — отдельным round-trip'ом
@@ -1367,16 +1633,19 @@ def build_metadata_cs(*, after_room_id: int | None = None,
         # что и элементы: иначе перепись мерила бы хозяина, а элементы
         # приходили бы из связи — и закон переписи поймал бы это как
         # расхождение, не назвав причины.
-        _source_binding_cs(link_title) + "\n" + _METADATA_CS
+        _source_binding_cs(link_title, link_instance_unique_id)
+        + "\n" + _METADATA_CS
         .replace("__ROOM_AFTER__", after, 1)
         .replace("__ROOM_TAKE__", str(EXTRACT_BATCH + 1))
         .replace("__ROOM_BATCH__", str(EXTRACT_BATCH))
         .replace("__CENSUS_NO_CATEGORY__", NO_CATEGORY_KEY)
+        .replace("__CENSUS_CATEGORY_THREW__", CATEGORY_READ_FAILED_KEY)
     )
 
 
 def build_category_probe_cs(category: str, *,
-                            link_title: str | None = None) -> str:
+                            link_title: str | None = None,
+                            link_instance_unique_id: str | None = None) -> str:
     """Build the count/level-scope probe for one fixed category."""
 
     spec = _SPEC_BY_NAME.get(category)
@@ -1384,7 +1653,7 @@ def build_category_probe_cs(category: str, *,
         raise ValueError(f"unknown extraction category: {category!r}")
     return "\n".join((
         _COMMON_HELPERS_CS,
-        _source_binding_cs(link_title),
+        _source_binding_cs(link_title, link_instance_unique_id),
         _collector_cs(spec),
         r"""
 var __counts = new Dictionary<string, int>();
@@ -1535,6 +1804,7 @@ def build_category_batch_cs(
     level_scope: str = "__all__",
     after_element_id: int | None = None,
     link_title: str | None = None,
+    link_instance_unique_id: str | None = None,
 ) -> str:
     """Build one deterministic page (at most ``EXTRACT_BATCH`` rows)."""
 
@@ -1564,6 +1834,13 @@ foreach (var __element in __page)
 {{
     var __row = new Dictionary<string, object>();
     __row["element_id"] = __element.Id.ToString();
+    __row["unique_id"] = null;
+    try
+    {{
+        if (!String.IsNullOrWhiteSpace(__element.UniqueId))
+            __row["unique_id"] = __element.UniqueId;
+    }}
+    catch {{ }}
     __row["category"] = __Category;
     __row["category_ru"] = "";
     try
@@ -1580,7 +1857,7 @@ foreach (var __element in __page)
         if (__typeId != null && __typeId != ElementId.InvalidElementId)
         {{
             __row["type_id"] = __typeId.ToString();
-            var __type = doc.GetElement(__typeId);
+            var __type = __src.GetElement(__typeId);
             if (__type != null && __type.Name != null)
                 __row["type_name"] = __type.Name;
         }}
@@ -1625,7 +1902,7 @@ return new Dictionary<string, object> {{
 """.strip()
     return "\n".join((
         _COMMON_HELPERS_CS,
-        _source_binding_cs(link_title),
+        _source_binding_cs(link_title, link_instance_unique_id),
         _ELEMENT_HELPERS_CS,
         GEOMETRY_HELPER_CS,
         _collector_cs(spec),
@@ -1986,6 +2263,84 @@ def _parse_metadata(value: Any, change_stamp: str) -> L0Document:
         raise ExtractionProtocolError(
             "metadata is missing required links array")
     links = _require_list(row.pop("links"), "metadata.links")
+    # The exact Bridge closure cannot compile SHA256 on Revit 2025/2026.
+    # Validate every measured isometry here and issue its canonical digest
+    # before persisting L0. Historical payloads without this additive axis
+    # stay readable, but are explicitly transform-incomplete downstream.
+    raw_identity = row.get("identity")
+    identity_row = (
+        _require_mapping(raw_identity, "metadata.identity")
+        if raw_identity is not None else {})
+
+    def document_key(value: Any, field_name: str) -> str | None:
+        if value is None:
+            return None
+        fact = _require_mapping(value, field_name)
+        source = fact.get("source")
+        identity_value = fact.get("value")
+        if (not isinstance(source, str) or not source
+                or not isinstance(identity_value, str) or not identity_value):
+            return None
+        return f"revit:{source}:{identity_value}"
+
+    raw_chain = identity_row.get("link_instance_chain") or []
+    if not isinstance(raw_chain, list) or any(
+            not isinstance(item, str) or not item for item in raw_chain):
+        raise ExtractionProtocolError(
+            "metadata.identity.link_instance_chain must be string array")
+    source_chain = tuple(raw_chain)
+    source_document_key = document_key(
+        identity_row.get("document_identity"),
+        "metadata.identity.document_identity")
+    root_document_key = document_key(
+        identity_row.get("federation_root_identity"),
+        "metadata.identity.federation_root_identity")
+    if row.get("federation_transform") is not None:
+        try:
+            row["federation_transform"] = (
+                FederationTransformEvidence.from_bridge_dict(
+                    row["federation_transform"],
+                    "metadata.federation_transform",
+                    subject_context=FederationTransformSubject(
+                        source_document_key=source_document_key,
+                        target_document_key=root_document_key,
+                        link_instance_chain=source_chain,
+                        target_link_instance_chain=())).to_dict())
+        except L0SchemaError as exc:
+            raise ExtractionProtocolError(
+                f"invalid metadata federation transform: {exc}") from exc
+    normalized_links: list[Any] = []
+    for index, raw_link in enumerate(links):
+        link_row = _require_mapping(raw_link, f"metadata.links[{index}]")
+        if link_row.get("transform") is not None:
+            try:
+                link_identity = _require_mapping(
+                    link_row.get("identity"),
+                    f"metadata.links[{index}].identity")
+                child_uid = link_identity.get("instance_unique_id")
+                child_chain = (
+                    (*source_chain, child_uid)
+                    if isinstance(child_uid, str) and child_uid
+                    else source_chain)
+                link_row["transform"] = (
+                    FederationTransformEvidence.from_bridge_dict(
+                        link_row["transform"],
+                        f"metadata.links[{index}].transform",
+                        subject_context=FederationTransformSubject(
+                            source_document_key=document_key(
+                                link_identity.get(
+                                    "linked_document_identity"),
+                                f"metadata.links[{index}].identity."
+                                "linked_document_identity"),
+                            target_document_key=source_document_key,
+                            link_instance_chain=child_chain,
+                            target_link_instance_chain=(
+                                source_chain))).to_dict())
+            except L0SchemaError as exc:
+                raise ExtractionProtocolError(
+                    f"invalid metadata link transform: {exc}") from exc
+        normalized_links.append(link_row)
+    links = normalized_links
     census = _parse_census(row)
     document = {
         **row,
@@ -2581,6 +2936,7 @@ async def _new_metadata(
     timeout_ms: int,
     retries: int,
     link_title: str | None = None,
+    link_instance_unique_id: str | None = None,
 ) -> L0Document:
     room_cursor: int | None = None
     metadata: L0Document | None = None
@@ -2588,7 +2944,9 @@ async def _new_metadata(
     while True:
         payload = await _execute_with_retries(
             executor, build_metadata_cs(after_room_id=room_cursor,
-                                        link_title=link_title),
+                                        link_title=link_title,
+                                        link_instance_unique_id=(
+                                            link_instance_unique_id)),
             timeout_ms=timeout_ms, retries=retries)
         page, has_more, next_cursor = _parse_metadata_page(
             payload, change_stamp, after_room_id=room_cursor)
@@ -2598,12 +2956,14 @@ async def _new_metadata(
             stable_first = (
                 metadata.doc_name, metadata.revit_version, metadata.units,
                 metadata.change_stamp, metadata.levels, metadata.grids,
-                metadata.project_info, metadata.links,
+                metadata.project_info, metadata.links, metadata.identity,
+                metadata.federation_transform,
             )
             stable_page = (
                 page.doc_name, page.revit_version, page.units,
                 page.change_stamp, page.levels, page.grids,
-                page.project_info, page.links,
+                page.project_info, page.links, page.identity,
+                page.federation_transform,
             )
             if stable_page != stable_first:
                 raise ExtractionProtocolError(
@@ -2632,6 +2992,8 @@ async def _new_metadata(
         # §18.1: перепись считается на ПЕРВОЙ странице комнат и живёт в
         # ``metadata``; страницы 2+ возвращают null и не должны её стирать.
         census=metadata.census,
+        identity=metadata.identity,
+        federation_transform=metadata.federation_transform,
     )
 
 
@@ -2673,10 +3035,14 @@ async def extract_document(
     on_progress: Callable[[ExtractProgress], None] | None = None,
     #: Читать не хозяина, а его СВЯЗЬ с таким Document.Title. Связанные
     #: документы уже открыты в сессии — открывать ничего не нужно. Слепок
-    #: связи отдельный, со своим штампом: ниже по течению это просто ещё
-    #: один документ, поэтому ни составных ключей, ни федеративной переписи
-    #: не требуется.
+    #: связи отдельный, со своим штампом; его header также несёт definition
+    #: identity и occurrence-path от корня федерации. ElementId между этими
+    #: отдельными потоками никогда не считается глобальным.
     link_title: str | None = None,
+    #: Preferred selector. Unlike Document.Title this identifies one exact
+    #: RevitLinkInstance occurrence and cannot collapse two placements of the
+    #: same linked definition.
+    link_instance_unique_id: str | None = None,
 ) -> ExtractionResult:
     """Extract one document without retaining its element population in RAM.
 
@@ -2687,6 +3053,9 @@ async def extract_document(
 
     if not isinstance(change_stamp, str) or not change_stamp:
         raise ValueError("change_stamp must be a non-empty string")
+    if link_title is not None and link_instance_unique_id is not None:
+        raise ValueError(
+            "link_title and link_instance_unique_id are mutually exclusive")
     if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) \
             or timeout_ms <= 0 or timeout_ms > EXTRACT_TIMEOUT_MS:
         raise ValueError(
@@ -2699,7 +3068,8 @@ async def extract_document(
     if output_path is None:
         metadata = await _new_metadata(
             executor, change_stamp, timeout_ms=timeout_ms, retries=retries,
-            link_title=link_title)
+            link_title=link_title,
+            link_instance_unique_id=link_instance_unique_id)
         # Читаем env КАЖДЫЙ раз: модуль импортируется один раз на процесс,
         # и запомненный на импорте корень нельзя переназначить конфигом.
         output = default_output_root() / (
@@ -2779,7 +3149,8 @@ async def extract_document(
             metadata = await _new_metadata(
                 executor, change_stamp,
                 timeout_ms=timeout_ms, retries=retries,
-                link_title=link_title)
+                link_title=link_title,
+                link_instance_unique_id=link_instance_unique_id)
         with output.open("wb") as handle:
             _write_record(handle, {
                 "record": "header",
@@ -2836,7 +3207,9 @@ async def extract_document(
                 _t0 = time.monotonic()
                 probe_payload = await _execute_awaiting_window(
                     executor,
-                    build_category_probe_cs(category, link_title=link_title),
+                    build_category_probe_cs(
+                        category, link_title=link_title,
+                        link_instance_unique_id=link_instance_unique_id),
                     timeout_ms=timeout_ms, retries=retries,
                     budget=window_budget, what=f"проба {category}")
                 slot_t["probe_ms"] += (time.monotonic() - _t0) * 1000.0
@@ -2851,7 +3224,9 @@ async def extract_document(
                             build_category_batch_cs(
                                 category, level_scope=scope.key,
                                 after_element_id=cursor,
-                                link_title=link_title),
+                                link_title=link_title,
+                                link_instance_unique_id=(
+                                    link_instance_unique_id)),
                             timeout_ms=timeout_ms, retries=retries,
                             budget=window_budget,
                             what=(f"страница {category}"
@@ -3230,4 +3605,6 @@ class L0JSONLReader:
             # §18.1: то же и на чтении — без переписи в материализованном
             # документе весь офлайн-хвост считает знаменателем выборку.
             census=metadata.census,
+            identity=metadata.identity,
+            federation_transform=metadata.federation_transform,
         )

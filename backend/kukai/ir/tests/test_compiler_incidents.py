@@ -86,13 +86,14 @@ def _raise_at(stage: str):
                 program, snapshot={}, query_id=_SECRET)
 
     if stage == "open_model_preflight":
+        profile = _empty_open_model_profile()
         with ground_patch, mock.patch(
             "kukai.ir.open_model.preflight_programs", side_effect=failure
         ):
             return compile_program(
                 program,
-                snapshot={},
-                open_model_profile=_empty_open_model_profile(),
+                snapshot=profile.to_ground_snapshot(),
+                open_model_profile=profile,
                 query_id=_SECRET,
             )
 
@@ -196,7 +197,8 @@ def test_supported_revit_version_is_readable_in_panic_log(
     (
         _query_program(),
         "2026",
-        "083552a81d7982cfc9349ebe0c76699c19e8b73770cd1485f1630f0abbe72129",
+        # PlannedProgram/3 additionally binds nested-operation contracts.
+        "4af9a33b267c929bd67d5f02f79728855e4386b3b455ab035fd17ade580b864b",
     ),
     (
         _query_program(),

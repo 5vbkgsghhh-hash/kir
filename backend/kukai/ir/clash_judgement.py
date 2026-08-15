@@ -47,6 +47,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
+from kukai.clash import detect as clash_detect
+
 __all__ = (
     "HOST_STATES",
     "JUDGEMENT_SCHEMA",
@@ -336,7 +338,9 @@ def _interior_witness(loop):
                 break
         if blocked:
             continue
-        return ((a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0)
+        vertex_count = len((a, b, c))
+        return ((a[0] + b[0] + c[0]) / vertex_count,
+                (a[1] + b[1] + c[1]) / vertex_count)
     return None
 
 
@@ -351,7 +355,7 @@ def _sub_edge_midpoints(loop, other):
     for i in range(n):
         a, b = loop[i], loop[(i + 1) % n]
         dx, dy = b[0] - a[0], b[1] - a[1]
-        ts = [0.0, 1.0]
+        ts = [0.0, 1]
         for j in range(m):
             c, d = other[j], other[(j + 1) % m]
             den = dx * (d[1] - c[1]) - dy * (d[0] - c[0])
@@ -359,11 +363,11 @@ def _sub_edge_midpoints(loop, other):
                 continue
             t = ((c[0] - a[0]) * (d[1] - c[1])
                  - (c[1] - a[1]) * (d[0] - c[0])) / den
-            if 0.0 < t < 1.0:
+            if 0.0 < t < 1:
                 ts.append(t)
         ts.sort()
         for k in range(len(ts) - 1):
-            t = 0.5 * (ts[k] + ts[k + 1])
+            t = (ts[k] + ts[k + 1]) / 2
             yield (a[0] + dx * t, a[1] + dy * t)
 
 
@@ -445,9 +449,8 @@ def loops_overlap(a: Sequence[Sequence[float]],
 #: (ключ, имя в квитанции, ЧТО БЕЗОПАСНО СДЕЛАТЬ). Порядок — от сильной к слабой.
 RUNGS: tuple[tuple[str, str, str], ...] = (
     ("fix", "ЧИНИТЬ",
-     "правьте программу: сдвиньте оп, измените размер, удалите лишний. "
-     "Разрушающее указание допустимо ТОЛЬКО здесь и только когда обе "
-     "оболочки тоньше габаритного бокса"),
+     "правьте программу: сдвиньте операцию или измените размер. Геометрия "
+     "сама по себе никогда не даёт права удалить BIM-элемент"),
     ("agree", "СОГЛАСОВАТЬ",
      "это узел, а не ошибка: объявите проём или гильзу и согласуйте со "
      "смежником. Двигать сеть вслепую — испортить рабочее решение"),
@@ -497,8 +500,8 @@ RULES: tuple[Rule, ...] = (
          "не спор. Строительного кодекса тут нет вовсе, это факт о заявлении"),
     Rule("duplicate", "duplicate",
          "детектор объявил род `coincident_duplicate`: два элемента стоят на "
-         "одном месте. Это диагностика модели, а не клеш — чинится удалением "
-         "лишнего, а не раздвиганием"),
+         "одном месте. Это кандидат на проверку: геометрия не доказывает "
+         "семантическую взаимозаменяемость и отсутствие зависимостей"),
     Rule("structure_contact", "adjacency",
          "плита опирается на стену и на колонну, стены смыкаются в углу, "
          "балка садится на колонну — КАСАНИЕ конструкций и есть способ, "
@@ -581,9 +584,11 @@ class Judged:
     kind: str
     rule_id: str
     rung: str
-    #: Доказано ли перекрытие ТРИСТЕЙТОМ. `True` — оболочки тоньше габарита и
-    #: ни одно наше огрубление его не объясняет; `False` — объясняет целиком;
-    #: `None` — сказать нечего (габаритный бокс). `None` — это НЕ «нет».
+    #: Доказано ли перекрытие ТЕЛ, а не их внешних оболочек.
+    #: `True` — детектор принёс `verdict=confirmed` на точной
+    #: геометрии; `False` — он принёс только `possible` либо наше
+    #: огрубление целиком объясняет перекрытие; `None` — свидетельство
+    #: грубое, неполное или внутренне противоречиво. `None` — это НЕ «нет».
     proven: bool | None
     depth_mm: float
     #: СЫРЫЕ ФАКТЫ ДЕТЕКТОРА, едущие рядом с суждением. Суждение выводится из
@@ -593,6 +598,12 @@ class Judged:
     relation: str
     pair_kind: str
     hull_grade: str
+    #: Сырой вердикт геометрии (`confirmed | possible`). Без него
+    #: `proven=False` не отличить от опровержения или дыры данных.
+    geometry_verdict: str
+    #: Full detector proof chain.  A positive user-visible claim must remain
+    #: auditable after judgement serialization, not only in the raw report.
+    physical_overlap_proof: dict[str, Any]
     a_label: str
     b_label: str
     #: Огрубления, объясняющие эту пару. Пусто — ни одно не применимо.
@@ -631,6 +642,8 @@ class Judged:
             "penetration_mm": round(float(self.depth_mm), 1),
             "relation": self.relation, "pair_kind": self.pair_kind,
             "hull_grade": self.hull_grade,
+            "geometry_verdict": self.geometry_verdict,
+            "physical_overlap_proof": self.physical_overlap_proof,
             "a_label": self.a_label, "b_label": self.b_label,
             "slack": list(self.slack),
             "text": self.text_ru,
@@ -757,25 +770,60 @@ def _hull_is_a_box(side: Mapping[str, Any]) -> bool:
     return str(side.get("hull_source") or "") == "bbox"
 
 
-def _destructive_is_safe(finding: Mapping[str, Any]) -> bool:
-    """Можно ли по этой находке ПРИКАЗАТЬ удаление.
+def _has_certified_inner_overlap(finding: Mapping[str, Any]) -> bool:
+    """Validate the detector's sealed proof chain fail-closed.
 
-    Только когда обе оболочки построены ОДНИМ источником тоньше габаритного
-    бокса: тогда совпадение доказано телами, а не двумя одинаковыми боксами.
-
-    ЭТОТ ПРЕДИКАТ ЖИВЁТ НЕ ЗДЕСЬ. Его место — у детектора, рядом с тем, кто
-    назначает род пары: ветка `feat/kir-clash-duplicate` (`c9d21573`) держит
-    его как `detect.duplicate_claim_is_proven` вместе с тристейтом
-    `hulls_coincide`. На этой ветке той правки ещё нет, а выдавать
-    разрушающее указание по совпадению двух БОКСОВ нельзя уже сегодня —
-    поэтому политика указания записана здесь, у того, кто указание печатает.
-    Когда ветки сойдутся, эта функция обязана стать вызовом той.
+    This consumer never recreates authority from plausible public fields.
+    ``detect`` owns the one narrow verifier for both certificate tags and the
+    pair tag; missing, replayed or edited serialized evidence stays unproven.
     """
+
+    if finding.get("verdict") != "confirmed":
+        return False
+    proof = finding.get("physical_overlap_proof")
+    side_a = finding.get("a")
+    side_b = finding.get("b")
+    if (not isinstance(proof, Mapping)
+            or not isinstance(side_a, Mapping)
+            or not isinstance(side_b, Mapping)):
+        return False
+    subject_a = side_a.get("source_element_id")
+    subject_b = side_b.get("source_element_id")
+    if not isinstance(subject_a, str) or not isinstance(subject_b, str):
+        return False
+    return clash_detect.verify_serialized_physical_overlap_proof(
+        proof, subject_a=subject_a, subject_b=subject_b)
+
+
+def _physical_overlap_proof(
+        finding: Mapping[str, Any], explains: tuple[str, ...]
+        ) -> bool | None:
+    """Доказала ли геометрия перекрытие ТЕЛ.
+
+    Это proof-firebreak между детектором и проектным суждением.
+    `detect` уже публикует типизированный `verdict`: пересечение
+    консервативных OUTER-оболочек — `possible`, а не факт о
+    телах. Слой суждения не имеет права повышать этот тип по
+    косвенному признаку «тоньше bbox».
+
+    `True` принимается только при согласованной цепочке
+    `confirmed + certified_inner_overlap + valid certificates`. Грейд
+    OUTER-оболочки в эту цепочку не входит. Любая противоречивая
+    или неполная запись закрывается в `None`, а не в догадку.
+    """
+    if explains:
+        return False
+    verdict = str(finding.get("verdict") or "")
+    grade = str(finding.get("hull_grade") or "")
     a, b = finding.get("a") or {}, finding.get("b") or {}
-    source = a.get("hull_source")
-    return (finding.get("hull_grade") in ("exact", "conservative")
-            and source is not None and source != "bbox"
-            and source == b.get("hull_source"))
+    if verdict == "possible":
+        # `coarse` не описывает тело вообще; у `conservative`
+        # тело локализовано, но OUTER-overlap остаётся лишь
+        # недоказанной гипотезой. Эти состояния намеренно
+        # разны: `None` — дыра данных, `False` — честный possible.
+        return None if grade == "coarse" or _hull_is_a_box(a) \
+            or _hull_is_a_box(b) else False
+    return True if _has_certified_inner_overlap(finding) else None
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1063,6 +1111,10 @@ def _rung(kind: str, finding: Mapping[str, Any], proven: bool | None) -> str:
         return "note"
     if kind in ("unproven", "unclassified"):
         return "nothing"
+    if kind == "duplicate":
+        # Exact geometric coincidence is still a review task until semantic
+        # equivalence and absence of external dependencies are proved.
+        return "look"
     if kind == "penetration":
         # Узел, но по габаритному боксу и узла не видно.
         #
@@ -1073,9 +1125,9 @@ def _rung(kind: str, finding: Mapping[str, Any], proven: bool | None) -> str:
         # и только при непустом огрублении. Условие, которое не может не
         # выполниться, читается проверкой, не будучи ею, — тот же класс, что
         # убитый на этой же неделе вакуумный сертификат `_plate_can_miss`.
-        return "agree" if proven is not None else "look"
+        return "agree" if proven is True else "look"
     # collision | duplicate
-    if proven is None:
+    if proven is not True:
         return "look"
     if depth <= tol:
         # Внутри собственного допуска грейда — смотреть, но не чинить.
@@ -1097,7 +1149,8 @@ def _diameter_of(op: Mapping[str, Any] | None) -> float | None:
 
 def _next_move(rule_id: str, finding: Mapping[str, Any],
                slack: tuple[str, ...], op_a: Mapping[str, Any] | None,
-               op_b: Mapping[str, Any] | None, safe_destructive: bool) -> str:
+               op_b: Mapping[str, Any] | None,
+               proven: bool | None) -> str:
     """ХОД, ВЫВОДИМЫЙ ИЗ ПРОГРАММЫ. Ни одной догадки: либо адрес операции и её
     операнд, либо число, посчитанное детектором, либо честное «нечем»."""
     a, b = finding["a"], finding["b"]
@@ -1106,12 +1159,13 @@ def _next_move(rule_id: str, finding: Mapping[str, Any],
     vector = finding.get("certified_separating_translation_mm")
 
     if rule_id == "duplicate":
-        if safe_destructive:
-            return (f"удалить ОДИН из двух: {addr_a} либо {addr_b} — тела "
-                    f"совпали, а не только габариты")
-        return (f"сверить {addr_a} и {addr_b} глазами: совпали ГАБАРИТЫ, а "
-                f"хотя бы одна оболочка — габаритный бокс; удалять по такой "
-                f"находке нельзя")
+        if clash_detect.duplicate_claim_is_proven(dict(finding)):
+            return (f"сверить {addr_a} и {addr_b}: точные тела совпали, но "
+                    "семантическая взаимозаменяемость и отсутствие внешних "
+                    "зависимостей не доказаны; автоматически удалять нельзя")
+        return (f"сверить {addr_a} и {addr_b} по точным телам: детектор "
+                f"видит совпадение внешних оболочек, но не доказал "
+                f"совпадение тел; удалять по такой находке нельзя")
     if rule_id == "host_declared":
         return "ничего: автор сам объявил вмещение через `host`"
     if rule_id == "structure_contact":
@@ -1127,6 +1181,13 @@ def _next_move(rule_id: str, finding: Mapping[str, Any],
                 "объявленные контуры в плане НЕ встречаются: спор возможен "
                 "только за пределами объявленного контура")
         return "; ".join(moves) or "дополнить заявление"
+    if (rule_id in ("run_through_envelope", "run_meets_run",
+                    "run_through_bearing", "run_meets_equipment")
+            and proven is not True):
+        return (
+            "проверить точное тело или получить inner-evidence: "
+            "сейчас пересекаются только внешние оболочки; "
+            "менять или удалять операции по этой находке нельзя")
     if rule_id == "run_through_envelope":
         run_op, run_id = ((op_a, a_id) if role_of(a.get("label")) in _RUN_ROLES
                           else (op_b, b_id))
@@ -1161,14 +1222,29 @@ def _text(rule: Rule, finding: Mapping[str, Any], proven: bool | None,
                       discipline_of(b.get("category")))
     disc = (f"раздел {disc_a}" if disc_a == disc_b
             else f"разделы {disc_a}↔{disc_b}")
-    sure = {True: "доказано оболочками",
-            False: "НЕ доказано",
-            None: "сказать нечего: оболочка — габаритный бокс"}[proven]
+    if proven is True:
+        sure = "доказано точной геометрией"
+    elif proven is False and finding.get("verdict") == "possible":
+        sure = "НЕ доказано: вердикт геометрии possible"
+    elif proven is False:
+        sure = "НЕ доказано: перекрытие объяснено огрублением"
+    else:
+        sure = "сказать нечего: свидетельство грубое или неполное"
+    possible = proven is not True
     head = {
-        "duplicate": f"ДУБЛИКАТ: {an} {a_id} и {bn} {b_id} стоят НА ОДНОМ МЕСТЕ",
-        "collision": f"СТОЛКНОВЕНИЕ: {an} {a_id} и {bn} {b_id} делят объём",
-        "penetration": (f"ПРОХОД СКВОЗЬ КОНСТРУКЦИЮ: {an} {a_id} в теле "
-                        f"{bn} {b_id}"),
+        "duplicate": (("ВОЗМОЖНЫЙ " if possible else "")
+                      + f"ДУБЛИКАТ: {an} {a_id} и {bn} {b_id} "
+                      + ("имеют перекрывающиеся оболочки" if possible
+                         else "стоят НА ОДНОМ МЕСТЕ")),
+        "collision": (("ВОЗМОЖНОЕ " if possible else "")
+                      + f"СТОЛКНОВЕНИЕ: {an} {a_id} и {bn} {b_id} "
+                      + ("пересекаются только внешними оболочками" if possible
+                         else "делят объём")),
+        "penetration": (("ВОЗМОЖНЫЙ " if possible else "")
+                        + f"ПРОХОД СКВОЗЬ КОНСТРУКЦИЮ: {an} {a_id} "
+                        + ((f"и {bn} {b_id} пересекаются только "
+                            "внешними оболочками") if possible
+                           else f"в теле {bn} {b_id}")),
         "adjacency": f"ПРИМЫКАНИЕ: {an} {a_id} и {bn} {b_id} соприкасаются",
         "unproven": (f"НЕ ДОКАЗАНО: {an} {a_id} и {bn} {b_id} спорят только "
                      f"в оболочках"),
@@ -1314,17 +1390,12 @@ def judge(findings: Iterable[Mapping[str, Any]], *,
         by_origin[origin] = by_origin.get(origin, 0) + 1
         rule_id, refused = _classify(finding, explains, host_state)
         rule = _RULE_BY_ID[rule_id]
-        # ДОКАЗАТЕЛЬНОСТЬ ТРИСТЕЙТОМ, тем же законом, что `hulls_coincide`:
-        # `None` значит «нечего сказать», и это НЕ «не доказано».
-        if explains:
-            proven: bool | None = False
-        elif (_hull_is_a_box(finding["a"]) or _hull_is_a_box(finding["b"])
-              or finding.get("hull_grade") == "coarse"):
-            proven = None
-        else:
-            proven = True
+        # ДОКАЗАТЕЛЬНОСТЬ НЕ ПОВЫШАЕТСЯ второй раз. `detect`
+        # уже решил `confirmed | possible`; суждение может только
+        # понизить его именованным огрублением, но не превратить
+        # OUTER-overlap в факт о телах.
+        proven = _physical_overlap_proof(finding, explains)
         rung = _rung(rule.kind, finding, proven)
-        safe = _destructive_is_safe(finding)
         why = rule.why_ru if not refused else REFUSED_RULES[refused]
         item = Judged(
             finding_id=str(finding.get("finding_id") or f"{a_id}~{b_id}"),
@@ -1334,6 +1405,9 @@ def judge(findings: Iterable[Mapping[str, Any]], *,
             relation=str(finding.get("hull_relation") or ""),
             pair_kind=str(finding.get("pair_kind") or ""),
             hull_grade=str(finding.get("hull_grade") or ""),
+            geometry_verdict=str(finding.get("verdict") or ""),
+            physical_overlap_proof=dict(
+                finding.get("physical_overlap_proof") or {}),
             a_label=str(finding["a"].get("label") or ""),
             b_label=str(finding["b"].get("label") or ""),
             slack=explains,
@@ -1342,7 +1416,8 @@ def judge(findings: Iterable[Mapping[str, Any]], *,
             + _host_note(host_state, host_id,
                          _same_host(a_id, b_id, hosted)
                          if host_state == "contradicts" else None),
-            next_move_ru=_next_move(rule_id, finding, explains, op_a, op_b, safe),
+            next_move_ru=_next_move(
+                rule_id, finding, explains, op_a, op_b, proven),
             why_ru=why,
             host_state=host_state, declared_host_id=host_id,
             host_source=host_source, origin=origin)

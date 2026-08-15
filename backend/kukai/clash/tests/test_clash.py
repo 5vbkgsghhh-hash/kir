@@ -251,7 +251,12 @@ def test_the_census_balances_by_construction():
     assert t == {"eligible": 3, "hulled": 1, "unsupported": 1,
                  "missing_geometry": 1, "not_eligible": 1,
                  # Ревью №10: то, что вообще не дошло до потока, тоже число.
-                 "outside_extraction_scope": 0, "linked_elements_unscored": 0}
+                 "outside_extraction_scope": 0, "linked_elements_unscored": 0,
+                 # 11.08.2026: связи, у которых число элементов прочитать НЕ
+                 # УДАЛОСЬ, — отдельное число, а не ноль в сумме выше. Этот
+                 # словарь закрыт нарочно, и он поймал добавление, как и
+                 # должен: новое поле переписи обязано быть решением.
+                 "links_without_element_count": 0}
 
 
 def test_an_unknown_category_is_named_not_dropped():
@@ -306,16 +311,19 @@ def test_a_coarse_pair_is_never_confirmed_and_never_publishes_a_translation():
     assert f.certified_separating_translation_mm is None
 
 
-def test_an_exact_pair_is_confirmed():
-    """`exact` ставится только оболочке, совпадающей с телом. Ревью №4 сняло
-    этот грейд у капсулы, поэтому здесь он задан РУКАМИ: тест сторожит правило
-    вердикта, а не право капсулы называться точной."""
+def test_an_exact_outer_word_alone_is_not_a_confirmation():
+    """Even an ``exact`` outer grade is not the positive proof channel.
+
+    Confirmation is carried by two independently certified inner subsets;
+    changing an outer label by hand must not mint that certificate.
+    """
     a = _rec("a", G.Capsule(((0, 0, 0), (1000, 0, 0)), 50.0),
              side="mep", grade="exact", label="pipe")
     b = _rec("b", G.Prism(((400, -500), (600, -500), (600, 500), (400, 500)),
                           -500, 500), side="struct", grade="exact", label="wall")
     f = D.evaluate(a, b)
-    assert f is not None and f.verdict == "confirmed"
+    assert f is not None and f.verdict == "possible"
+    assert f.physical_overlap_proof.status == "not_proven"
     assert f.hull_overlap_depth_mm > 0
     assert f.certified_separating_translation_mm is not None
 
@@ -417,6 +425,64 @@ def test_pairs_in_scope_aggregate_equals_brute_force():
         assert got == brute, (pf.__name__, got, brute)
 
 
+def test_pairs_in_scope_refuses_a_filter_the_aggregate_cannot_count():
+    """Фильтр НЕ классовый → `pairs_in_scope` обязан быть None с причиной.
+
+    Найдено живым замером 14.08.2026 на сводной модели: маршрут
+    `/api/viewer/federation/clash` вернул `pairs_in_scope: 0` рядом с
+    58 280 находками и 59 937 рассмотренными парами. Агрегат спрашивает
+    фильтр про ПРЕДСТАВИТЕЛЯ класса `(label, mvp_side)`, а
+    `cross_model_pair_filter` решает по имени модели в `source_id` —
+    оба представителя приходят из одного разбора, и «разные модели?»
+    отвечает «нет» для всех классов сразу.
+
+    Ноль, рождённый нарушенным предусловием, неотличим от честного нуля.
+    Контроль-FAIL этого теста: вернуть прежнюю ветку без проверки
+    `_CLASS_DETERMINED_FILTERS` — тогда `got` снова станет 0 и тест
+    покраснеет.
+    """
+    els = []
+    for i in range(6):
+        els.append({"element_id": str(2000 + i), "category": "OST_Walls",
+                    "bbox_min_mm": [i * 100.0, 0.0, 0.0],
+                    "bbox_max_mm": [i * 100.0 + 400, 400.0, 400.0],
+                    "level_id": "L1", "type_name": "t"})
+    snap = S.build_from_elements(els, origin={"run_dir": "cross", "l0_sha": "0"})
+    # Имена моделей — как их ставит сводная: `<разбор>::<номер элемента>`.
+    import dataclasses
+    recs = [dataclasses.replace(r, source_id=f"m{i % 2}::{r.source_id}")
+            for i, r in enumerate(snap.records)]
+    snap = S.ClashGeometrySnapshot(records=recs, census=snap.census,
+                                   origin=snap.origin, refusals=snap.refusals)
+
+    rep = D.detect(snap, pair_filter=D.cross_model_pair_filter)
+    got = rep["search"]["pairs_in_scope"]
+    assert got is None, (
+        "агрегат посчитал число для фильтра, чьё предусловие он нарушает: "
+        f"{got!r}")
+    reason = [n for n in rep["notes"] if "cross_model_pair_filter" in n]
+    assert reason, "число не посчитано, а причина не названа — это молчание"
+
+    # И ПРИ ЭТОМ ПОИСК ИДЁТ: отказ касается ТОЛЬКО счётчика охвата.
+    # Иначе «честный None» превратился бы в отключённый детектор.
+    assert rep["search"]["candidate_pairs"] > 0
+    assert all(f["a"]["source_element_id"].split("::")[0]
+               != f["b"]["source_element_id"].split("::")[0]
+               for f in rep["findings"])
+
+
+def test_pairs_in_scope_still_counts_for_the_canonical_filters():
+    """Контроль-PASS к тесту выше: классовые фильтры считаются как считались."""
+    els = [{"element_id": str(3000 + i), "category": "OST_Walls",
+            "bbox_min_mm": [i * 100.0, 0.0, 0.0],
+            "bbox_max_mm": [i * 100.0 + 400, 400.0, 400.0],
+            "level_id": "L1", "type_name": "t"} for i in range(5)]
+    snap = S.build_from_elements(els, origin={"run_dir": "ok", "l0_sha": "0"})
+    rep = D.detect(snap, pair_filter=D.any_physical_pair_filter)
+    assert rep["search"]["pairs_in_scope"] == 5 * 4 // 2
+    assert not [n for n in rep["notes"] if "агрегат по классам неприменим" in n]
+
+
 def test_the_canon_contains_no_wall_clock():
     """Канон — функция входа. Приёмка 28.07: голден агента нёс тайминги
     (0.1 мс), прогон лида дал 0.0 — байт-в-байт ломался самим построением.
@@ -506,8 +572,24 @@ def test_the_facade_publishes_the_gap_between_the_model_and_the_stream():
     assert snap.origin["header_census_total"] == 30489
     assert snap.origin["elements_in_l0"] == 3153
     assert snap.census.outside_extraction_scope == 27336
+    # ЧИСЛО СВЯЗЕЙ И ЧИСЛО ИХ ЭЛЕМЕНТОВ — РАЗНЫЕ ВЕЛИЧИНЫ, И НА ЭТОМ ЗДАНИИ
+    # ОНИ РАСХОДЯТСЯ В 65 000 РАЗ (замер 11.08.2026 на этом самом артефакте).
+    # Здесь стояло `linked_elements_unscored == 8`, и равенство держалось не
+    # потому что так вышло на фасаде, а потому что поле, названное ЭЛЕМЕНТАМИ,
+    # получало число СТРОК-СВЯЗЕЙ. Одна связь фасада
+    # (`SOB6.2_STR_ALL_DOO_KR_R23.rvt`) несёт 466 184 элемента.
     assert snap.origin["links_in_l0"] == 8
-    assert snap.census.linked_elements_unscored == 8
+    assert snap.origin["linked_elements_in_l0"] == 524_865
+    assert snap.census.linked_elements_unscored == 524_865
+    # И 524 865 — НИЖНЯЯ ГРАНИЦА, а не итог: шесть связей из восьми не
+    # загружены, `GetLinkDocument()` по ним пуст, числа элементов у них НЕТ.
+    # Без отдельного счётчика эти шесть молча вошли бы в сумму нулями, и
+    # нижняя граница читалась бы как точное число — та же подмена, только
+    # тише. По корпусу это не редкость, а правило: 316 связей из 386.
+    assert snap.census.links_without_element_count == 6
+    assert (snap.census.links_without_element_count
+            == snap.origin["links_without_element_count"])
+    assert snap.census.links_without_element_count <= snap.origin["links_in_l0"]
     j = snap.join_manifest()
     assert j["eligible"] == j["scored"] + j["not_scored"]
     assert j["l1_join"] == "absent"

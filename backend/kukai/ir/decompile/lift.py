@@ -19,6 +19,10 @@ from kukai.ir import contour as _contour
 from kukai.ir import geom as _geom
 from kukai.ir import spec
 from kukai.ir.ops_authoring import WALL_LOCATION_LINE_NAMES
+# Имена БЕЗ псевдонимов: храповик журналов находит объявления сканом исходника
+# по образцу `ИМЯ = Ledger(`, и `_Ledger(` он не видит — журнал старел бы молча
+# (случай 12.08, седьмая общая форма).
+from kukai.ir.record_ratchet import CLOSE_BY, STANDS, Entry, Ledger
 from kukai.ir.reverse_contract import (
     REVERSE_CONTRACTS,
     ReverseMode,
@@ -97,7 +101,7 @@ from kukai.ir.decompile.annotation_extract import (
 )
 from kukai.ir.decompile.tag_extract import (
     TAG_CATEGORIES,
-    TAG_FAMILY_INDEPENDENT,
+    TAG_FAMILIES,
     TAG_ORIENTATION_HORIZONTAL,
     TagExtraction,
     TagPayloadError,
@@ -2536,13 +2540,24 @@ def _lift_tag(
             "без точки вида или без помеченного элемента "
             f"(element_id={element.element_id!r})")
 
-    if record.get("tag_family") != TAG_FAMILY_INDEPENDENT:
+    # РОД МАРКИ БОЛЬШЕ НЕ ОТКАЗ (13.08.2026). Здесь стоял отказ «прямой ход
+    # строит марку единственным способом, IndependentTag.Create» — честный,
+    # называвший маршрут, и он дождался прямого хода: `authoring._emit_tag`
+    # различает цель в C# и строит `NewRoomTag`/`NewSpaceTag`/`NewAreaTag`
+    # (все 6/6 по эталонным сборкам, контроли CS1061/CS7036 — см.
+    # `tests/test_spatial_tag_is_its_own_class.py`).
+    #
+    # ЦЕНА ОТКАЗА, СНЯТОГО ЭТОЙ СТРОКОЙ, ЗАМЕРЕНА: 7 067 элементов на
+    # `len_ar_me_r24_v1` — крупнейшая причина `unsupported_forward_signature`
+    # на здании. Ниже отказы ОСТАЮТСЯ и для пространственной марки: выноска
+    # (точка означала бы конец выноски) и неявная ориентация. Проверять род
+    # здесь больше нечего — класс решает ЦЕЛЬ, и решает это Ревит.
+    if record.get("tag_family") not in TAG_FAMILIES:
         _refuse(
             AtomReason.UNSUPPORTED_SIGNATURE,
-            f"марка рода {record.get('tag_family')!r} — это "
-            "SpatialElementTag (помещение/площадь/пространство), а прямой "
-            "ход строит марку единственным способом, IndependentTag.Create; "
-            "пересборка дала бы элемент другого класса, а не эту марку")
+            f"род марки {record.get('tag_family')!r} не из закрытого списка "
+            f"{sorted(TAG_FAMILIES)}: читатель увидел то, чего словарь не "
+            "знает, и молча счесть это независимой маркой нельзя")
 
     # ВЫНОСКА МЕНЯЕТ СМЫСЛ САМОЙ ТОЧКИ, и это не наша догадка, а дословная
     # строка Autodesk про седьмой аргумент ``IndependentTag.Create`` — одна и
@@ -3623,7 +3638,94 @@ def _placement_absence_detail(element_id: str, context: _Context) -> str:
 _POINT_PLACED_PLACEMENTS = frozenset((
     FamilyPlacementType.ONE_LEVEL_BASED,
     FamilyPlacementType.ONE_LEVEL_BASED_HOSTED,
+    # ── TwoLevelsBased ДОБАВЛЕН 12.08.2026, И ПРЕЖНЯЯ СТРОКА РЯДОМ УТВЕРЖДАЛА
+    # ОБРАТНОЕ. Комментарий выше гласил: «CurveDrivenStructural, TwoLevelsBased,
+    # WorkPlaneBased и Adaptive точкой не ставятся». Для двухуровневого это
+    # НЕВЕРНО, и опровергается замером, а не рассуждением: в разборе
+    # `k2_ar_rd_v15` 5 337 строк `TwoLevelsBased`, и у ВСЕХ до одной есть точка,
+    # поворот, `placement_available`, разрешимый `FAMILY_BASE_LEVEL_PARAM` и
+    # разрешимый `FAMILY_TOP_LEVEL_PARAM`. Ни одной вложенной, ни одной
+    # in-place, ни одного хоста.
+    #
+    # Отдельной перегрузки Revit для этого рода НЕ ИМЕЕТ: экземпляр ставится
+    # ТОЙ ЖЕ точечной перегрузкой, а «до какого уровня» задаётся параметрами
+    # после размещения — и `place_family` это УЖЕ эмитирует (`authoring.py`,
+    # ветка `two_levels`), уже несёт операнды `top_level`/`base_offset_mm`/
+    # `top_offset_mm` и уже имеет обязательство свидетеля
+    # «FAMILY_TOP_LEVEL_PARAM == top_level when given». Проверено компилятором
+    # на всех шести версиях, с контролями: сам член перечисления, оба
+    # BuiltInParameter, точечная перегрузка с уровнем и ЧТЕНИЕ ОБОИХ УРОВНЕЙ
+    # ОБРАТНО у построенного экземпляра — 6/6.
+    #
+    # ЭТО ТРЕТИЙ СЛУЧАЙ ОДНОЙ СЕМЬИ В ЭТОМ ФАЙЛЕ: производитель научился,
+    # потребитель со своим закрытым списком — нет. Первый — `OneLevelBasedHosted`
+    # («оп научился хосту, а ворота лифта не расширили», 2 053 элемента на этой
+    # же башне). Родственник в воротах — производитель безусловен, потребитель
+    # за выключенным флагом. Две стороны одного факта развиваются порознь, и
+    # ничто не заставляет их совпасть; поэтому список ниже теперь ЗАКРЫТ
+    # ЖУРНАЛОМ, а не отсутствием строк.
+    #
+    # 679 несущих колонн из тех же 5 337 сюда НЕ ПОПАДУТ и не могут: они
+    # разрешаются раньше, по категории, в `create_column` (проверено — 679
+    # опов, ноль атомов). Расширение забирает 4 658: телефонные устройства
+    # 4 479, оборудование 175, обобщённые модели 4.
+    FamilyPlacementType.TWO_LEVELS_BASED,
 ))
+
+
+#: РОДЫ РАЗМЕЩЕНИЯ, КОТОРЫЕ ТОЧКОЙ НЕ СТАВЯТСЯ — С ПРИЧИНОЙ И ДАТОЙ У КАЖДОГО.
+#:
+#: ЗАЧЕМ ЖУРНАЛ, А НЕ ПРОСТО ОТСУТСТВИЕ В МНОЖЕСТВЕ ВЫШЕ. Расширить множество
+#: на одну запись значит починить сегодня и сохранить механизм: следующий род
+#: упрётся в ту же стену молча, и это будет ТРЕТИЙ раз в одном файле. Пока
+#: исключение выражено ОТСУТСТВИЕМ, оно не требует решения ни от кого; будучи
+#: записью с причиной и сроком — требует. Замена списка на правило «есть точка
+#: ⇒ поднимаем» при этом ЗАПРЕЩЕНА: у `WorkPlaneBased` точка тоже есть (5 060
+#: строк в той же башне), а рабочая плоскость — отдельный факт, и подъём точкой
+#: потерял бы её молча.
+#:
+#: Тест `tests/test_placement_kinds_are_all_decided.py` требует, чтобы КАЖДЫЙ
+#: член `FamilyPlacementType` был либо точечным, либо видозависимым, либо
+#: назван здесь. Пустого четвёртого варианта нет.
+PLACEMENTS_NOT_POINT_PLACED = Ledger(
+    "lift.PLACEMENTS_NOT_POINT_PLACED",
+    {
+        FamilyPlacementType.WORK_PLANE_BASED.value: Entry(
+            CLOSE_BY, "2026-08-12", "2026-09-11",
+            "точка у него ЕСТЬ (5 060 строк в k2_ar_rd_v15), но рабочая "
+            "плоскость — отдельный факт, которого точка не несёт; подъём "
+            "точкой потерял бы привязку молча. Закрывается операндом плоскости "
+            "у place_family либо отдельным опом, не расширением этих ворот"),
+        FamilyPlacementType.CURVE_BASED.value: Entry(
+            CLOSE_BY, "2026-08-12", "2026-09-11",
+            "семейство по КРИВОЙ: у place_family для этого своя ветка "
+            "(`p0_mm`/`p1_mm` + host), и она уже построена — сюда он не "
+            "относится вовсе, гейт точки для него не тот вопрос"),
+        FamilyPlacementType.CURVE_DRIVEN_STRUCTURAL.value: Entry(
+            CLOSE_BY, "2026-08-12", "2026-09-11",
+            "несущее по кривой (41 строка в той же башне): ставится "
+            "перегрузкой с Line и StructuralType, а не точкой; у балок это "
+            "уже делает create_beam, и заводить второй путь через "
+            "place_family значило бы двух судей об одном"),
+        FamilyPlacementType.CURVE_BASED_DETAIL.value: Entry(
+            CLOSE_BY, "2026-08-12", "2026-09-11",
+            "детальное по кривой (413 строк): и кривая, и ВИД — два "
+            "недостающих факта сразу, поэтому оно не станет точечным даже "
+            "после операнда вида"),
+        FamilyPlacementType.ADAPTIVE.value: Entry(
+            CLOSE_BY, "2026-08-12", "2026-09-11",
+            "адаптивное семейство описывается НАБОРОМ точек-узлов, а не одной "
+            "точкой вставки; одна точка не выражает его формы, и подъём был "
+            "бы утверждением о геометрии, которого мы не делали"),
+        FamilyPlacementType.INVALID.value: Entry(
+            STANDS, "2026-08-12", "",
+            "значение перечисления, означающее ОТСУТСТВИЕ рода размещения; "
+            "поднимать нечего по построению, и срока у этого не бывает"),
+    },
+    instrument=(
+        "боковой индекс размещений разбора: доля строк этого рода, у которых "
+        "есть точка, поворот и разрешимые уровни — если появились все входы, "
+        "запись обязана уехать в _POINT_PLACED_PLACEMENTS, а не ждать"))
 
 
 # ВИДОЗАВИСИМОЕ размещение — отдельный отказ, и вот почему он не тот же самый.
@@ -3837,6 +3939,39 @@ def _lift_family_fallback(
         "hand_flipped": record.hand_flipped,
         "facing_flipped": record.facing_flipped,
     }
+    # ВЕРХНИЙ УРОВЕНЬ — ТОЛЬКО ЕСЛИ ОН ПРОЧИТАН, И ОТКАЗ, ЕСЛИ РОД ЕГО ТРЕБУЕТ.
+    #
+    # Двухуровневое семейство БЕЗ верхнего уровня — не «поднимем как обычное»:
+    # `TwoLevelsBased` значит, что верх задан привязкой, и потерять её значило
+    # бы построить экземпляр, который стоит не туда, при зелёном свидетеле
+    # (свидетель верхнего уровня УСЛОВЕН и разряжается отсутствием операнда —
+    # то есть молчанием прикрыл бы собственную потерю).
+    # ИДИОМА ВЗЯТА У СОСЕДА, А НЕ НАПИСАНА ЗАНОВО: ровно так же разрешает верх
+    # лифтер колонны в этом же файле (`context.levels_by_id`, типизированные
+    # отказы, та же форма селектора и то же смещение). Второй способ читать тот
+    # же параметр означал бы двух судей об одном факте.
+    if record.placement_type is FamilyPlacementType.TWO_LEVELS_BASED:
+        top_level_id = (element.params or {}).get("FAMILY_TOP_LEVEL_PARAM")
+        if not isinstance(top_level_id, str):
+            _refuse(
+                AtomReason.MISSING_METADATA,
+                "двухуровневое размещение: FAMILY_TOP_LEVEL_PARAM не строка-id")
+        top = context.levels_by_id.get(top_level_id)
+        if top is None:
+            _refuse(
+                AtomReason.MISSING_METADATA,
+                "двухуровневое размещение: FAMILY_TOP_LEVEL_PARAM не "
+                "разрешается в прочитанный уровень — верх задан привязкой, и "
+                "поднять экземпляр как одноуровневый значило бы молча её "
+                "потерять при УСЛОВНОМ свидетеле, который на отсутствие "
+                "операнда разряжается")
+        params["top_level"] = {"by": "name", "value": top.name, "_id": top.id}
+        top_offset = _finite(
+            (element.params or {}).get("FAMILY_TOP_LEVEL_OFFSET_PARAM"))
+        if top_offset is not None and abs(top_offset) >= 1.0:
+            params["top_offset_mm"] = _bounded_param(
+                element, "FAMILY_TOP_LEVEL_OFFSET_PARAM", "place_family",
+                "top_offset_mm")
     return _op_node(element, "place_family", params, anchor=point)
 
 
@@ -4049,6 +4184,45 @@ def _diagnostic(
 # form the owning op is about.  A refusal about a VALUE or a REFERENCE stays
 # terminal, because ``place_family`` would "resolve" it by discarding the facts
 # the specialised op exists to preserve.
+#: РАЗВЁРНУТО 12.08.2026 И ПРОВЕРЕНО НА ОТСТАВАНИЕ — ОТСТАВАНИЯ НЕТ.
+#:
+#: После того как `_POINT_PLACED_PLACEMENTS` оказался уже, чем умеет оп (4 658
+#: элементов), встал вопрос, сколько ещё таких списков. Прибор привязывал СПИСОК
+#: к ОТКАЗУ (константа, чья проверка стоит перед `_refuse`), а не искал
+#: константы вообще: список, ни разу не решающий отказ, вопросу не отвечает.
+#: Решающих отказ нашлось ПЯТЬ, и все в этом файле — `fold.py` и
+#: `materialize.py` не решают подъём ни одним списком (8 и 6 констант, ноль у
+#: отказов).
+#:
+#: Что показала проверка каждого на «умеет ли пишущая сторона больше»:
+#:
+#:   `_POINT_PLACED_PLACEMENTS`   ОТСТАВАЛ — исправлено, 4 658 элементов;
+#:   `_VIEW_SPECIFIC_PLACEMENTS`  НЕ отстаёт: у `place_family` нет операнда
+#:                                вида вовсе (834 элемента башни), то есть
+#:                                отказ верен, а не узок;
+#:   `_LOCATION_LINE_CHOICES`     разойтись НЕ МОЖЕТ ПО ПОСТРОЕНИЮ — берётся
+#:                                у `spec.OPS["create_wall"]`, эталон приёма;
+#:   `_CANDIDATES` (35 строк)     НЕ отстаёт: у КАЖДОЙ категории с `no_lifter`
+#:                                оп в реестре отсутствует вовсе — `OST_Lines`
+#:                                9 407, `OST_SpotElevations` 2 292,
+#:                                `OST_GenericAnnotation` 1 954. Диспетчеру
+#:                                некуда посылать, и это пробел ЯЗЫКА, а не
+#:                                бухгалтерии;
+#:   `_SHAPE_REFUSALS`            НЕ отстаёт — см. ниже.
+#:
+#: ЗАМЕР ПО ЭТОМУ СПИСКУ. Элементов, лежащих в индексе размещений (то есть
+#: второй шанс через `place_family` был бы технически возможен) и получивших
+#: причину ВНЕ множества: 21 926, из них 20 932 — `generator_child`, которым
+#: второй шанс давать НЕЛЬЗЯ (родитель их уже строит), и 994 —
+#: `missing_reference` от неподнятого хоста, то есть порядок зависимостей, а не
+#: узость списка. Оба исключения уже названы: первое — прямо ниже
+#: (`_FALLBACK_REASONS_THAT_WIN`), второе — отдельная работа.
+#:
+#: ВЫВОД, КОТОРЫЙ ВАЖНЕЕ САМОЙ РАЗВЁРТКИ: случай `TwoLevelsBased` оказался
+#: ЕДИНИЧНЫМ среди списков этого файла. Три известных случая одной семьи
+#: (`OneLevelBasedHosted`, `TwoLevelsBased`, личность в воротах) — не признак
+#: того, что бухгалтерия отстаёт повсюду; проверять надо было, и проверка
+#: ответила «нет».
 _SHAPE_REFUSALS = frozenset((
     AtomReason.MISSING_GEOMETRY,
     AtomReason.UNSUPPORTED_GEOMETRY,

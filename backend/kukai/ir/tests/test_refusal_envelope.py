@@ -36,6 +36,7 @@ from kukai.ir.tests.acceptance_fakes import PassingAcceptanceBridge  # noqa: E40
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
 from kukai.llm.envelope import result_is_error  # noqa: E402
 from kukai.will.evaluator import _err_code  # noqa: E402
+from kukai.ir.tests.gate_fixture import enter_kir_mode
 
 
 def _run(coro):
@@ -77,6 +78,8 @@ class _KirRefusalBase(unittest.TestCase):
         self._prev_acceptance_dir = os.environ.get(
             "KIR_ACCEPTANCE_EVIDENCE_DIR")
         os.environ["KIR_ACCEPTANCE_EVIDENCE_DIR"] = self._acceptance_dir.name
+        # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08): режим КИР ставится ЯВНО.
+        enter_kir_mode(self)
 
     def tearDown(self):
         self._dev.stop()
@@ -271,15 +274,49 @@ class ReceiptNamesTheRefusal(unittest.TestCase):
     def _record(self, bridge_result):
         """Тот же стенд, что у штатных тестов конвейера: фальшивый транспорт
         и пройденный compile-gate — меряем ИМЕННО отказ рантайма, а не
-        несобравшийся шаблон."""
+        несобравшийся шаблон.
+
+        ПОЛОСА ВЫСТАВЛЯЕТСЯ ЯВНО, И ЭТО НЕ ФОРМАЛЬНОСТЬ. С 11.08 несвязанная
+        отправка требует решения: пара `(tool, op)` обязана быть либо в
+        `UNBOUND_DISPATCH_OPS` с причиной, либо СВЯЗАННОЙ. `("revit_ir",
+        "write")` намеренно отсутствует в списке — это и есть связанная
+        полоса регулярной записи.
+
+        Обоснование той правки гласило: «полосу забыть нельзя по построению,
+        `_run_declarative` выводит её из `op == "write"`». Верно — но вывод
+        живёт в `serving._run_declarative`, а этот стенд зовёт МЕТОД
+        КОНВЕЙЕРА напрямую, минуя его. Предусловие, истинное для одного пути,
+        применялось ко всем: страж отказывал ДО эффекта `precondition_unmet`,
+        и квитанция называла не тот отказ, который тест про неё и проверяет.
+        Ослаблять `test_refusal_envelope` было бы починкой наоборот —
+        квитанция, говорящая «предусловие» про отказ рантайма, посылает
+        инженера не туда. Поэтому стенд выглядит так же, как настоящий путь.
+        """
         from tests.test_revit_execution_pipeline import FakeTransport, make_deps
-        from kukai.llm.revit_execution_pipeline import RevitExecutionPipeline
+        from kukai.ir.acceptance_evidence import ExecutionArtifactBinding
+        from kukai.llm.revit_execution_pipeline import (
+            REGULAR_WRITE_EXECUTION_LANE, RevitExecutionPipeline,
+            wrap_user_code,
+        )
         deps, _transport, _cc = make_deps(
             transport=FakeTransport(results=[bridge_result]))
         pipe = RevitExecutionPipeline(deps)
+        code = "var x = 1;\nreturn __res;"
+        # Дайджест считается от ОБЁРНУТОГО текста той же функцией, которой
+        # оборачивает сам конвейер, — спрашиваем авторитет, а не повторяем
+        # обёртку в тесте: копия разошлась бы с оригиналом молча.
+        binding = ExecutionArtifactBinding.from_source(
+            wrap_user_code(code),
+            run_id="a1b2c3d4e5f60718293a4b5c6d7e8f90", revit_version="2024",
+            plan_digest="ab" * 32, ground_digest="cd" * 32,
+            ground_context_digest="ef" * 32,
+            execution_lane=REGULAR_WRITE_EXECUTION_LANE,
+            tool="revit_ir", op="write")
         return _run(pipe.run_declarative(
-            "var x = 1;\nreturn __res;", tool="revit_ir", op="write",
-            args={}, timeout_ms=60_000))
+            code, tool="revit_ir", op="write",
+            args={}, timeout_ms=60_000,
+            execution_lane=REGULAR_WRITE_EXECUTION_LANE,
+            execution_artifact_binding=binding))
 
     def test_postcondition_refusal_is_named_in_the_receipt(self):
         rec = self._record({"error": "postconditions_violated",

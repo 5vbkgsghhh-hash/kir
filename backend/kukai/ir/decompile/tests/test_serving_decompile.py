@@ -8,6 +8,8 @@ executor/bridge and the materializer are mocked.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -26,6 +28,101 @@ from kukai.ir import serving  # noqa: E402
 from kukai.ir.decompile.tests.test_serving_idempotence import (  # noqa: E402
     _persist_decompile,
 )
+
+# RebuildInstrument temporarily installs a fake materializer in sys.modules.
+# Keep the real object so randomized cross-file order cannot leave direct
+# imports in test_materialize bound to one module while mock.patch resolves a
+# freshly imported second module.
+_REAL_MATERIALIZE_MODULE = sys.modules["kukai.ir.decompile.materialize"]
+
+
+def _canonical_digest(value):
+    raw = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _accounted_materialized(
+        leaves, programs, *, skipped=(), escrowed=(), plans=(),
+        plan_checks=()):
+    """Build a strict v2 fake result without bypassing the serving boundary."""
+
+    MaterializationAccounting = (
+        _REAL_MATERIALIZE_MODULE.MaterializationAccounting)
+    MaterializationRecord = _REAL_MATERIALIZE_MODULE.MaterializationRecord
+    MaterializeStats = _REAL_MATERIALIZE_MODULE.MaterializeStats
+    skip_by_source = {
+        record.source_id: record for record in skipped}
+    escrow_by_source = {
+        record.source_id: record for record in escrowed}
+    locations = {}
+    for program_index, program in enumerate(programs):
+        for op in program["ops"]:
+            locations[op["id"]] = (program_index, op)
+    records = []
+    for leaf in leaves:
+        source_id = leaf["source_element_id"]
+        leaf_id = leaf["_id"]
+        kind = leaf["kind"]
+        category = leaf.get("op_name") if kind == "op" else leaf["category"]
+        op_id = "e" + source_id
+        location = locations.get(op_id)
+        skip = skip_by_source.get(source_id)
+        escrow = escrow_by_source.get(source_id)
+        if kind == "op" and skip is not None \
+                and skip.reason == "datum_pinned_existing":
+            records.append(MaterializationRecord(
+                source_id, leaf_id, kind, category, "datum_policy_pin",
+                reason=skip.reason, element_id=int(source_id),
+                evidence_state="same_document_unproven"))
+        elif skip is not None:
+            records.append(MaterializationRecord(
+                source_id, leaf_id, kind, category, "typed_residual",
+                reason=skip.reason))
+        elif escrow is not None:
+            records.append(MaterializationRecord(
+                source_id, leaf_id, kind, category, "atom_escrow",
+                op_id=op_id, program_index=location[0],
+                evidence_state="pending_runtime_witness"))
+        else:
+            records.append(MaterializationRecord(
+                source_id, leaf_id, kind, category, "emitted_semantic_op",
+                op_id=op_id, program_index=location[0]))
+    records.sort(key=lambda record: (record.source_id, record.leaf_id))
+    accounting = MaterializationAccounting(
+        input_digest=_canonical_digest(sorted(
+            leaves, key=lambda leaf: (
+                leaf["source_element_id"], leaf["_id"]))),
+        programs_digest=_canonical_digest(programs),
+        records=tuple(records),
+        programs_count=len(programs),
+        emitted_ops_count=sum(len(program["ops"]) for program in programs),
+    )
+    stats = MaterializeStats(
+        op_leaves=sum(record.leaf_kind == "op" for record in records),
+        materialized_ops=sum(len(program["ops"]) for program in programs),
+        programs=len(programs),
+        atoms_skipped=sum(
+            record.leaf_kind == "atom"
+            and record.disposition == "typed_residual" for record in records),
+        atoms_escrowed=sum(
+            record.disposition == "atom_escrow" for record in records),
+        datums_skipped=sum(
+            record.disposition == "datum_policy_pin" for record in records),
+        semantic_ops_skipped=sum(
+            record.leaf_kind == "op"
+            and record.disposition == "typed_residual" for record in records),
+    )
+    return types.SimpleNamespace(
+        programs=programs,
+        skipped=list(skipped),
+        escrowed=list(escrowed),
+        stats=stats,
+        accounting=accounting,
+        plans=tuple(plans),
+        plan_checks=tuple(plan_checks),
+    )
 
 
 def _run(coro):
@@ -194,7 +291,8 @@ class RebuildInstrument(unittest.TestCase):
         self._dev.stop()
         os.environ.pop("KUKAI_KIR_DECOMPILE", None)
         os.environ.pop("KUKAI_IR_ATOM_ESCROW", None)
-        sys.modules.pop("kukai.ir.decompile.materialize", None)
+        sys.modules["kukai.ir.decompile.materialize"] = (
+            _REAL_MATERIALIZE_MODULE)
 
     def test_materializer_pending_when_module_absent(self):
         # Интеграционный шов A1×A3: модуль materialize ТЕПЕРЬ существует
@@ -211,9 +309,26 @@ class RebuildInstrument(unittest.TestCase):
         self.assertEqual(result["error"], "materializer_pending")
 
     def test_dry_run_compiles_chunks_with_mocked_materializer(self):
-        # Inject a fake materialize module that returns two empty programs; the
-        # compiler gates each chunk.  Also requires a persisted tree.json.
+        # Inject a fake materialize module with a valid total-accounting
+        # receipt.  The second chunk is above the ordinary 20-op LLM budget.
+        from kukai.ir.decompile.tests.test_materialize import _op_leaf
+
         fake = types.ModuleType("kukai.ir.decompile.materialize")
+        leaves = [
+            _op_leaf("query_count", "9400", {"kind": "wall"}),
+            *[
+            _op_leaf("query_count", str(9400 + index), {"kind": "door"})
+            for index in range(1, 26)
+            ],
+        ]
+        programs = [
+            {"ir_version": "1.0", "ops": [
+                {"op": "query_count", "id": "e9400", "kind": "wall"}]},
+            {"ir_version": "1.0", "ops": [
+                {"op": "query_count", "id": f"e{9400 + index}",
+                 "kind": "door"}
+                for index in range(1, 26)]},
+        ]
 
         def _leaves_to_program(leaves, mode="same_document", chunk=250):
             # The REAL A3 materializer returns a MaterializeResult whose
@@ -224,13 +339,7 @@ class RebuildInstrument(unittest.TestCase):
             # rebuild dry-run must compile materializer chunks with bulk=True,
             # else every real chunk (250 ops) is refused KIR-L001 — the seam
             # that surfaced on the live «демо» dry-run, 2026-07-21.
-            return types.SimpleNamespace(programs=[
-                {"ir_version": "1.0", "ops": [
-                    {"op": "query_count", "id": "q0", "kind": "wall"}]},
-                {"ir_version": "1.0", "ops": [
-                    {"op": "query_count", "id": f"q{i}", "kind": "door"}
-                    for i in range(25)]},
-            ])
+            return _accounted_materialized(leaves, programs)
 
         fake.leaves_to_program = _leaves_to_program  # type: ignore[attr-defined]
         sys.modules["kukai.ir.decompile.materialize"] = fake
@@ -238,10 +347,9 @@ class RebuildInstrument(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             import json
             import pathlib
-            # A minimal TreeNode so iter_l1_leaves has something to walk (the
-            # mocked materializer ignores the leaves anyway).
             (pathlib.Path(tmp) / "tree.json").write_text(
-                json.dumps({"payload": None, "members": [], "children": []}),
+                json.dumps({
+                    "payload": None, "members": leaves, "children": []}),
                 encoding="utf-8")
             with mock.patch.object(serving, "_decompile_out_dir",
                                    return_value=tmp):
@@ -254,15 +362,26 @@ class RebuildInstrument(unittest.TestCase):
         self.assertEqual(result["chunks_ok"], 2)
 
     def test_dry_run_reuses_materializer_plan_and_reports_its_digest(self):
+        from kukai.ir.compiler import plan_program
+        from kukai.ir.decompile.tests.test_materialize import _op_leaf
+
         fake = types.ModuleType("kukai.ir.decompile.materialize")
-        retained_plan = types.SimpleNamespace(plan_digest="a" * 64)
+        leaf = _op_leaf("query_count", "9460", {"kind": "wall"})
         raw_program = {
             "ir_version": "1.0",
-            "ops": [{"op": "query_count", "id": "q0", "kind": "wall"}],
+            "ops": [{"op": "query_count", "id": "e9460", "kind": "wall"}],
         }
+        retained_plan = plan_program(raw_program, bulk=True)
+        plan_check = _REAL_MATERIALIZE_MODULE.ProgramPlanCheck(
+            program_index=0,
+            accepted=True,
+            source_digest=_canonical_digest(raw_program),
+            plan_digest=retained_plan.plan_digest,
+        )
         fake.leaves_to_program = (  # type: ignore[attr-defined]
-            lambda leaves, **kwargs: types.SimpleNamespace(
-                programs=[raw_program], plans=(retained_plan,)))
+            lambda leaves, **kwargs: _accounted_materialized(
+                leaves, [raw_program], plans=(retained_plan,),
+                plan_checks=(plan_check,)))
         sys.modules["kukai.ir.decompile.materialize"] = fake
 
         compiled = types.SimpleNamespace(
@@ -271,7 +390,8 @@ class RebuildInstrument(unittest.TestCase):
             import json
             import pathlib
             (pathlib.Path(tmp) / "tree.json").write_text(
-                json.dumps({"payload": None, "members": [], "children": []}),
+                json.dumps({
+                    "payload": leaf, "members": [], "children": []}),
                 encoding="utf-8")
             with (
                 mock.patch.object(serving, "_decompile_out_dir",
@@ -285,7 +405,53 @@ class RebuildInstrument(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertIs(compile_mock.call_args.args[0], retained_plan)
-        self.assertEqual(result["chunks"][0]["plan_digest"], "a" * 64)
+        self.assertEqual(
+            result["chunks"][0]["plan_binding"], "retained_verified")
+        self.assertEqual(
+            result["chunks"][0]["plan_digest"], retained_plan.plan_digest)
+
+    def test_positional_retained_plan_cannot_bypass_exact_raw_program(self):
+        from kukai.ir.compiler import plan_program
+        from kukai.ir.decompile.tests.test_materialize import _op_leaf
+
+        fake = types.ModuleType("kukai.ir.decompile.materialize")
+        leaf = _op_leaf("unknown_semantic_op", "9461", {})
+        raw_program = {
+            "ir_version": "1.0",
+            "ops": [{"op": "unknown_semantic_op", "id": "e9461"}],
+        }
+        unrelated = {
+            "ir_version": "1.0",
+            "ops": [{"op": "query_count", "id": "e9461", "kind": "wall"}],
+        }
+        retained_plan = plan_program(unrelated, bulk=True)
+        forged_positional_check = _REAL_MATERIALIZE_MODULE.ProgramPlanCheck(
+            program_index=0,
+            accepted=True,
+            source_digest=_canonical_digest(raw_program),
+            plan_digest=retained_plan.plan_digest,
+        )
+        fake.leaves_to_program = (  # type: ignore[attr-defined]
+            lambda leaves, **kwargs: _accounted_materialized(
+                leaves, [raw_program], plans=(retained_plan,),
+                plan_checks=(forged_positional_check,)))
+        sys.modules["kukai.ir.decompile.materialize"] = fake
+
+        with tempfile.TemporaryDirectory() as tmp:
+            import pathlib
+            pathlib.Path(tmp, "tree.json").write_text(json.dumps({
+                "payload": leaf, "members": [], "children": [],
+            }), encoding="utf-8")
+            with mock.patch.object(
+                    serving, "_decompile_out_dir", return_value=tmp):
+                result = _run(serving.handle_revit_rebuild(
+                    {"doc_stamp": "docA", "dry_run": True},
+                    _ShimLLM(), _never_bridge))
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["error"], "compile_refused")
+        self.assertEqual(
+            result["chunks"][0]["plan_binding"], "raw_plan_refused")
 
     def test_offset_is_validated_and_forwarded_to_materializer(self):
         fake = types.ModuleType("kukai.ir.decompile.materialize")
@@ -293,7 +459,7 @@ class RebuildInstrument(unittest.TestCase):
 
         def _leaves_to_program(leaves, **kwargs):
             seen.update(kwargs)
-            return types.SimpleNamespace(programs=[])
+            return _accounted_materialized(leaves, [])
 
         fake.leaves_to_program = _leaves_to_program  # type: ignore[attr-defined]
         sys.modules["kukai.ir.decompile.materialize"] = fake
@@ -313,6 +479,244 @@ class RebuildInstrument(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(seen["offset_mm"], (1250.0, -500.5, 0.0))
         self.assertEqual(result["offset_mm"], [1250.0, -500.5, 0.0])
+
+    def test_materializable_input_cannot_succeed_with_zero_chunks(self):
+        """`all([])` used to turn a disappeared create_dimension into a
+        green rebuild.  An empty building remains representable; an empty
+        materialization of a real semantic leaf does not."""
+        from kukai.ir.decompile.tests.test_materialize import _op_leaf
+
+        fake = types.ModuleType("kukai.ir.decompile.materialize")
+        fake.leaves_to_program = (  # type: ignore[attr-defined]
+            lambda leaves, **kwargs: types.SimpleNamespace(
+                programs=[], skipped=[]))
+        sys.modules["kukai.ir.decompile.materialize"] = fake
+        leaf = _op_leaf(
+            "create_wall", "9100",
+            {
+                "p0_mm": [0.0, 0.0],
+                "p1_mm": [5000.0, 0.0],
+                "level": {"by": "name", "value": "L1", "_id": "500"},
+            })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            import json
+            import pathlib
+            pathlib.Path(tmp, "tree.json").write_text(json.dumps({
+                "payload": leaf, "members": [], "children": [],
+            }), encoding="utf-8")
+            with mock.patch.object(
+                    serving, "_decompile_out_dir", return_value=tmp):
+                result = _run(serving.handle_revit_rebuild(
+                    {"doc_stamp": "docA", "dry_run": True},
+                    _ShimLLM(), _never_bridge))
+
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["refused"])
+        self.assertFalse(result["complete"])
+        self.assertEqual(
+            result["error"], "materialization_accounting_invalid")
+        self.assertIn("accounting", result["detail"])
+
+    def test_stats_wire_mismatch_blocks_before_compile(self):
+        from kukai.ir.decompile.tests.test_materialize import _op_leaf
+
+        fake = types.ModuleType("kukai.ir.decompile.materialize")
+        leaf = _op_leaf("query_count", "9101", {"kind": "wall"})
+        program = {"ir_version": "1.0", "ops": [
+            {"op": "query_count", "id": "e9101", "kind": "wall"},
+        ]}
+
+        def _materialize(leaves, **kwargs):
+            result = _accounted_materialized(leaves, [program])
+            result.stats = types.SimpleNamespace(
+                op_leaves=1,
+                materialized_ops=0,
+                programs=1,
+                atoms_skipped=0,
+                atoms_escrowed=0,
+                datums_skipped=0,
+                semantic_ops_skipped=0,
+            )
+            return result
+
+        fake.leaves_to_program = _materialize  # type: ignore[attr-defined]
+        sys.modules["kukai.ir.decompile.materialize"] = fake
+        with tempfile.TemporaryDirectory() as tmp:
+            import pathlib
+            pathlib.Path(tmp, "tree.json").write_text(json.dumps({
+                "payload": leaf, "members": [], "children": [],
+            }), encoding="utf-8")
+            with mock.patch.object(
+                    serving, "_decompile_out_dir", return_value=tmp):
+                result = _run(serving.handle_revit_rebuild(
+                    {"doc_stamp": "docA", "dry_run": True},
+                    _ShimLLM(), _never_bridge))
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(
+            result["error"], "materialization_accounting_invalid")
+        self.assertIn("stats.materialized_ops", result["detail"])
+
+    def test_accounting_exact_dict_rejects_additive_unknown_field(self):
+        from kukai.ir.decompile.tests.test_materialize import _op_leaf
+
+        fake = types.ModuleType("kukai.ir.decompile.materialize")
+        leaf = _op_leaf("query_count", "9102", {"kind": "wall"})
+        program = {"ir_version": "1.0", "ops": [
+            {"op": "query_count", "id": "e9102", "kind": "wall"},
+        ]}
+
+        def _materialize(leaves, **kwargs):
+            result = _accounted_materialized(leaves, [program])
+            payload = result.accounting.as_dict()
+            payload["future_unversioned_field"] = True
+            result.accounting = payload
+            return result
+
+        fake.leaves_to_program = _materialize  # type: ignore[attr-defined]
+        sys.modules["kukai.ir.decompile.materialize"] = fake
+        with tempfile.TemporaryDirectory() as tmp:
+            import pathlib
+            pathlib.Path(tmp, "tree.json").write_text(json.dumps({
+                "payload": leaf, "members": [], "children": [],
+            }), encoding="utf-8")
+            with mock.patch.object(
+                    serving, "_decompile_out_dir", return_value=tmp):
+                result = _run(serving.handle_revit_rebuild(
+                    {"doc_stamp": "docA", "dry_run": True},
+                    _ShimLLM(), _never_bridge))
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(
+            result["error"], "materialization_accounting_invalid")
+        self.assertIn("unknown or missing field", result["detail"])
+
+    def test_semantic_skips_are_explicit_and_fail_closed(self):
+        from kukai.ir.decompile.tests.test_materialize import _op_leaf
+
+        fake = types.ModuleType("kukai.ir.decompile.materialize")
+        skipped = types.SimpleNamespace(
+            source_id="9200", category="create_dimension",
+            reason="host_unmaterialized:datum-grid-a")
+        fake.leaves_to_program = (  # type: ignore[attr-defined]
+            lambda leaves, **kwargs: _accounted_materialized(
+                leaves, [], skipped=[skipped]))
+        sys.modules["kukai.ir.decompile.materialize"] = fake
+        leaf = _op_leaf(
+            "create_dimension", "9200",
+            {
+                "in_view": {
+                    "by": "name", "value": "Plan", "_id": "9000"},
+                "refs": [{"ref": "datum-grid-a"},
+                         {"ref": "datum-grid-b"}],
+                "line_at": [0.0, 0.0],
+            })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            import json
+            import pathlib
+            pathlib.Path(tmp, "tree.json").write_text(json.dumps({
+                "payload": leaf, "members": [], "children": [],
+            }), encoding="utf-8")
+            with mock.patch.object(
+                    serving, "_decompile_out_dir", return_value=tmp):
+                result = _run(serving.handle_revit_rebuild(
+                    {"doc_stamp": "docA", "dry_run": True},
+                    _ShimLLM(), _never_bridge))
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["error"], "semantic_skips")
+        self.assertEqual(result["semantic_skips"], 1)
+        self.assertEqual(result["skips_total"], 1)
+        self.assertEqual(result["skips"][0], {
+            "source_id": "9200",
+            "category": "create_dimension",
+            "reason": "host_unmaterialized:datum-grid-a",
+        })
+
+    def test_atom_residual_is_executable_but_never_claims_full_fidelity(self):
+        """Unsupported atoms are honest residuals, not compiler failures.
+
+        The supported semantic subset remains executable for compatibility,
+        but callers get an unmissable partial/complete verdict instead of a
+        green result that could be mistaken for a full round-trip.
+        """
+        from kukai.ir.decompile.tests.test_materialize import (
+            _atom_leaf,
+            _op_leaf,
+        )
+
+        fake = types.ModuleType("kukai.ir.decompile.materialize")
+        atom_skip = types.SimpleNamespace(
+            source_id="9301", category="OST_Furniture",
+            reason="atom:no_lifter")
+        fake.leaves_to_program = (  # type: ignore[attr-defined]
+            lambda leaves, **kwargs: _accounted_materialized(
+                leaves,
+                [{"ir_version": "1.0", "ops": [
+                    {"op": "query_count", "id": "e9300", "kind": "wall"},
+                ]}],
+                skipped=[atom_skip],
+            ))
+        sys.modules["kukai.ir.decompile.materialize"] = fake
+        wall = _op_leaf("query_count", "9300", {"kind": "wall"})
+        atom = _atom_leaf("9301", "OST_Furniture")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            import json
+            import pathlib
+            pathlib.Path(tmp, "tree.json").write_text(json.dumps({
+                "payload": None,
+                "members": [wall, atom],
+                "children": [],
+            }), encoding="utf-8")
+            with mock.patch.object(
+                    serving, "_decompile_out_dir", return_value=tmp):
+                result = _run(serving.handle_revit_rebuild(
+                    {"doc_stamp": "docA", "dry_run": True},
+                    _ShimLLM(), _never_bridge))
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["refused"])
+        self.assertTrue(result["partial"])
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["semantic_skips"], 0)
+        self.assertEqual(result["atom_residuals"], 1)
+        self.assertEqual(result["residual_skips"], 1)
+        self.assertIn("ЧАСТИЧНЫЙ", result["message_ru"])
+
+    def test_datum_pin_is_not_partial_but_cannot_claim_unproved_complete(self):
+        from kukai.ir.decompile.tests.test_materialize import _op_leaf
+
+        sys.modules["kukai.ir.decompile.materialize"] = (
+            _REAL_MATERIALIZE_MODULE)
+        level = _op_leaf(
+            "create_level", "9500",
+            {"name": "L1", "elevation_mm": 0.0})
+        with tempfile.TemporaryDirectory() as tmp:
+            import pathlib
+            pathlib.Path(tmp, "tree.json").write_text(json.dumps({
+                "payload": level, "members": [], "children": [],
+            }), encoding="utf-8")
+            with mock.patch.object(
+                    serving, "_decompile_out_dir", return_value=tmp):
+                result = _run(serving.handle_revit_rebuild(
+                    {"doc_stamp": "docA", "dry_run": True},
+                    _ShimLLM(), _never_bridge))
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["partial"])
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["policy_skips"], 1)
+        self.assertEqual(
+            result["datum_binding_state"], "same_document_unproven")
+        self.assertEqual(result["fidelity_state"],
+                         "incomplete_unproven_binding")
+        self.assertEqual(result["schema_version"], "rebuild-summary/2")
+        self.assertEqual(
+            result["materialization_accounting"]["schema_version"],
+            "materialization-accounting/2")
 
     def test_rebuild_refuses_without_decompile(self):
         fake = types.ModuleType("kukai.ir.decompile.materialize")
@@ -406,6 +810,11 @@ class RebuildInstrument(unittest.TestCase):
         self.assertEqual(result["atoms_escrowed"], 1)
         self.assertEqual(result["atoms_skipped"], 0)
         self.assertEqual(result["chunks_total"], 1)
+        self.assertTrue(result["partial"])
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["pending_acceptance_evidence"])
+        self.assertEqual(result["pending_acceptance_evidence_count"], 1)
+        self.assertIn("pending_runtime_witness", result["partial_reasons"])
         self.assertEqual(
             result["escrow_evidence"][0]["acceptance_state"],
             "pending_runtime_witness",
@@ -474,7 +883,7 @@ class RebuildInstrument(unittest.TestCase):
     def _fake_materializer(self):
         fake = types.ModuleType("kukai.ir.decompile.materialize")
         fake.leaves_to_program = (  # type: ignore[attr-defined]
-            lambda leaves, **kwargs: types.SimpleNamespace(programs=[]))
+            lambda leaves, **kwargs: _accounted_materialized(leaves, []))
         sys.modules["kukai.ir.decompile.materialize"] = fake
 
     def test_rebuild_refuses_a_partial_read_decompile(self):
@@ -506,6 +915,9 @@ class RebuildInstrument(unittest.TestCase):
         self.assertTrue(result["allow_partial"])
         self.assertTrue(result["is_partial_read"])
         self.assertEqual(result["worksets_closed"], 2)
+        self.assertTrue(result["partial"])
+        self.assertFalse(result["complete"])
+        self.assertIn("partial_read", result["partial_reasons"])
 
     def test_rebuild_rejects_non_boolean_allow_partial(self):
         self._fake_materializer()
@@ -531,6 +943,7 @@ class RebuildInstrument(unittest.TestCase):
                     _ShimLLM(), _never_bridge))
         self.assertTrue(result["ok"], msg=result)
         self.assertFalse(result["is_partial_read"])
+        self.assertTrue(result["complete"])
 
 
 class ScopeLeavesHostClosure(unittest.TestCase):

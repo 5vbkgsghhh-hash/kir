@@ -108,6 +108,7 @@ from __future__ import annotations
 
 import json
 from kukai.ir.emit_utils import cs_string_literal
+from kukai.ir import spec as _spec
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping
 
@@ -158,7 +159,12 @@ TAG_CATEGORIES = frozenset({
 })
 
 #: Версии, на которые компилируется прямой ход. Шов проходит ровно посередине.
-TAG_SUPPORTED_VERSIONS = ("2021", "2022", "2023", "2024", "2025", "2026")
+#:
+#: СПРАШИВАЕТСЯ У РЕЕСТРА, А НЕ ВЫПИСЫВАЕТСЯ. До 13.08.2026 здесь стояли те же
+#: шесть лет литералами — вторая копия авторитета, которая молча осталась бы
+#: шестёркой в день, когда `spec.REVIT_VERSIONS` вырастет, и тесты марок
+#: продолжили бы «проверять все версии», проверяя старые.
+TAG_SUPPORTED_VERSIONS = tuple(_spec.REVIT_VERSIONS)
 #: Первая версия, где марка умеет держать НЕСКОЛЬКО целей (и где появился
 #: множественный член чтения вместо свойства ``TaggedLocalElementId``).
 TAG_MULTI_REFERENCE_SINCE = 2022

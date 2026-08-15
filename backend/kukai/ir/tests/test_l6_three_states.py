@@ -220,6 +220,7 @@ def _solo_obligations(name, node):
     Условное обязательство, чей операнд не назван, разряжается
     ОТСУТСТВИЕМ свидетеля — вырезать там нечего, и считать это
     выжившим значило бы обвинять правильное поведение."""
+    tc._ensure_table()
     out = []
     for o in tc.REFINEMENT[name].obligations:
         if not o.witness_markers:

@@ -202,12 +202,52 @@ class RefusalsAreNamedNotAvoided(unittest.TestCase):
         self.assertEqual(code, AtomReason.MISSING_REFERENCE.value)
         self.assertIn(WALL_ID, detail)
 
-    def test_a_room_tag_refuses_because_the_forward_path_cannot_build_it(self) -> None:
+    def test_an_unknown_tag_family_is_refused_rather_than_assumed(self) -> None:
+        """Род вне закрытого словаря — отказ, а не «наверное, независимая».
+
+        ПРЕЖДЕ здесь стоял отказ РОДУ `spatial` («прямой ход строит марку
+        единственным способом»). Он снят 13.08.2026, потому что прямой ход
+        научился: `authoring._emit_tag` различает цель в C# и строит
+        `NewRoomTag`/`NewSpaceTag`/`NewAreaTag`. Отказ был честным и назвал
+        маршрут — он дождался, а не устарел.
+
+        Проверка НЕ УДАЛЕНА, а переставлена на границу, которая осталась:
+        словарь родов ЗАКРЫТ, и незнакомое значение обязано кричать. Удалить
+        её значило бы отдать даром то, что тест охранял, — молчаливое
+        превращение неизвестного в известное.
+        """
         code, detail = self._atom(
             document=_document("OST_RoomTags"),
-            tag_index=_index(tag_family="spatial"))
+            tag_index=_index(tag_family="совершенно новый род"))
         self.assertEqual(code, AtomReason.UNSUPPORTED_SIGNATURE.value)
-        self.assertIn("IndependentTag.Create", detail)
+        self.assertIn("род марки", detail)
+
+    def test_a_room_tag_now_lifts_to_an_op(self) -> None:
+        """7 067 элементов `len_ar_me_r24_v1` — цена снятого отказа.
+
+        Замер 13.08.2026 на втором жилом здании, прочитанном полностью:
+        марки рода `spatial` были крупнейшей причиной
+        `unsupported_forward_signature`. Здесь закреплено, что они
+        поднимаются, а не остаются атомом.
+        """
+        result = lift_document_detailed(
+            _document("OST_RoomTags"), tag_index=_index(tag_family="spatial"))
+        node = _node(result, TAG_ID)
+        self.assertEqual(node["kind"], "op")
+        self.assertEqual(node["op_name"], "create_tag")
+
+    def test_a_spatial_tag_with_a_leader_is_still_refused(self) -> None:
+        """Снятие одного отказа не снимает соседний.
+
+        Точка марки С ВЫНОСКОЙ означает конец выноски, а прочитана голова.
+        Это верно для ОБОИХ родов, и прямой эмиттер отказывает выноске у
+        пространственной марки тоже — оба конца должны рвать в одном месте.
+        """
+        code, detail = self._atom(
+            document=_document("OST_RoomTags"),
+            tag_index=_index(tag_family="spatial", leader=True))
+        self.assertEqual(code, AtomReason.UNSUPPORTED_SIGNATURE.value)
+        self.assertIn("выноск", detail)
 
     def test_a_leadered_tag_refuses_because_at_stops_meaning_the_head(self) -> None:
         """Дословная строка Autodesk про седьмой аргумент Create.
@@ -279,7 +319,11 @@ class TheRefusalIsNotQuietlySubstituted(unittest.TestCase):
         result = lift_document_detailed(
             _document("OST_RoomTags"),
             family_placement_index=self._placement_index(),
-            tag_index=_index(tag_family="spatial"))
+            # ПОВОД ОТКАЗА СМЕНЁН 13.08: род `spatial` перестал быть
+            # отказом (прямой ход научился), а цель теста — «отказ марки не
+            # имеет права стать place_family» — осталась. Берём отказ,
+            # который жив: выноска.
+            tag_index=_index(leader=True))
         node = _node(result, TAG_ID)
         self.assertEqual(node["kind"], "atom", node.get("op_name"))
         self.assertEqual(node["reason"]["code"],

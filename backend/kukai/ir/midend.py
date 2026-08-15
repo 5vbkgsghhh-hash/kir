@@ -14,24 +14,25 @@ therefore changes the evidence identity even when its source spelling does not.
 
 ``GroundedProgram`` is a parent-bound child of that exact plan.  It freezes the
 model-dependent selector decisions that authoring emitters still consume as
-legacy dictionaries and accounts for every nested ``__grounded__`` marker.
-The digest names the exact trusted-grounder output; it does **not** attest the
-identity or revision of the snapshot that produced it.  That requires a future
-authoritative context contract and must not be inferred from ``ground_digest``.
+legacy dictionaries, accounts for every nested ``__grounded__`` marker, and
+binds that output to a content-addressed :class:`GroundingContext`.  Document
+identity and full revision authority remain separate evidence bits: a captured
+snapshot may be identity-bound without pretending to be revision-authoritative.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
-from kukai.ir.registry_base import EffectKind, ResultSpec
+from kukai.ir.registry_base import EffectKind, ResultSpec, SYNTHETIC_FIELDS
 
 
-PLAN_SCHEMA = "kir-planned-program/1"
-GROUND_SCHEMA = "kir-grounded-program/1"
+PLAN_SCHEMA = "kir-planned-program/3"
+GROUND_SCHEMA = "kir-grounded-program/3"
+GROUND_CONTEXT_SCHEMA = "kir-grounding-context/1"
 
 
 class PlanEncodingError(ValueError):
@@ -77,6 +78,169 @@ class OperationFamily(str, Enum):
 class ProgramFamily(str, Enum):
     QUERY = "query"
     WRITE = "write"
+
+
+def _sha256(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if (not isinstance(value, str)
+            or len(value) != 64
+            or any(ch not in "0123456789abcdef" for ch in value)):
+        raise ValueError(f"{field_name} must be a lowercase sha256 digest")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class GroundingContext:
+    """Content-addressed evidence for the exact model read used by grounding.
+
+    ``GroundedProgram`` used to bind only the *output* of selector resolution.
+    Two documents producing the same ids/names therefore shared one
+    ``ground_digest`` even though they were different execution contexts.
+    This value binds the complete JSON input, a privacy-preserving document
+    identity digest, and (when supplied by a revision-guarded caller) the
+    revision/profile evidence.
+
+    ``trusted_source`` names a transport boundary, not a cryptographic
+    signature.  Consequently ``authoritative`` is deliberately false unless
+    the trusted caller also supplies a revision-bound authoritative profile.
+    Document identity alone is still useful and is exposed separately as
+    ``execution_bound``; the generated C# guard rechecks that identity before
+    the first mutation.
+    """
+
+    snapshot_digest: str
+    document_digest: str | None
+    revision_digest: str | None
+    profile_digest: str | None
+    source: str
+    trusted_source: bool = False
+    profile_authoritative: bool = False
+
+    def __post_init__(self) -> None:
+        _sha256(self.snapshot_digest, "snapshot_digest")
+        _sha256(self.document_digest, "document_digest")
+        _sha256(self.revision_digest, "revision_digest")
+        _sha256(self.profile_digest, "profile_digest")
+        if not isinstance(self.source, str) or not self.source:
+            raise ValueError("grounding context needs a named source")
+        if not isinstance(self.trusted_source, bool):
+            raise TypeError("trusted_source must be bool")
+        if not isinstance(self.profile_authoritative, bool):
+            raise TypeError("profile_authoritative must be bool")
+        if self.profile_authoritative and self.profile_digest is None:
+            raise ValueError(
+                "an authoritative profile needs a bound profile digest")
+
+    @property
+    def identity_bound(self) -> bool:
+        return self.document_digest is not None
+
+    @property
+    def revision_bound(self) -> bool:
+        return self.revision_digest is not None
+
+    @property
+    def execution_bound(self) -> bool:
+        return self.trusted_source and self.identity_bound
+
+    @property
+    def authoritative(self) -> bool:
+        return (
+            self.execution_bound
+            and self.revision_bound
+            and self.profile_authoritative
+        )
+
+    def _unsigned_evidence(self) -> dict[str, Any]:
+        return {
+            "schema": GROUND_CONTEXT_SCHEMA,
+            "snapshot_digest": self.snapshot_digest,
+            "document_digest": self.document_digest,
+            "revision_digest": self.revision_digest,
+            "profile_digest": self.profile_digest,
+            "source": self.source,
+            "trusted_source": self.trusted_source,
+            "profile_authoritative": self.profile_authoritative,
+            "identity_bound": self.identity_bound,
+            "revision_bound": self.revision_bound,
+            "execution_bound": self.execution_bound,
+            "authoritative": self.authoritative,
+        }
+
+    @property
+    def context_digest(self) -> str:
+        return hashlib.sha256(
+            _canonical_json(self._unsigned_evidence()).encode("utf-8")
+        ).hexdigest()
+
+    def to_evidence_dict(self) -> dict[str, Any]:
+        payload = self._unsigned_evidence()
+        payload["context_digest"] = self.context_digest
+        return payload
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: Any,
+        *,
+        source: str,
+        trusted_source: bool = False,
+        profile_digest: str | None = None,
+        profile_authoritative: bool = False,
+        revision_proof: Any = None,
+    ) -> "GroundingContext":
+        """Bind the exact grounder input without inventing missing evidence."""
+
+        snapshot_json = _canonical_json(snapshot)
+        snapshot_digest = hashlib.sha256(
+            snapshot_json.encode("utf-8")).hexdigest()
+
+        document_digest: str | None = None
+        raw_document = (
+            snapshot.get("__document_fingerprint")
+            if isinstance(snapshot, Mapping) else None
+        )
+        if raw_document is not None:
+            from kukai.ir.contracts import DocumentFingerprint
+
+            try:
+                document = DocumentFingerprint.from_dict(raw_document)
+            except (TypeError, ValueError):
+                # Grounding owns the typed refusal for malformed/empty legacy
+                # snapshots.  Context evidence must not turn it into a panic.
+                document = None
+            if document is not None and document.title and (
+                    document.path_name or document.project_uid):
+                document_digest = document.digest
+
+        revision_digest: str | None = None
+        if revision_proof is not None:
+            from kukai.ir.contracts import RevisionProof
+
+            if not isinstance(revision_proof, RevisionProof):
+                raise TypeError("revision_proof must be RevisionProof or None")
+            revision_json = _canonical_json(revision_proof.to_dict())
+            revision_digest = hashlib.sha256(
+                revision_json.encode("utf-8")).hexdigest()
+
+        return cls(
+            snapshot_digest=snapshot_digest,
+            document_digest=document_digest,
+            revision_digest=revision_digest,
+            profile_digest=profile_digest,
+            source=source,
+            trusted_source=trusted_source,
+            profile_authoritative=profile_authoritative,
+        )
+
+    @classmethod
+    def unbound(cls) -> "GroundingContext":
+        return cls.from_snapshot(
+            None,
+            source="legacy_unbound",
+            trusted_source=False,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,7 +302,9 @@ class PlannedOp:
     family: OperationFamily
     effect: EffectKind
     result: ResultSpec
+    contract_digest: str
     provenance: OpProvenance
+    nested_contracts: tuple["NestedOpContract", ...]
     _payload_json: str = field(repr=False)
 
     def __post_init__(self) -> None:
@@ -152,8 +318,17 @@ class PlannedOp:
             raise TypeError("planned op effect must be typed")
         if not isinstance(self.result, ResultSpec):
             raise TypeError("planned op result must be typed")
+        if (not isinstance(self.contract_digest, str)
+                or len(self.contract_digest) != 64
+                or any(ch not in "0123456789abcdef"
+                       for ch in self.contract_digest)):
+            raise ValueError("planned op needs a lowercase sha256 contract digest")
         if not isinstance(self.provenance, OpProvenance):
             raise TypeError("planned op provenance must be typed")
+        if (not isinstance(self.nested_contracts, tuple)
+                or any(not isinstance(item, NestedOpContract)
+                       for item in self.nested_contracts)):
+            raise TypeError("nested operation contracts must be a typed tuple")
         try:
             payload = json.loads(self._payload_json)
         except (TypeError, ValueError) as exc:
@@ -166,6 +341,27 @@ class PlannedOp:
             raise ValueError("planned op payload is not canonical")
         if set(payload) != {name for name, _ in self.provenance.field_origins}:
             raise ValueError("field provenance must cover the whole payload")
+        if self.op_name != "create_group" and self.nested_contracts:
+            raise ValueError("only create_group can carry nested contracts")
+        if self.op_name == "create_group":
+            members = payload.get("members")
+            if not isinstance(members, list):
+                raise ValueError("create_group needs a member list")
+            member_identity = [
+                (item.get("id"), item.get("op"))
+                for item in members if isinstance(item, dict)
+            ]
+            contract_identity = [
+                (item.member_id, item.op_name) for item in self.nested_contracts
+            ]
+            if contract_identity != member_identity:
+                raise ValueError(
+                    "nested contracts must cover group members in exact order")
+            for member, contract in zip(members, self.nested_contracts):
+                if contract.payload_digest != hashlib.sha256(
+                        _canonical_json(member).encode("utf-8")).hexdigest():
+                    raise ValueError(
+                        "nested contract payload digest disagrees with member")
 
     @classmethod
     def from_dict(
@@ -175,7 +371,9 @@ class PlannedOp:
         family: OperationFamily,
         effect: EffectKind,
         result: ResultSpec,
+        contract_digest: str,
         provenance: OpProvenance,
+        nested_contracts: tuple["NestedOpContract", ...] = (),
     ) -> "PlannedOp":
         return cls(
             op_id=payload["id"],
@@ -183,7 +381,9 @@ class PlannedOp:
             family=family,
             effect=effect,
             result=result,
+            contract_digest=contract_digest,
             provenance=provenance,
+            nested_contracts=nested_contracts,
             _payload_json=_canonical_json(payload),
         )
 
@@ -208,7 +408,54 @@ class PlannedOp:
                     if self.result.reference_kind is not None else None
                 ),
             },
+            "contract_digest": self.contract_digest,
+            "nested_contracts": [
+                item.to_evidence_dict() for item in self.nested_contracts
+            ],
             "provenance": self.provenance.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NestedOpContract:
+    """Contract identity of one fully planned ``create_group`` member.
+
+    The member payload already lives inside the parent operation.  The
+    additional typed row binds the registry/lowering semantics under which
+    that payload was validated; a changed member contract therefore changes
+    the parent ``plan_digest`` even when the authored JSON does not.
+    """
+
+    member_id: str
+    op_name: str
+    contract_digest: str
+    payload_digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.member_id, str) or not self.member_id:
+            raise ValueError("nested contract needs a member id")
+        if not isinstance(self.op_name, str) or not self.op_name:
+            raise ValueError("nested contract needs an operation name")
+        _sha256(self.contract_digest, "nested contract_digest")
+        _sha256(self.payload_digest, "nested payload_digest")
+
+    @classmethod
+    def from_planned_op(cls, operation: PlannedOp) -> "NestedOpContract":
+        if not isinstance(operation, PlannedOp):
+            raise TypeError("nested contract source must be PlannedOp")
+        return cls(
+            member_id=operation.op_id,
+            op_name=operation.op_name,
+            contract_digest=operation.contract_digest,
+            payload_digest=operation.payload_digest,
+        )
+
+    def to_evidence_dict(self) -> dict[str, str]:
+        return {
+            "member_id": self.member_id,
+            "op_name": self.op_name,
+            "contract_digest": self.contract_digest,
+            "payload_digest": self.payload_digest,
         }
 
 
@@ -430,22 +677,382 @@ class GroundedOp:
         return hashlib.sha256(self._payload_json.encode("utf-8")).hexdigest()
 
 
+_GROUND_MARKER_KEYS = frozenset({
+    "id", "name", "via", "ref", "in_emit", "category", "family_name",
+    "type_name", "disambiguate_by", "rule_detail",
+})
+_GROUND_ID_VIAS = frozenset({
+    "element_id", "name", "name+disambiguate_by", "family_type",
+    "sole_entry", "sole_entry+disambiguate_by", "most_used",
+    "most_used+disambiguate_by",
+})
+_GRAPH_OPS = frozenset({
+    "create_pipe_system", "route_pipe_system", "route_duct_system",
+})
+_SLOPE_OPS = frozenset({"route_pipe_system", "route_duct_system"})
+
+
+def _valid_ground_marker(value: Any) -> bool:
+    if not (isinstance(value, dict) and set(value) == {"__grounded__"}):
+        return False
+    detail = value.get("__grounded__")
+    if (not isinstance(detail, dict)
+            or not set(detail).issubset(_GROUND_MARKER_KEYS)):
+        return False
+    via = detail.get("via")
+    if not isinstance(via, str) or not via:
+        return False
+    if via == "ref":
+        return (
+            set(detail) == {"ref", "via"}
+            and isinstance(detail.get("ref"), str)
+            and bool(detail["ref"])
+        )
+    if via == "doc_default":
+        return (
+            set(detail) == {"id", "name", "via", "in_emit"}
+            and detail.get("id") is None
+            and detail.get("name") is None
+            and detail.get("in_emit") == "__doc_default__"
+        )
+    identifier = detail.get("id")
+    if (via not in _GROUND_ID_VIAS
+            or isinstance(identifier, bool)
+            or not isinstance(identifier, int)
+            or not 1 <= identifier <= 0x7FFF_FFFF_FFFF_FFFF
+            or (detail.get("name") is not None
+                and not isinstance(detail.get("name"), str))):
+        return False
+    base = {"id", "name", "via"}
+    if via == "family_type":
+        return (
+            set(detail) == base | {"category", "family_name", "type_name"}
+            and all(isinstance(detail.get(name), str) and detail[name]
+                    for name in ("category", "family_name", "type_name"))
+        )
+    if via.startswith("most_used"):
+        rule = detail.get("rule_detail")
+        expected = base | {"rule_detail"}
+        if via.endswith("+disambiguate_by"):
+            expected.add("disambiguate_by")
+        return (
+            set(detail) == expected
+            and isinstance(rule, dict)
+            and set(rule) == {"instances", "candidates", "runner_up"}
+            and all(isinstance(rule[name], int) and not isinstance(
+                    rule[name], bool) and rule[name] >= 0 for name in rule)
+        )
+    expected = set(base)
+    if via.endswith("+disambiguate_by"):
+        expected.add("disambiguate_by")
+    return set(detail) == expected
+
+
+def _valid_grounded_selector(planned: Any, grounded: Any) -> bool:
+    if isinstance(planned, list):
+        return (
+            isinstance(grounded, list)
+            and len(grounded) == len(planned)
+            and all(_valid_grounded_selector(source, resolved)
+                    for source, resolved in zip(planned, grounded))
+        )
+    if not _valid_ground_marker(grounded):
+        return False
+    # An omitted optional selector may be deterministically inserted by the
+    # grounder.  There is no authored selector to compare in that case.
+    if planned is None:
+        return True
+    if not isinstance(planned, dict):
+        return False
+    detail = grounded["__grounded__"]
+    by = planned.get("by")
+    if by == "element_id":
+        return (
+            detail.get("via") == "element_id"
+            and detail.get("id") == planned.get("value")
+        )
+    if by == "ref":
+        return (
+            detail.get("via") == "ref"
+            and detail.get("ref") == planned.get("value")
+        )
+    if by == "family_type":
+        return (
+            detail.get("via") == "family_type"
+            and all(detail.get(name) == planned.get(name)
+                    for name in ("category", "family_name", "type_name"))
+        )
+    disambiguator = planned.get("disambiguate_by")
+    if by == "name":
+        resolved_name = detail.get("name")
+        wanted = planned.get("value")
+        return (
+            detail.get("via") == (
+                "name+disambiguate_by" if disambiguator is not None else "name")
+            and isinstance(resolved_name, str)
+            and isinstance(wanted, str)
+            and resolved_name.strip().casefold() == wanted.strip().casefold()
+            and detail.get("disambiguate_by") == disambiguator
+        )
+    if by == "default":
+        expected_vias = (
+            {"sole_entry+disambiguate_by", "most_used+disambiguate_by"}
+            if disambiguator is not None else
+            {"doc_default", "sole_entry", "most_used"}
+        )
+        return (
+            detail.get("via") in expected_vias
+            and detail.get("disambiguate_by") == disambiguator
+        )
+    return False
+
+
+def _refinement_error(path: str, message: str) -> ValueError:
+    return ValueError(f"illegal grounding refinement at {path}: {message}")
+
+
+_NO_DERIVED_ARTIFACT = object()
+
+
+def _recomputed_derived_artifact(
+    planned: dict[str, Any],
+    key: str,
+    snapshot: Any,
+) -> Any:
+    """Re-run the pure lowering rule for one compiler-derived artifact."""
+
+    from kukai.ir import connect, contour, route_mep, spec
+
+    op_name = planned["op"]
+    op_spec = spec.OPS[op_name]
+    diagnostics: list[Any] = []
+    diameter_spec = next(
+        (param for param in op_spec.params if param.name == "diameter_mm"),
+        None,
+    )
+    diameter_bounds = (
+        (diameter_spec.min_val, diameter_spec.max_val)
+        if diameter_spec is not None else None
+    )
+
+    if key == "__region__":
+        region_fields = [
+            param.name for param in op_spec.params
+            if param.kind == "region" and param.name in planned
+        ]
+        if len(region_fields) != 1:
+            return _NO_DERIVED_ARTIFACT
+        grids = (
+            snapshot.get("grids", [])
+            if isinstance(snapshot, Mapping) else []
+        )
+        try:
+            result = contour.validate_region(
+                planned[region_fields[0]], grids, planned["id"],
+                region_fields[0], diagnostics)
+        except Exception as exc:  # malformed/unavailable replay input
+            raise _refinement_error(
+                f"ops[{planned['id']}].__region__",
+                f"region replay failed: {type(exc).__name__}",
+            ) from exc
+        if result is None or diagnostics:
+            raise _refinement_error(
+                f"ops[{planned['id']}].__region__",
+                "region lowering could not be independently replayed",
+            )
+        return result
+
+    if key == "__graph__" and op_name in _GRAPH_OPS:
+        source = (
+            route_mep.strip_slope_keys(planned)
+            if op_name in _SLOPE_OPS else planned
+        )
+        result = connect.graph_validate(
+            source,
+            planned["id"],
+            diagnostics,
+            planned.get("diameter_mm"),
+            diameter_bounds,
+        )
+        if result is None or diagnostics:
+            raise _refinement_error(
+                f"ops[{planned['id']}].__graph__",
+                "graph lowering could not be independently replayed",
+            )
+        return result
+
+    if key == "__slope_reqs__" and op_name in _SLOPE_OPS:
+        result = route_mep.extract_slope_requirements(
+            planned, planned["id"], diagnostics)
+        if result is None or diagnostics:
+            raise _refinement_error(
+                f"ops[{planned['id']}].__slope_reqs__",
+                "slope lowering could not be independently replayed",
+            )
+        return result
+
+    return _NO_DERIVED_ARTIFACT
+
+
+def _assert_payload_refinement(
+    planned: dict[str, Any],
+    grounded: dict[str, Any],
+    *,
+    path: str,
+    grounded_by_id: Mapping[str, dict[str, Any]],
+    snapshot: Any,
+) -> None:
+    """Prove that grounding changed only the closed lowering surface."""
+
+    from kukai.ir import relate, spec
+
+    if planned.get("id") != grounded.get("id") \
+            or planned.get("op") != grounded.get("op"):
+        raise _refinement_error(path, "operation identity changed")
+    op_name = str(planned["op"])
+    op_spec = spec.OPS.get(op_name)
+    if op_spec is None:
+        raise _refinement_error(path, "operation disappeared from registry")
+    required_derived: set[str] = set()
+    if any(param.kind == "region" and param.name in planned
+           for param in op_spec.params):
+        required_derived.add("__region__")
+    if op_name in _GRAPH_OPS:
+        required_derived.add("__graph__")
+    if op_name in _SLOPE_OPS:
+        required_derived.add("__slope_reqs__")
+    missing_derived = sorted(required_derived - set(grounded))
+    if missing_derived:
+        raise _refinement_error(
+            path, f"required lowering artifacts missing: {missing_derived}")
+    if not set(planned).issubset(grounded):
+        removed = sorted(set(planned) - set(grounded))
+        raise _refinement_error(path, f"planned fields removed: {removed}")
+
+    grounded_fields = {name for name, _pool, _required in op_spec.grounded}
+    address_fields = relate.addressable_params(op_name)
+    changed_addresses = {
+        name for name in address_fields
+        if name in planned
+        and relate.is_address(planned[name])
+        and grounded.get(name) != planned[name]
+    }
+    receipts = grounded.get("__address__")
+    receipt_by_param: dict[str, Any] = {}
+    if receipts is not None:
+        if not isinstance(receipts, list):
+            raise _refinement_error(path + ".__address__", "receipt is not a list")
+        for row in receipts:
+            if (not isinstance(row, dict)
+                    or row.get("op_id") != planned["id"]
+                    or not isinstance(row.get("param"), str)
+                    or row["param"] in receipt_by_param):
+                raise _refinement_error(
+                    path + ".__address__", "receipt identity is invalid")
+            receipt_by_param[row["param"]] = row.get("point_mm")
+        if set(receipt_by_param) != changed_addresses:
+            raise _refinement_error(
+                path + ".__address__",
+                "receipt does not account for exactly the changed addresses",
+            )
+        for name in changed_addresses:
+            if grounded.get(name) != receipt_by_param[name]:
+                raise _refinement_error(
+                    f"{path}.{name}", "resolved point disagrees with receipt")
+    elif changed_addresses:
+        raise _refinement_error(path, "address changed without a receipt")
+
+    for key, planned_value in planned.items():
+        grounded_value = grounded[key]
+        if grounded_value == planned_value:
+            continue
+        field_path = f"{path}.{key}"
+        if key in grounded_fields:
+            if not _valid_grounded_selector(planned_value, grounded_value):
+                raise _refinement_error(
+                    field_path, "declared selector did not lower to a valid marker")
+            continue
+        if key in changed_addresses:
+            continue
+        if key == "members" and op_name == "create_group":
+            if (not isinstance(planned_value, list)
+                    or not isinstance(grounded_value, list)
+                    or len(planned_value) != len(grounded_value)):
+                raise _refinement_error(
+                    field_path, "member cardinality/order changed")
+            for index, (planned_member, grounded_member) in enumerate(zip(
+                    planned_value, grounded_value)):
+                if not isinstance(planned_member, dict) or not isinstance(
+                        grounded_member, dict):
+                    raise _refinement_error(
+                        f"{field_path}[{index}]", "member is not an object")
+                _assert_payload_refinement(
+                    planned_member,
+                    grounded_member,
+                    path=f"{field_path}[{index}]",
+                    grounded_by_id={},
+                    snapshot=snapshot,
+                )
+            continue
+        raise _refinement_error(field_path, "ordinary planned value changed")
+
+    added = set(grounded) - set(planned)
+    for key in sorted(added):
+        value = grounded[key]
+        field_path = f"{path}.{key}"
+        if key in grounded_fields:
+            if not _valid_grounded_selector(None, value):
+                raise _refinement_error(
+                    field_path, "omitted selector gained an invalid marker")
+            continue
+        if key == "__address__" and changed_addresses:
+            continue
+        expected_derived = _recomputed_derived_artifact(
+            planned, key, snapshot)
+        if (expected_derived is not _NO_DERIVED_ARTIFACT
+                and _canonical_json(value) == _canonical_json(
+                    expected_derived)):
+            continue
+        # Владельцев поля спрашиваем у ВЛАСТИ (registry_base.SYNTHETIC_FIELDS),
+        # а не носим их парой рядом с проверкой: пара уже разошлась однажды —
+        # разбор опа о поле не знал вовсе, и группа с дверью не собиралась.
+        if op_name in SYNTHETIC_FIELDS.get(key, frozenset()):
+            host = planned.get("host")
+            host_id = host.get("value") if isinstance(host, dict) else None
+            host_op = grounded_by_id.get(host_id)
+            if isinstance(host_op, dict):
+                expected = {
+                    name: host_op[name] for name in ("p0_mm", "p1_mm")
+                    if name in host_op
+                }
+                if isinstance(host_op.get("arc"), dict):
+                    expected["arc"] = host_op["arc"]
+                if value == expected and set(expected) >= {"p0_mm", "p1_mm"}:
+                    continue
+        raise _refinement_error(field_path, "undeclared lowering field added")
+
+
 @dataclass(frozen=True, slots=True)
 class GroundedProgram:
     """Immutable exact output of grounding one :class:`PlannedProgram`.
 
     Parent binding fixes operation order/identity and prevents a changed
-    output from retaining the same digest.  It does not independently prove
-    that each changed planned value was a legal lowering: ``ground_program``
-    trusts the existing ground stage for that semantic transformation.
+    output from retaining the same digest.  The constructor also proves the
+    closed refinement surface independently of the grounder: authored values
+    are immutable, while selectors, addresses and named compiler artifacts may
+    change only where the registry/op contract declares that lowering.
     """
 
     planned: PlannedProgram
     ops: tuple[GroundedOp, ...]
     resolutions: tuple[GroundingResolution, ...]
+    context: GroundingContext = field(default_factory=GroundingContext.unbound)
     ground_digest: str = ""
+    verification_snapshot: InitVar[Any] = None
+    selector_resolution_replayed: bool = field(init=False, default=False)
+    derived_artifacts_verified: bool = field(init=False, default=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, verification_snapshot: Any) -> None:
         if not isinstance(self.planned, PlannedProgram):
             raise TypeError("grounded program needs a typed parent plan")
         if (not isinstance(self.ops, tuple)
@@ -455,6 +1062,15 @@ class GroundedProgram:
                 or any(not isinstance(item, GroundingResolution)
                        for item in self.resolutions)):
             raise TypeError("grounding resolutions must be a typed tuple")
+        if not isinstance(self.context, GroundingContext):
+            raise TypeError("grounded program needs typed context evidence")
+        if verification_snapshot is not None:
+            snapshot_digest = hashlib.sha256(
+                _canonical_json(verification_snapshot).encode("utf-8")
+            ).hexdigest()
+            if snapshot_digest != self.context.snapshot_digest:
+                raise ValueError(
+                    "grounding verification snapshot disagrees with context")
 
         planned_identity = [
             (op.op_id, op.op_name) for op in self.planned.ops
@@ -464,13 +1080,18 @@ class GroundedProgram:
             raise ValueError(
                 "grounded operations must preserve parent order and identity")
 
-        # Grounding legitimately replaces selectors and addressed geometry,
-        # so equality with planned values is not a valid law here.  Preserve
-        # every planned field, then bind the exact resulting values in the
-        # payload digest below.  Legality remains the trusted grounder's job.
+        grounded_payloads = {
+            op.op_id: op.to_dict() for op in self.ops
+        }
         for planned_op, grounded_op in zip(self.planned.ops, self.ops):
-            if not set(planned_op.to_dict()).issubset(grounded_op.to_dict()):
-                raise ValueError("grounding removed a planned field")
+            _assert_payload_refinement(
+                planned_op.to_dict(),
+                grounded_op.to_dict(),
+                path=f"ops[{planned_op.op_id}]",
+                grounded_by_id=grounded_payloads,
+                snapshot=verification_snapshot,
+            )
+        object.__setattr__(self, "derived_artifacts_verified", True)
 
         known_ids = {op.op_id for op in self.ops}
         if any(item.op_id not in known_ids for item in self.resolutions):
@@ -486,6 +1107,15 @@ class GroundedProgram:
         if self.resolutions != expected_resolutions:
             raise ValueError(
                 "grounding report must cover every grounded selector exactly")
+        # Marker shape and authored-selector consistency are independently
+        # checked above.  Pool membership/ambiguity is not reimplemented here:
+        # without replaying the exact snapshot resolver, claiming that proof
+        # would overstate what a content digest alone establishes.
+        object.__setattr__(
+            self,
+            "selector_resolution_replayed",
+            not self.resolutions,
+        )
 
         computed = hashlib.sha256(
             _canonical_json(self._unsigned_evidence()).encode("utf-8")
@@ -500,6 +1130,8 @@ class GroundedProgram:
         planned: PlannedProgram,
         ops: list[dict[str, Any]],
         resolutions: tuple[GroundingResolution, ...] | None = None,
+        context: GroundingContext | None = None,
+        snapshot: Any = None,
     ) -> "GroundedProgram":
         grounded_ops = tuple(GroundedOp.from_dict(op) for op in ops)
         if resolutions is None:
@@ -515,12 +1147,20 @@ class GroundedProgram:
             planned=planned,
             ops=grounded_ops,
             resolutions=resolutions,
+            context=context if context is not None else GroundingContext.unbound(),
+            verification_snapshot=snapshot,
         )
 
     def _unsigned_evidence(self) -> dict[str, Any]:
         return {
             "schema": GROUND_SCHEMA,
             "plan_digest": self.planned.plan_digest,
+            "context": self.context.to_evidence_dict(),
+            "validation": {
+                "derived_artifacts_verified": self.derived_artifacts_verified,
+                "selector_resolution_replayed": (
+                    self.selector_resolution_replayed),
+            },
             "ops": [
                 {"payload": op.to_dict(), "payload_digest": op.payload_digest}
                 for op in self.ops

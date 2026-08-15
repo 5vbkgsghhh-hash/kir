@@ -61,12 +61,12 @@ from kukai.ir.decompile.tests.test_merkle import (  # noqa: E402
     _fold,
     _grid_building,
 )
+from unittest import mock
+from kukai.ir.decompile import materialize
+from kukai.ir.decompile import native_group
 
 _ZERO = (0.0, 0.0, 0.0)
-_LOT31_TREE = Path(os.environ.get(
-    "KIR_LOT31_TREE",
-    Path.home() / "lot31_full" / "_tree_cache.pkl",
-))
+_LOT31_TREE = Path.home() / "lot31_full" / "_tree_cache.pkl"
 
 
 def _abs_multiset(leaves):

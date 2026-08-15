@@ -15,7 +15,7 @@ FamilySymbol __el_T1 = null; bool __dupd_T1 = false;
 Parameter __pw_T1 = null;
 Parameter __pd_T1 = null;
 Material __mat_T1 = null;
-using (Transaction __t = new Transaction(doc, "KIR: жб колонна 400x400"))
+using (Transaction __t = new Transaction(doc, "KIR: жб колонна 400x400 из существующего типа"))
 {
     try
     {

@@ -12,6 +12,7 @@ os.environ.setdefault("KIR_REJECTIONS_PATH",
                       os.path.join(tempfile.gettempdir(), "kir_a6_rej.jsonl"))
 
 from kukai.ir import serving, witness_feed  # noqa: E402
+from kukai.ir.tests.gate_fixture import enter_kir_mode
 
 
 def _run(coro):
@@ -38,6 +39,38 @@ class SkeletonHash(unittest.TestCase):
 
 
 class Writer(unittest.TestCase):
+    def test_ground_context_keeps_only_digests_and_authority_flags(self):
+        from kukai.ir.midend import GroundingContext
+
+        snapshot = {
+            "__document_fingerprint": {
+                "title": "SECRET MODEL",
+                "path_name": r"C:\secret\project.rvt",
+                "project_uid": "secret-project-uid",
+            },
+            "levels": [{"id": 42, "name": "SECRET LEVEL"}],
+        }
+        context = GroundingContext.from_snapshot(
+            snapshot, source="trusted_bridge", trusted_source=True)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "w.jsonl")
+            with mock.patch.dict(os.environ, {"KIR_WITNESS_PATH": path}):
+                witness_feed.record_witness(
+                    program={"ops": []}, family="write",
+                    revit_version="2026", ok=False, witness=None,
+                    duration_ms=1, ground_context=context)
+
+            row = json.loads(open(path, encoding="utf-8").readline())
+            evidence = row["ground_context"]
+            self.assertEqual(evidence["context_digest"],
+                             context.context_digest)
+            self.assertTrue(evidence["execution_bound"])
+            self.assertFalse(evidence["authoritative"])
+            encoded = json.dumps(evidence)
+            self.assertNotIn("SECRET MODEL", encoded)
+            self.assertNotIn("SECRET LEVEL", encoded)
+            self.assertNotIn("project.rvt", encoded)
+
     def test_planned_execution_is_bound_to_immutable_digest(self):
         from kukai.ir.compiler import plan_program
 
@@ -54,7 +87,7 @@ class Writer(unittest.TestCase):
                     result_payload={"q": {"count": 1}})
 
             row = json.loads(open(path, encoding="utf-8").readline())
-            self.assertEqual(row["plan_schema"], "kir-planned-program/1")
+            self.assertEqual(row["plan_schema"], "kir-planned-program/3")
             self.assertEqual(row["plan_digest"], planned.plan_digest)
             self.assertEqual(row["source_op_count"], 1)
 
@@ -102,14 +135,18 @@ class Writer(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "w.jsonl")
             evidence = {
-                "schema_version": "kir-acceptance-evidence/1",
+                "schema_version": "kir-acceptance-evidence/2",
                 "state": "accepted",
                 "reason": "measured",
+                "ground_selector_resolution_replayed": False,
+                "ground_derived_artifacts_verified": True,
+                "execution_artifact_binding_digest": "9" * 64,
                 "evidence_digest": "a" * 64,
                 "registration_digest": "b" * 64,
                 "registration": {
                     "run_id": "c" * 32,
                     "plan_digest": "d" * 64,
+                    "ground_digest": "1" * 64,
                     "expectation_digest": "e" * 64,
                     "before": [{"level_name": "SECRET PROJECT LEVEL"}],
                 },
@@ -129,6 +166,17 @@ class Writer(unittest.TestCase):
             encoded = json.dumps(row["acceptance_evidence"])
             self.assertEqual(
                 row["acceptance_evidence"]["evidence_digest"], "a" * 64)
+            self.assertEqual(
+                row["acceptance_evidence"]["ground_digest"], "1" * 64)
+            self.assertFalse(row["acceptance_evidence"][
+                "ground_selector_resolution_replayed"])
+            self.assertTrue(row["acceptance_evidence"][
+                "ground_derived_artifacts_verified"])
+            self.assertEqual(
+                row["acceptance_evidence"][
+                    "execution_artifact_binding_digest"],
+                "9" * 64,
+            )
             self.assertTrue(row["acceptance_evidence"]["journal"]["durable"])
             self.assertNotIn("SECRET PROJECT LEVEL", encoded)
 
@@ -220,6 +268,8 @@ class HandlerIntegration(unittest.TestCase):
         self._dev.start()
         self.llm = mock.Mock()
         self.llm._revit_version = "2024"
+        # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08): режим КИР ставится ЯВНО.
+        enter_kir_mode(self)
 
     def tearDown(self):
         self._dev.stop()

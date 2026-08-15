@@ -73,8 +73,8 @@ isolated/slab перестал бы быть жёстким отказом «lev
 работающих ветвей ради ветви, которой уровень не нужен вовсе; отдельный оп не
 забирает ничего.
 
-ЗАМЕР API (компиляция на :52412, 2021-2026, 09.08 — арбитр здесь компилятор,
-а не XML):
+ЗАМЕР API (компиляция на :52412, 2021-2026, 09.08 — арбитр здесь компилятор, а
+не XML; см. инженерные правила про SpatialElementTag):
 
   WallFoundation.Create(Document, ElementId typeId, ElementId wallId)  → 6/6
   WallFoundation.WallId                                                → 6/6
@@ -154,7 +154,7 @@ create_beam_system / create_truss: ВОЛНА КАРКАСА (09.08.2026). Об�
 Нижние шесть строк — не педантизм, каждая закрыла соблазн. Уровень балочной
 системы читается СВОЙСТВОМ (цепочки BIP у неё нет вовсе), тип фермы и «тип
 балки по умолчанию» спросить у документа НЕЛЬЗЯ ПО ПОСТРОЕНИЮ (как у двери и
-окна — это названное умолчание), а `Members` считается
+окна — см. НАЗВАННОЕ УМОЛЧАНИЕ в инженерных правилах KIR), а `Members` считается
 `.Count`, а не `.Size`.
 
 ПРОФИЛЬ БАЛОЧНОЙ СИСТЕМЫ — ЕСТЕСТВЕННЫЙ ПОТРЕБИТЕЛЬ CONTOUR, И ЭТО ЗАМЕР, А
@@ -184,7 +184,7 @@ create_area_reinforcement: ВОЛНА АРМИРОВАНИЯ (10.08.2026). Пе�
 ОДИН — тот, у которого свидетель читает РЕЗУЛЬТАТ и может ПРОВАЛИТЬСЯ.
 
 ЗАМЕР API (компиляция на :52412 против настоящих сборок 2021-2026, 10.08 —
-арбитр компилятор, а не XML):
+арбитр компилятор, а не XML; см. инженерные правила про SpatialElementTag):
 
   AreaReinforcement.Create(Document, Element, XYZ, ElementId×3)      → 6/6
   AreaReinforcement.Create(Document, Element, IList<Curve>, XYZ, ×3) → 6/6
@@ -347,7 +347,7 @@ OPS = [
                 # with different resolution semantics (doc-default support a
                 # FamilySymbol selector doesn't have). Consistent naming, not
                 # an arbitrary choice.
-                ParamSpec("symbol", "sel"),        # omitted -> sole snapshot entry, else AMBIGUOUS
+                ParamSpec("symbol", "sel", ref_kinds=(ReferenceKind.FAMILY_SYMBOL,)),        # omitted -> sole snapshot entry, else AMBIGUOUS
             ),
             capability=(("create", "element"),),
             post=("beam exists; LocationCurve endpoints == p0/p1 (±5mm, 3D) — "
@@ -376,7 +376,7 @@ OPS = [
                           choices=("isolated", "slab")),
                 # isolated-only:
                 ParamSpec("xy", "pt_xy"),
-                ParamSpec("symbol", "sel"),         # omitted -> sole snapshot entry
+                ParamSpec("symbol", "sel", ref_kinds=(ReferenceKind.FAMILY_SYMBOL,)),         # omitted -> sole snapshot entry
                 # slab-only (mirrors create_floor's own outline/holes/type):
                 ParamSpec("outline", "pts"),
                 ParamSpec("holes", "pts_list"),     # 2022+ only, same as create_floor
@@ -476,7 +476,7 @@ OPS = [
                 # обычные несущие FamilyInstance, и пул уже отфильтрован по
                 # типу размещения (open_model.py). Пропущенный селектор
                 # разрешается общим правилом «единственный / most_used».
-                ParamSpec("symbol", "sel"),
+                ParamSpec("symbol", "sel", ref_kinds=(ReferenceKind.FAMILY_SYMBOL,)),
             ),
             capability=(("create", "element"), ("create", "geometry")),
             # ОБЕЩАНО РОВНО ТО, ЧТО ПЕРЕЧИТЫВАЕТСЯ. Отдельной клаузулой

@@ -6,7 +6,7 @@
 в коде, тестами-приёмкой и порядком исполнения. Написан так, чтобы Opus мог
 исполнять волну за волной без Fable-уровня суждений: все спорные развилки ПРИБИТЫ.
 
-Связанные артефакты: аудит `/home/claude/kir_audit/KIR_AUDIT_REPORT.md` (+repro),
+Связанные артефакты: аудит `kir_audit/KIR_AUDIT_REPORT.md` (+repro),
 prod-live `78a4ceb5` (влиты create_group + пакет фиксов аудита F1-F3/F7-F12).
 
 ---
@@ -168,7 +168,7 @@ absolute fail-open, typed dicts), `decompile/extract.py::extract_document`
 component→create_group; канонические RLVR-пары.
 **Якоря:** `l1_schema.py` (диалекты ссылок), `compiler._parse_and_check`
 (host_wall-аттач, DAG), `ground._needs_pool` (element_id-программы не требуют
-снапшота), мои ad-hoc скрипты `/home/claude/lot31_full/*.py` (рабочий прототип
+снапшота), ad-hoc скрипты `lot31_full/*.py` (рабочий прототип
 этой логики — использовать как прайор-арт).
 **Прибитые решения:**
 - Модуль `kukai/ir/decompile/materialize.py`:

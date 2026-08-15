@@ -75,7 +75,7 @@ def test_write_ahead_receipt_ack_and_deduplicated_replay(monkeypatch):
             # Authoritative row exists before a byte is dispatched.
             before_send = await store.get(identity.operation_id)
             assert before_send is not None
-            assert before_send.phase is OperationPhase.PERSISTED_SERVER
+            assert before_send.phase is OperationPhase.DISPATCH_CLAIMED
             receipt = _receipt(identity)
             bridge._handle_bridge_response(
                 {

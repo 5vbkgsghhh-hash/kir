@@ -4,6 +4,16 @@
 fixtures.  Every assertion here is about the STORED corpus and about the two
 sentences the corpus contradicts.
 
+ВСЕ ЧИСЛА НИЖЕ — ДОПРАВОЧНЫЕ, и это сказано ЗДЕСЬ, а не в чьей-то памяти.
+2026-08-13 `build_library` получила правило «заявка не превышает кратность
+источника» (C-RT правилом построения, а не свойством), и оно ОТВЕРГАЕТ
+экземпляры: на фикстуре 2 компонента / 6 размещений становятся 1 / 4. Значит
+состав библиотеки на корпусе сдвинулся, и каждое число этого списка — состояние
+ДО правки, а не сегодняшнее. Пересъёмка тем же прибором заказана и не сделана:
+бокс занят чужим полным набором, а мерить под чужим набором — значит получить
+другое измерение под тем же именем. **Не цитировать эти числа как текущие;
+`test_component_overclaim_fixture.py` держит правило независимо от них.**
+
 Measured 2026-08-11 over `backend/backend/data/decompile`, one run per
 `doc_name` (10 runs, 368 313 folded leaves), indexes from `build_index`,
 libraries from this layer's own `build_library` + `prove_execution_fidelity`:

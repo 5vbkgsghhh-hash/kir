@@ -185,9 +185,20 @@ class OneTableForOneRelation(unittest.TestCase):
                          "OST_StructuralFoundation")
 
     def test_ops_the_registry_does_not_carry_are_named_as_gaps(self):
-        for op in ("create_curtain_grid_line", "create_wall_foundation"):
-            self.assertIn(op, CB.REGISTRY_GAPS)
-            self.assertIsNotNone(CB.category_of({"op": op}))
+        """СТРОКА, КОТОРАЯ НЕ РАБОТАЛА, СНЯТА (замер 11.08.2026).
+
+        Здесь стояли ДВЕ операции. `create_curtain_grid_line` не проходила
+        этот тест никогда: последнее слово в `category_of` — за
+        `hulls.KIND_TABLE`, а `OST_CurtainGridsWall` у неё `eligible=False`,
+        поэтому ответ был `None` при живой строке `REGISTRY_GAPS`. Таблица
+        объявляла ответ, которого функция не отдавала, — тот же класс, что и
+        снятая `OP_CATEGORY`, только внутри одного файла. Операция переехала
+        в `OP_NO_BODY` с названной причиной, строка гэпа снята.
+        """
+        self.assertIn("create_wall_foundation", CB.REGISTRY_GAPS)
+        self.assertIsNotNone(CB.category_of({"op": "create_wall_foundation"}))
+        self.assertNotIn("create_curtain_grid_line", CB.REGISTRY_GAPS)
+        self.assertIn("create_curtain_grid_line", CB.OP_NO_BODY)
 
     def test_room_and_text_still_produce_no_element(self):
         for op in ("create_room", "create_text", "place_family"):

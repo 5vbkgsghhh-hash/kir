@@ -2,19 +2,19 @@
 
 ## Почему это ОТДЕЛЬНАЯ схема, а не `clash-report/3`
 
-`clash-report/2` — артефакт ДОКАЗАТЕЛЬСТВА. На нём стоят три закона:
+`clash-report/3` — артефакт ДОКАЗАТЕЛЬСТВА. На нём стоят три закона:
 канонический байт-в-байт JSON (`detect.dumps`), замороженный голден и
 оракульная приёмка. Все они держатся на одном свойстве: **отчёт есть чистая
 функция входа**.
 
 Статус находки (`open/discussed/dismissed/fixed`, кто и когда) — величина
-ИЗМЕНЯЕМАЯ и принадлежащая пользователю. Положить её в `/2` значит сделать
+ИЗМЕНЯЕМАЯ и принадлежащая пользователю. Положить её в `/3` значит сделать
 канон зависящим от того, кто и когда его смотрел: один и тот же вход перестал
 бы давать один и тот же файл, и голден стал бы бессмысленным. Ровно поэтому
 `_timings_ms` уже исключён из канона — часы не входят в функцию входа, и
 статус не входит тем более.
 
-Поэтому здесь — **отдельный слой `clash-review/1`**, ВЫВОДИМЫЙ из `/2` чистой
+Поэтому здесь — **отдельный слой `clash-review/2`**, ВЫВОДИМЫЙ из `/3` чистой
 функцией. Доказательство остаётся неизменным и версионируется своей чередой;
 представление меняется под продукт и версионируется своей. Ни одного НОВОГО
 замера в этом модуле нет: только переупаковка того, что детектор уже отдал.
@@ -23,18 +23,19 @@
 
 * сводку по РОДАМ («что с этим делать» вместо «сколько строк»);
 * группировку по ЭЛЕМЕНТУ — у проектировщика в работе элемент, а не пара;
-* `severity` из УЖЕ ИМЕЮЩИХСЯ осей (род, отношение, глубина, грейд);
+* ортогональные `evidence_state`, `impact_severity` и `actionability`;
+* legacy `severity` как консервативный приоритет очереди, не как доказательство;
 * поле `status` — пустое, но зарезервированное, чтобы схема не сломалась,
   когда приедет цикл «обсудили → закрыли».
 """
 from __future__ import annotations
 
 import collections
-from typing import Any
+from typing import Any, Mapping
 
 from kukai.clash import detect as D
 
-REVIEW_SCHEMA = "clash-review/1"
+REVIEW_SCHEMA = "clash-review/2"
 
 #: Русское имя КЛАССА элемента (не типа и не семейства!). Ключ — `label` из
 #: закрытой таблицы `hulls.KIND_TABLE`, то есть словарь закрыт вместе с ней.
@@ -62,13 +63,16 @@ LABEL_RU: dict[str, str] = {
 #: Порядок серьёзности. Публикуется В ОТЧЁТЕ, чтобы правило можно было
 #: оспорить, а не угадывать по числам.
 SEVERITY_ORDER = ("критично", "высокая", "средняя", "низкая")
+EVIDENCE_STATES = ("confirmed", "possible")
+IMPACT_SEVERITIES = ("critical", "high", "medium", "low", "unknown")
+ACTIONABILITY_STATES = ("delete", "repair", "verify", "none")
 
 SEVERITY_RULE = (
-    "Дубликат — всегда «критично»: два элемента на одном месте не чинятся "
-    "раздвиганием. Дальше — по ГЛУБИНЕ перекрытия, но не выше «средней», "
-    "пока хотя бы одна оболочка `coarse`: у грубой пары проникание тел НЕ "
-    "доказано, и обещать проектировщику больше, чем доказано, нельзя. "
-    "Касание (`contact`) — всегда «низкая»."
+    "Legacy severity — приоритет проверки, а не истинность коллизии. "
+    "`possible` ограничен средней/низкой очередью независимо от глубины "
+    "внешних оболочек. Критичный геометрический дубликат требует двух "
+    "независимых sealed-доказательств: физического пересечения и точного "
+    "равенства тел; это всё равно не является правом удаления BIM-элемента."
 )
 
 
@@ -76,52 +80,140 @@ def _ru(label: str) -> str:
     return LABEL_RU.get(label, label or "элемент")
 
 
-def severity_of(finding: dict) -> str:
-    """Серьёзность ТОЛЬКО из уже посчитанных осей. Новых замеров нет."""
-    if finding.get("pair_kind") == "coincident_duplicate":
-        return "критично"
+def evidence_state_of(finding: Mapping[str, Any]) -> str:
+    """Accept ``confirmed`` only through the detector's sealed proof chain."""
+
+    if finding.get("verdict") != "confirmed":
+        return "possible"
+    a, b = finding.get("a"), finding.get("b")
+    proof = finding.get("physical_overlap_proof")
+    if (not isinstance(a, Mapping) or not isinstance(b, Mapping)
+            or not isinstance(proof, Mapping)):
+        return "possible"
+    subject_a, subject_b = a.get("source_element_id"), b.get(
+        "source_element_id")
+    if not isinstance(subject_a, str) or not isinstance(subject_b, str):
+        return "possible"
+    return ("confirmed" if D.verify_serialized_physical_overlap_proof(
+        proof, subject_a=subject_a, subject_b=subject_b) else "possible")
+
+
+def impact_severity_of(
+        finding: Mapping[str, Any], evidence_state: str | None = None,
+        duplicate_equality_proven: bool | None = None) -> str:
+    """Potential impact, separate from evidence and available action."""
+
+    evidence = evidence_state or evidence_state_of(finding)
+    if evidence != "confirmed":
+        return "unknown"
     if finding.get("hull_relation") == "contact":
-        return "низкая"
-    depth = float(finding.get("hull_overlap_depth_mm") or 0.0)
-    coarse = finding.get("hull_grade") == "coarse"
-    if coarse:
-        # Грубая пара не доказывает проникания тел — потолок «средняя».
-        return "средняя" if depth >= 100.0 else "низкая"
+        return "low"
+    duplicate_proven = (D.duplicate_claim_is_proven(dict(finding))
+                        if duplicate_equality_proven is None
+                        else duplicate_equality_proven)
+    if (finding.get("pair_kind") == "coincident_duplicate"
+            and duplicate_proven):
+        return "critical"
+    proof = finding.get("physical_overlap_proof") or {}
+    depth = float(proof.get("inner_overlap_depth_mm") or 0.0)
     if depth >= 100.0:
-        return "критично"
+        return "critical"
     if depth >= 10.0:
-        return "высокая"
-    return "средняя"
+        return "high"
+    return "medium"
 
 
-def phrase(finding: dict) -> str:
+def severity_of(finding: dict, *, evidence_state: str | None = None,
+                impact_severity: str | None = None) -> str:
+    """Legacy conservative work priority; never upgrades possible to fact."""
+
+    evidence = evidence_state or evidence_state_of(finding)
+    if evidence != "confirmed":
+        return "низкая" if finding.get("hull_relation") == "contact" else "средняя"
+    impact = impact_severity or impact_severity_of(finding, evidence)
+    return {
+        "critical": "критично", "high": "высокая", "medium": "средняя",
+        "low": "низкая", "unknown": "средняя",
+    }[impact]
+
+
+def actionability_of(
+        finding: dict, evidence_state: str | None = None,
+        duplicate_equality_proven: bool | None = None,
+        ) -> tuple[str, bool]:
+    """Return (actionability, verification_required) without unsafe repair."""
+
+    evidence = evidence_state or evidence_state_of(finding)
+    if evidence != "confirmed":
+        return "verify", True
+    if finding.get("hull_relation") == "contact":
+        return "verify", True
+    if finding.get("pair_kind") == "coincident_duplicate":
+        # Exact body equality is a geometric fact, not a deletion
+        # capability.  Two distinct BIM elements can intentionally occupy the
+        # same body while differing by phase, design option, system, group,
+        # ownership or downstream references.  Until a separate semantic and
+        # dependency-equivalence proof exists, deletion always needs review.
+        # Keep evaluating the geometry proof above for evidence/ranking, but
+        # never promote it into a destructive instruction here.
+        _ = (D.duplicate_claim_is_proven(finding)
+             if duplicate_equality_proven is None
+             else duplicate_equality_proven)
+        return "verify", True
+    return "repair", False
+
+
+def phrase(finding: dict, *, evidence_state: str | None = None,
+           actionability: str | None = None,
+           duplicate_equality_proven: bool | None = None) -> str:
     """Строка, которую читает прораб. «Лоток 123 стоит внутри лотка 456»
     вместо «pair 123/456 overlap 141mm».
 
-    Совет не бывает увереннее улики. «Удалить одну из них» — указание
-    РАЗРУШИТЕЛЬНОЕ, и оно печатается только там, где совпадение доказано
-    геометрией (`detect.duplicate_claim_is_proven`). У пары, про которую
-    известен один габаритный бокс, тот же бокс дают и две диагонали квадрата,
-    поэтому строка называет ровно то, что совпало, и посылает смотреть модель.
+    Совет не бывает увереннее улики. Даже доказанное совпадение геометрии не
+    доказывает равенство фаз, систем, групп и внешних зависимостей, поэтому
+    этот слой никогда не печатает указание удалить. У пары, про которую
+    известен один габаритный бокс, тот же бокс дают и две диагонали квадрата;
+    строка называет ровно то, что совпало, и посылает смотреть модель.
     """
     a, b = finding["a"], finding["b"]
     an, bn = _ru(a.get("label")), _ru(b.get("label"))
     ai, bi = a["source_element_id"], b["source_element_id"]
     depth = float(finding.get("hull_overlap_depth_mm") or 0.0)
+    evidence = evidence_state or evidence_state_of(finding)
+    duplicate_proven = (D.duplicate_claim_is_proven(finding)
+                        if duplicate_equality_proven is None
+                        else duplicate_equality_proven)
+    action = actionability or actionability_of(
+        finding, evidence, duplicate_proven)[0]
+    if evidence != "confirmed":
+        if finding.get("pair_kind") == "coincident_duplicate":
+            return (f"{an.capitalize()} {ai} и {bn} {bi}: внешние оболочки "
+                    "совпали — "
+                    "возможный дубликат; равенство точных тел не доказано, "
+                    "требуется проверка в модели")
+        if finding.get("hull_relation") == "contact":
+            return (f"{an.capitalize()} {ai} и {bn} {bi}: внешние оболочки "
+                    "касаются — "
+                    "контакт тел не подтверждён, требуется проверка")
+        return (f"{an.capitalize()} {ai} и {bn} {bi}: внешние оболочки "
+                "перекрываются "
+                f"на {depth:.0f} мм — возможная коллизия; пересечение тел "
+                "не подтверждено, требуется проверка")
     if finding.get("pair_kind") == "coincident_duplicate":
-        if D.duplicate_claim_is_proven(finding):
-            return (f"{an.capitalize()} {ai} и {bn} {bi} стоят НА ОДНОМ МЕСТЕ — "
-                    f"похоже на дубликат, чинится удалением одного из них")
-        return (f"{an.capitalize()} {ai} и {bn} {bi} совпадают ГАБАРИТАМИ — "
-                f"возможно, дубликат. Форма обоих известна только габаритным "
-                f"боксом, такой же бокс дают и два разных элемента: сверить в "
-                f"модели")
+        if duplicate_proven:
+            return (f"Точные тела {an} {ai} и {bn} {bi} совпадают, но "
+                    "семантическая взаимозаменяемость и отсутствие внешних "
+                    "зависимостей не доказаны — проверить; автоматически "
+                    "удалять нельзя")
+        return (f"Пересечение тел {an} {ai} и {bn} {bi} подтверждено, но "
+                "их точное равенство не доказано — сверить перед изменением")
     if finding.get("hull_relation") == "contact":
-        return f"{an.capitalize()} {ai} касается {bn} {bi} вплотную"
-    certainty = ("габариты пересекаются" if finding.get("hull_grade") == "coarse"
-                 else "пересечение")
-    return (f"{an.capitalize()} {ai} входит в {bn} {bi} на {depth:.0f} мм "
-            f"({certainty})")
+        return f"Контакт тел {an} {ai} и {bn} {bi} подтверждён; сверить узел"
+    proof = finding.get("physical_overlap_proof") or {}
+    inner_depth = float(proof.get("inner_overlap_depth_mm") or 0.0)
+    return (f"Пересечение тел {an} {ai} и {bn} {bi} подтверждено: "
+            f"сертифицированные внутренние области перекрываются на "
+            f"{inner_depth:.0f} мм; требуется исправление")
 
 
 def _status_stub() -> dict:
@@ -131,24 +223,90 @@ def _status_stub() -> dict:
             "note": None, "discussion_ref": None}
 
 
+def _search_completeness(report: Mapping[str, Any]) -> tuple[bool, bool, str | None]:
+    """Return (complete, contract_valid, user-visible note), fail-closed."""
+
+    search = report.get("search")
+    comp = search.get("completeness") if isinstance(search, Mapping) else None
+    if not isinstance(comp, Mapping):
+        return False, False, (
+            "ВНИМАНИЕ: контракт полноты поиска отсутствует — список нельзя "
+            "считать полным")
+    required_axes = {"extraction", "federation", "geometry", "query_scope"}
+    axes = comp.get("axes")
+    complete = comp.get("complete")
+    if (comp.get("schema_version") != "clash-completeness/1"
+            or not isinstance(complete, bool)
+            or not isinstance(axes, Mapping)
+            or not required_axes.issubset(axes)):
+        return False, False, (
+            "ВНИМАНИЕ: контракт полноты поиска неполон или неизвестной "
+            "версии — список нельзя считать полным")
+    axis_states = {
+        name: (axis.get("complete") if isinstance(axis, Mapping) else None)
+        for name, axis in axes.items()}
+    if any(not isinstance(value, bool) for value in axis_states.values()):
+        return False, False, (
+            "ВНИМАНИЕ: контракт полноты содержит ось без вердикта — список "
+            "нельзя считать полным")
+    derived = all(axis_states.values())
+    if complete != derived:
+        return False, False, (
+            "ВНИМАНИЕ: общий вердикт полноты противоречит своим осям — "
+            "список нельзя считать полным")
+    if complete:
+        return True, True, None
+    missing = ", ".join(sorted(
+        name for name, value in axis_states.items() if not value))
+    return False, True, (
+        f"ВНИМАНИЕ: поиск неполон по осям {missing}; список находок неполон")
+
+
 def build_review(report: dict, *, top: int = 50, max_per_element: int = 20,
                  max_elements: int | None = None) -> dict:
-    """`clash-report/2` -> `clash-review/1`. Чистая функция, без замеров.
+    """`clash-report/3` -> `clash-review/2`. Чистая функция, без замеров.
 
     `max_elements` режет ХВОСТ группировки для выгрузки на диск: на ЭОМ v10
     полный обзор — 17 МБ, и фронту столько сразу не нужно. Срез НАЗЫВАЕТСЯ
     полем `elements_truncated_to`, а не молчит: усечённый список, выглядящий
     полным, — та же ложь, что и молчаливый ноль.
     """
+    if report.get("schema_version") != D.REPORT_SCHEMA:
+        report = D.migrate_report(report)
     findings = report.get("findings") or []
     rows = []
     for f in findings:
-        sev = severity_of(f)
+        evidence = evidence_state_of(f)
+        duplicate_proven = D.duplicate_claim_is_proven(f)
+        impact = impact_severity_of(f, evidence, duplicate_proven)
+        sev = severity_of(
+            f, evidence_state=evidence, impact_severity=impact)
+        actionability, verification_required = actionability_of(
+            f, evidence, duplicate_proven)
         rows.append({
             "finding_id": f["finding_id"],
             "severity": sev,
+            "evidence_state": evidence,
+            "impact_severity": impact,
+            "actionability": actionability,
+            "verification_required": verification_required,
             "pair_kind": f.get("pair_kind", "interference"),
-            "text": phrase(f),
+            "duplicate_equality_proven": duplicate_proven,
+            # Geometry and BIM semantics are independent proof axes.  This
+            # explicit false prevents downstream clients from treating
+            # `duplicates_confirmed` as permission to mutate the model.
+            "deletion_safe": False,
+            "deletion_blockers": (
+                (["exact_body_equality_unproven"]
+                 if (f.get("pair_kind") == "coincident_duplicate"
+                     and not duplicate_proven) else [])
+                + (["semantic_equivalence_unproven",
+                    "dependency_equivalence_unproven"]
+                   if f.get("pair_kind") == "coincident_duplicate" else [])
+            ),
+            "text": phrase(
+                f, evidence_state=evidence, actionability=actionability,
+                duplicate_equality_proven=duplicate_proven),
             "a_element_id": f["a"]["source_element_id"],
             "b_element_id": f["b"]["source_element_id"],
             "a_label": _ru(f["a"].get("label")),
@@ -160,7 +318,8 @@ def build_review(report: dict, *, top: int = 50, max_per_element: int = 20,
             "status": _status_stub(),
         })
     order = {s: i for i, s in enumerate(SEVERITY_ORDER)}
-    rows.sort(key=lambda r: (order.get(r["severity"], 9),
+    rows.sort(key=lambda r: (0 if r["evidence_state"] == "confirmed" else 1,
+                             order.get(r["severity"], 9),
                              -(r["depth_mm"] or 0.0), r["finding_id"]))
 
     by_el: dict[str, dict] = {}
@@ -171,14 +330,22 @@ def build_review(report: dict, *, top: int = 50, max_per_element: int = 20,
             slot = by_el.setdefault(me, {
                 "element_id": me, "label": my_lab, "level_id": r["level_id"],
                 "conflicts": [], "worst_severity": r["severity"],
-                "counts": collections.Counter()})
+                "counts": collections.Counter(),
+                "evidence_counts": collections.Counter(),
+                "actionability_counts": collections.Counter()})
             slot["counts"][r["severity"]] += 1
+            slot["evidence_counts"][r["evidence_state"]] += 1
+            slot["actionability_counts"][r["actionability"]] += 1
             if order.get(r["severity"], 9) < order.get(slot["worst_severity"], 9):
                 slot["worst_severity"] = r["severity"]
             if len(slot["conflicts"]) < max_per_element:
                 slot["conflicts"].append(
                     {"with_element_id": other, "with_label": other_lab,
                      "severity": r["severity"], "text": r["text"],
+                     "evidence_state": r["evidence_state"],
+                     "impact_severity": r["impact_severity"],
+                     "actionability": r["actionability"],
+                     "verification_required": r["verification_required"],
                      "finding_id": r["finding_id"], "status": r["status"]})
     elements = sorted(by_el.values(),
                       key=lambda e: (order.get(e["worst_severity"], 9),
@@ -186,19 +353,39 @@ def build_review(report: dict, *, top: int = 50, max_per_element: int = 20,
     for e in elements:
         e["conflict_total"] = sum(e["counts"].values())
         e["counts"] = dict(e["counts"])
+        e["evidence_counts"] = dict(e["evidence_counts"])
+        e["actionability_counts"] = dict(e["actionability_counts"])
     elements_total = len(elements)
     if max_elements is not None and elements_total > max_elements:
         elements = elements[:max_elements]
 
     kinds = collections.Counter(r["pair_kind"] for r in rows)
     sev = collections.Counter(r["severity"] for r in rows)
-    dup = kinds.get("coincident_duplicate", 0)
-    overlaps = sum(1 for r in rows
+    duplicate_candidates = kinds.get("coincident_duplicate", 0)
+    confirmed_duplicates = sum(
+        1 for r in rows if r["duplicate_equality_proven"]
+        and r["evidence_state"] == "confirmed")
+    possible_duplicates = duplicate_candidates - confirmed_duplicates
+    overlaps_confirmed = sum(1 for r in rows
                    if r["pair_kind"] == "interference"
-                   and r["hull_relation"] == "overlap")
-    touches = sum(1 for r in rows if r["hull_relation"] == "contact")
+                   and r["hull_relation"] == "overlap"
+                   and r["evidence_state"] == "confirmed")
+    overlaps_possible = sum(1 for r in rows
+                   if r["pair_kind"] == "interference"
+                   and r["hull_relation"] == "overlap"
+                   and r["evidence_state"] == "possible")
+    touches_confirmed = sum(1 for r in rows
+        if r["hull_relation"] == "contact"
+        and r["evidence_state"] == "confirmed")
+    touches_possible = sum(1 for r in rows
+        if r["hull_relation"] == "contact"
+        and r["evidence_state"] == "possible")
+    evidence_counts = collections.Counter(r["evidence_state"] for r in rows)
+    impact_counts = collections.Counter(r["impact_severity"] for r in rows)
+    action_counts = collections.Counter(r["actionability"] for r in rows)
     org = report.get("origin") or {}
-    comp = (report.get("search") or {}).get("completeness") or {}
+    search_complete, search_contract_valid, search_note = _search_completeness(
+        report)
     return {
         "schema_version": REVIEW_SCHEMA,
         "derived_from": {"schema": report.get("schema_version"),
@@ -207,25 +394,47 @@ def build_review(report: dict, *, top: int = 50, max_per_element: int = 20,
                          "revision": (org.get("revision") or {}).get("fingerprint")},
         "summary": {
             "total": len(rows),
-            "duplicates": dup,
-            # Тот же закон, что и в `phrase`: над счётчиком, куда попадают и
-            # недоказанные пары, не смеет стоять одно разрушительное указание.
-            "duplicates_hint": ("совпали геометрией — чинится удалением одного "
-                                "из пары; совпали только габаритами — сначала "
-                                "сверить в модели"),
-            "overlaps": overlaps,
-            "overlaps_hint": "элементы входят друг в друга — нужна правка",
-            "touches": touches,
-            "touches_hint": "касание вплотную — часто законно, проверить глазами",
+            "confirmed": evidence_counts.get("confirmed", 0),
+            "possible": evidence_counts.get("possible", 0),
+            "duplicates": duplicate_candidates,
+            "duplicates_confirmed": confirmed_duplicates,
+            "duplicates_possible": possible_duplicates,
+            "duplicates_geometry_confirmed": confirmed_duplicates,
+            "duplicates_delete_safe": sum(
+                1 for row in rows
+                if row["pair_kind"] == "coincident_duplicate"
+                and row["deletion_safe"]),
+            "duplicates_hint": (
+                "sealed exact-body equality подтверждает геометрию, но не "
+                "семантическую взаимозаменяемость и не отсутствие зависимостей; "
+                "все кандидаты требуют проверки перед удалением"),
+            "overlaps": overlaps_confirmed + overlaps_possible,
+            "overlaps_confirmed": overlaps_confirmed,
+            "overlaps_possible": overlaps_possible,
+            "overlaps_hint": (
+                "confirmed можно исправлять; possible означает лишь "
+                "перекрытие внешних оболочек и требует проверки"),
+            "touches": touches_confirmed + touches_possible,
+            "touches_confirmed": touches_confirmed,
+            "touches_possible": touches_possible,
+            "touches_hint": (
+                "контакт не является автоматическим дефектом; проверить узел"),
             "by_severity": {s: sev.get(s, 0) for s in SEVERITY_ORDER},
+            "by_evidence_state": {
+                state: evidence_counts.get(state, 0)
+                for state in EVIDENCE_STATES},
+            "by_impact_severity": {
+                state: impact_counts.get(state, 0)
+                for state in IMPACT_SEVERITIES},
+            "by_actionability": {
+                state: action_counts.get(state, 0)
+                for state in ACTIONABILITY_STATES},
             "elements_involved": elements_total,
             "elements_truncated_to": (
                 len(elements) if len(elements) != elements_total else None),
-            "search_complete": comp.get("complete", True),
-            "search_incomplete_note": (
-                None if comp.get("complete", True) else
-                f"ВНИМАНИЕ: {comp.get('without_hull_on_mvp_side', 0)} элементов "
-                f"не участвовали в проверке — список неполон"),
+            "search_complete": search_complete,
+            "search_completeness_contract_valid": search_contract_valid,
+            "search_incomplete_note": search_note,
         },
         "severity_rule": SEVERITY_RULE,
         "status_vocabulary": ["open", "discussed", "dismissed", "fixed"],
@@ -241,19 +450,25 @@ def to_markdown(review: dict, *, top: int = 10) -> str:
         out += [f"> **{s['search_incomplete_note']}**", ""]
     out += [
         f"Всего замечаний: **{s['total']}** по {s['elements_involved']} элементам.",
+        f"Доказано: **{s['confirmed']}**; требует проверки: **{s['possible']}**.",
         "",
-        "| род | сколько | что с этим делать |",
-        "|---|---|---|",
-        f"| дубликаты | {s['duplicates']} | {s['duplicates_hint']} |",
-        f"| пересечения | {s['overlaps']} | {s['overlaps_hint']} |",
-        f"| касания | {s['touches']} | {s['touches_hint']} |",
+        "| род | confirmed | possible | что с этим делать |",
+        "|---|---:|---:|---|",
+        f"| дубликаты | {s['duplicates_confirmed']} | "
+        f"{s['duplicates_possible']} | {s['duplicates_hint']} |",
+        f"| пересечения | {s['overlaps_confirmed']} | "
+        f"{s['overlaps_possible']} | {s['overlaps_hint']} |",
+        f"| касания | {s['touches_confirmed']} | "
+        f"{s['touches_possible']} | {s['touches_hint']} |",
         "",
         "По серьёзности: " + ", ".join(
             f"{k} — {v}" for k, v in s["by_severity"].items() if v),
         "", f"## Первые {top} по серьёзности", "",
     ]
     for i, r in enumerate(review["top_findings"][:top], 1):
-        out.append(f"{i}. **[{r['severity']}]** {r['text']}")
+        out.append(
+            f"{i}. **[{r['severity']}; {r['evidence_state']}; "
+            f"{r['actionability']}]** {r['text']}")
     out += ["", "## Элементы с наибольшим числом замечаний", "",
             "| элемент | класс | замечаний | худшее |", "|---|---|---|---|"]
     for e in review["elements"][:top]:

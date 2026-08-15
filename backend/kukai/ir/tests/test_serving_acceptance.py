@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -13,6 +14,7 @@ import pytest
 from kukai.ir import serving
 from kukai.ir.tests.acceptance_fakes import PassingAcceptanceBridge
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT
+from kukai.llm.turn_context import kir_mode_active, publish_kir_mode
 
 
 L1 = "Этаж 1"
@@ -31,13 +33,23 @@ PROGRAM = {
 
 @pytest.fixture
 def live_door(tmp_path: Path, monkeypatch):
+    # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08, `61e276bb`): режим КИР ставится ЯВНО и
+    # возвращается НАБЛЮДЁННЫМ. Здесь это фикстура, а не `enter_kir_mode`:
+    # помощник берёт `unittest.TestCase` и его `addCleanup`, которых у
+    # pytest-теста нет. Форма разная, правило одно — путь открывают все три
+    # условия, и предусловие теста не должно держаться на молчании гейта.
+    observed = kir_mode_active()
+    publish_kir_mode(True)
     monkeypatch.setenv("KUKAI_KIR_TOOL", "stage2")
     monkeypatch.setenv("KIR_ACCEPTANCE_EVIDENCE_DIR", str(tmp_path))
     client = mock.Mock()
     client._revit_version = "2026"
-    with mock.patch.object(
-            serving, "_turn_device_id", return_value=serving.ADMIN_DEVICE):
-        yield client, tmp_path
+    try:
+        with mock.patch.object(
+                serving, "_turn_device_id", return_value=serving.ADMIN_DEVICE):
+            yield client, tmp_path
+    finally:
+        publish_kir_mode(observed)
 
 
 def _run_with(
@@ -113,9 +125,18 @@ def test_exact_live_delta_is_the_only_green_regular_write(live_door):
     assert result["acceptance"]["state"] == "accepted"
     assert result["acceptance"]["journal"]["durable"] is True
     assert len(result["acceptance"]["evidence_digest"]) == 64
+    assert len(result["acceptance"][
+        "execution_artifact_binding_digest"]) == 64
+    assert result["acceptance"]["execution_artifact"][
+        "source_byte_length"] > 0
     journals = list(evidence_root.glob("*.jsonl"))
     assert len(journals) == 1
-    assert journals[0].read_text(encoding="utf-8").count("\n") == 2
+    rows = [json.loads(row) for row in journals[0].read_text(
+        encoding="utf-8").splitlines()]
+    assert [row["event"] for row in rows] == [
+        "prepared", "artifact_bound", "finalized"]
+    assert rows[1]["binding_digest"] == result["acceptance"][
+        "execution_artifact_binding_digest"]
 
 
 @pytest.mark.parametrize(("mutate", "mismatch"), [
@@ -164,7 +185,9 @@ def test_invalid_post_read_never_turns_commit_green(live_door):
     assert result["outcome"]["acceptance"] == "inconclusive"
     assert result["diagnostics"][0]["code"] == "KIR-A007"
     journal = next(evidence_root.glob("*.jsonl"))
-    assert journal.read_text(encoding="utf-8").count("\n") == 2
+    assert [json.loads(row)["event"] for row in journal.read_text(
+        encoding="utf-8").splitlines()] == [
+            "prepared", "artifact_bound", "finalized"]
 
 
 def test_unexpected_post_commit_bug_cannot_forget_a_confirmed_effect(
@@ -290,6 +313,11 @@ def test_mutation_baseline_is_embedded_as_transaction_identity_guard(live_door):
     assert "VersionGuid" in seen[0]
     # Guarded both before opening the transaction and again inside it.
     assert seen[0].count("kir-model-binding-guard/1") >= 2
+    from kukai.llm.revit_execution_pipeline import wrap_user_code
+    wrapped = wrap_user_code(seen[0]).encode("utf-8")
+    artifact = result["acceptance"]["execution_artifact"]
+    assert artifact["source_byte_length"] == len(wrapped)
+    assert artifact["source_sha256"] == hashlib.sha256(wrapped).hexdigest()
 
 
 def test_change_type_guards_both_target_and_desired_type(live_door):

@@ -841,6 +841,7 @@ PROGRAMS = {
                                             "in_emit": "__doc_default__"}}},
                  {"op": "place_family", "id": "F1", "xyz": [31000, 24000, 0],
                   "rotation_deg": 90.0, "mirrored": True,
+                  "hand_flipped": True, "facing_flipped": False,
                   "level": {"__grounded__": {"id": 42, "name": None,
                                              "via": "element_id"}},
                   "symbol": {"__grounded__": {"id": 555, "name": "Стул",
@@ -974,6 +975,20 @@ PROGRAMS = {
              "profile_mm": [[0, 4000], [8000, 4000]],
              "level": LVL_ID, "type": {"by": "element_id", "value": 771},
              "start_mm": -3000, "end_mm": 9000},
+        ]},
+    # МНОГОЭТАЖНЫЙ МАРШ ВЫНЕСЕН В СВОЮ ПРОГРАММУ 12.08.2026, И ЭТО НЕ
+    # КОСМЕТИКА. У него появился типизированный отказ ниже 2025 (весь API
+    # `MultistoryStairs` типизирован `ISet<ElementId>`, а развёрнутый плагин
+    # на net48 не связывает `System.dll` — см. datum_emit.emit_multistory_
+    # stairs). `__min_ver__` — свойство ПРОГРАММЫ, поэтому оставить марш в
+    # общей программе значило бы поднять её границу до 2025 ЦЕЛИКОМ и увести
+    # цепь осей с выдавленной кровлей из-под проверки на четырёх версиях —
+    # покрытие, потерянное молча ради чужой границы. Две программы вместо
+    # одной сохраняют обе: датумы проверяются 6/6, марш — там, где законен.
+    "datums_multistory_only": {
+        "ir_version": "1.0", "intent": "многоэтажная лестница",
+        "__min_ver__": "2025",
+        "ops": [
             {"op": "create_multistory_stairs", "id": "MS1",
              "stairs": {"by": "element_id", "value": 8145901},
              "levels": [LVL, {"by": "element_id", "value": 43}]},

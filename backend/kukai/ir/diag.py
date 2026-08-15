@@ -40,6 +40,7 @@ PLAN_SOLO_OP = "KIR-L002"            # op requires its own program (own transact
 # политики bulk. Отсюда L006, и он ЦЕНТРАЛЬНЫЙ, а не литерал: правил формы фазы
 # сразу семь, и семь литералов разъехались бы на первой правке.
 PLAN_PHASE_SHAPE = "KIR-L006"        # phase(): shape of the phase plan inside one script
+PLAN_OP_CONTRACT = "KIR-L007"        # write op lacks a complete canonical lowering contract
 EMIT_VERSION = "KIR-E001"            # op unsupported on a requested Revit version
 # ОДНА МЫСЛЬ — ОДНА КОНСТАНТА (10.08.2026). Два кода ниже жили РАЗМНОЖЕННЫМИ
 # по эмиттерам: `KIR-E007` объявляли ЧЕТЫРЕ модуля (site/sweep/opening/mass),

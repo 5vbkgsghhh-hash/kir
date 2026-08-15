@@ -611,3 +611,45 @@ class LiveSnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoincidentWallsAreFoundOnTheProgramPathToo(unittest.TestCase):
+    """`COINCIDENT_WALLS` выставлялся РОВНО в одном месте — по разобранному
+    зданию. Программа, объявившая две стены с одними и теми же концами, не
+    помечалась ничем.
+
+    Тот же перекос входа, что был у замкнутости: способность есть на одном
+    источнике и отсутствует на другом. А дубль стены — дефект АВТОРСКИЙ: его
+    чинит тот, кто пишет программу, и узнать о нём он обязан ДО того, как это
+    станет двумя стенами в модели.
+    """
+
+    _LVL = {"by": "ref", "value": "L1"}
+    _LEVEL = {"op": "create_level", "id": "L1", "elev_mm": 0.0, "name": "Этаж 1"}
+
+    def _wall(self, oid, p0, p1):
+        return {"op": "create_wall", "id": oid, "level": self._LVL,
+                "height_mm": 3000.0, "p0_mm": list(p0), "p1_mm": list(p1)}
+
+    def _flagged(self, ops):
+        preview = P.build_program_preview(
+            {"ir_version": "1.0", "intent": "проба", "ops": [self._LEVEL] + ops})
+        return {element.element_id
+                for plan in preview.plans for element in plan.elements
+                if P.AnomalyReason.COINCIDENT_WALLS in element.anomalies}
+
+    def test_two_walls_with_the_same_ends_are_both_flagged(self):
+        assert self._flagged([self._wall("d1", (0, 0), (6000, 0)),
+                              self._wall("d2", (0, 0), (6000, 0))]) == {"d1", "d2"}
+
+    def test_the_same_ends_reversed_are_still_the_same_wall(self):
+        """Личность стены не зависит от порядка концов — иначе автор обходил бы
+        находку, поменяв местами две точки."""
+        assert self._flagged([self._wall("r1", (0, 0), (6000, 0)),
+                              self._wall("r2", (6000, 0), (0, 0))]) == {"r1", "r2"}
+
+    def test_two_genuinely_different_walls_are_left_alone(self):
+        """КОНТРОЛЬ. Без него прибор, помечающий ВСЁ, был бы зелен на первых
+        двух проверках и не измерял бы ничего."""
+        assert self._flagged([self._wall("u1", (0, 0), (6000, 0)),
+                              self._wall("u2", (0, 2000), (6000, 2000))]) == set()

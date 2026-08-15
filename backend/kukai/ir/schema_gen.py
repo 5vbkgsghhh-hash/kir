@@ -403,6 +403,21 @@ def _op_schema(op: spec.OpSpec) -> dict:
                  "properties": {"value": {"type": "number"},
                                 "unit": {"type": "string", "enum": ["mm", "raw"]}},
                  "required": ["value", "unit"], "additionalProperties": False},
+                # ССЫЛКА: `{"material": "<имя>"}`. Схема обязана НЕ УЖЕ
+                # валидатора — иначе программа, законная для компилятора,
+                # отвергалась бы на входе, и причина приходила бы не оттуда.
+                {"type": "object",
+                 "properties": {"material": {"type": "string", "minLength": 1,
+                                             "maxLength": 1000}},
+                 "required": ["material"], "additionalProperties": False},
+                {"type": "object",
+                 "properties": {"phase": {"type": "string", "minLength": 1,
+                                          "maxLength": 1000}},
+                 "required": ["phase"], "additionalProperties": False},
+                {"type": "object",
+                 "properties": {"workset": {"type": "string", "minLength": 1,
+                                            "maxLength": 1000}},
+                 "required": ["workset"], "additionalProperties": False},
             ]}
         elif p.kind == "str":
             # cap defaults to 64 (every pre-existing str param leaves max_val

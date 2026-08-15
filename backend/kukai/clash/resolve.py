@@ -17,7 +17,7 @@
 
   ЧИСЛО         — элемент, направление, расстояние, законность. Есть всегда,
                   когда геометрия его даёт, независимо от классов сторон.
-  РЕКОМЕНДАЦИЯ  — `move` | `review` | `delete_duplicate` | `assembly_relation`.
+  РЕКОМЕНДАЦИЯ  — `move` | `review` | `verify_duplicate` | `assembly_relation`.
                   Говорит, что с числом делать, и никогда не притворяется
                   сильнее, чем данные позволяют.
 
@@ -112,7 +112,7 @@ __all__ = (
     "to_russian",
 )
 
-RESOLVE_SCHEMA = "kir-clash-resolution/1"
+RESOLVE_SCHEMA = "kir-clash-resolution/2"
 
 #: Что делать с числом. Закрытый список: рекомендация вне его — та самая
 #: неподписанная ось, ради которой всё это писалось.
@@ -120,8 +120,9 @@ RECOMMENDATIONS: dict[str, str] = {
     "move": "исполняйте: сторона, которая уступает, определена порядком сборки",
     "review": "решает человек: обе стороны — конструкция, и её положение "
               "назначено расчётом, а не этим отчётом",
-    "delete_duplicate": "два элемента на одном месте: чинится удалением "
-                        "лишнего, а не раздвиганием",
+    "verify_duplicate": "геометрия похожа на дубликат, но удаление запрещено "
+                        "до отдельного доказательства семантической и "
+                        "dependency-эквивалентности",
     "assembly_relation": "это УЗЕЛ, а не ошибка: дверь в стене, панель в "
                          "витраже. Число дано для проверки, ход не назначается",
 }
@@ -218,7 +219,12 @@ def _order(a: H.HullRecord, b: H.HullRecord) -> tuple[H.HullRecord, H.HullRecord
 
 def _recommendation(a: H.HullRecord, b: H.HullRecord, pair_kind: str) -> str:
     if pair_kind == "coincident_duplicate":
-        return "delete_duplicate"
+        # Geometry answers only whether the occupied bodies coincide.  It says
+        # nothing about phases, design options, systems, groups, ownership or
+        # dependants.  Those are exactly the facts that decide whether either
+        # BIM element may be deleted.  Keep the duplicate class visible, but
+        # never mint a destructive recommendation from this geometry-only API.
+        return "verify_duplicate"
     if frozenset({a.label or "", b.label or ""}) in ASSEMBLY_PAIRS:
         return "assembly_relation"
     ca, _, _ = mobility_of(a)
@@ -735,7 +741,7 @@ AXIS_NAME = {(1, 0, 0): "по +X", (-1, 0, 0): "по −X", (0, 1, 0): "по +Y"
              (0, -1, 0): "по −Y", (0, 0, 1): "вверх", (0, 0, -1): "вниз"}
 
 _VERB = {"move": "сдвиньте", "review": "чтобы развести, нужно сдвинуть",
-         "delete_duplicate": "дубликат; геометрически развело бы",
+         "verify_duplicate": "возможный дубликат; для проверки геометрически развело бы",
          "assembly_relation": "узел; геометрически развело бы"}
 
 

@@ -83,7 +83,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from kukai.live import journal as _journal
 
@@ -282,10 +282,49 @@ def judge(key: _journal.SessionKey, *,
                                 "message_ru": f"{_preamble(head)}\n"
                                               f"ВЕРДИКТ О ЗДАНИИ НЕДОСТУПЕН: "
                                               f"{exc}"}, clash)
-        return _with_clash({**head, **_describe(report, head, _verdict)}, clash)
+        block = _with_clash({**head, **_describe(report, head, _verdict)}, clash)
+        return _with_assembly(block, report, pack)
     except Exception:  # noqa: BLE001 — АБСОЛЮТНЫЙ fail-open, см. шапку
         logger.debug("building verdict failed (fail-open)", exc_info=True)
         return None
+
+
+def _with_assembly(block: dict[str, Any], report: Any,
+                   pack: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Дописать в блок СВОДКУ О СБОРКЕ — из УЖЕ ПОСЧИТАННОГО вердикта.
+
+    ЗАЧЕМ ЗДЕСЬ, А НЕ ОТДЕЛЬНЫМ ВЫЗОВОМ. Судья уже позван строкой выше, и его
+    объект существует. Позвать `check_bundle` второй раз ради сводки значило бы
+    завести ДВА СУЖДЕНИЯ ОБ ОДНОМ, оплатить их дважды и получить два ответа,
+    которым нечем совпадать.
+
+    ЧТО ДОБАВЛЯЕТСЯ И ПОЧЕМУ ДВА КЛЮЧА, А НЕ ОДИН:
+      `assembly`      структура — её читает модель В ПРЕДЕЛАХ ХОДА;
+      `assembly_note` плоская строка — она единственная ПЕРЕЖИВАЕТ сворачивание
+                      истории (`chat_helpers._summarize_tool_result` заменяет
+                      каждый словарь и список на «свёрнуто», оставляя скаляры).
+
+    Прозу блока (`message_ru`) НЕ ТРОГАЕТ: она для человека, сводка для модели.
+    Отказ сводки не имеет права уронить вердикт — она младше него.
+    """
+    try:
+        from kukai.ir import assembly_view as _av
+
+        ops: list[Mapping[str, Any]] = []
+        for entry in pack:
+            ops.extend(op for op in (entry.get("ops") or ())
+                       if isinstance(op, Mapping))
+        walls = [str(op.get("id")) for op in ops
+                 if op.get("op") == "create_wall" and op.get("id") is not None]
+        # ПАЧКА ПЕРЕДАЁТСЯ ЦЕЛИКОМ: второй источник (`preview`) читает
+        # ПРОГРАММУ, а не вердикт, и без неё сводка отвечала бы одинаково на
+        # здоровую стену и на дубль — замерено 15.08 на трёх программах.
+        view = _av.observe_verdict(report, walls, programs=list(pack))
+        block["assembly"] = view.to_dict()
+        block["assembly_note"] = _av.digest(view)
+    except Exception:  # noqa: BLE001 — сводка младше вердикта и не роняет его
+        logger.debug("assembly view stamping failed", exc_info=True)
+    return block
 
 
 def _new_from(entry: Any, since_seq: int | None) -> int | None:
@@ -394,16 +433,39 @@ def _clash_block(pack: list[dict[str, Any]],
 
 def _with_clash(block: dict[str, Any],
                 clash: dict[str, Any] | None) -> dict[str, Any]:
-    """Приклеить находки к квитанции. ОТСУТСТВУЮЩЕЕ ОСТАЁТСЯ ОТСУТСТВУЮЩИМ:
-    при выключенном флаге возвращается ТОТ ЖЕ объект, ни одного нового ключа и
-    ни одного нового байта в тексте."""
-    if not clash:
-        return block
+    """Приклеить находки к квитанции и НАЗВАТЬ РАЗМЕР ПОЛЯ — всегда.
+
+    ОТСУТСТВУЮЩЕЕ ОСТАЁТСЯ ОТСУТСТВУЮЩИМ в том, что касается НАХОДОК: при
+    выключенном флаге нет ключа `clash` и нет ни одного нового байта в тексте.
+
+    А `receipt_chars` едет при обоих положениях флага, и это исправление
+    (13.08.2026). Он был внутри ветки «клеш есть», и тогда прибор отвечал
+    лишь в одной из двух конфигураций — прибор на часть диапазона, который
+    у нас опаснее отсутствующего: читатель, не нашедший ключа, не отличает
+    «поле пустое» от «мерить было некому».
+
+    ОСНОВАНИЕ ИМЕННО ТАКОЕ, и НЕ то, которое напрашивается. Напрашивается
+    «иначе размер растёт молча при выключенном клеше» — это неверно и
+    проверяется на месте: вердиктная половина ограничена `_VERDICT_TEXT_CAP`
+    и режется С ОБЪЯВЛЕНИЕМ реза в самом тексте (см. ниже по файлу). Молча
+    не растёт ничего. Довод не в бесконтрольности, а в ПОКРЫТИИ: поле
+    `message_ru` есть в КАЖДОЙ квитанции, значит и число о нём обязано быть
+    в каждой.
+
+    ЧТО ЭТО СТОИТ ПРОВЕРКЕ НЕИЗМЕННОСТИ. Ключевое множество не поехало:
+    `set(включено) - set(выключено)` по-прежнему ровно `{"clash"}`. Но
+    поштучная сверка полей обязана исключить `receipt_chars` — ровно там же,
+    где она исключает `message_ru`, и по той же причине: это ФУНКЦИЯ от
+    текста, а текст дописывается намеренно. Сверять производную, исключив
+    оригинал, значило бы проверять то же самое под другим именем.
+    """
     out = dict(block)
-    out["clash"] = clash
-    text = str(clash.get("message_ru") or "")
-    if text:
-        out["message_ru"] = f"{block.get('message_ru') or ''}\n\n{text}".strip()
+    if clash:
+        out["clash"] = clash
+        text = str(clash.get("message_ru") or "")
+        if text:
+            out["message_ru"] = (
+                f"{block.get('message_ru') or ''}\n\n{text}".strip())
     # СУММА — ЧИСЛОМ И В САМОМ ОТВЕТЕ. Поле несёт ДВЕ половины с двумя
     # потолками, и до этой волны его собственный размер не знал никто: обе
     # половины проверяли себя, а ПОЛЕ не проверял никто. Величина, которую

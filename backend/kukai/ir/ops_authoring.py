@@ -9,7 +9,31 @@ from kukai.ir.registry_base import *  # noqa: F401,F403 (OpSpec/ParamSpec/DEFAUL
 #: ``create_wall.location_line`` spelled out <-> Revit's ``WallLocationLine``
 #: ordinals, which is what ``WALL_KEY_REF_PARAM`` stores.  ONE table, shared by
 #: the emitter (word -> ordinal) and the lift (ordinal -> word), so the two
-#: directions cannot drift apart.  Order is Revit's, and the tests pin it.
+#: directions cannot drift apart.
+#:
+#: ЧТО ЭТУ ТАБЛИЦУ ПИННИТ, А ЧТО НЕТ — замерено 2026-08-12, потому что строка,
+#: стоявшая здесь ("Order is Revit's, and the tests pin it"), обещала шире
+#: сделанного.  Тесты пиннят ПОРЯДОК ЗНАЧЕНИЙ (`list(values()) == [0..5]`),
+#: длину, членство имён и инъективность — и НИКОГДА ПАРУ имя-ординал.
+#: Переставь две пары, оставив значения 0..5 по порядку, и не заметит НИЧТО:
+#: полный набор побайтно неподвижен (7 failed / 6140 passed / 7750 subtests
+#: до и после), ворота Roslyn 6/6 (1872 compiled), 0 из 57 голденов несут
+#: ``WALL_KEY_REF_PARAM``.  Правка, которой это случится на практике, — не
+#: диверсия, а АЛФАВИТНАЯ СОРТИРОВКА КЛЮЧЕЙ: обычная уборка, ломает четыре
+#: пары из шести, все сторожа зелёные.
+#:
+#: ПРИЧИНА СТРУКТУРНАЯ, А НЕ «НЕ НАПИСАЛИ ТЕСТ».  Эмиттер пишет
+#: ``ORDINALS[name]`` (``authoring.py:557``), свидетель сверяет
+#: ``ORDINALS[name]`` (``authoring.py:725``) — оба конца берут число ОТСЮДА,
+#: сойтись их заставляет общий источник, и свидетель не может возразить
+#: таблице.  Пара имя-ординал — внешний факт о Revit, поэтому пиннить её
+#: способен только авторитет ВНЕ этого репозитория: сборки RevitAPI, где
+#: дубликат метки ``case`` даёт ``CS0152``, то есть программа обязана НЕ
+#: компилироваться ровно тогда, когда пара верна.  Такая стадия ворот
+#: написана на ветке ``fix/kir-gate-binding-guard-accounting`` (``3003c388``)
+#: и В ЭТОМ ДЕРЕВЕ ЕЁ НЕТ — проверь, что она здесь, прежде чем считать пару
+#: защищённой.  Пока её нет, таблица верна (36/36 пар подтверждены Autodesk
+#: на шести версиях 12.08), но НЕ ЗАЩИЩЕНА.
 WALL_LOCATION_LINE_ORDINALS = {
     "wall_centerline": 0,
     "core_centerline": 1,
@@ -132,6 +156,45 @@ OPS = [
                     # умолчание у заливки есть, но выбирать штриховку
                     # умолчанием — то же самое, что выбирать её жребием.
                     "filled_region_types",
+                    # ═══ 12.08.2026: ВОСЕМЬ ПУЛОВ, В КОТОРЫЕ КОМПИЛЯТОР УМЕЛ
+                    # ПИСАТЬ, НЕ УМЕЯ ЧИТАТЬ. Множество взято у РЕЕСТРА, а не
+                    # у списка задач: `OpSpec.grounded` по ВСЕМ опам минус эти
+                    # choices. Прежний замер называл ШЕСТЬ — он выводился из
+                    # нужд тридцати НЕПРОВЕРЕННЫХ опов, а `create_ceiling` и
+                    # `create_railing` давно проверены и потому в тот срез не
+                    # попали. Ответ по части множества опять оказался меньше
+                    # ответа по всему множеству.
+                    #
+                    # ЧТО ЭТО СТОИЛО ДАННЫХ: НИЧЕГО. Все восемь пулов снимок
+                    # УЖЕ собирает (`open_model.__profile_required_pools`, 36
+                    # имён), и коллектор каждого уже написан там же. Разошлась
+                    # ровно эта таблица — читающее перечисление вели рукой
+                    # против пишущей стороны, которую ведёт реестр.
+                    #
+                    # РАЗМЕР ОТВЕТА ЗАМЕРЕН ДО РАСШИРЕНИЯ, а не предположен:
+                    # 69 сохранённых профилей корпуса, `total_count` каждого
+                    # пула. `ceiling_types` максимум 8 (медиана 3),
+                    # `railing_types` максимум 22 (медиана 6), усечений по
+                    # всему корпусу НИ ОДНОГО. Самый большой пул вообще —
+                    # `family_symbols` 741, и он читаем давно: потолок канала
+                    # эти восемь не двигают. Проверка не формальная: канал
+                    # ОТВЕТА — второй такой же канал, что и печать контракта,
+                    # а резак, режущий МНОЖЕСТВО по длине, отдал бы модели
+                    # список, читаемый как полный, из которого делается выбор.
+                    #
+                    # ШЕСТЬ ИЗ ВОСЬМИ ОФЛАЙН НЕ ЗАМЕРИТЬ, И ЭТО НАЗВАНО:
+                    # `toposolid_types`, `building_pad_types`,
+                    # `wall_foundation_types`, `area_reinforcement_types`,
+                    # `rebar_bar_types`, `rebar_hook_types` попали в снимок
+                    # 09–10.08 (`cea112cc`, `2a84ede1`, `1f39658a`), а самый
+                    # новый профиль корпуса — 04.08. НИ ОДИН сохранённый
+                    # профиль не мог их нести; их размер закрывает первое же
+                    # живое чтение, а не правка кода. Тот же порядок, что у
+                    # `dimension_extract`.
+                    "ceiling_types", "railing_types", "toposolid_types",
+                    "building_pad_types", "wall_foundation_types",
+                    "area_reinforcement_types", "rebar_bar_types",
+                    "rebar_hook_types",
                 )),
             ),
             capability=(("list", "category"), ("list", "element")),
@@ -696,7 +759,7 @@ OPS = [
                           ref_kinds=(ReferenceKind.LEVEL,)),
                 ParamSpec("category", "enum", default="structural",
                           choices=("structural", "architectural")),
-                ParamSpec("symbol", "sel"),        # omitted -> sole snapshot entry, else AMBIGUOUS
+                ParamSpec("symbol", "sel", ref_kinds=(ReferenceKind.FAMILY_SYMBOL,)),        # omitted -> sole snapshot entry, else AMBIGUOUS
                 ParamSpec("rotation_deg", "deg", default=0.0),
                 # top_xy — the column's TOP plan position.  Present and the
                 # column is SLANTED: Revit models that as a location CURVE
@@ -748,7 +811,7 @@ OPS = [
                 # level, so an upper-storey window legitimately carries a
                 # multi-metre sill.
                 ParamSpec("sill_mm", "mm", default=900.0, min_val=0, max_val=100_000),
-                ParamSpec("symbol", "sel"),
+                ParamSpec("symbol", "sel", ref_kinds=(ReferenceKind.FAMILY_SYMBOL,)),
                 # audit F5: swing/mirror state.  Optional bools; an absent flag
                 # stays implicit (validate's bool rule: "default stays
                 # implicit"), so every pre-existing window program, hash and
@@ -789,7 +852,7 @@ OPS = [
                 # 92.7% of them into atoms.  Sign is not a defect signal — the
                 # witness checks the resulting LocationPoint (±10mm).
                 ParamSpec("sill_mm", "mm", min_val=-100_000, max_val=100_000),
-                ParamSpec("symbol", "sel"),
+                ParamSpec("symbol", "sel", ref_kinds=(ReferenceKind.FAMILY_SYMBOL,)),
                 # audit F5: дверь без створки — не та дверь.  Same optional
                 # bools as create_window/place_family; absent stays implicit
                 # (byte-stable pre-existing programs), the emitter enforces the
@@ -875,7 +938,7 @@ OPS = [
                           ref_kinds=(ReferenceKind.ELEMENT,)),
                 ParamSpec("level", "sel",
                           ref_kinds=(ReferenceKind.LEVEL,)),
-                ParamSpec("symbol", "sel"),        # omitted -> sole snapshot entry
+                ParamSpec("symbol", "sel", ref_kinds=(ReferenceKind.FAMILY_SYMBOL,)),        # omitted -> sole snapshot entry
                 ParamSpec("rotation_deg", "deg", default=0.0),
                 ParamSpec("mirrored", "bool", default=False),
                 ParamSpec("hand_flipped", "bool", default=False),

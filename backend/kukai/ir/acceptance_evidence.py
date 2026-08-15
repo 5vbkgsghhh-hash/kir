@@ -17,7 +17,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
 from kukai.ir import spec
 from kukai.ir.acceptance import (
@@ -38,14 +38,28 @@ from kukai.ir.contracts import DocumentFingerprint
 from kukai.ir.outcome import AcceptanceState
 
 
-ACCEPTANCE_REGISTRATION_SCHEMA_VERSION = "kir-acceptance-registration/1"
-ACCEPTANCE_EVIDENCE_SCHEMA_VERSION = "kir-acceptance-evidence/1"
+ACCEPTANCE_REGISTRATION_SCHEMA_VERSION = "kir-acceptance-registration/2"
+ACCEPTANCE_EVIDENCE_SCHEMA_VERSION = "kir-acceptance-evidence/2"
+EXECUTION_ARTIFACT_BINDING_SCHEMA_VERSION = "kir-execution-artifact-binding/1"
+REGULAR_WRITE_EXECUTION_LANE = "kir_regular_write"
+# Private in-process transport capability plus its JSON-safe public address.
+# The object itself must never cross the websocket; Bridge consumes it before
+# constructing the client message.  Keeping the digest beside it makes the
+# operation payload identity and telemetry independently address the same
+# durable journal row.
+EXECUTION_ARTIFACT_CAPABILITY_KEY = "_kir_execution_artifact_binding"
+EXECUTION_ARTIFACT_DIGEST_KEY = "_kir_execution_artifact_binding_digest"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _RUN_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
+_EXECUTION_LABEL_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
 
 
 class AcceptanceEvidenceError(ValueError):
     """Independent acceptance evidence is malformed or self-contradictory."""
+
+
+class ExecutionArtifactBindingError(AcceptanceEvidenceError):
+    """The executable bytes or their dispatch identity are not the bound ones."""
 
 
 class AcceptanceReason(str, Enum):
@@ -92,12 +106,245 @@ def _run_id(value: Any) -> str:
     return value
 
 
+def _execution_label(value: Any, field_name: str) -> str:
+    if (not isinstance(value, str)
+            or _EXECUTION_LABEL_RE.fullmatch(value) is None):
+        raise ExecutionArtifactBindingError(
+            f"{field_name} must be a canonical execution label")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionArtifactBinding:
+    """Content address of the exact wrapped C# authorized for one dispatch.
+
+    ``source_sha256`` and ``source_byte_length`` describe the UTF-8 bytes sent
+    in the Bridge ``code`` parameter, after the execution pipeline wrapper has
+    been applied.  The surrounding identity prevents a valid source digest
+    from being replayed for another acceptance run, Revit dialect or transport
+    lane.  This is a typed value; a bare caller-supplied digest is never write
+    authority.
+    """
+
+    run_id: str
+    revit_version: str
+    plan_digest: str
+    ground_digest: str
+    ground_context_digest: str
+    execution_lane: str
+    tool: str
+    op: str
+    source_sha256: str
+    source_byte_length: int
+
+    def __post_init__(self) -> None:
+        _run_id(self.run_id)
+        if self.revit_version not in spec.REVIT_VERSIONS:
+            raise ExecutionArtifactBindingError(
+                "execution artifact Revit version is outside the shipped matrix")
+        _sha256(self.plan_digest, "plan_digest")
+        _sha256(self.ground_digest, "ground_digest")
+        _sha256(self.ground_context_digest, "ground_context_digest")
+        _execution_label(self.execution_lane, "execution_lane")
+        _execution_label(self.tool, "tool")
+        _execution_label(self.op, "op")
+        _sha256(self.source_sha256, "source_sha256")
+        if (not isinstance(self.source_byte_length, int)
+                or isinstance(self.source_byte_length, bool)
+                or self.source_byte_length <= 0):
+            raise ExecutionArtifactBindingError(
+                "source_byte_length must be a positive integer")
+
+    @classmethod
+    def from_source(
+        cls,
+        source: str,
+        *,
+        run_id: str,
+        revit_version: str,
+        plan_digest: str,
+        ground_digest: str,
+        ground_context_digest: str,
+        execution_lane: str,
+        tool: str,
+        op: str,
+    ) -> "ExecutionArtifactBinding":
+        if not isinstance(source, str):
+            raise ExecutionArtifactBindingError(
+                "execution artifact source must be text")
+        try:
+            source_bytes = source.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ExecutionArtifactBindingError(
+                "execution artifact source is not valid UTF-8 text") from exc
+        return cls(
+            run_id=run_id,
+            revit_version=revit_version,
+            plan_digest=plan_digest,
+            ground_digest=ground_digest,
+            ground_context_digest=ground_context_digest,
+            execution_lane=execution_lane,
+            tool=tool,
+            op=op,
+            source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+            source_byte_length=len(source_bytes),
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "ExecutionArtifactBinding":
+        if not isinstance(value, Mapping) or not all(
+                isinstance(key, str) for key in value):
+            raise ExecutionArtifactBindingError(
+                "execution artifact binding must be an object")
+        expected = {
+            "schema_version", "run_id", "revit_version", "plan_digest",
+            "ground_digest", "ground_context_digest", "execution_lane",
+            "tool", "op", "source_encoding", "source_sha256",
+            "source_byte_length", "binding_digest",
+        }
+        if set(value) != expected:
+            raise ExecutionArtifactBindingError(
+                "execution artifact binding has unknown or missing fields")
+        if value.get("schema_version") != (
+                EXECUTION_ARTIFACT_BINDING_SCHEMA_VERSION):
+            raise ExecutionArtifactBindingError(
+                "execution artifact binding schema is unsupported")
+        if value.get("source_encoding") != "utf-8":
+            raise ExecutionArtifactBindingError(
+                "execution artifact source encoding is unsupported")
+        binding = cls(
+            run_id=value.get("run_id"),
+            revit_version=value.get("revit_version"),
+            plan_digest=value.get("plan_digest"),
+            ground_digest=value.get("ground_digest"),
+            ground_context_digest=value.get("ground_context_digest"),
+            execution_lane=value.get("execution_lane"),
+            tool=value.get("tool"),
+            op=value.get("op"),
+            source_sha256=value.get("source_sha256"),
+            source_byte_length=value.get("source_byte_length"),
+        )
+        if value.get("binding_digest") != binding.binding_digest:
+            raise ExecutionArtifactBindingError(
+                "execution artifact binding digest disagrees with payload")
+        return binding
+
+    def _unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": EXECUTION_ARTIFACT_BINDING_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "revit_version": self.revit_version,
+            "plan_digest": self.plan_digest,
+            "ground_digest": self.ground_digest,
+            "ground_context_digest": self.ground_context_digest,
+            "execution_lane": self.execution_lane,
+            "tool": self.tool,
+            "op": self.op,
+            "source_encoding": "utf-8",
+            "source_sha256": self.source_sha256,
+            "source_byte_length": self.source_byte_length,
+        }
+
+    @property
+    def binding_digest(self) -> str:
+        return _digest(self._unsigned_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self._unsigned_dict()
+        payload["binding_digest"] = self.binding_digest
+        return payload
+
+    def require_exact(
+        self,
+        source: str,
+        *,
+        run_id: str,
+        revit_version: str,
+        plan_digest: str,
+        ground_digest: str,
+        ground_context_digest: str,
+        execution_lane: str,
+        tool: str,
+        op: str,
+    ) -> None:
+        """Сверить связывание с НЕЗАВИСИМЫМ источником всех его полей.
+
+        Полная форма существует ради `acceptance_runtime`, где независимый
+        источник действительно есть: там все пять величин приходят из
+        ФСИНКНУТОЙ регистрации (`self.registration.*`), а не из проверяемого
+        объекта, и сравнение доказывает, что артефакт не подменили после
+        записи в журнал. НЕ сужать эту сигнатуру: сужение удалило бы ту
+        единственную сверку, ради которой она и написана.
+
+        У транспортной границы независимого источника этих полей НЕТ —
+        связывание там единственный их носитель. Ей адресован
+        :meth:`require_transport_exact`, чья сигнатура называет ровно то, что
+        та граница может проверить сама.
+        """
+        candidate = type(self).from_source(
+            source,
+            run_id=run_id,
+            revit_version=revit_version,
+            plan_digest=plan_digest,
+            ground_digest=ground_digest,
+            ground_context_digest=ground_context_digest,
+            execution_lane=execution_lane,
+            tool=tool,
+            op=op,
+        )
+        if candidate != self:
+            raise ExecutionArtifactBindingError(
+                "execution artifact or dispatch identity differs from binding")
+
+    def require_transport_exact(
+        self,
+        source: str,
+        *,
+        revit_version: str,
+        execution_lane: str,
+        tool: str,
+        op: str,
+    ) -> None:
+        """Сверка на транспортной границе: только то, что она знает сама.
+
+        ЗАВЕДЕНО 11.08.2026, ПОТОМУ ЧТО ПОЛНАЯ ФОРМА ЗДЕСЬ НЕ МОГЛА УПАСТЬ.
+        `bridge_protocol` звал :meth:`require_exact`, подавая `run_id`,
+        `plan_digest`, `ground_digest` и `ground_context_digest` ИЗ
+        ПРОВЕРЯЕМОГО ОБЪЕКТА (`raw.run_id=raw.run_id`): пять сравнений из
+        десяти были тождественны по построению, а сигнатура обещала читателю
+        независимую сверку десяти полей. Величина заявлялась в одном месте и
+        читалась в другом — в проверке, написанной против этого самого класса.
+
+        Что граница знает независимо, и что здесь единственно и проверяется:
+        сами байты `code`, версию Revit из контекста сессии и три константы
+        полосы, инструмента и операции. Подмена байтов после приёмки ловится
+        ровно этим — а подмена метаданных ловится раньше, в
+        `acceptance_runtime` против фсинкнутой регистрации.
+
+        Появится у границы независимый источник, скажем, `plan_digest` —
+        добавить его сюда осознанно, а не восстанавливать полную форму
+        потому, что она когда-то тут стояла.
+        """
+        self.require_exact(
+            source,
+            run_id=self.run_id,
+            revit_version=revit_version,
+            plan_digest=self.plan_digest,
+            ground_digest=self.ground_digest,
+            ground_context_digest=self.ground_context_digest,
+            execution_lane=execution_lane,
+            tool=tool,
+            op=op,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AcceptanceRegistration:
     """All predicates and baselines fsynced before a possible write."""
 
     run_id: str
     plan_digest: str
+    ground_digest: str
     revit_version: str
     expectation: Expectation
     mutation_expectation: MutationExpectation
@@ -105,10 +352,16 @@ class AcceptanceRegistration:
     categories: tuple[str, ...]
     before: ScopeCensusObservation | None
     mutation_before: MutationObservation | None
+    ground_context_digest: str | None = None
+    ground_context_execution_bound: bool = False
+    ground_context_authoritative: bool = False
+    ground_selector_resolution_replayed: bool = False
+    ground_derived_artifacts_verified: bool = False
 
     def __post_init__(self) -> None:
         _run_id(self.run_id)
         _sha256(self.plan_digest, "plan_digest")
+        _sha256(self.ground_digest, "ground_digest")
         if self.revit_version not in spec.REVIT_VERSIONS:
             raise AcceptanceEvidenceError(
                 "registration Revit version is outside the shipped matrix")
@@ -121,6 +374,29 @@ class AcceptanceRegistration:
         if not isinstance(self.document, DocumentFingerprint):
             raise AcceptanceEvidenceError(
                 "registration document must be typed")
+        if self.ground_context_digest is not None:
+            _sha256(self.ground_context_digest, "ground_context_digest")
+        if not isinstance(self.ground_context_execution_bound, bool):
+            raise AcceptanceEvidenceError(
+                "ground_context_execution_bound must be bool")
+        if not isinstance(self.ground_context_authoritative, bool):
+            raise AcceptanceEvidenceError(
+                "ground_context_authoritative must be bool")
+        if not isinstance(self.ground_selector_resolution_replayed, bool):
+            raise AcceptanceEvidenceError(
+                "ground_selector_resolution_replayed must be bool")
+        if not isinstance(self.ground_derived_artifacts_verified, bool):
+            raise AcceptanceEvidenceError(
+                "ground_derived_artifacts_verified must be bool")
+        if ((self.ground_context_execution_bound
+             or self.ground_context_authoritative)
+                and self.ground_context_digest is None):
+            raise AcceptanceEvidenceError(
+                "ground context authority needs a bound context digest")
+        if (self.ground_context_authoritative
+                and not self.ground_context_execution_bound):
+            raise AcceptanceEvidenceError(
+                "authoritative ground context must be execution-bound")
         expected_categories = expectation_categories(self.expectation)
         if self.categories != expected_categories:
             raise AcceptanceEvidenceError(
@@ -226,10 +502,11 @@ class AcceptanceRegistration:
         return _digest(self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": ACCEPTANCE_REGISTRATION_SCHEMA_VERSION,
             "run_id": self.run_id,
             "plan_digest": self.plan_digest,
+            "ground_digest": self.ground_digest,
             "revit_version": self.revit_version,
             "expectation_digest": self.expectation_digest,
             "expectation": self.expectation.to_dict(),
@@ -251,7 +528,18 @@ class AcceptanceRegistration:
                 self.mutation_before.observation_digest
                 if self.mutation_before is not None else None
             ),
+            "ground_selector_resolution_replayed": (
+                self.ground_selector_resolution_replayed),
+            "ground_derived_artifacts_verified": (
+                self.ground_derived_artifacts_verified),
         }
+        if self.ground_context_digest is not None:
+            payload["ground_context_digest"] = self.ground_context_digest
+            payload["ground_context_execution_bound"] = (
+                self.ground_context_execution_bound)
+            payload["ground_context_authoritative"] = (
+                self.ground_context_authoritative)
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +553,7 @@ class AcceptanceEvidence:
     verdict: Verdict | None = None
     mutation_after: MutationObservation | None = None
     mutation_verdict: MutationVerdict | None = None
+    execution_artifact_binding_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.registration, AcceptanceRegistration):
@@ -281,6 +570,11 @@ class AcceptanceEvidence:
                 "evidence state must be a completed acceptance state")
         if not isinstance(self.reason, AcceptanceReason):
             raise AcceptanceEvidenceError("evidence reason must be typed")
+        if self.execution_artifact_binding_digest is not None:
+            _sha256(
+                self.execution_artifact_binding_digest,
+                "execution_artifact_binding_digest",
+            )
 
         has_measurement = (self.after is not None
                            or self.mutation_after is not None)
@@ -405,6 +699,8 @@ class AcceptanceEvidence:
                 self.mutation_verdict.to_dict()
                 if self.mutation_verdict is not None else None
             ),
+            "execution_artifact_binding_digest": (
+                self.execution_artifact_binding_digest),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -520,10 +816,16 @@ def incomplete_acceptance(
 __all__ = [
     "ACCEPTANCE_EVIDENCE_SCHEMA_VERSION",
     "ACCEPTANCE_REGISTRATION_SCHEMA_VERSION",
+    "EXECUTION_ARTIFACT_CAPABILITY_KEY",
+    "EXECUTION_ARTIFACT_DIGEST_KEY",
+    "EXECUTION_ARTIFACT_BINDING_SCHEMA_VERSION",
+    "REGULAR_WRITE_EXECUTION_LANE",
     "AcceptanceEvidence",
     "AcceptanceEvidenceError",
     "AcceptanceReason",
     "AcceptanceRegistration",
+    "ExecutionArtifactBinding",
+    "ExecutionArtifactBindingError",
     "assess_acceptance",
     "incomplete_acceptance",
     "new_acceptance_run_id",

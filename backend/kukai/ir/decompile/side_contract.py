@@ -68,9 +68,26 @@ class SideFailureReason(str, Enum):
 
     TIME_BUDGET_EXCEEDED = "time_budget_exceeded"
     CALL_BUDGET_EXHAUSTED = "call_budget_exhausted"
-    # Запрошенный id не нашёлся в документе за один ограниченный проход
+    # Запрошенный id не нашёлся В ДОКУМЕНТЕ за один ограниченный проход
     # коллектора (модель могла измениться, id мог прийти из чужого разбора).
+    # Замер, ради которого причина сужена до этой строки: у
+    # `snowdon_elec_v1` 1 837 таких отказов сопровождались 20 строками из
+    # ЧУЖОГО документа (`dependencies.py`) — то есть смысл «пришёл извне»
+    # реален и обязан остаться различимым.
     ELEMENT_UNRESOLVED = "element_unresolved"
+    # Стадия ЗАПРОСИЛА id, ни один её коллектор его не забрал, и элемент
+    # ЛЕЖИТ В L0 этого же прогона. Это граница ОХВАТА стадии, а не отсутствие
+    # в документе. Заведено 12.08.2026 после того, как общий улов
+    # `sketch_extract` слал `element_unresolved` для 172 `OST_StairsRailing`,
+    # найденных в L0 все 172 из 172 (контроль: 8 из 8 настоящих id найдены,
+    # 0 из 5 выдуманных). Два читателя вывели по этому коду ПРОТИВОПОЛОЖНОЕ,
+    # каждый верно относительно своего источника: контракт объявлял «нет в
+    # документе», производитель писал «не читаю». Разошлись АВТОРИТЕТ и
+    # ПРОИЗВОДИТЕЛЬ, а не два невнимательных человека.
+    # Форма лечения — та же, что у HOST_KIND_UNRESOLVED ниже: причина
+    # разделена, старый код ОСТАЁТСЯ объявленным ради артефактов, снятых до
+    # разделения, и новые разборы его в этом месте не пишут.
+    ELEMENT_NOT_CLAIMED = "element_not_claimed"
     # Элемент нашёлся, но он не того класса, который читает эта стадия
     # (панель-стена в витраже — не FamilyInstance). ЧЕСТНЫЙ факт о модели, а
     # не сбой: именно эти 242 строки и терялись молча.
@@ -188,6 +205,7 @@ SIDE_FAILURE_KINDS: dict["SideFailureReason", SideFailureKind] = {
     SideFailureReason.TIME_BUDGET_EXCEEDED: SideFailureKind.CUT,
     SideFailureReason.CALL_BUDGET_EXHAUSTED: SideFailureKind.CUT,
     SideFailureReason.ELEMENT_UNRESOLVED: SideFailureKind.CUT,
+    SideFailureReason.ELEMENT_NOT_CLAIMED: SideFailureKind.CUT,
     SideFailureReason.READ_FAILED: SideFailureKind.CUT,
     SideFailureReason.ROW_UNPARSABLE: SideFailureKind.CUT,
     SideFailureReason.MIRROR_INVARIANT_VIOLATED: SideFailureKind.CUT,
@@ -640,7 +658,10 @@ ELEMENT_ID_OUT_OF_RANGE_REASON = (
 )
 
 
-def source_binding_cs(link_title: str | None) -> str:
+def source_binding_cs(
+    link_title: str | None,
+    link_instance_unique_id: str | None = None,
+) -> str:
     """Привязка источника: хозяин или его СВЯЗЬ с таким ``Document.Title``.
 
     Один текст на ВСЕ тела — и основное извлечение, и каждую боковую стадию.
@@ -664,19 +685,81 @@ def source_binding_cs(link_title: str | None) -> str:
     ОГОВОРКА, КОТОРУЮ НЕЛЬЗЯ ПРЯТАТЬ: ревизионный страж отпечатывает документ
     ХОЗЯИНА, поэтому на чтении связи concurrent-правку он не поймает (см.
     ``extract._source_binding_cs``).
+
+    Exact ``RevitLinkInstance.UniqueId`` is the authoritative selector.
+    ``Document.Title`` remains only a legacy selector and requires exactly one
+    loaded match; two placements with the same title refuse instead of
+    choosing an arbitrary occurrence.  Either route retains the exact
+    ``RevitLinkInstance`` for identity and transform evidence.
     """
+    if link_title is not None and link_instance_unique_id is not None:
+        raise ValueError(
+            "link_title and link_instance_unique_id are mutually exclusive")
+    if link_instance_unique_id is not None and (
+            not isinstance(link_instance_unique_id, str)
+            or not link_instance_unique_id.strip()):
+        raise ValueError("link_instance_unique_id must be a non-blank string")
     if not link_title:
-        return "Document __src = doc;"
+        if link_instance_unique_id is not None:
+            uid = csharp_string(link_instance_unique_id)
+            return (
+                "Document __federationRoot = doc;\n"
+                "Document __src = null;\n"
+                "RevitLinkInstance __sourceLinkInstance = null;\n"
+                "int __sourceLinkMatches = 0;\n"
+                + SOURCE_HOST_LOOKUP_CS + "\n"
+                "         .OfClass(typeof(RevitLinkInstance)).WhereElementIsNotElementType()\n"
+                "         .Cast<RevitLinkInstance>()\n"
+                "         .OrderBy(__x => __x.Id.ToString()))\n"
+                "{\n"
+                "    string __candidateUniqueId = null;\n"
+                "    try { __candidateUniqueId = __srcLi.UniqueId; } catch { }\n"
+                "    if (__candidateUniqueId == " + uid + ")\n"
+                "    {\n"
+                "        __sourceLinkMatches++;\n"
+                "        Document __srcLd = __srcLi.GetLinkDocument();\n"
+                "        if (__srcLd != null)\n"
+                "        {\n"
+                "            __src = __srcLd;\n"
+                "            __sourceLinkInstance = __srcLi;\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+                "if (__sourceLinkMatches > 1) throw new InvalidOperationException(\n"
+                "    \"duplicate RevitLinkInstance.UniqueId: \" + " + uid + ");\n"
+                "if (__sourceLinkMatches == 0) throw new InvalidOperationException(\n"
+                "    \"link instance UniqueId not found: \" + " + uid + ");\n"
+                "if (__src == null) throw new InvalidOperationException(\n"
+                "    \"link instance is not loaded: \" + " + uid + ");"
+            )
+        return (
+            "Document __federationRoot = doc;\n"
+            "Document __src = doc;\n"
+            "RevitLinkInstance __sourceLinkInstance = null;")
     return (
+        "Document __federationRoot = doc;\n"
         "Document __src = null;\n"
+        "RevitLinkInstance __sourceLinkInstance = null;\n"
+        "int __sourceLinkMatches = 0;\n"
         + SOURCE_HOST_LOOKUP_CS + "\n"
         "         .OfClass(typeof(RevitLinkInstance)).WhereElementIsNotElementType()\n"
-        "         .Cast<RevitLinkInstance>())\n"
+        "         .Cast<RevitLinkInstance>()\n"
+        "         .OrderBy(__x => __x.Id.ToString()))\n"
         "{\n"
         "    Document __srcLd = __srcLi.GetLinkDocument();\n"
         "    if (__srcLd != null && __srcLd.Title == " + csharp_string(link_title) + ")\n"
-        "    { __src = __srcLd; break; }\n"
+        "    {\n"
+        "        __sourceLinkMatches++;\n"
+        "        if (__sourceLinkMatches == 1)\n"
+        "        {\n"
+        "            __src = __srcLd;\n"
+        "            __sourceLinkInstance = __srcLi;\n"
+        "        }\n"
+        "    }\n"
         "}\n"
+        "if (__sourceLinkMatches > 1) throw new InvalidOperationException(\n"
+        "    \"linked document title is ambiguous; select a link instance: \" + "
+        + csharp_string(link_title) + ");\n"
         "if (__src == null) throw new InvalidOperationException(\n"
         "    \"linked document not found or not loaded: \" + "
         + csharp_string(link_title) + ");"

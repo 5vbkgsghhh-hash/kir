@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Diagnostics;
+using System.Collections.Immutable;
 using Microsoft.CodeAnalysis.CSharp;
 
 namespace CompileService;
@@ -117,20 +119,26 @@ public sealed class RoslynCompiler
     private static readonly string[] AllowedExactNames =
     {
         "System",
+        // WPF — 2026-08-13. Лента Ревита (Autodesk.Windows.RibbonControl) наследует
+        // System.Windows.Controls.Control, поэтому ЛЮБОЕ типизированное обращение к
+        // ComponentManager.Ribbon требует этих трёх сборок, даже если сам код WPF не
+        // трогает. Без них ворота отвечали CS0012 «type Control is defined in an
+        // assembly that is not referenced», а агент объяснял это себе как «доступ к
+        // UI из изолированного контекста не поддерживается» — то есть искал причину
+        // не там, где она была. AdWindows/UIFramework добавили 09.08, а их базу — нет.
+        //
+        // Расширения песочницы тут нет: запрет на опасные вызовы живёт в отдельной
+        // проверке (она же 13.08 отвергла Type.GetType), а эти три сборки нужны
+        // компилятору только для разбора иерархии типов.
+        "PresentationFramework",   // System.Windows.Controls.Control
+        "PresentationCore",        // System.Windows.UIElement, Visual
+        "WindowsBase",             // DependencyObject, DispatcherObject
     };
 
     private static readonly CSharpCompilationOptions CompilationOptions = new(
         OutputKind.DynamicallyLinkedLibrary,
         optimizationLevel: OptimizationLevel.Release,
-        allowUnsafe: false,
-        platform: Platform.AnyCpu,
-        nullableContextOptions: NullableContextOptions.Disable
-    );
-
-    private static readonly CSharpParseOptions ParseOptions = new(
-        languageVersion: LanguageVersion.CSharp10,
-        documentationMode: DocumentationMode.None,
-        kind: SourceCodeKind.Regular
+        allowUnsafe: false
     );
 
     public RoslynCompiler(ILogger<RoslynCompiler> logger)
@@ -161,7 +169,7 @@ public sealed class RoslynCompiler
 
     /// <summary>
     /// Compiles the given C# code against the specified Revit version.
-    /// Runs the same full Emit gate as the Bridge and returns diagnostics.
+    /// Returns only diagnostics — no assembly is emitted.
     /// </summary>
     public CompileResult Compile(string code, string revitVersion)
     {
@@ -183,7 +191,7 @@ public sealed class RoslynCompiler
         allRefs.AddRange(systemRefs);
         allRefs.AddRange(revitApiRefs);
 
-        var syntaxTree = CSharpSyntaxTree.ParseText(code, ParseOptions);
+        var syntaxTree = CSharpSyntaxTree.ParseText(code);
 
         var compilation = CSharpCompilation.Create(
             assemblyName: $"CompileCheck_{Guid.NewGuid():N}",
@@ -191,9 +199,38 @@ public sealed class RoslynCompiler
             references: allRefs,
             options: CompilationOptions);
 
-        using var assemblyStream = new MemoryStream();
-        var emitResult = compilation.Emit(assemblyStream);
-        var diagnostics = emitResult.Diagnostics;
+        var diagnostics = compilation.GetDiagnostics();
+
+        // ── Наши анализаторы Revit API ────────────────────────────────────
+        //
+        // Написаны 19.05.2026 и до 13.08 в проде не существовали: ворота
+        // проверяли только то, что код КОМПИЛИРУЕТСЯ, и пропускали то, от чего
+        // Ревит замирает. KUKAI001 ловит транзакцию внутри цикла — а замер за
+        // 30 дней дал 41 зависание интерфейса, медиана 56 с, максимум 33 минуты.
+        //
+        // Сбой анализатора НЕ ИМЕЕТ ПРАВА уронить компиляцию всем: если что-то
+        // пойдёт не так, остаются обычные диагностики, то есть худший случай
+        // равен вчерашнему, а не хуже.
+        try
+        {
+            var analyzers = ImmutableArray.Create<DiagnosticAnalyzer>(
+                new KukaiRevitAnalyzers.KUKAI001_TransactionInsideLoop(),
+                new KukaiRevitAnalyzers.KUKAI002_MissingNullGuard(),
+                new KukaiRevitAnalyzers.KUKAI003_WrongNamespace(),
+                new KukaiRevitAnalyzers.KUKAI004_InvalidOverload(),
+                new KukaiRevitAnalyzers.KUKAI005_StaleElementId(),
+                new KukaiRevitAnalyzers.KUKAI006_MissingRegenerate());
+            var analyzerDiagnostics = compilation
+                .WithAnalyzers(analyzers)
+                .GetAnalyzerDiagnosticsAsync()
+                .GetAwaiter()
+                .GetResult();
+            diagnostics = diagnostics.AddRange(analyzerDiagnostics);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Kukai analyzers skipped — falling back to plain diagnostics");
+        }
 
         var errors = diagnostics
             .Where(d => d.Severity == DiagnosticSeverity.Error)
@@ -241,6 +278,52 @@ public sealed class RoslynCompiler
             }
         }
 
+        // WPF для net8 (Revit 2025/2026). TRUSTED_PLATFORM_ASSEMBLIES службы — это
+        // обычный ASP.NET Core на Linux, сборок Windows Desktop там нет и быть не
+        // может. Берём их из пакета ссылок; если пакета нет — предупреждаем и живём
+        // дальше: ворота останутся строже, чем нужно, но НЕ упадут.
+        refs.AddRange(LoadWindowsDesktopReferences());
+
+        return refs;
+    }
+
+    /// <summary>
+    /// Сборки WPF из пакета ссылок Microsoft.WindowsDesktop.App.Ref.
+    /// Нужны только как база типов Autodesk.Windows — см. AllowedExactNames.
+    /// </summary>
+    private List<MetadataReference> LoadWindowsDesktopReferences()
+    {
+        var refs = new List<MetadataReference>();
+        var root = Path.Combine(ResolveNuGetPackagesRoot(), "microsoft.windowsdesktop.app.ref");
+        if (!Directory.Exists(root))
+        {
+            _logger.LogWarning(
+                "WPF reference pack not found at {Path} — Revit 2025/2026 code touching " +
+                "the ribbon will fail with CS0012", root);
+            return refs;
+        }
+
+        // Старшая доступная версия пакета: она содержит те же публичные типы, а
+        // привязка к точному номеру ломалась бы при любом обновлении.
+        foreach (var verDir in Directory.GetDirectories(root).OrderByDescending(d => d))
+        {
+            var libDir = Path.Combine(verDir, "ref", "net8.0");
+            if (!Directory.Exists(libDir))
+                continue;
+            foreach (var name in new[] { "PresentationFramework", "PresentationCore", "WindowsBase" })
+            {
+                var dll = Path.Combine(libDir, name + ".dll");
+                if (!File.Exists(dll))
+                    continue;
+                try { refs.Add(MetadataReference.CreateFromFile(dll)); }
+                catch (Exception ex) { RecordFailedReference(dll, "net8-wpf", ex); }
+            }
+            if (refs.Count > 0)
+                break;
+        }
+
+        if (refs.Count == 0)
+            _logger.LogWarning("WPF reference pack found at {Path} but no net8.0 assemblies inside", root);
         return refs;
     }
 
@@ -333,7 +416,14 @@ public sealed class RoslynCompiler
             if (!Directory.Exists(libDir))
                 continue;
 
-            var requiredDlls = new[] { "RevitAPI.dll", "RevitAPIUI.dll" };
+            // AdWindows + UIFramework added 2026-08-09 at the operator's request: the
+            // agent needs the Revit ribbon at runtime, and RevitAPIUI only exposes
+            // it during IExternalApplication.OnStartup. These two ship in the SAME
+            // NuGet package for all six versions (verified on disk), so the surface
+            // stays deterministic. They are UNSUPPORTED Autodesk internals: they can
+            // change between Revit versions without notice, and anything touching
+            // the ribbon must run on the UI thread.
+            var requiredDlls = new[] { "RevitAPI.dll", "RevitAPIUI.dll", "AdWindows.dll", "UIFramework.dll" };
             var revitRefs = new List<MetadataReference>();
             var completeReferenceSet = true;
             foreach (var dllName in requiredDlls)

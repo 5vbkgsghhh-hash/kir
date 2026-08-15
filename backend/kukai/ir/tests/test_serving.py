@@ -15,6 +15,7 @@ from kukai.ir import serving  # noqa: E402
 from kukai.ir.compiler import compile_program  # noqa: E402
 from kukai.ir.tests.acceptance_fakes import PassingAcceptanceBridge  # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
+from kukai.ir.tests.gate_fixture import enter_kir_mode
 
 
 def _run(coro):
@@ -108,8 +109,32 @@ class DeviceGate(unittest.TestCase):
         with mock.patch.object(serving, "_turn_device_id", return_value=None):
             self.assertFalse(serving.revit_ir_enabled())
 
-    def test_stage2_admin_device_visible(self):
+    def test_stage2_admin_device_is_NOT_enough_without_the_mode(self):
+        """УТВЕРЖДЕНИЕ ПЕРЕВЁРНУТО 13.08, и это смена СМЫСЛА, а не фикстуры.
+
+        До `61e276bb` тест назывался `..._visible` и требовал: флаг stage2 плюс
+        админское устройство ⇒ инструмент виден. **Оператор решил иначе:** КИР —
+        отдельный режим (кнопка, отдельное окно), и возврат флага сам по себе
+        его больше не открывает. Значит прежнее утверждение стало ЛОЖНЫМ, и
+        дать этому тесту фикстуру режима означало бы позеленить его вхолостую,
+        сделав запрет оператора несторожимым.
+
+        Здесь и ниже — обе стороны третьего условия, потому что одна ничего не
+        разделяет: «закрыто» верно и у гейта, закрытого по другой причине.
+        """
         os.environ["KUKAI_KIR_TOOL"] = "stage2"
+        with mock.patch.object(serving, "_turn_device_id",
+                               return_value=serving.ADMIN_DEVICE):
+            self.assertFalse(
+                serving.revit_ir_enabled(),
+                "флага и устройства снова достаточно — режим перестал быть "
+                "третьим условием, и КИР вернулся в обычный чат")
+
+    def test_stage2_admin_device_and_mode_opens_it(self):
+        """Вторая сторона: три условия вместе ОТКРЫВАЮТ, иначе гейт глухой."""
+
+        os.environ["KUKAI_KIR_TOOL"] = "stage2"
+        enter_kir_mode(self)
         with mock.patch.object(serving, "_turn_device_id",
                                return_value=serving.ADMIN_DEVICE):
             self.assertTrue(serving.revit_ir_enabled())
@@ -136,6 +161,8 @@ class HandlerOutcomes(unittest.TestCase):
         self._prev_acceptance_dir = os.environ.get(
             "KIR_ACCEPTANCE_EVIDENCE_DIR")
         os.environ["KIR_ACCEPTANCE_EVIDENCE_DIR"] = self._acceptance_dir.name
+        # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08): режим КИР ставится ЯВНО.
+        enter_kir_mode(self)
 
     def tearDown(self):
         self._dev.stop()

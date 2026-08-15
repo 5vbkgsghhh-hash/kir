@@ -80,6 +80,32 @@ _MAX_VIOLATIONS = 10
 #: заводить второй потолок для текста той же природы значило бы иметь две
 #: дисциплины размера вместо одной.
 _MAX_TEXT = 200
+
+#: Бюджет СКАЛЯРНЫХ ФАКТОВ ридбэка, доезжающих на ОДИН оп.
+#:
+#: Число НАЗНАЧЕНО, а не выведено, и назначено по замеру: перепись эмиссии
+#: 13.08.2026 нашла 264 различных ключа квитанции на 148 файлов, а самый
+#: широкий одиночный ридбэк (`create_curtain_grid_line`) кладёт 11. Шестнадцать
+#: покрывает всякий существующий оп с запасом и удерживает строку от роста на
+#: программе в 300 опов. Урезание ВИДИМО (`__dropped`), а не безмолвно.
+_MAX_FACTS_PER_OP = 16
+#: Потолок строкового ЗНАЧЕНИЯ факта. Значение длиннее НЕ обрезается — оно
+#: выбрасывается со счётчиком: обрезанная строка читается как полная и потому
+#: лжёт, а канон уже платил за потолок, который резал одну половину поля, пока
+#: вторая дописывалась в него же.
+_MAX_FACT_TEXT = 80
+#: Три ключа, РЕШАЮЩИЕ метку `op_outcomes`. Список ПОЛНЫЙ ПО ПОСТРОЕНИЮ:
+#: его состав берётся у самого выражения, которое метку и вычисляет (см.
+#: `record_witness`), поэтому четвёртый ключ там потребует правки здесь же.
+#:
+#: УСЛОВИЕ ПЕРЕСМОТРА — про СРОК, а не про место. Полнота держится на том, что
+#: метку решает НАЛИЧИЕ ключа. Она истечёт, когда метка начнёт зависеть от
+#: ЗНАЧЕНИЯ: тогда присутствие ключа перестанет быть тем, что решает, и
+#: исключать его из фактов ПО ИМЕНИ станет неверно — факт придётся исключать по
+#: тому же предикату, каким считается метка, иначе одна величина снова поедет
+#: двумя маршрутами.
+_LABEL_KEYS = frozenset({"id", "deleted_id", "refused"})
+
 _WRITE_LOCK = threading.Lock()
 _ZERO_CHECKSUM = "0" * 64
 
@@ -113,17 +139,28 @@ def _acceptance_summary(value: Any) -> dict[str, Any] | None:
     for key in (
         "schema_version", "state", "reason", "run_id", "evidence_digest",
         "registration_digest", "expectation_digest",
-        "mutation_expectation_digest", "plan_digest", "revit_version",
+        "mutation_expectation_digest", "plan_digest", "ground_digest",
+        "revit_version",
+        "ground_context_digest", "ground_context_execution_bound",
+        "ground_context_authoritative",
+        "ground_selector_resolution_replayed",
+        "ground_derived_artifacts_verified",
+        "execution_artifact_binding_digest",
         "journal_checksum", "journal_finalized",
     ):
         item = value.get(key)
         if isinstance(item, str):
             summary[key] = item[:128]
-        elif key == "journal_finalized" and isinstance(item, bool):
+        elif key in (
+                "journal_finalized", "ground_context_execution_bound",
+                "ground_context_authoritative",
+                "ground_selector_resolution_replayed",
+                "ground_derived_artifacts_verified") and isinstance(item, bool):
             summary[key] = item
     registration = value.get("registration")
     if isinstance(registration, Mapping):
-        for key in ("run_id", "plan_digest", "expectation_digest"):
+        for key in ("run_id", "plan_digest", "ground_digest",
+                    "expectation_digest"):
             item = registration.get(key)
             if isinstance(item, str):
                 summary.setdefault(key, item[:128])
@@ -135,6 +172,123 @@ def _acceptance_summary(value: Any) -> dict[str, Any] | None:
             if key in journal and isinstance(
                 journal[key], (str, int, bool))
         }
+    return summary or None
+
+
+def _readback_facts(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Скалярные ФАКТЫ одного ридбэка: счёт, булево, перечисление, ВЕЛИЧИНА.
+
+    ЗАЧЕМ. До 13.08.2026 весь словарь ридбэка схлопывался здесь в одну из трёх
+    строк-меток, и в корпусе из 1 331 строки не было НИ ОДНОГО измерения о
+    построенном — только шесть чисел бухгалтерии самой записи. Из 264 ключей
+    квитанции доезжали 3, и то лишь фактом наличия. Поэтому каждое наше
+    «живой прогон ответит ЧИСЛОМ» не могло сбыться ни при каком прогоне:
+    маршрута не было. Замерено переписью канала, а не предположено.
+
+    ПРАВИЛО У МЕСТА ПОТЕРИ БЫЛО ВЕРНЫМ — сломано было ИСПОЛНЕНИЕ. Комментарий
+    гласил «только НЕгеометрические факты — сами координаты остаются в
+    модели», и это правильно: авторитет геометрии — модель, вторая её копия в
+    леджере была бы второй правдой. Но `mullions_on_line` это СЧЁТ,
+    `line_locked` БУЛЕВО, `default_panel_state` ПЕРЕЧИСЛЕНИЕ — ни одно не
+    координата, а «не координаты» исполнялось как «ничего».
+
+    РОД ЭТОГО СПИСКА: **ПОЛНЫЙ ПО ПОСТРОЕНИЮ.** Решение принимается по ТИПУ
+    значения, а не по имени ключа, поэтому ключ, заведённый завтра, попадает
+    под правило сам и никакой список здесь вести не нужно. Контейнер (список,
+    словарь) не записывается НИКОГДА — наборы точек, контуры, кривые и есть
+    та геометрия, ради которой правило писалось. Это же автоматически
+    разделяет пару, на которой видно замысел: `position_mm` — массив, координата,
+    не едет; `position_delta_mm` — скаляр, РАСХОЖДЕНИЕ, едет.
+
+    УРЕЗАНИЕ ВИДИМО. Тёмный канал, заменённый лгущим, хуже тёмного, поэтому
+    выброшенное считается по родам в `__dropped` и никогда не молчит:
+    ``geometry`` — контейнер, выброшен по правилу, это не дефект;
+    ``over_budget`` — строковое значение длиннее потолка (выброшено целиком,
+    НЕ обрезано); ``over_count`` — полей больше бюджета.
+
+    Возвращает None, когда записывать нечего, — пустой словарь в строке
+    неотличим от «фактов не было», а это разные вещи.
+
+    УСЛОВИЕ ПЕРЕСМОТРА, названное здесь, чтобы правило не жило вечно и без
+    основания. Сужение без причины выглядит НЕДОСМОТРОМ, и следующий читатель
+    «чинит» его по инерции.
+
+    Правило перестанет быть верным, когда появится **измеренная величина,
+    которая ЕСТЬ контейнер по своей природе** — распределение, пара мин/макс,
+    вектор невязок по сегментам. Она не координата, держать её вне леджера
+    незачем, но нынешний тип-предикат выбросит её как геометрию.
+
+    **Сигнал измерим, а не предположителен:** ненулевой `__dropped.geometry` у
+    опа, чья квитанция не несёт НИ ОДНОГО массива координат. Тогда расширять
+    надо список РОДОВ выброса, а не смягчать сам предикат по типу: смягчение
+    вернуло бы в леджер вторую копию геометрии, ради запрета которой правило и
+    писано.
+    """
+    facts: dict[str, Any] = {}
+    dropped: dict[str, int] = {}
+
+    def _drop(kind: str) -> None:
+        dropped[kind] = dropped.get(kind, 0) + 1
+
+    for key, value in row.items():
+        if not isinstance(key, str) or key.startswith("_"):
+            continue
+        if key in _LABEL_KEYS:
+            # НЕ выброшено и потому не считается: эти три уже доехали —
+            # соседним полем `op_outcomes`, метку которого они и решают.
+            # Записать их ещё и сюда значило бы завести вторую правду об
+            # одном факте, то есть ровно тот дефект, против которого писано
+            # правило. Ratchet `test_refusal_identity` поймал это на зелёной
+            # строке из одних `id` — «отсутствующее остаётся отсутствующим».
+            continue
+        if value is None:
+            continue                       # ничего не измерено — не факт
+        if len(facts) >= _MAX_FACTS_PER_OP:
+            _drop("over_count")
+            continue
+        # bool ПЕРЕД int: в Python bool наследует int, и обратный порядок
+        # записал бы вердикт как единицу.
+        if isinstance(value, bool):
+            facts[key[:64]] = value
+        elif isinstance(value, (int, float)):
+            facts[key[:64]] = value
+        elif isinstance(value, str):
+            if len(value) > _MAX_FACT_TEXT:
+                _drop("over_budget")
+            else:
+                facts[key[:64]] = value
+        else:
+            _drop("geometry")              # список/словарь — авторитет модель
+    if dropped:
+        facts["__dropped"] = dropped
+    return facts or None
+
+
+def _ground_context_summary(value: Any) -> dict[str, Any] | None:
+    """Keep proof digests/flags, never the model catalogue or path names."""
+
+    try:
+        from kukai.ir.midend import GroundingContext
+        if isinstance(value, GroundingContext):
+            row = value.to_evidence_dict()
+        elif isinstance(value, Mapping):
+            row = dict(value)
+        else:
+            return None
+    except Exception:  # noqa: BLE001 — telemetry remains fail-open
+        return None
+    summary: dict[str, Any] = {}
+    for key in (
+        "schema", "context_digest", "snapshot_digest", "document_digest",
+        "revision_digest", "profile_digest", "source",
+        "trusted_source", "profile_authoritative", "identity_bound",
+        "revision_bound", "execution_bound", "authoritative",
+    ):
+        item = row.get(key)
+        if isinstance(item, str):
+            summary[key] = item[:128]
+        elif isinstance(item, bool):
+            summary[key] = item
     return summary or None
 
 
@@ -291,8 +445,10 @@ def record_witness(*, program: Any, family: str, revit_version: str,
                    result_payload: Optional[dict] = None,
                    outcome: Optional[dict] = None,
                    acceptance_evidence: Optional[Mapping[str, Any]] = None,
+                   ground_context: Any = None,
                    author_digest: Optional[str] = None,
                    env_digest: Optional[str] = None,
+                   txn_isolation: Optional[str] = None,
                    ) -> None:
     """Записать одно ЖИВОЕ исполнение. Никогда не raises (fail-open)."""
     path = _feed_path()
@@ -350,6 +506,9 @@ def record_witness(*, program: Any, family: str, revit_version: str,
         acceptance = _acceptance_summary(acceptance_evidence)
         if acceptance is not None:
             record["acceptance_evidence"] = acceptance
+        context = _ground_context_summary(ground_context)
+        if context is not None:
+            record["ground_context"] = context
         if diag_code is not None:
             record["diag_code"] = diag_code
         # ОПЕРАЦИЯ, КОТОРУЮ ДИАГНОСТИКА УЖЕ НАЗВАЛА.
@@ -424,6 +583,40 @@ def record_witness(*, program: Any, family: str, revit_version: str,
         #
         # Зелёной строки это не касается ни одним байтом: у успеха причины
         # нет, и её отсутствие обязано выглядеть как отсутствие.
+        # ИЗОЛЯЦИЯ ТРАНЗАКЦИИ РЕВИТА — НЕ ПЕСОЧНИЦА PYTHON.
+        #
+        # `serving._sandbox_receipt` читает поле `isolation` у результата
+        # ПЕСОЧНИЦЫ (`namespaces`/`filesystem`/`network_probe`). Это другой
+        # предмет под тем же словом, и 13.08.2026 на нём едва не был сделан
+        # вывод «изоляция уже записывается». Поэтому поле здесь называется
+        # `txn_isolation`, а различение написано ЗДЕСЬ — там, где следующий
+        # читатель встретит поле, а не там, где мы это обсуждали.
+        #
+        # ЗАЧЕМ ОНО В СТРОКЕ. `tools/live_op_rates.py` считает четыре корзины,
+        # и одна из них — «сопутствующий»: чужое нарушение откатило
+        # транзакцию. **Под `per_op` сопутствующего не бывает ПО
+        # ПОСТРОЕНИЮ.** Пока изоляции в строке не было, корпус смешивал две
+        # популяции с разной семантикой этой корзины и разделить их было
+        # нечем: измерено 13.08 — `isolation`/`per_op`/`atomic` встречаются в
+        # корпусе 1331 строки РОВНО 0 раз. Поле нужно не для любопытства, а
+        # чтобы главный прибор по-оповых ставок перестал смешивать две
+        # семантики.
+        #
+        # НЕ ЗАПИСЫВАЕТСЯ, КОГДА ВЫЗЫВАЮЩИЙ НЕ НАЗВАЛ. Отсутствие значит
+        # «не сказано» и относится ко всем 1331 строке до этой правки;
+        # подставить сюда `"atomic"` по умолчанию значило бы задним числом
+        # утверждать про них то, чего никто не измерял.
+        #
+        # УСЛОВИЕ ПЕРЕСМОТРА. Это чтение истинно ровно пока существует хоть
+        # один вызывающий, не называющий изоляцию. Пин
+        # `test_every_live_call_site_states_it` обходит AST и требует поля у
+        # КАЖДОЙ площадки `record_witness` в `serving.py`; пока он зелён,
+        # единственный источник отсутствия — строки старше 13.08.2026.
+        # Когда таких строк в корпусе не останется (один `grep -c` по `ts`),
+        # отсутствие поля станет неотличимо от ДЕФЕКТА — и тогда правильный
+        # ход не «подставить умолчание», а ОТКАЗАТЬ вызову без изоляции.
+        if isinstance(txn_isolation, str) and txn_isolation:
+            record["txn_isolation"] = txn_isolation[:32]
         if not ok:
             record["refusal_cause"] = (
                 _CAUSE_DIAGNOSTIC if diag_code is not None
@@ -434,17 +627,45 @@ def record_witness(*, program: Any, family: str, revit_version: str,
             # Пост-коммитные ридбэки по опам: только НЕгеометрические факты
             # (id создан/refused) — сами координаты остаются в модели.
             per_op = {}
+            per_op_facts: dict[str, Any] = {}
+            # АВТОРИТЕТ ОПОВ — СПИСОК ОПОВ, А НЕ ФОРМА ЗНАЧЕНИЯ. Квитанция
+            # ПЛОСКАЯ: программные ключи (`ok`, `created_ids`,
+            # `postcondition_violations`, `results`) лежат в ней вперемешку с
+            # построчными ридбэками по `oid`. Сегодня словарное значение есть
+            # только у ридбэков, и потому «взять все dict-значения» работает —
+            # но это свойство ФОРМЫ, а не проверка: один `summary: {...}`,
+            # добавленный рядом, завёл бы в фактах несуществующий оп, и его
+            # искали бы в реестре. Берём идентификаторы у САМОЙ ПРОГРАММЫ, до
+            # усечения (`raw_ops`, не `ops`), иначе широкая программа теряла бы
+            # законные факты за потолком записи.
+            _known_oids = {_op_id(o) for o in raw_ops if isinstance(o, dict)}
+            _known_oids.discard(None)
             for oid, row in list(result_payload.items())[:_MAX_OPS_PER_RECORD]:
                 if isinstance(row, dict):
-                    per_op[str(oid)[:64]] = (
+                    key = str(oid)[:64]
+                    per_op[key] = (
                         "refused" if "refused" in row
                         else "created" if ("id" in row or "deleted_id" in row)
                         else "other")
+                    # Метка НЕ ограничивается списком опов: она пишется с
+                    # 2026-07 и её непрерывность — свойство корпуса, которое
+                    # `live_op_rates` читает по всей истории. Ограничен ФАКТ,
+                    # то есть ровно то, что заводится сегодня.
+                    if key in _known_oids:
+                        facts = _readback_facts(row)
+                        if facts:
+                            per_op_facts[key] = facts
             if per_op:
                 record["op_outcomes"] = per_op
                 if len(result_payload) > _MAX_OPS_PER_RECORD:
                     record["op_outcomes_truncated"] = (
                         len(result_payload) - _MAX_OPS_PER_RECORD)
+            # ОТДЕЛЬНОЕ поле, а не обогащение `op_outcomes`: его значения
+            # читаются как строки (`tools/live_op_rates.py:404` сравнивает с
+            # "refused"), и смена их типа сломала бы прибор четырёх корзин.
+            # Радиус правки — граф импорта, а не файл.
+            if per_op_facts:
+                record["op_facts"] = per_op_facts
         directory = os.path.dirname(path) or "."
         existed = os.path.exists(path)
         os.makedirs(directory, exist_ok=True)

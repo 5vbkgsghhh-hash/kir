@@ -201,7 +201,8 @@ class HostedInHasThreeOutcomes(unittest.TestCase):
         edges = graph.out_edges("F1", Relation.HOSTED_IN)
         self.assertEqual(len(edges), 1, "ребро стёрто — слепота выдана за факт")
         self.assertIs(edges[0].modality, Modality.UNRESOLVED_TARGET)
-        self.assertEqual(edges[0].evidence["why"], "host_outside_extraction")
+        self.assertEqual(
+            edges[0].evidence["why"], "target_not_in_snapshot")
         self.assertEqual(len(graph.unresolved_targets()), 1)
 
     def test_no_host_declared_yields_no_edge_at_all(self) -> None:

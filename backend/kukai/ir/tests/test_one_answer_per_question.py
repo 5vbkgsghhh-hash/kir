@@ -18,6 +18,9 @@
 from __future__ import annotations
 
 import inspect
+import io
+import os
+import re
 import os
 import tempfile
 import unittest
@@ -98,30 +101,55 @@ class OneCategoryTableOwnedByTheRegistry(unittest.TestCase):
         self.assertEqual(named - writing, set(),
                          "регистр называет несуществующий оп")
 
-    def test_the_remaining_duplicate_disagrees_on_exactly_one_op(self):
-        """РАТЧЕТ НА ОСТАВШИЙСЯ ДУБЛИКАТ. `clash_bundle.OP_CATEGORY` мигрируют
-        следующим; пока он жив, расхождение обязано быть ровно одно и ровно
-        то, что записано.
+    def test_no_second_stored_answer_to_the_category_question_exists(self):
+        """ДОЛГ ЗАКРЫТ, И РАТЧЕТ ТЕПЕРЬ СТЕРЕЖЁТ ФОРМУ, А НЕ ИМЯ (11.08.2026).
 
-        Пустая строка у clash — НЕ мнение о категории, а маркер «решено
-        веткой выше» (`category_of` читает её как `... or None`), поэтому
-        `create_column` в расхождения не попадает, хотя выглядит как спор.
+        Здесь стоял ратчет на `clash_bundle.OP_CATEGORY`: пока дубликат жив,
+        расхождение обязано быть ровно одно (`create_railing`). Дубликат
+        мигрировали, ратчет упал на `ImportError` — и вместе с ним замолчали
+        ещё три сторожа полноты, читавшие ту же таблицу.
+
+        ПОЧЕМУ НЕ `hasattr(CB, "OP_CATEGORY")`, КАК У СОСЕДА. Запрет по ИМЕНИ
+        не может назвать следующий ход и ловит ровно одно написание: вторая
+        таблица, названная `OP_CATS` или `_CATEGORY_BY_OP`, прошла бы мимо
+        него молча — то есть прибор покрывал бы часть своего диапазона.
+        Запрещается ФОРМА: любое модульное отображение «имя опа -> категория
+        Revit», кроме названных исключений. Исключение — тоже решение: чтобы
+        добавить строку, надо вписать её сюда и объяснить.
         """
-        from kukai.ir.clash_bundle import OP_CATEGORY
+        from kukai.ir import clash_bundle as CB
 
-        disagreeing = set()
-        for op_name, clash_value in OP_CATEGORY.items():
-            if not clash_value:            # маркер отложенного разбора
+        #: Единственное разрешённое отображение оп -> категория, и оно НЕ
+        #: второй ответ: реестр на эти опы молчит либо отвечает несколькими,
+        #: и строка называет выбор вслух (см. шапку `REGISTRY_GAPS`).
+        allowed = {"REGISTRY_GAPS"}
+        ops = set(spec.OPS)
+        stored: set[str] = set()
+        for attr, value in vars(CB).items():
+            if not isinstance(value, dict) or not value:
                 continue
-            ours = spec.OP_RESULT_CATEGORIES.get(op_name)
-            if ours is not None and tuple(sorted(ours)) != (clash_value,):
-                disagreeing.add(op_name)
+            if not all(isinstance(k, str) and k in ops for k in value):
+                continue
+            flat = [v for value_ in value.values()
+                    for v in (value_ if isinstance(value_, tuple) else (value_,))]
+            if flat and all(isinstance(v, str) and v.startswith("OST_")
+                            for v in flat):
+                stored.add(attr)
         self.assertEqual(
-            disagreeing, {"create_railing"},
-            "появилось НОВОЕ расхождение двух словарей категорий — либо "
-            "clash мигрировали и тест пора снять")
+            stored, allowed,
+            "в clash_bundle появилось ХРАНИМОЕ отображение оп -> категория "
+            f"({sorted(stored - allowed)}). Ответ на этот вопрос один и живёт "
+            "в реестре: спрашивайте `spec.op_result_categories` через "
+            "`clash_bundle.category_of`/`op_categories`. Если строка нужна "
+            "как названное исключение — впишите её имя в `allowed` здесь и "
+            "объясните, чего реестр не отвечает")
+        self.assertIs(CB._REGISTRY_CATEGORIES, spec.op_result_categories)
+        # Расхождение, ради которого стоял прежний ратчет, теперь не может
+        # существовать: у ограждения ответ ОДИН и он реестровый.
         self.assertEqual(spec.OP_RESULT_CATEGORIES["create_railing"],
                          ("OST_Railings", "OST_StairsRailing"))
+        self.assertEqual(CB.op_categories("create_railing"),
+                         ("OST_StairsRailing",))
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -153,9 +181,49 @@ class OneWireCodeOneRepair(unittest.TestCase):
     def test_the_never_raised_code_is_gone(self):
         """`KIR-C001` (`COMPILE_FAIL`) был объявлен, задокументирован и НИ
         РАЗУ не выдан. Объявленный, но не выдаваемый код — обещание, которого
-        никто не держит, и он занимал целую букву."""
+        никто не держит, и он занимал целую букву.
+
+        ЗДЕСЬ СТОЯЛО ЧТЕНИЕ ПРОЗЫ, И ОНО СЛОМАЛОСЬ ОТ СОБСТВЕННОЙ ПРАВОТЫ
+        (11.08.2026). Проверка была `assertNotIn("KIR-C001",
+        inspect.getsource(diag))` — то есть искала СТРОКУ в исходнике целиком,
+        вместе с комментариями. Стоило объяснить в комментарии, что буква C
+        освободилась и почему, как тест нашёл названный им же код и покраснел.
+        Он запрещал не объявление кода, а УПОМИНАНИЕ о нём, и тем самым
+        запрещал документировать собственное решение.
+
+        Свойство, которое действительно нужно: код НЕ ОБЪЯВЛЕН — ни здесь, ни
+        в другом модуле пакета. Оно проверяется по объявлениям, а не по
+        тексту, поэтому комментарий, история и этот докстринг могут называть
+        `KIR-C001` сколько угодно раз.
+        """
         self.assertFalse(hasattr(diag, "COMPILE_FAIL"))
-        self.assertNotIn("KIR-C001", inspect.getsource(diag))
+
+        # 1. Ни одна константа самого `diag` его не несёт.
+        in_diag = {name for name, value in vars(diag).items()
+                   if name.isupper() and isinstance(value, str)
+                   and value == "KIR-C001"}
+        self.assertEqual(in_diag, set(),
+                         "код снова объявлен константой в diag")
+
+        # 2. И ни один не-тестовый модуль пакета — читаем ОБЪЯВЛЕНИЯ тем же
+        #    разбором, которым `code_collisions` ищет столкновения имён, а не
+        #    сырой текст.
+        declarations = re.compile(
+            r"^([A-Z][A-Z0-9_]*)\s*(?::[^=]+)?=\s*[\"'](KIR-C001)[\"']", re.M)
+        package = os.path.dirname(os.path.abspath(diag.__file__))
+        offenders: list[str] = []
+        for folder, _dirs, files in os.walk(package):
+            if os.path.sep + "tests" in folder or "__pycache__" in folder:
+                continue
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                path = os.path.join(folder, fname)
+                with io.open(path, encoding="utf-8") as fh:
+                    for name, _code in declarations.findall(fh.read()):
+                        offenders.append(f"{os.path.relpath(path, package)}:{name}")
+        self.assertEqual(offenders, [],
+                         "мёртвый код KIR-C001 снова объявлен в пакете")
 
     def test_no_code_inside_diag_carries_two_names(self):
         """Замок на импорте: он и есть то, чего не было, когда T003 разошёлся."""

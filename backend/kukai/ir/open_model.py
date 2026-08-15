@@ -1715,6 +1715,8 @@ Action<string, System.Collections.Generic.IEnumerable<Element>, int> __AddPool =
     if (__total > __limit) __snap[__pool + "__truncated"] = true;
 };
 __AddPool("levels", new FilteredElementCollector(doc).OfClass(typeof(Level)).Cast<Element>(), 1000);
+__AddPool("phases", new FilteredElementCollector(doc).OfClass(typeof(Phase)).Cast<Element>(), 1000);
+__AddPool("materials", new FilteredElementCollector(doc).OfClass(typeof(Material)).Cast<Element>(), 1000);
 __AddPool("wall_types", new FilteredElementCollector(doc).OfClass(typeof(WallType)).Cast<Element>(), 1000);
 __AddPool("floor_types", new FilteredElementCollector(doc).OfClass(typeof(FloorType)).Cast<Element>(), 1000);
 __AddPool("pipe_types", new FilteredElementCollector(doc).OfClass(typeof(Autodesk.Revit.DB.Plumbing.PipeType)).Cast<Element>(), 1000);
@@ -1825,6 +1827,18 @@ __AddPool("building_pad_types", new FilteredElementCollector(doc).OfClass(typeof
 // операции один параметр.
 __AddPool("wall_sweep_types", new FilteredElementCollector(doc).WherePasses(new ElementMulticategoryFilter(new List<BuiltInCategory> { BuiltInCategory.OST_Cornices, BuiltInCategory.OST_Reveals })).WhereElementIsElementType().Cast<Element>(), 1000);
 __AddPool("slab_edge_types", new FilteredElementCollector(doc).OfClass(typeof(SlabEdgeType)).Cast<Element>(), 1000);
+// СТРОКОЙ, А НЕ typeof — И ЭТО ЗАПИСЬ О ВЕРСИОННОМ ЗАПРЕТЕ. Не пишите здесь
+// typeof(ToposolidType): класса НЕТ в эталонных сборках 2021-2023 (проверено
+// по поверхности API всех шести), и снапшот перестанет собираться на трёх
+// версиях из шести. Сравнение имени — единственная форма, компилирующаяся
+// везде.
+//
+// СЛЕДСТВИЕ, стоившее живого прогона 13.08.2026: на 2021-2023 этот пул пуст
+// ВСЕГДА, в любом документе. Отказ «пусто в модели» там был бы ложью и звал
+// бы автора заводить тип, которого на его Ревите не бывает, — поэтому версия
+// отвечает РАНЬШЕ заземления (`ops_site.toposolid_version_refusal`, зовётся
+// из `compiler` до стадии ground). Знание о запрете жило здесь, в
+// исполняемом виде, и не переходило одну границу.
 __AddPool("toposolid_types", new FilteredElementCollector(doc).OfClass(typeof(HostObjAttributes)).Cast<Element>().Where(__tse => { try { return __tse.GetType().Name == "ToposolidType"; } catch { return false; } }), 1000);
 // wave/detail (2026-08-09): типы заливки. ПО КЛАССУ, как все остальные:
 // FilledRegionType — самостоятельный тип ElementType, существующий на всех
@@ -1833,6 +1847,32 @@ __AddPool("toposolid_types", new FilteredElementCollector(doc).OfClass(typeof(Ho
 // категорийный фильтр вернул бы пул, половина которого не является типом и
 // отвергается самим `FilledRegion.IsValidFilledRegionTypeId`.
 __AddPool("filled_region_types", new FilteredElementCollector(doc).OfClass(typeof(FilledRegionType)).Cast<Element>(), 1000);
+// РАБОЧИЕ НАБОРЫ. Кладутся ОТДЕЛЬНО, а не через __AddPool, и это не стиль:
+// `Workset` НЕ наследует `Element`, поэтому `Cast<Element>()` к нему неприменим,
+// а коллектор у него свой. Замерено по индексу ловушек 13.08.2026 на шести
+// версиях; `Parameter.Set(WorksetId)` не существует (CS1503 6/6), набор
+// адресуется ЦЕЛЫМ `WorksetId.IntegerValue`.
+var __worksets = new List<object>();
+try
+{
+    if (doc.IsWorkshared)
+    {
+        foreach (Workset __w in new FilteredWorksetCollector(doc).ToWorksets().Take(1000))
+        {
+            var __wr = new Dictionary<string, object>();
+            __wr["id"] = __w.Id.IntegerValue;
+            try { __wr["name"] = __w.Name ?? ""; } catch { __wr["name"] = ""; }
+            try { __wr["kind"] = __w.Kind.ToString(); } catch { __wr["kind"] = ""; }
+            __worksets.Add(__wr);
+        }
+    }
+}
+catch { }
+// НЕ РАЗДЕЛЁННЫЙ ДОКУМЕНТ ДАЁТ ПУСТОЙ ПУЛ, А НЕ ОТСУТСТВУЮЩИЙ КЛЮЧ: пустой
+// читается как «наборов нет», отсутствующий — как «мы не спрашивали», и это
+// разные утверждения. Различает их `worksets__workshared`.
+__snap["worksets"] = __worksets;
+__snap["worksets__workshared"] = doc.IsWorkshared;
 var __gridQuery = new FilteredElementCollector(doc).OfClass(typeof(Grid))
     .Cast<Grid>().OrderBy(__x => __Id(__x)).ToList();
 var __grids = new List<object>();
@@ -1886,6 +1926,9 @@ __snap["__profile_required_pools"] = new string[] {
     "piping_system_types", "point_load_types", "railing_types",
     "roof_types", "slab_edge_types", "toposolid_types", "truss_types",
     "wall_foundation_types",
+    "materials",
+    "phases",
+    "worksets",
     "wall_sweep_types", "wall_types", "window_symbols"
 };
 try { __snap["__revit_version"] = doc.Application.VersionNumber ?? ""; }

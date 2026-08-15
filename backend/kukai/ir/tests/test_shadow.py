@@ -19,6 +19,22 @@ os.environ["KIR_REJECTIONS_PATH"] = _REJ
 from kukai.ir import shadow  # noqa: E402
 
 
+# ─── ФАЙЛ МЕНЯЕТ ПРОЦЕССНОЕ ОКРУЖЕНИЕ — ВОЗВРАЩАЕМ ЕГО НА МЕСТО ──────────────
+# Замер 12.08.2026: этот файл оставлял за собой ключи, и сторож в
+# `kukai/ir/tests/conftest.py` называет это отказом на ПРОИЗВОДИТЕЛЕ, а не на
+# следующей жертве. Восстановление объявлено ЗДЕСЬ, а не спрятано в общий
+# автофикс: файл, меняющий окружение, обязан сказать об этом сам.
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.fixture(autouse=True)
+def _environment_is_returned_as_found():
+    _saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(_saved)
+
+
 def _clean():
     for p in (_SHADOW, _REJ):
         if os.path.exists(p):

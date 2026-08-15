@@ -1111,7 +1111,53 @@ class Golden(unittest.TestCase):
     """(b): byte-stable emit corpus, own annotation_*.golden.cs files.
     annotation_explicit_types.tag_type forces the >=2022 symId branch, so it
     is golden-reviewed at revit_version="2022" (2021 would be a typed
-    KIR-E003 refusal for that program, proven separately in TagVersionAxis)."""
+    KIR-E003 refusal for that program, proven separately in TagVersionAxis).
+
+    ЗАМОРОЖЕНО 13.08.2026, И ДО ЭТОГО ДНЯ ФАЙЛОВ НЕ БЫЛО ВОВСЕ. Тест стоял
+    красным, и его собственное сообщение говорило причину дословно —
+    «missing — run once with KIR_UPDATE_GOLDEN=1 and review». Это НЕ был дрейф
+    эмиссии и НЕ коллизия владельцев (два других красных голдена той же ночи
+    были именно ею): сверять было не с чем.
+
+    ДЕТЕРМИНИЗМ ДО ЗАМОРОЗКИ, а не после: две заморозки двумя процессами с
+    `PYTHONHASHSEED` 0 и 12345 дали побайтно одно и то же —
+    `annotation_full_set` 33 425 байт `sha a7fa70aafe1d`,
+    `annotation_explicit_types` 35 697 байт `sha 1d55a658630d`.
+
+    ЧТО ЭТИ ДВА ГОЛДЕНА ПИНЯТ (прочитано в эмитированном C#, не предположено):
+
+    * `AngularDimension.Create(doc, view, arc, refs, dimType)` — ПЯТИаргументную
+      перегрузку, единственную во всей семье размеров, что собирается на всех
+      шести (`LinearDimension.Create`/`RadialDimension`/`ArcLengthDimension` —
+      2025-2026 только; `NewAngularDimension`/`NewDiameterDimension` живут на
+      `FamilyItemFactory`, то есть только в редакторе семейств). Замена на любую
+      из них покраснеет здесь;
+    * линейный размер через `NewDimension` + **`ReferenceArray`** — то есть
+      ГЕОМЕТРИЧЕСКИЕ ссылки, а не `Reference(element)`, который `NewDimension`
+      не принимает (замерено, канон);
+    * точку вида через БАЗИС ВИДА:
+      `__vw.Origin + RightDirection.Multiply(U(x)) + UpDirection.Multiply(U(y))`
+      у `TextNote.Create` — то есть `[u,v]` как модельный сдвиг от `View.Origin`,
+      а не как координаты листа. Сырой XY здесь покраснеет;
+    * ДВЕ РАЗНЫЕ формы `IndependentTag.Create`: без типа
+      (`false`, `TM_ADDBY_CATEGORY`) в `full_set` и с типом плюс выноской
+      (`__ttel_T1.Id`, `true`, `TagOrientation`) в `explicit_types`. Мощность 2
+      здесь не украшение: при одной форме подстановка другой была бы невидима.
+
+    ЧЕГО ОНИ НЕ ПИНЯТ, и это важнее списка выше:
+
+    * ВЕРСИОННУЮ ОСЬ. Каждый голден снят на ОДНОЙ версии (2026 и 2022), поэтому
+      различие эмиссии между шестью версиями они не сверяют ничем — это работа
+      ворот, и там аннотации идут отдельными программами;
+    * что Revit ПОСТРОИТ описанное. Голден сверяет байты C#, а не поведение;
+      живого свидетельства у `create_angular_dimension` нет (см. `UNPROVEN`);
+    * ДУГУ углового размера по существу: она ВЫВОДИТСЯ эмиттером из двух
+      ссылок, и голден пинит текст, её строящий, но не проверяет, что центр
+      лёг в вершину пересечения плоскостей — офлайн это неотличимо;
+    * `leader_to` у текста и `leader` у марки только в ОДНОЙ конфигурации
+      каждый: обратная (текст без выноски при явном типе, марка с выноской без
+      типа) не покрыта ни одним из двух.
+    """
 
     def test_golden(self):
         update = os.environ.get("KIR_UPDATE_GOLDEN") == "1"

@@ -4,8 +4,9 @@
 acceptance session so that the handler cannot accidentally reorder the
 correctness loop:
 
-    typed plan -> pre-read -> fsynced registration -> write -> post-read
-    -> code-computed verdict -> fsynced terminal evidence
+    typed plan -> pre-read -> fsynced registration -> identity-guarded lower
+    -> fsynced exact wrapped artifact -> write -> post-read -> code-computed
+    verdict -> fsynced terminal evidence
 
 Every write routed through the regular serving body enters this state machine,
 including its admin bulk budget door.  A5 has a separate runner and a stronger
@@ -13,7 +14,7 @@ revision-bound journal/form-acceptance protocol.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -28,6 +29,8 @@ from kukai.ir.acceptance_evidence import (
     AcceptanceEvidence,
     AcceptanceReason,
     AcceptanceRegistration,
+    ExecutionArtifactBinding,
+    ExecutionArtifactBindingError,
     assess_acceptance,
     incomplete_acceptance,
     new_acceptance_run_id,
@@ -53,7 +56,7 @@ from kukai.ir.acceptance_journal import (
 )
 from kukai.ir.bridge_result import extract_error
 from kukai.ir.contracts import DocumentFingerprint, ElementIdentityProof
-from kukai.ir.midend import PlannedProgram
+from kukai.ir.midend import GroundedProgram
 from kukai.ir.outcome import AcceptanceState, ProgramOutcome, WitnessState
 
 
@@ -177,6 +180,88 @@ class AcceptanceSession:
     journal: AcceptanceJournal
 
     @property
+    def execution_artifact_binding(self) -> ExecutionArtifactBinding | None:
+        return self.journal.state.artifact_binding
+
+    def bind_execution_artifact(
+        self,
+        wrapped_source: str,
+        *,
+        execution_lane: str,
+        tool: str,
+        op: str,
+    ) -> ExecutionArtifactBinding:
+        """Content-address and fsync the exact wrapped C# before dispatch."""
+
+        context_digest = self.registration.ground_context_digest
+        if context_digest is None:
+            raise AcceptanceRuntimeError(
+                "KIR-A010",
+                "исполняемый артефакт не привязан к контексту — запись не запускалась",
+                "execution artifact needs a ground context digest",
+            )
+        try:
+            binding = ExecutionArtifactBinding.from_source(
+                wrapped_source,
+                run_id=self.registration.run_id,
+                revit_version=self.registration.revit_version,
+                plan_digest=self.registration.plan_digest,
+                ground_digest=self.registration.ground_digest,
+                ground_context_digest=context_digest,
+                execution_lane=execution_lane,
+                tool=tool,
+                op=op,
+            )
+            self.journal.bind_execution_artifact(binding)
+        except (ExecutionArtifactBindingError, AcceptanceJournalError) as exc:
+            raise AcceptanceRuntimeError(
+                "KIR-A010",
+                "исполняемый артефакт не удалось надёжно связать — "
+                "запись не запускалась",
+                str(exc),
+            ) from exc
+        return binding
+
+    def require_execution_artifact(
+        self,
+        wrapped_source: str,
+        *,
+        execution_lane: str,
+        tool: str,
+        op: str,
+    ) -> ExecutionArtifactBinding:
+        """Recompute the complete binding immediately before dispatch."""
+
+        binding = self.execution_artifact_binding
+        context_digest = self.registration.ground_context_digest
+        if binding is None or context_digest is None:
+            raise AcceptanceRuntimeError(
+                "KIR-A010",
+                "исполняемый артефакт не зарегистрирован — запись не запускалась",
+                "regular write dispatch has no durable artifact binding",
+            )
+        try:
+            binding.require_exact(
+                wrapped_source,
+                run_id=self.registration.run_id,
+                revit_version=self.registration.revit_version,
+                plan_digest=self.registration.plan_digest,
+                ground_digest=self.registration.ground_digest,
+                ground_context_digest=context_digest,
+                execution_lane=execution_lane,
+                tool=tool,
+                op=op,
+            )
+        except ExecutionArtifactBindingError as exc:
+            raise AcceptanceRuntimeError(
+                "KIR-A010",
+                "исполняемый артефакт изменился после регистрации — "
+                "запись не запускалась",
+                str(exc),
+            ) from exc
+        return binding
+
+    @property
     def execution_identity_proofs(self) -> tuple[ElementIdentityProof, ...]:
         """Exact pre-read identities that the emitted write must guard."""
 
@@ -192,13 +277,23 @@ class AcceptanceSession:
         *,
         timeout_ms: int,
     ) -> AcceptanceEvidence:
+        binding = self.execution_artifact_binding
+        if binding is None:
+            raise AcceptanceRuntimeError(
+                "KIR-A004",
+                "запись не имеет связанного исполняемого артефакта",
+                "post-read cannot assess an unbound execution artifact",
+            )
         if not self.registration.checkable:
             reason = (
                 AcceptanceReason.PARTIAL_BLIND_SCOPE
                 if self.registration.blind
                 else AcceptanceReason.VACUOUS
             )
-            return incomplete_acceptance(self.registration, reason)
+            return replace(
+                incomplete_acceptance(self.registration, reason),
+                execution_artifact_binding_digest=binding.binding_digest,
+            )
         try:
             observed = await _read_bound_observation(
                 reader,
@@ -217,11 +312,17 @@ class AcceptanceSession:
                 if exc.code == "KIR-A004"
                 else AcceptanceReason.POST_READ_UNAVAILABLE
             )
-            return incomplete_acceptance(self.registration, reason)
-        return assess_acceptance(
-            self.registration,
-            observed.scope_census,
-            observed.mutations,
+            return replace(
+                incomplete_acceptance(self.registration, reason),
+                execution_artifact_binding_digest=binding.binding_digest,
+            )
+        return replace(
+            assess_acceptance(
+                self.registration,
+                observed.scope_census,
+                observed.mutations,
+            ),
+            execution_artifact_binding_digest=binding.binding_digest,
         )
 
     @staticmethod
@@ -259,11 +360,18 @@ class AcceptanceSession:
             "state": evidence.state.value,
             "reason": evidence.reason.value,
             "plan_digest": self.registration.plan_digest,
+            "ground_digest": self.registration.ground_digest,
+            "ground_selector_resolution_replayed": (
+                self.registration.ground_selector_resolution_replayed),
+            "ground_derived_artifacts_verified": (
+                self.registration.ground_derived_artifacts_verified),
             "registration_digest": self.registration.registration_digest,
             "expectation_digest": self.registration.expectation_digest,
             "mutation_expectation_digest": (
                 self.registration.mutation_expectation_digest),
             "evidence_digest": evidence.evidence_digest,
+            "execution_artifact_binding_digest": (
+                evidence.execution_artifact_binding_digest),
             "verdict": (
                 evidence.verdict.to_dict()
                 if evidence.verdict is not None else None
@@ -273,6 +381,13 @@ class AcceptanceSession:
                 if evidence.mutation_verdict is not None else None
             ),
         }
+        if self.registration.ground_context_digest is not None:
+            payload["ground_context_digest"] = (
+                self.registration.ground_context_digest)
+            payload["ground_context_execution_bound"] = (
+                self.registration.ground_context_execution_bound)
+            payload["ground_context_authoritative"] = (
+                self.registration.ground_context_authoritative)
         payload["journal"] = {
             "schema_version": ACCEPTANCE_JOURNAL_SCHEMA_VERSION,
             "durable": self.journal.state.finalized,
@@ -280,28 +395,52 @@ class AcceptanceSession:
             "sequence": self.journal.state.sequence,
             "checksum": self.journal.state.checksum,
         }
+        if self.execution_artifact_binding is not None:
+            payload["execution_artifact"] = (
+                self.execution_artifact_binding.to_dict())
         return payload
 
     def registration_wire(self) -> dict[str, Any]:
         """Small proof that the predicate was durable before execution."""
 
-        return {
+        binding = self.execution_artifact_binding
+        payload = {
             "schema_version": ACCEPTANCE_JOURNAL_SCHEMA_VERSION,
-            "state": "prepared",
+            "state": (
+                "finalized" if self.journal.state.finalized
+                else "artifact_bound" if binding is not None
+                else "prepared"),
             "run_id": self.registration.run_id,
             "registration_digest": self.registration.registration_digest,
             "expectation_digest": self.registration.expectation_digest,
             "mutation_expectation_digest": (
                 self.registration.mutation_expectation_digest),
             "plan_digest": self.registration.plan_digest,
+            "ground_digest": self.registration.ground_digest,
+            "ground_selector_resolution_replayed": (
+                self.registration.ground_selector_resolution_replayed),
+            "ground_derived_artifacts_verified": (
+                self.registration.ground_derived_artifacts_verified),
             "revit_version": self.registration.revit_version,
             "journal_checksum": self.journal.state.checksum,
             "durable": True,
         }
+        if binding is not None:
+            payload["execution_artifact_binding_digest"] = (
+                binding.binding_digest)
+            payload["execution_artifact"] = binding.to_dict()
+        if self.registration.ground_context_digest is not None:
+            payload["ground_context_digest"] = (
+                self.registration.ground_context_digest)
+            payload["ground_context_execution_bound"] = (
+                self.registration.ground_context_execution_bound)
+            payload["ground_context_authoritative"] = (
+                self.registration.ground_context_authoritative)
+        return payload
 
 
 async def prepare_acceptance(
-    planned: PlannedProgram,
+    grounded: GroundedProgram,
     snapshot: Mapping[str, Any],
     document: DocumentFingerprint,
     reader: AcceptanceReader,
@@ -310,16 +449,38 @@ async def prepare_acceptance(
     timeout_ms: int,
     evidence_root: str | Path | None = None,
 ) -> AcceptanceSession:
-    """Pre-read and fsync the predicate before returning write authority."""
+    """Pre-read and fsync a predicate bound to exact grounded execution."""
 
-    if not isinstance(planned, PlannedProgram):
-        raise TypeError("acceptance preparation requires PlannedProgram")
+    if not isinstance(grounded, GroundedProgram):
+        raise TypeError("acceptance preparation requires GroundedProgram")
+    planned = grounded.planned
     if planned.family.value != "write":
         raise ValueError("independent mutation acceptance requires a write plan")
     if not isinstance(snapshot, Mapping):
         raise TypeError("acceptance preparation requires the ground snapshot")
     if not isinstance(document, DocumentFingerprint):
         raise TypeError("acceptance preparation requires document identity")
+    observed_context = type(grounded.context).from_snapshot(
+        snapshot,
+        source="acceptance_recheck",
+        trusted_source=False,
+    )
+    if (grounded.context.snapshot_digest
+            != observed_context.snapshot_digest):
+        raise AcceptanceRuntimeError(
+            "KIR-A002",
+            "контекст заземления не совпал со снимком приёмки — "
+            "транзакция не запускалась",
+            "ground context snapshot digest mismatch",
+        )
+    if (grounded.context.document_digest is not None
+            and grounded.context.document_digest != document.digest):
+        raise AcceptanceRuntimeError(
+            "KIR-A002",
+            "контекст заземления принадлежит другому документу — "
+            "транзакция не запускалась",
+            "ground context document digest mismatch",
+        )
     root = Path(evidence_root) if evidence_root is not None else (
         configured_evidence_root())
     if root is None:
@@ -367,6 +528,7 @@ async def prepare_acceptance(
     registration = AcceptanceRegistration(
         run_id=run_id,
         plan_digest=planned.plan_digest,
+        ground_digest=grounded.ground_digest,
         revit_version=revit_version,
         expectation=expectation,
         mutation_expectation=mutation_expectation,
@@ -374,6 +536,13 @@ async def prepare_acceptance(
         categories=expectation_categories(expectation),
         before=before,
         mutation_before=mutation_before,
+        ground_context_digest=grounded.context.context_digest,
+        ground_context_execution_bound=grounded.context.execution_bound,
+        ground_context_authoritative=grounded.context.authoritative,
+        ground_selector_resolution_replayed=(
+            grounded.selector_resolution_replayed),
+        ground_derived_artifacts_verified=(
+            grounded.derived_artifacts_verified),
     )
     try:
         journal = AcceptanceJournal.create(root, registration)

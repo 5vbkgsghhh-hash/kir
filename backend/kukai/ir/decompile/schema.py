@@ -7,11 +7,20 @@ rewrite extraction truth in place.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Sequence
+
+from .identity import (
+    AUTHORITATIVE_DOCUMENT_IDENTITY_SOURCES,
+    DOCUMENT_IDENTITY_SOURCES,
+    L0_IDENTITY_METADATA_SCHEMA,
+    IdentityGap,
+    IdentityStatus,
+)
 
 
 # ── CONSTANTS — KIR_DECOMPILE_SPEC Part 11 ──────────────────────────────────
@@ -77,6 +86,14 @@ EXTRACT_WINDOW_WAIT_S = max(0.0, float(
 EXTRACT_WINDOW_POLL_S = 10.0
 L0_SCHEMA_VERSION = "1.0"
 L0_UNITS = "mm"
+
+# Transform evidence is versioned independently from the frozen L0 record
+# dialect.  Adding this optional side axis therefore keeps historical L0 1.0
+# streams readable without pretending that those streams measured a frame.
+FEDERATION_TRANSFORM_SCHEMA = "kir-l0-federation-transform/1"
+FEDERATION_TRANSFORM_CONVENTION = (
+    "row_major_source_to_target_affine_mm")
+FEDERATION_TRANSFORM_ORTHONORMAL_TOL = 1e-8
 
 
 class L0SchemaError(ValueError):
@@ -352,6 +369,38 @@ class HostSource(str, Enum):
     INSULATION_LINING = "insulation_lining"
 
 
+class LineOwner(str, Enum):
+    """ЧЕМУ ПРИНАДЛЕЖИТ ЛИНИЯ: виду или плоскости построения (13.08).
+
+    ``OST_Lines`` держит В ОДНОЙ КАТЕГОРИИ два разных рода: модельная линия
+    (авторская геометрия, живёт на плоскости построения) и линия детализации
+    (оформление, живёт на виде). Различить их по категории нельзя ПО
+    ПОСТРОЕНИЮ, и `tools/content_coverage.py` говорит об этом прямо в своей
+    строке классификатора: «отнесено к оформлению ПО БОЛЬШИНСТВУ в реальных
+    РД; если модель линиями МОДЕЛИРУЕТ, строку надо править». Замерено 13.08
+    на `k2_ar_rd_v7`: 9 407 таких элементов, у ВСЕХ пустой `type_name` и
+    нет уровня, при этом геометрия есть (9 256 кривых с концами, 151
+    габарит) — то есть в L0 не было НИ ОДНОГО поля, способного отделить один
+    род от другого, хотя сама линия описана.
+
+    Значение называет ВЕТКУ ЧТЕНИЯ, которая ответила, — тот же приём, что у
+    :class:`HostSource` и у `default_panel_source` витражей: одно значение не
+    имеет права означать три разные правды.
+
+    ``None`` (ключа в строке НЕТ) — ОТДЕЛЬНОЕ состояние: НЕ СНИМАЛОСЬ. Так
+    выглядит весь замороженный L0 и всякая строка не-`CurveElement`.
+    ``NONE`` — снято и НЕ ОПРЕДЕЛЕНО: ни вида, ни плоскости; это
+    ТИПИЗИРОВАННЫЙ ОТКАЗ, а не пустое поле. ``READ_FAILED`` — попытка была и
+    бросила. Смешение первых двух и есть дефект, на котором этот дом уже
+    обжигался (§18.2, молчание боковой стадии).
+    """
+
+    VIEW = "view"
+    SKETCH_PLANE = "sketch_plane"
+    NONE = "none"
+    READ_FAILED = "read_failed"
+
+
 class CategoryState(str, Enum):
     COMPLETE = "complete"
     PARTIAL = "partial"
@@ -445,6 +494,758 @@ def _bbox_pair(
     if bbox_min_mm is not None and any(
             low > high for low, high in zip(bbox_min_mm, bbox_max_mm or ())):
         raise L0SchemaError(f"{field_name}: bbox min must not exceed bbox max")
+
+
+class FederationTransformStatus(str, Enum):
+    """Authority of one measured source-to-declared-target transform."""
+
+    AUTHORITATIVE = "authoritative"
+    INCOMPLETE = "incomplete"
+
+
+class FederationTransformGap(str, Enum):
+    """Closed reasons why a Revit transform could not be federated."""
+
+    TRANSFORM_UNAVAILABLE = "transform_unavailable"
+    TRANSFORM_INVALID = "transform_invalid"
+
+
+class FederationTransformTarget(str, Enum):
+    """The coordinate frame named by the matrix output."""
+
+    FEDERATION_ROOT = "federation_root"
+    PARENT_SOURCE = "parent_source"
+
+
+_FEDERATION_TRANSFORM_KEYS = frozenset({
+    "schema_version", "convention", "matrix", "status", "gaps",
+    "content_digest", "target_frame", "subject_context",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class FederationTransformSubject:
+    """Exact occurrence context to which a measured matrix belongs.
+
+    Keys use the same opaque ``revit:<source>:<value>`` namespace as graph
+    ``DocumentIdentity``.  Missing identities remain representable so the
+    transform can still be inspected, but such evidence is not replay-safe and
+    cannot enter :func:`federate_hulls`.
+    """
+
+    source_document_key: str | None
+    target_document_key: str | None
+    link_instance_chain: tuple[str, ...]
+    target_link_instance_chain: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("source_document_key", self.source_document_key),
+            ("target_document_key", self.target_document_key),
+        ):
+            if value is not None and (
+                    not isinstance(value, str) or not value.strip()):
+                raise L0SchemaError(f"transform.subject.{name} is invalid")
+        for name in ("link_instance_chain", "target_link_instance_chain"):
+            raw = getattr(self, name)
+            if isinstance(raw, str):
+                raise L0SchemaError(f"transform.subject.{name} must be an array")
+            chain = tuple(raw)
+            if any(not isinstance(item, str) or not item.strip()
+                   for item in chain):
+                raise L0SchemaError(
+                    f"transform.subject.{name} contains an invalid id")
+            object.__setattr__(self, name, chain)
+        parent = self.target_link_instance_chain
+        if self.link_instance_chain[:len(parent)] != parent:
+            raise L0SchemaError(
+                "transform target chain must be a prefix of source chain")
+
+    @property
+    def replay_safe(self) -> bool:
+        return (
+            self.source_document_key is not None
+            and self.target_document_key is not None)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_document_key": self.source_document_key,
+            "target_document_key": self.target_document_key,
+            "link_instance_chain": list(self.link_instance_chain),
+            "target_link_instance_chain": list(
+                self.target_link_instance_chain),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, value: Any, field_name: str = "transform.subject_context",
+    ) -> "FederationTransformSubject":
+        row = _mapping(value, field_name)
+        expected = frozenset({
+            "source_document_key", "target_document_key",
+            "link_instance_chain", "target_link_instance_chain",
+        })
+        if frozenset(row) != expected:
+            raise L0SchemaError(f"{field_name} keys mismatch")
+        source_key = row.get("source_document_key")
+        target_key = row.get("target_document_key")
+        for name, raw in (
+            ("source_document_key", source_key),
+            ("target_document_key", target_key),
+        ):
+            if raw is not None and (not isinstance(raw, str) or not raw.strip()):
+                raise L0SchemaError(f"{field_name}.{name} is invalid")
+        source_chain = row.get("link_instance_chain")
+        target_chain = row.get("target_link_instance_chain")
+        if not isinstance(source_chain, list) or not isinstance(target_chain, list):
+            raise L0SchemaError(f"{field_name} chains must be arrays")
+        return cls(
+            source_document_key=source_key,
+            target_document_key=target_key,
+            link_instance_chain=tuple(source_chain),
+            target_link_instance_chain=tuple(target_chain),
+        )
+
+
+def _canonical_affine_matrix(value: Any, field_name: str) -> tuple[float, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) != 16:
+        raise L0SchemaError(f"{field_name} must contain exactly 16 numbers")
+    matrix: list[float] = []
+    for index, item in enumerate(value):
+        if (isinstance(item, bool) or not isinstance(item, (int, float))
+                or not math.isfinite(item)):
+            raise L0SchemaError(
+                f"{field_name}[{index}] must be a finite number")
+        number = float(item)
+        matrix.append(0.0 if number == 0.0 else number)
+    result = tuple(matrix)
+    tol = FEDERATION_TRANSFORM_ORTHONORMAL_TOL
+    # The Bridge constructs this row from literals, so numerical drift cannot
+    # occur here.  Accepting a merely-near affine row would be dangerous:
+    # `_point` intentionally evaluates the 3x4 affine block and ignores W,
+    # while the evidence digest would attest different projective bytes.
+    if result[12:] != (0.0, 0.0, 0.0, 1.0):
+        raise L0SchemaError(
+            f"{field_name} must have affine last row [0, 0, 0, 1]")
+
+    # Revit link transforms are Euclidean isometries.  Columns are basis
+    # vectors because p_parent = BasisX*x + BasisY*y + BasisZ*z + Origin.
+    columns = tuple(
+        (result[column], result[4 + column], result[8 + column])
+        for column in range(3))
+    for index, column in enumerate(columns):
+        norm2 = sum(component * component for component in column)
+        if abs(norm2 - 1.0) > tol:
+            raise L0SchemaError(
+                f"{field_name} basis column {index} is scaled or singular")
+    for left in range(3):
+        for right in range(left + 1, 3):
+            dot = sum(
+                columns[left][axis] * columns[right][axis]
+                for axis in range(3))
+            if abs(dot) > tol:
+                raise L0SchemaError(
+                    f"{field_name} basis contains shear")
+    a, b, c = columns
+    determinant = (
+        a[0] * (b[1] * c[2] - b[2] * c[1])
+        - b[0] * (a[1] * c[2] - a[2] * c[1])
+        + c[0] * (a[1] * b[2] - a[2] * b[1]))
+    # abs(det)=1 admits mirrored Revit links while still rejecting collapse,
+    # scale and shear.  Reflection is an evidence fact, not an error.
+    if abs(abs(determinant) - 1.0) > tol:
+        raise L0SchemaError(
+            f"{field_name} basis determinant must be +1 or -1")
+    return result
+
+
+def federation_transform_digest(
+    matrix: Sequence[float],
+    target_frame: FederationTransformTarget = (
+        FederationTransformTarget.FEDERATION_ROOT),
+    subject_context: FederationTransformSubject | None = None,
+) -> str:
+    """Content digest of the exact canonical transform convention + matrix."""
+
+    canonical = _canonical_affine_matrix(matrix, "transform.matrix")
+    if not isinstance(target_frame, FederationTransformTarget):
+        raise L0SchemaError("transform.target_frame must be typed")
+    if not isinstance(subject_context, FederationTransformSubject):
+        raise L0SchemaError("transform.subject_context must be typed")
+    payload = {
+        "schema_version": FEDERATION_TRANSFORM_SCHEMA,
+        "convention": FEDERATION_TRANSFORM_CONVENTION,
+        "matrix": list(canonical),
+        "target_frame": target_frame.value,
+        "subject_context": subject_context.to_dict(),
+    }
+    raw = json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class FederationTransformEvidence:
+    """Validated source-to-declared-target frame evidence.
+
+    The matrix and its digest are an orthogonal axis to document identity:
+    knowing *which* link occurrence was read does not prove *where* it was
+    placed, and knowing a transform does not identify a document.
+    """
+
+    matrix: tuple[float, ...] | None
+    status: FederationTransformStatus
+    gaps: tuple[FederationTransformGap, ...]
+    content_digest: str | None
+    target_frame: FederationTransformTarget = (
+        FederationTransformTarget.FEDERATION_ROOT)
+    subject_context: FederationTransformSubject | None = None
+    schema_version: str = FEDERATION_TRANSFORM_SCHEMA
+    convention: str = FEDERATION_TRANSFORM_CONVENTION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != FEDERATION_TRANSFORM_SCHEMA:
+            raise L0SchemaError(
+                f"unsupported federation transform schema "
+                f"{self.schema_version!r}")
+        if self.convention != FEDERATION_TRANSFORM_CONVENTION:
+            raise L0SchemaError(
+                f"unsupported federation transform convention "
+                f"{self.convention!r}")
+        if not isinstance(self.status, FederationTransformStatus):
+            raise L0SchemaError("transform.status must be typed")
+        if not isinstance(self.target_frame, FederationTransformTarget):
+            raise L0SchemaError("transform.target_frame must be typed")
+        if not isinstance(self.subject_context, FederationTransformSubject):
+            raise L0SchemaError("transform.subject_context must be typed")
+        gaps = tuple(self.gaps)
+        if (len(gaps) != len(set(gaps))
+                or any(not isinstance(gap, FederationTransformGap)
+                       for gap in gaps)):
+            raise L0SchemaError("transform.gaps are invalid or duplicated")
+        object.__setattr__(self, "gaps", gaps)
+        if self.matrix is None:
+            if self.status is not FederationTransformStatus.INCOMPLETE:
+                raise L0SchemaError(
+                    "missing transform cannot be authoritative")
+            if len(gaps) != 1:
+                raise L0SchemaError(
+                    "missing transform requires exactly one named gap")
+            if self.content_digest is not None:
+                raise L0SchemaError(
+                    "missing transform cannot carry a content digest")
+            return
+        canonical = _canonical_affine_matrix(
+            self.matrix, "transform.matrix")
+        object.__setattr__(self, "matrix", canonical)
+        if self.status is not FederationTransformStatus.AUTHORITATIVE or gaps:
+            raise L0SchemaError(
+                "present transform must be authoritative and gap-free")
+        expected = federation_transform_digest(
+            canonical, self.target_frame, self.subject_context)
+        if self.content_digest != expected:
+            raise L0SchemaError("transform.content_digest mismatch")
+
+    @property
+    def authoritative(self) -> bool:
+        return self.status is FederationTransformStatus.AUTHORITATIVE
+
+    @property
+    def determinant(self) -> float | None:
+        if self.matrix is None:
+            return None
+        m = self.matrix
+        return (
+            m[0] * (m[5] * m[10] - m[6] * m[9])
+            - m[1] * (m[4] * m[10] - m[6] * m[8])
+            + m[2] * (m[4] * m[9] - m[5] * m[8]))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "convention": self.convention,
+            "matrix": list(self.matrix) if self.matrix is not None else None,
+            "status": self.status.value,
+            "gaps": [gap.value for gap in self.gaps],
+            "content_digest": self.content_digest,
+            "target_frame": self.target_frame.value,
+            "subject_context": self.subject_context.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, value: Any, field_name: str = "federation_transform",
+    ) -> "FederationTransformEvidence":
+        row = _mapping(value, field_name)
+        keys = frozenset(row)
+        if keys != _FEDERATION_TRANSFORM_KEYS:
+            missing = sorted(_FEDERATION_TRANSFORM_KEYS - keys)
+            extra = sorted(keys - _FEDERATION_TRANSFORM_KEYS)
+            raise L0SchemaError(
+                f"{field_name} keys mismatch; missing={missing}, extra={extra}")
+        try:
+            status = FederationTransformStatus(row.get("status"))
+        except (TypeError, ValueError) as exc:
+            raise L0SchemaError(
+                f"{field_name}.status is invalid: {row.get('status')!r}") from exc
+        try:
+            target_frame = FederationTransformTarget(row.get("target_frame"))
+        except (TypeError, ValueError) as exc:
+            raise L0SchemaError(
+                f"{field_name}.target_frame is invalid: "
+                f"{row.get('target_frame')!r}") from exc
+        raw_gaps = row.get("gaps")
+        if not isinstance(raw_gaps, list):
+            raise L0SchemaError(f"{field_name}.gaps must be an array")
+        try:
+            gaps = tuple(FederationTransformGap(item) for item in raw_gaps)
+        except (TypeError, ValueError) as exc:
+            raise L0SchemaError(
+                f"{field_name}.gaps contains an unknown reason") from exc
+        digest = row.get("content_digest")
+        if digest is not None and (
+                not isinstance(digest, str) or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)):
+            raise L0SchemaError(
+                f"{field_name}.content_digest must be lowercase sha256 or null")
+        raw_matrix = row.get("matrix")
+        subject = FederationTransformSubject.from_dict(
+            row.get("subject_context"), f"{field_name}.subject_context")
+        return cls(
+            schema_version=_nonempty_string(
+                row.get("schema_version"), f"{field_name}.schema_version"),
+            convention=_nonempty_string(
+                row.get("convention"), f"{field_name}.convention"),
+            matrix=(
+                _canonical_affine_matrix(raw_matrix, f"{field_name}.matrix")
+                if raw_matrix is not None else None),
+            status=status,
+            gaps=gaps,
+            content_digest=digest,
+            target_frame=target_frame,
+            subject_context=subject,
+        )
+
+    @classmethod
+    def from_bridge_dict(
+        cls, value: Any, field_name: str = "federation_transform",
+        *, subject_context: FederationTransformSubject,
+    ) -> "FederationTransformEvidence":
+        """Issue the digest at the Python trust boundary.
+
+        Revit 2025/2026 cannot compile ``SHA256`` in the exact Bridge closure.
+        The collector therefore returns only the measured matrix/status/gaps;
+        the server validates the isometry and issues the canonical digest
+        before a byte reaches persisted L0.
+        """
+
+        row = _mapping(value, field_name)
+        if not isinstance(subject_context, FederationTransformSubject):
+            raise L0SchemaError(
+                f"{field_name} requires typed subject_context")
+        expected = frozenset({"matrix", "status", "gaps", "target_frame"})
+        if frozenset(row) != expected:
+            raise L0SchemaError(
+                f"{field_name} bridge keys must be exactly "
+                "matrix,status,gaps,target_frame")
+        try:
+            target_frame = FederationTransformTarget(row.get("target_frame"))
+        except (TypeError, ValueError) as exc:
+            raise L0SchemaError(
+                f"{field_name}.target_frame is invalid: "
+                f"{row.get('target_frame')!r}") from exc
+        raw_matrix = row.get("matrix")
+        if raw_matrix is None:
+            matrix = None
+            digest = None
+        else:
+            matrix = _canonical_affine_matrix(
+                raw_matrix, f"{field_name}.matrix")
+            digest = federation_transform_digest(
+                matrix, target_frame, subject_context)
+        return cls.from_dict({
+            "schema_version": FEDERATION_TRANSFORM_SCHEMA,
+            "convention": FEDERATION_TRANSFORM_CONVENTION,
+            "matrix": list(matrix) if matrix is not None else None,
+            "status": row.get("status"),
+            "gaps": row.get("gaps"),
+            "content_digest": digest,
+            "target_frame": target_frame.value,
+            "subject_context": subject_context.to_dict(),
+        }, field_name)
+
+
+def identity_federation_transform(
+    *,
+    document_key: str = "test:federation-root",
+) -> FederationTransformEvidence:
+    matrix = (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
+    return FederationTransformEvidence(
+        matrix=matrix,
+        status=FederationTransformStatus.AUTHORITATIVE,
+        gaps=(),
+        content_digest=federation_transform_digest(
+            matrix, FederationTransformTarget.FEDERATION_ROOT,
+            FederationTransformSubject(
+                source_document_key=document_key,
+                target_document_key=document_key,
+                link_instance_chain=(),
+                target_link_instance_chain=())),
+        target_frame=FederationTransformTarget.FEDERATION_ROOT,
+        subject_context=FederationTransformSubject(
+            source_document_key=document_key,
+            target_document_key=document_key,
+            link_instance_chain=(),
+            target_link_instance_chain=()),
+    )
+
+
+class L0SourceKind(str, Enum):
+    """How the source document is observed from the federation root."""
+
+    ROOT = "root"
+    LINK = "link"
+
+
+def _identity_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise L0SchemaError(f"{field_name} must be a non-blank string")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentIdentityFact:
+    """One Revit-owned document identity fact, before graph namespacing."""
+
+    source: str
+    value: str
+
+    def __post_init__(self) -> None:
+        if self.source not in DOCUMENT_IDENTITY_SOURCES:
+            raise L0SchemaError(
+                f"unsupported document identity source {self.source!r}")
+        _identity_text(self.value, "DocumentIdentityFact.value")
+
+    @property
+    def authoritative(self) -> bool:
+        """Whether this source may namespace graph definitions by itself."""
+        return self.source in AUTHORITATIVE_DOCUMENT_IDENTITY_SOURCES
+
+    def to_dict(self) -> dict[str, str]:
+        return {"source": self.source, "value": self.value}
+
+    @classmethod
+    def from_dict(
+        cls, value: Any, field_name: str = "document_identity",
+    ) -> "DocumentIdentityFact":
+        row = _mapping(value, field_name)
+        _require_fields(row, ("source", "value"), field_name)
+        return cls(
+            source=_identity_text(
+                row.get("source"), f"{field_name}.source"),
+            value=_identity_text(
+                row.get("value"), f"{field_name}.value"),
+        )
+
+
+_DOCUMENT_CONTEXT_GAPS = frozenset({
+    IdentityGap.SOURCE_DOCUMENT_IDENTITY_UNAVAILABLE,
+    IdentityGap.SOURCE_DOCUMENT_IDENTITY_NOT_AUTHORITATIVE,
+    IdentityGap.FEDERATION_ROOT_IDENTITY_UNAVAILABLE,
+    IdentityGap.FEDERATION_ROOT_IDENTITY_NOT_AUTHORITATIVE,
+    IdentityGap.LINK_INSTANCE_UNIQUE_ID_UNAVAILABLE,
+})
+
+_LINK_IDENTITY_GAPS = frozenset({
+    IdentityGap.LINK_INSTANCE_UNIQUE_ID_UNAVAILABLE,
+    IdentityGap.LINKED_DOCUMENT_UNAVAILABLE,
+    IdentityGap.LINKED_DOCUMENT_IDENTITY_UNAVAILABLE,
+    IdentityGap.LINKED_DOCUMENT_IDENTITY_NOT_AUTHORITATIVE,
+})
+
+
+def _identity_gaps(
+    value: Any,
+    field_name: str,
+    *,
+    allowed: frozenset[IdentityGap],
+) -> tuple[IdentityGap, ...]:
+    if not isinstance(value, list):
+        raise L0SchemaError(f"{field_name} must be an array")
+    parsed: list[IdentityGap] = []
+    for index, item in enumerate(value):
+        try:
+            gap = IdentityGap(item)
+        except (TypeError, ValueError) as exc:
+            raise L0SchemaError(
+                f"{field_name}[{index}] is invalid: {item!r}") from exc
+        if gap not in allowed:
+            raise L0SchemaError(
+                f"{field_name}[{index}] is not valid in this identity seam")
+        parsed.append(gap)
+    if len(parsed) != len(set(parsed)):
+        raise L0SchemaError(f"{field_name} contains duplicates")
+    return tuple(parsed)
+
+
+@dataclass(frozen=True, slots=True)
+class L0IdentityMetadata:
+    """Identity context captured by the same Revit call as the L0 header.
+
+    This is intentionally optional on :class:`L0Document`: old snapshots did
+    not capture it and remain readable, but their graph identity is explicitly
+    incomplete.  The status is checked against the facts so a producer cannot
+    claim authority with an empty link path or a missing document identity.
+    """
+
+    source_kind: L0SourceKind
+    document_identity: DocumentIdentityFact | None
+    federation_root_identity: DocumentIdentityFact | None
+    link_instance_chain: tuple[str, ...]
+    status: IdentityStatus
+    gaps: tuple[IdentityGap, ...]
+    schema_version: str = L0_IDENTITY_METADATA_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema_version != L0_IDENTITY_METADATA_SCHEMA:
+            raise L0SchemaError(
+                f"unsupported L0 identity schema {self.schema_version!r}")
+        if not isinstance(self.source_kind, L0SourceKind):
+            raise L0SchemaError("L0IdentityMetadata.source_kind must be typed")
+        for name, value in (
+            ("document_identity", self.document_identity),
+            ("federation_root_identity", self.federation_root_identity),
+        ):
+            if value is not None and not isinstance(value, DocumentIdentityFact):
+                raise L0SchemaError(
+                    f"L0IdentityMetadata.{name} must be typed or null")
+        if isinstance(self.link_instance_chain, str):
+            raise L0SchemaError("identity link chain must be an array")
+        chain = tuple(self.link_instance_chain)
+        for index, value in enumerate(chain):
+            _identity_text(value, f"identity.link_instance_chain[{index}]")
+        object.__setattr__(self, "link_instance_chain", chain)
+        if self.source_kind is L0SourceKind.ROOT and chain:
+            raise L0SchemaError("root identity cannot carry a link chain")
+        if (self.source_kind is L0SourceKind.ROOT
+                and self.document_identity is not None
+                and self.federation_root_identity is not None
+                and self.document_identity != self.federation_root_identity):
+            raise L0SchemaError(
+                "root document identity differs from federation root")
+        if not isinstance(self.status, IdentityStatus):
+            raise L0SchemaError("identity.status must be typed")
+        gaps = tuple(self.gaps)
+        if (len(gaps) != len(set(gaps))
+                or any(gap not in _DOCUMENT_CONTEXT_GAPS for gap in gaps)):
+            raise L0SchemaError("identity.gaps are invalid or duplicated")
+        object.__setattr__(self, "gaps", gaps)
+        expected_gaps: set[IdentityGap] = set()
+        if self.document_identity is None:
+            expected_gaps.add(
+                IdentityGap.SOURCE_DOCUMENT_IDENTITY_UNAVAILABLE)
+        elif not self.document_identity.authoritative:
+            expected_gaps.add(
+                IdentityGap.SOURCE_DOCUMENT_IDENTITY_NOT_AUTHORITATIVE)
+        if self.federation_root_identity is None:
+            expected_gaps.add(
+                IdentityGap.FEDERATION_ROOT_IDENTITY_UNAVAILABLE)
+        elif not self.federation_root_identity.authoritative:
+            expected_gaps.add(
+                IdentityGap.FEDERATION_ROOT_IDENTITY_NOT_AUTHORITATIVE)
+        if self.source_kind is L0SourceKind.LINK and not chain:
+            expected_gaps.add(
+                IdentityGap.LINK_INSTANCE_UNIQUE_ID_UNAVAILABLE)
+        if set(gaps) != expected_gaps:
+            raise L0SchemaError(
+                "identity.gaps do not exactly describe missing facts")
+        complete = (
+            self.document_identity is not None
+            and self.document_identity.authoritative
+            and self.federation_root_identity is not None
+            and self.federation_root_identity.authoritative
+            and (self.source_kind is L0SourceKind.ROOT or bool(chain))
+            and not gaps)
+        if (self.status is IdentityStatus.AUTHORITATIVE) != complete:
+            raise L0SchemaError(
+                "identity.status contradicts captured facts/gaps")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "source_kind": self.source_kind.value,
+            "document_identity": (
+                self.document_identity.to_dict()
+                if self.document_identity is not None else None),
+            "federation_root_identity": (
+                self.federation_root_identity.to_dict()
+                if self.federation_root_identity is not None else None),
+            "link_instance_chain": list(self.link_instance_chain),
+            "status": self.status.value,
+            "gaps": [gap.value for gap in self.gaps],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "L0IdentityMetadata":
+        row = _mapping(value, "identity")
+        _require_fields(row, (
+            "schema_version", "source_kind", "document_identity",
+            "federation_root_identity", "link_instance_chain", "status",
+            "gaps",
+        ), "identity")
+        try:
+            source_kind = L0SourceKind(row.get("source_kind"))
+        except (TypeError, ValueError) as exc:
+            raise L0SchemaError(
+                f"identity.source_kind is invalid: "
+                f"{row.get('source_kind')!r}") from exc
+        try:
+            status = IdentityStatus(row.get("status"))
+        except (TypeError, ValueError) as exc:
+            raise L0SchemaError(
+                f"identity.status is invalid: {row.get('status')!r}") from exc
+        raw_chain = row.get("link_instance_chain")
+        if not isinstance(raw_chain, list):
+            raise L0SchemaError("identity.link_instance_chain must be an array")
+        return cls(
+            schema_version=_nonempty_string(
+                row.get("schema_version"), "identity.schema_version"),
+            source_kind=source_kind,
+            document_identity=(
+                DocumentIdentityFact.from_dict(
+                    row["document_identity"], "identity.document_identity")
+                if row.get("document_identity") is not None else None),
+            federation_root_identity=(
+                DocumentIdentityFact.from_dict(
+                    row["federation_root_identity"],
+                    "identity.federation_root_identity")
+                if row.get("federation_root_identity") is not None else None),
+            link_instance_chain=tuple(
+                _identity_text(
+                    item, f"identity.link_instance_chain[{index}]")
+                for index, item in enumerate(raw_chain)),
+            status=status,
+            gaps=_identity_gaps(
+                row.get("gaps"), "identity.gaps",
+                allowed=_DOCUMENT_CONTEXT_GAPS),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class L0LinkIdentity:
+    """Identity facts for one RevitLinkInstance in the root header."""
+
+    instance_unique_id: str | None
+    linked_document_identity: DocumentIdentityFact | None
+    status: IdentityStatus
+    gaps: tuple[IdentityGap, ...]
+    schema_version: str = L0_IDENTITY_METADATA_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema_version != L0_IDENTITY_METADATA_SCHEMA:
+            raise L0SchemaError(
+                f"unsupported link identity schema {self.schema_version!r}")
+        if self.instance_unique_id is not None:
+            _identity_text(
+                self.instance_unique_id,
+                "L0LinkIdentity.instance_unique_id")
+        if (self.linked_document_identity is not None
+                and not isinstance(
+                    self.linked_document_identity, DocumentIdentityFact)):
+            raise L0SchemaError(
+                "linked_document_identity must be typed or null")
+        if not isinstance(self.status, IdentityStatus):
+            raise L0SchemaError("link.identity.status must be typed")
+        gaps = tuple(self.gaps)
+        if (len(gaps) != len(set(gaps))
+                or any(gap not in _LINK_IDENTITY_GAPS for gap in gaps)):
+            raise L0SchemaError("link.identity.gaps are invalid or duplicated")
+        object.__setattr__(self, "gaps", gaps)
+        expected_instance_gap = self.instance_unique_id is None
+        if ((IdentityGap.LINK_INSTANCE_UNIQUE_ID_UNAVAILABLE in gaps)
+                != expected_instance_gap):
+            raise L0SchemaError(
+                "link.identity instance gap contradicts instance_unique_id")
+        linked_gaps = {
+            IdentityGap.LINKED_DOCUMENT_UNAVAILABLE,
+            IdentityGap.LINKED_DOCUMENT_IDENTITY_UNAVAILABLE,
+            IdentityGap.LINKED_DOCUMENT_IDENTITY_NOT_AUTHORITATIVE,
+        } & set(gaps)
+        if self.linked_document_identity is None:
+            if len(linked_gaps) != 1:
+                raise L0SchemaError(
+                    "missing linked document identity needs one named gap")
+        elif self.linked_document_identity.authoritative:
+            if linked_gaps:
+                raise L0SchemaError(
+                    "link.identity linked-document gap contradicts its fact")
+        elif linked_gaps != {
+                IdentityGap.LINKED_DOCUMENT_IDENTITY_NOT_AUTHORITATIVE}:
+            raise L0SchemaError(
+                "weak linked document identity needs its authority gap")
+        complete = (
+            self.instance_unique_id is not None
+            and self.linked_document_identity is not None
+            and self.linked_document_identity.authoritative
+            and not gaps)
+        if (self.status is IdentityStatus.AUTHORITATIVE) != complete:
+            raise L0SchemaError(
+                "link.identity.status contradicts captured facts/gaps")
+
+    @property
+    def authoritative(self) -> bool:
+        return self.status is IdentityStatus.AUTHORITATIVE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "instance_unique_id": self.instance_unique_id,
+            "linked_document_identity": (
+                self.linked_document_identity.to_dict()
+                if self.linked_document_identity is not None else None),
+            "status": self.status.value,
+            "gaps": [gap.value for gap in self.gaps],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "L0LinkIdentity":
+        row = _mapping(value, "link.identity")
+        _require_fields(row, (
+            "schema_version", "instance_unique_id",
+            "linked_document_identity", "status", "gaps",
+        ), "link.identity")
+        try:
+            status = IdentityStatus(row.get("status"))
+        except (TypeError, ValueError) as exc:
+            raise L0SchemaError(
+                f"link.identity.status is invalid: "
+                f"{row.get('status')!r}") from exc
+        return cls(
+            schema_version=_nonempty_string(
+                row.get("schema_version"),
+                "link.identity.schema_version"),
+            instance_unique_id=(
+                _identity_text(
+                    row.get("instance_unique_id"),
+                    "link.identity.instance_unique_id")
+                if row.get("instance_unique_id") is not None else None),
+            linked_document_identity=(
+                DocumentIdentityFact.from_dict(
+                    row["linked_document_identity"],
+                    "link.identity.linked_document_identity")
+                if row.get("linked_document_identity") is not None else None),
+            status=status,
+            gaps=_identity_gaps(
+                row.get("gaps"), "link.identity.gaps",
+                allowed=_LINK_IDENTITY_GAPS),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -685,6 +1486,17 @@ class L0Element:
     # диалекта это не двигает: диалект называет поколение ТАБЛИЦЫ КАТЕГОРИЙ,
     # а не набор полей записи (см. «ЗАКОН ДОПИСИ В ХВОСТ» в шапке файла).
     host_source: "HostSource | None" = None
+    # Federated identity capture.  ``element_id`` remains the local Revit
+    # address used by all historical L0 consumers; this additive field is the
+    # stable definition fact.  None means a legacy/unmeasured row, never a
+    # synthesized identity from the local id.
+    unique_id: str | None = None
+    # Принадлежность линии (13.08). Дописано В ХВОСТ по тому же закону, что
+    # `curve_kind` и `host_source` выше. Значение по умолчанию оставляет
+    # замороженный L0 разбираемым запись в запись, и отсутствие ключа
+    # означает «не снималось», а не «не определено» — см. :class:`LineOwner`.
+    line_owner_kind: "LineOwner | None" = None
+    line_owner_id: str | None = None
 
     def __post_init__(self) -> None:
         _nonempty_string(self.element_id, "L0Element.element_id")
@@ -735,6 +1547,29 @@ class L0Element:
                 raise L0SchemaError(
                     "L0Element.host_source without host_id: the reader that "
                     "answered must have produced a host id")
+        if self.unique_id is not None:
+            _identity_text(self.unique_id, "L0Element.unique_id")
+        if self.line_owner_kind is not None:
+            if not isinstance(self.line_owner_kind, LineOwner):
+                raise L0SchemaError(
+                    "L0Element.line_owner_kind must be a LineOwner or null")
+            # Владелец без своего id и id без владельца — испорченный поток,
+            # а не бедная строка: съёмщик пишет пару одним присваиванием.
+            # Отказ поимённый, как требует шапка файла от любого УЖЕСТОЧЕНИЯ.
+            if self.line_owner_kind in (LineOwner.VIEW, LineOwner.SKETCH_PLANE):
+                if self.line_owner_id is None:
+                    raise L0SchemaError(
+                        "L0Element.line_owner_kind names an owner but "
+                        "line_owner_id is absent")
+            elif self.line_owner_id is not None:
+                raise L0SchemaError(
+                    "L0Element.line_owner_id without an owner: "
+                    f"line_owner_kind is {self.line_owner_kind.value}")
+            _optional_string(self.line_owner_id, "L0Element.line_owner_id")
+        elif self.line_owner_id is not None:
+            raise L0SchemaError(
+                "L0Element.line_owner_id without line_owner_kind: an id "
+                "whose provenance was never recorded is not a measurement")
         if self.geom_kind is GeometryKind.CURVE:
             if self.p0_mm is None or self.p1_mm is None:
                 raise L0SchemaError("curve geometry requires p0_mm and p1_mm")
@@ -755,7 +1590,7 @@ class L0Element:
                 "bbox_only geometry must not carry point/curve fields")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        row = {
             "element_id": self.element_id,
             "category": self.category,
             "category_ru": self.category_ru,
@@ -784,6 +1619,16 @@ class L0Element:
                 self.host_source.value
                 if self.host_source is not None else None),
         }
+        # Preserve frozen legacy byte shape for objects constructed without
+        # the new capture. Fresh extraction always writes the key.
+        if self.unique_id is not None:
+            row["unique_id"] = self.unique_id
+        # Ключ пишется ТОЛЬКО когда снималось: отсутствие обязано читаться как
+        # «не снималось», и запись `null` отняла бы у поля это состояние.
+        if self.line_owner_kind is not None:
+            row["line_owner_kind"] = self.line_owner_kind.value
+            row["line_owner_id"] = self.line_owner_id
+        return row
 
     @classmethod
     def from_dict(cls, value: Any) -> "L0Element":
@@ -798,7 +1643,20 @@ class L0Element:
         except (TypeError, ValueError) as exc:
             raise L0SchemaError(
                 f"element.geom_kind is invalid: {row.get('geom_kind')!r}") from exc
+        raw_line_owner = row.get("line_owner_kind")
+        if raw_line_owner is None:
+            line_owner_kind = None
+        else:
+            try:
+                line_owner_kind = LineOwner(raw_line_owner)
+            except (TypeError, ValueError) as exc:
+                raise L0SchemaError(
+                    "element.line_owner_kind is invalid: "
+                    f"{raw_line_owner!r}") from exc
         return cls(
+            line_owner_kind=line_owner_kind,
+            line_owner_id=_optional_string(
+                row.get("line_owner_id"), "element.line_owner_id"),
             element_id=_nonempty_string(
                 row.get("element_id"), "element.element_id"),
             category=_nonempty_string(row.get("category"), "element.category"),
@@ -838,6 +1696,9 @@ class L0Element:
                 LocationCurveKind, row.get("curve_kind"), "element.curve_kind"),
             host_source=_optional_enum(
                 HostSource, row.get("host_source"), "element.host_source"),
+            unique_id=(
+                _identity_text(row.get("unique_id"), "element.unique_id")
+                if row.get("unique_id") is not None else None),
         )
 
 
@@ -850,6 +1711,13 @@ class LinkSummary:
     bbox_min_mm: Vec3 | None
     bbox_max_mm: Vec3 | None
     discipline: str
+    # None is the readable legacy state. Fresh metadata always carries a
+    # typed identity result, including named gaps for unloaded links.
+    identity: L0LinkIdentity | None = None
+    # Child-document coordinates -> this source-document coordinates.  It is
+    # independent from identity: an unloaded link can still have a placement,
+    # while a known linked document can still lack trustworthy frame evidence.
+    transform: FederationTransformEvidence | None = None
 
     def __post_init__(self) -> None:
         _nonempty_string(self.element_id, "LinkSummary.element_id")
@@ -867,9 +1735,32 @@ class LinkSummary:
         _optional_vec(self.bbox_max_mm, 3, "LinkSummary.bbox_max_mm")
         _bbox_pair(self.bbox_min_mm, self.bbox_max_mm, "LinkSummary")
         _nonempty_string(self.discipline, "LinkSummary.discipline")
+        if self.identity is not None:
+            if not isinstance(self.identity, L0LinkIdentity):
+                raise L0SchemaError(
+                    "LinkSummary.identity must be L0LinkIdentity or null")
+            if (not self.loaded
+                    and self.identity.linked_document_identity is not None):
+                raise L0SchemaError(
+                    "unloaded link cannot claim linked document identity")
+            if (not self.loaded
+                    and IdentityGap.LINKED_DOCUMENT_UNAVAILABLE
+                    not in self.identity.gaps):
+                raise L0SchemaError(
+                    "unloaded link identity must name linked_document_unavailable")
+            if (self.loaded
+                    and IdentityGap.LINKED_DOCUMENT_UNAVAILABLE
+                    in self.identity.gaps):
+                raise L0SchemaError(
+                    "loaded link cannot claim linked_document_unavailable")
+        if (self.transform is not None
+                and not isinstance(
+                    self.transform, FederationTransformEvidence)):
+            raise L0SchemaError(
+                "LinkSummary.transform must be typed or null")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        row = {
             "element_id": self.element_id,
             "name": self.name,
             "loaded": self.loaded,
@@ -880,6 +1771,11 @@ class LinkSummary:
                 list(self.bbox_max_mm) if self.bbox_max_mm is not None else None),
             "discipline": self.discipline,
         }
+        if self.identity is not None:
+            row["identity"] = self.identity.to_dict()
+        if self.transform is not None:
+            row["transform"] = self.transform.to_dict()
+        return row
 
     @classmethod
     def from_dict(cls, value: Any) -> "LinkSummary":
@@ -910,6 +1806,13 @@ class LinkSummary:
                 "link.bbox_max_mm"),  # type: ignore[arg-type]
             discipline=_nonempty_string(
                 row.get("discipline"), "link.discipline"),
+            identity=(
+                L0LinkIdentity.from_dict(row["identity"])
+                if row.get("identity") is not None else None),
+            transform=(
+                FederationTransformEvidence.from_dict(
+                    row["transform"], "link.transform")
+                if row.get("transform") is not None else None),
         )
 
 
@@ -1154,6 +2057,13 @@ class L0Document:
     # обязан оставаться раздельным — иначе отсутствие знаменателя выглядит
     # как полное покрытие.
     census: tuple["CensusEntry", ...] = ()
+    # Trusted production extraction context. None is the legacy state and is
+    # intentionally non-authoritative downstream.
+    identity: L0IdentityMetadata | None = None
+    # Current source-document coordinates -> federation-root coordinates.
+    # Optional only for historical streams; new extraction always measures or
+    # emits a typed gap.
+    federation_transform: FederationTransformEvidence | None = None
 
     @property
     def census_total(self) -> int:
@@ -1198,6 +2108,15 @@ class L0Document:
         if not isinstance(self.project_info, ProjectInfo):
             raise L0SchemaError(
                 "L0Document.project_info must be a ProjectInfo")
+        if (self.identity is not None
+                and not isinstance(self.identity, L0IdentityMetadata)):
+            raise L0SchemaError(
+                "L0Document.identity must be L0IdentityMetadata or null")
+        if (self.federation_transform is not None
+                and not isinstance(
+                    self.federation_transform, FederationTransformEvidence)):
+            raise L0SchemaError(
+                "L0Document.federation_transform must be typed or null")
         if tuple(sorted(self.levels, key=lambda level: level.elevation_mm)) != self.levels:
             raise L0SchemaError("L0Document.levels must be sorted by elevation")
         for field_name, identifiers in (
@@ -1225,7 +2144,7 @@ class L0Document:
         # L0.jsonl и что читают все потребители ниже по течению (A5, re-lift,
         # паспорт). Пока эти три поля жили лишь в to_dict(), сигнал «читалась
         # часть модели» терялся между C# и первым же артефактом.
-        return {
+        row = {
             "doc_name": self.doc_name,
             "revit_version": self.revit_version,
             "units": self.units,
@@ -1242,6 +2161,11 @@ class L0Document:
             # запись L0.jsonl и что читают все потребители ниже по течению.
             "census": [entry.to_dict() for entry in self.census],
         }
+        if self.identity is not None:
+            row["identity"] = self.identity.to_dict()
+        if self.federation_transform is not None:
+            row["federation_transform"] = self.federation_transform.to_dict()
+        return row
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1293,4 +2217,12 @@ class L0Document:
             worksets_closed=int(row.get("worksets_closed") or 0),
             census=tuple(
                 CensusEntry.from_dict(item) for item in census_rows),
+            identity=(
+                L0IdentityMetadata.from_dict(row["identity"])
+                if row.get("identity") is not None else None),
+            federation_transform=(
+                FederationTransformEvidence.from_dict(
+                    row["federation_transform"],
+                    "document.federation_transform")
+                if row.get("federation_transform") is not None else None),
         )

@@ -81,7 +81,8 @@ VERSIONS = ("2021", "2022", "2023", "2024", "2025", "2026")
 # without an edit.  Override with --docs or KIR_REVIT_DOCS.
 NUGET_ROOT = pathlib.Path(os.environ.get(
     "KIR_REVIT_DOCS",
-    str(pathlib.Path.home() / ".nuget/packages/revit_all_main_versions_api_x64")))
+    str(pathlib.Path.home() / ".nuget" / "packages"
+        / "revit_all_main_versions_api_x64")))
 FRAMEWORKS = ("net48", "net8.0")
 
 DEFAULT_DB = (pathlib.Path(__file__).resolve().parent.parent

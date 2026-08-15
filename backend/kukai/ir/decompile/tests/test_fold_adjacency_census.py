@@ -50,7 +50,20 @@ def _element(element_id, category, host_id=None):
     return L0Element(
         element_id=element_id, category=category, category_ru="",
         type_id="t", type_name="T", level_id=None, level_name=None,
-        geom_kind=GeometryKind.POINT, p0_mm=None, p1_mm=None,
+        # ВИД ГЕОМЕТРИИ ОБЪЯВЛЯЛСЯ ОДИН, А НЕСЁЛСЯ ДРУГОЙ. Здесь стояло
+        # `POINT` при `p0_mm=None`, то есть «точка без точки»; схема этого не
+        # допускает (`point geometry requires only p0_mm`) и шесть тестов
+        # переписи падали на конструкторе, не дойдя ни до одной проверки —
+        # то есть файл шесть раз сообщал не о том, что проверяет.
+        # Тесту геометрия безразлична — он про смежность и перепись, — и
+        # ровно эту форму схема называет `BBOX_ONLY`: все три поля точки и
+        # кривой пусты. Объявляем то, что несём.
+        # И ВТОРАЯ ПОЛОВИНА, БЕЗ КОТОРОЙ ПЕРВАЯ ЧИТАЕТСЯ КАК ПОСЛАБЛЕНИЕ:
+        # `POINT` без `p0_mm` — НЕВЕРНАЯ строка L0, и прод-схема обязана
+        # отвергать её и дальше. Чинилась фикстура, а не правило.
+        # (Две сессии пришли к этой правке независимо и написали её
+        # одинаково; обе половины комментария сведены при слиянии.)
+        geom_kind=GeometryKind.BBOX_ONLY, p0_mm=None, p1_mm=None,
         rotation_deg=None, bbox_min_mm=None, bbox_max_mm=None,
         host_id=host_id)
 

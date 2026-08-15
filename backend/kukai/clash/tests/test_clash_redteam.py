@@ -217,6 +217,11 @@ def test_r5_a_missing_hull_on_an_mvp_side_makes_the_report_say_it_is_incomplete(
     rep = D.detect(S.build_from_elements(els, origin={"run_dir": "t"}))
     comp = rep["search"]["completeness"]
     assert comp["complete"] is False
+    assert comp["incomplete_axes"] == ["geometry"]
+    assert comp["axes"]["geometry"]["complete"] is False
+    assert comp["axes"]["extraction"]["complete"] is True
+    assert comp["axes"]["federation"]["complete"] is True
+    assert comp["axes"]["query_scope"]["complete"] is True
     assert comp["without_hull_on_mvp_side"] == 1
     assert comp["by_category"]["OST_Walls"] == 1
     md = D.to_markdown(rep)
@@ -229,7 +234,86 @@ def test_r5_a_complete_search_says_so_too():
             "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [5000, 200, 3000]}]
     rep = D.detect(S.build_from_elements(els, origin={"run_dir": "t"}),
                    pair_filter=D.any_physical_pair_filter)
-    assert rep["search"]["completeness"]["complete"] is True
+    comp = rep["search"]["completeness"]
+    assert comp["complete"] is True
+    assert comp["incomplete_axes"] == []
+    assert all(axis["complete"] for axis in comp["axes"].values())
+
+
+def test_r5_completeness_vector_does_not_hide_extraction_or_federation_gaps():
+    """A perfect host hull census cannot certify rows that never entered L0
+    or linked geometry that was discovered but never transformed/scored."""
+    snap = S.build_from_elements(
+        [{"element_id": "w", "category": "OST_Walls",
+          "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [10, 10, 10]}],
+        origin={"run_dir": "t", "links_in_l0": 3})
+    snap.census.outside_extraction_scope = 7
+    # ДВЕ РАЗНЫЕ ВЕЛИЧИНЫ, И ТЕПЕРЬ ОНИ РАЗВЕДЕНЫ (правка слияния 11.08.2026).
+    # Здесь стояло только `linked_elements_unscored = 3`, и полнота решалась
+    # по нему — что было верно, пока поле держало ЧИСЛО СВЯЗЕЙ. Поле исправлено
+    # и держит ЭЛЕМЕНТЫ, поэтому три связи и число элементов за ними заданы
+    # ОТДЕЛЬНО: 3 связи, 12 000 элементов. Если бы полнота по-прежнему читала
+    # сумму, здание с выгруженными связями (сумма 0) объявило бы себя полным.
+    snap.census.linked_elements_unscored = 12_000
+    snap.census.links_without_element_count = 1
+
+    comp = D.detect(snap)["search"]["completeness"]
+    assert comp["axes"]["geometry"]["complete"] is True
+    assert comp["axes"]["extraction"]["complete"] is False
+    assert comp["axes"]["extraction"]["outside_extraction_scope"] == 7
+    assert comp["axes"]["federation"]["complete"] is False
+    assert comp["axes"]["federation"]["links_in_l0"] == 3
+    assert comp["axes"]["federation"]["linked_elements_unscored"] == 12_000
+    assert comp["axes"]["federation"]["links_without_element_count"] == 1
+    assert comp["incomplete_axes"] == ["extraction", "federation"]
+    assert comp["complete"] is False
+    with pytest.raises(S.SnapshotIntegrityError,
+                       match="extraction.*federation"):
+        D.detect(snap, require_complete=True)
+
+
+def test_r5_query_scope_and_all_physical_geometry_are_independent_axes():
+    snap = S.build_from_elements(
+        [{"element_id": "w", "category": "OST_Walls",
+          "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [10, 10, 10]},
+         {"element_id": "u", "category": "OST_UnknownPhysical",
+          "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [10, 10, 10]}],
+        origin={"run_dir": "t"})
+
+    comp = D.completeness_of(
+        snap, scope_id="all_physical_diagnostic", candidate_pairs=1,
+        narrow_evaluations=1, narrow_refusals={"narrow_unsupported": 1})
+    assert comp["axes"]["geometry"]["complete"] is False
+    assert comp["axes"]["geometry"]["without_hull"] == 1
+    assert comp["axes"]["query_scope"]["complete"] is False
+    assert comp["axes"]["query_scope"]["refused_pairs"] == 1
+    assert comp["incomplete_axes"] == ["geometry", "query_scope"]
+    # Compatibility is intentionally conservative: it cannot remain green
+    # when either new axis is red.
+    assert comp["complete"] is False
+
+
+def test_r5_a_narrow_refusal_makes_the_serialized_query_axis_incomplete(
+        monkeypatch):
+    snap = S.build_from_elements(
+        [{"element_id": "w", "category": "OST_Walls",
+          "bbox_min_mm": [0, 0, 0], "bbox_max_mm": [100, 100, 100]},
+         {"element_id": "p", "category": "OST_PipeCurves",
+          "bbox_min_mm": [40, 40, 40], "bbox_max_mm": [60, 60, 60]}],
+        origin={"run_dir": "t"})
+    monkeypatch.setattr(
+        D, "evaluate_with_reason",
+        lambda *args, **kwargs: (None, "forced_narrow_refusal"))
+
+    comp = D.detect(snap)["search"]["completeness"]
+    query = comp["axes"]["query_scope"]
+    assert query["evaluation_status"] == "incomplete"
+    assert query["candidate_pairs"] == query["narrow_evaluations"] == 1
+    assert query["narrow_refusals"] == {"forced_narrow_refusal": 1}
+    assert comp["incomplete_axes"] == ["query_scope"]
+    assert comp["complete"] is False
+    with pytest.raises(S.SnapshotIntegrityError, match="query_scope"):
+        D.detect(snap, require_complete=True)
 
 
 def test_r5_require_complete_turns_the_warning_into_a_refusal():

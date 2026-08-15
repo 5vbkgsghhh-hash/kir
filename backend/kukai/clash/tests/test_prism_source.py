@@ -89,27 +89,62 @@ class ThePrismBuilderIsCorrect(unittest.TestCase):
         self.assertEqual(why, "")
 
 
-class TheSourceIsNotClaimedByAnyoneYet(unittest.TestCase):
+class TheSourceIsClaimedOnlyWhereNothingCanBeMeasured(unittest.TestCase):
+    """14.08.2026 полоса допущена — и допущена УЖЕ, чем читается строка таблицы.
 
-    def test_no_category_declares_the_prism_source(self):
-        """Замок закрыт замером, а не забывчивостью. Если строка таблицы
-        когда-нибудь заявит `prism`, этот тест обязан упасть — и упасть
-        ВМЕСТЕ с требованием переснять ворота содержания."""
+    Прежний храповик здесь требовал верного: заявить `prism` можно только
+    ВМЕСТЕ с пересъёмкой ворот содержания. Ворота НЕ пересняты, и 97 нарушений
+    из 800 остаются в силе. Изменилось другое: те 800 — стены, РАЗОБРАННЫЕ из
+    модели, у которых настоящий габарит есть, и полоса с ним спорит. У стены,
+    ОБЪЯВЛЕННОЙ программой, габарита нет вовсе — там выбор «полоса против
+    ничего», и замок ворот про этот случай не говорит ничего.
+
+    Поэтому допуск стоит на ДАННЫХ, а не на намерении, и эти три теста держат
+    обе его половины: где мерить не с чем — полоса; где есть чем — габарит,
+    как и было.
+    """
+
+    def test_the_wall_is_the_only_category_claiming_the_prism(self):
+        """Список заявителей ЗАКРЫТ. Новая категория с полосой обязана прийти
+        со своим замером, а не унаследовать чужой."""
         claimed = [category for category, rule in H.KIND_TABLE.items()
                    if "prism" in rule.sources]
-        self.assertEqual(claimed, [], "источник `prism` заявлен без замера")
+        self.assertEqual(claimed, ["OST_Walls"])
+        self.assertEqual(H.KIND_TABLE["OST_Walls"].sources, H.SOURCES_PRISM)
 
-    def test_the_wall_stays_on_its_bounding_box(self):
-        self.assertEqual(H.KIND_TABLE["OST_Walls"].sources, H.SOURCES_BBOX)
+    def test_a_declared_wall_gets_the_band_instead_of_nothing(self):
+        """Стена без габарита: до правки — ноль тел, после — полоса.
+
+        Это ровно случай владельца 14.08: программа назвала тип, толщина
+        приехала из снимка, а сцена осталась пустой.
+        """
+        record, refusal = H.build_hull(_wall({"width_mm": 200.0,
+                                              "uniform": True}))
+        self.assertIsNone(refusal)
+        self.assertEqual(record.hull_source, "prism")
+        self.assertEqual(record.grade, "conservative")
 
     def test_a_wall_with_a_prism_still_falls_back_to_the_box(self):
-        """Даже если числа приехали, таблица решает — и решает габаритом."""
+        """ГЛАВНЫЙ ЗАМОК ПРАВКИ, и он не сдвинулся ни на байт: там, где
+        настоящее тело измерено, оно и остаётся телом. Замок содержания
+        закрыт для этого случая, и полоса его не обходит."""
         element = _wall({"width_mm": 200.0, "uniform": True})
         element["bbox_min_mm"] = [0.0, -500.0, 0.0]
         element["bbox_max_mm"] = [5000.0, 500.0, 3000.0]
         record, refusal = H.build_hull(element)
         self.assertIsNone(refusal)
         self.assertEqual(record.hull_source, "bbox")
+
+    def test_the_corpus_shape_is_untouched_because_it_carries_no_prism(self):
+        """РАДИУС ПРАВКИ, замеренный, а не обещанный: элемент КОРПУСА — это
+        габарит без ключа `prism`, и он получает ровно то же, что получал."""
+        element = _wall()
+        element["bbox_min_mm"] = [0.0, -500.0, 0.0]
+        element["bbox_max_mm"] = [5000.0, 500.0, 3000.0]
+        record, refusal = H.build_hull(element)
+        self.assertIsNone(refusal)
+        self.assertEqual(record.hull_source, "bbox")
+        self.assertEqual(record.grade, "coarse")
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ os.environ.setdefault("KIR_REJECTIONS_PATH",
                       os.path.join(tempfile.gettempdir(),
                                    "kir_test_space_queue.jsonl"))
 
-from kukai.ir import spec                                        # noqa: E402
+from kukai.ir import authoring, spec                             # noqa: E402
 from kukai.ir.compiler import compile_program                    # noqa: E402
 from kukai.ir.registry_base import IdentityCardinality           # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT as SNAPSHOT  # noqa: E402
@@ -376,10 +376,24 @@ class WitnessesReadTheResult(unittest.TestCase):
         self.assertNotIn('__rb["name"]', self.readback)
 
     def test_the_tolerance_comes_from_the_registry(self):
-        self.assertEqual(spec.OPS[OP].tolerances["location_mm"], 5.0)
+        """ДОПУСК В ПРОВЕРКЕ — НЕ ЧИСЛО, А ЧИСЛО СО СВОИМ ПРОИСХОЖДЕНИЕМ.
+
+        Здесь стояло `assertEqual(location.tol, 5.0)`, и оно падало
+        `Tolerance(op='create_space', key='location_mm', value=5.0) != 5.0`.
+        Тип завёден намеренно: он несёт `op`/`key` и помнит каждую строку,
+        которой себя отрендерил. Сравнить его с голым числом значит выбросить
+        ровно то, ради чего он существует, — поэтому сверяем ОБЕ половины:
+        величину против реестра и происхождение против этого опа.
+        """
+        registry_tol = spec.OPS[OP].tolerances["location_mm"]
+        self.assertEqual(registry_tol, 5.0)
         _c, checks, _rb = _checks()
         location = {c.obligation_key: c for c in checks}["location"]
-        self.assertEqual(location.tol, 5.0)
+        self.assertEqual(location.tol.value, registry_tol,
+                         "допуск проверки разошёлся с реестром")
+        self.assertEqual((location.tol.op, location.tol.key),
+                         (OP, "location_mm"),
+                         "допуск не помнит, чей он — происхождение потеряно")
 
 
 # ── шов транзакции и областей видимости ──────────────────────────────────────
@@ -425,7 +439,11 @@ class CommitGateInvariants(unittest.TestCase):
             _space("SP1", level=LVL_BY_NAME),
         ]), revit_version="2024", snapshot=SNAPSHOT, bulk=True)
         self.assertTrue(out.ok, _codes(out)[:3])
-        regen = out.csharp.find("finalize wall enclosures")
+        # ТРЕТЬЯ КОПИЯ ОДНОЙ И ТОЙ ЖЕ СТРОКИ, И ТРЕТЬЯ ОТСТАВШАЯ. Здесь
+        # искалось `"finalize wall enclosures"`, в `test_regen_before_spatial`
+        # — `"doc.Regenerate();  // finalize"`, а эмиттер пишет третье.
+        # Спрашиваем эмиттер (`authoring.SPATIAL_REGEN_CS`), а не пересказываем.
+        regen = out.csharp.find(authoring.SPATIAL_REGEN_CS)
         self.assertGreater(regen, 0)
         self.assertLess(regen, out.csharp.find("// create_space"))
 

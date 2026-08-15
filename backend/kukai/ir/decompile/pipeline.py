@@ -114,11 +114,14 @@ from kukai.ir.decompile.family_placement_extract import (
     parse_family_placement_index,
 )
 from kukai.ir.decompile.side_contract import (
+    SideFailureKind,
     SideStageContractError,
     failure_element_id,
+    failure_kind,
     receipts_summary_ru,
     reconcile_side_stage,
     record_element_id,
+    resolved_typed_reason,
     summarize_side_failures,
 )
 from kukai.ir.decompile.fold import fold_document
@@ -757,7 +760,14 @@ _STAGE_CATEGORIES: dict[str, frozenset[str]] = {
     #
     # Строка и коллекторы в sketch_extract.py обязаны двигаться ВМЕСТЕ:
     # категория здесь без коллектора там ⇒ каждый id уходит квитанцией
-    # element_unresolved (класс CUT) и раздувает срез на ровном месте;
+    # element_not_claimed (класс CUT) и раздувает срез на ровном месте;
+    # ЭТОТ КОММЕНТАРИЙ УГАДАЛ ДЕФЕКТ И НЕ ПОМЕШАЛ ЕМУ (замер 12.08.2026):
+    # `OST_StairsRailing` стоит в наборе ниже, коллектор забирает лишь часть
+    # её элементов, и 172 из 173 квитанций общего улова на `k2_ar_rd_v7` —
+    # именно она. Проза оказалась права и пролежала: «записать прозой» —
+    # низшее лекарство нашей лестницы, и это его цена. До 12.08 улов слал
+    # `element_unresolved`, то есть заявлял ОТСУТСТВИЕ В ДОКУМЕНТЕ у
+    # элементов, найденных в L0 все 173 из 173;
     # коллектор там без строки здесь ⇒ id никогда не запрашиваются, __skAccept
     # их отсекает, и стадия молча не читает ничего.
     "sketch": frozenset({
@@ -1208,10 +1218,58 @@ def _is_valid_artifact(path: Path) -> bool:
 # требовать полного перечитывания архива ради формы (та же осознанная миграция,
 # что у полей рабочих наборов в §18.4).
 def _side_counts(extraction: Any) -> dict[str, int]:
+    """КЛЮЧ СВЕРКИ ПРИ RESUME. Расширять НЕЛЬЗЯ — см. ``_side_breakdown``."""
     return {
         "rows": len(getattr(extraction, "records", ()) or ()),
         "failures": len(getattr(extraction, "failures", ()) or ()),
     }
+
+
+def _side_breakdown(extraction: Any, stage: str) -> dict[str, int]:
+    """Из чего состоит ``failures`` этой стадии: срезы против ответов.
+
+    ПОЧЕМУ ОТДЕЛЬНОЙ ФУНКЦИЕЙ, А НЕ ПОЛЯМИ В ``_side_counts``: тот словарь —
+    КЛЮЧ СВЕРКИ при resume (``_side_counts_agree``), и любое новое поле в нём
+    объявило бы каждый уже снятый разбор непереиспользуемым, потребовав
+    перечитать архив ради формы. Разбивка пишется РЯДОМ и в сверке не
+    участвует.
+
+    ЗАЧЕМ ВООБЩЕ. Класс ``SideFailureKind`` и полный словарь
+    ``SIDE_FAILURE_KINDS`` построены 29.07 ровно против этого прочтения, и
+    ``run.json`` их несёт. МАНИФЕСТ — не нёс: он печатал одно слово
+    ``failures``, и оно складывало три несравнимые вещи. Замер 13.08 на
+    ``len_ar_me_r24_v1`` (53 686 строк), сделанный по манифесту и потому
+    неверный:
+
+        всего «отказов»              12 073   22.5% строк — заголовок манифеста
+        ├─ аспекта нет               10 267   ПРАВИЛЬНЫЙ отрицательный ответ
+        │    curtain not_curtain      9 715 — стена НЕ витражная, читатель прав
+        ├─ не тот род на входе        1 710   фильтр ВЫЗЫВАЮЩЕГО, не читатель
+        └─ настоящий срез                96   0.18% — вот это наша работа
+
+    ``curtain`` возглавляет манифест с 99.5% «отказа» и здоров на все сто.
+    Ранжируя стадии по этой колонке, работу закажешь ровно туда, где её нет —
+    и это уже случилось дважды: 29.07 на башне (14 343 при 19 настоящих) и
+    13.08 здесь. Прибор чинили один раз, но чинили не тот его выход.
+    """
+    cuts = 0
+    determinations = 0
+    untyped = 0
+    for failure in tuple(getattr(extraction, "failures", ()) or ()):
+        reason = resolved_typed_reason(failure, stage)
+        if reason is None:
+            untyped += 1
+            continue
+        kind = failure_kind(reason)
+        if kind is SideFailureKind.CUT:
+            cuts += 1
+        elif kind is SideFailureKind.DETERMINATION:
+            determinations += 1
+    # ``untyped`` печатается ВСЕГДА, а не только когда он ненулевой: его
+    # отсутствие в записи неотличимо от нуля, а он обязан быть нулём и это
+    # проверяется тестом. Молчащее поле — не доказательство.
+    return {"cuts": cuts, "determinations": determinations,
+            "failures_untyped": untyped}
 
 
 def _requested_ids_digest(requested_ids: Sequence[str]) -> str:
@@ -1247,7 +1305,9 @@ def _record_side_counts(
     # пересчитываются по очереди, и общая запись, обновлённая первой из них,
     # объявила бы «наши» ещё не тронутые чужие индексы остальных.
     stage_manifest: dict[str, Any] = {
-        **_side_counts(extraction), "source": link_title}
+        **_side_counts(extraction),
+        **_side_breakdown(extraction, stage),
+        "source": link_title}
     if requested_ids is not None:
         stage_manifest.update({
             "requested_ids_count": len(requested_ids),

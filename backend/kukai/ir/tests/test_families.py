@@ -425,33 +425,40 @@ class FamiliesPBT(unittest.TestCase):
                 self.assertIn('__results["F1"]', cs)
 
 
-class Golden(unittest.TestCase):
-    """Gate (b): golden corpus, chibicc discipline (SPEC 12.6a) — snapshots
-    update ONLY via KIR_UPDATE_GOLDEN=1 plus human/coordinator diff review.
-    Own files in the SHARED golden/ dir (families_*.golden.cs — no filename
-    collision with any other wave's programs), own PROGRAMS dict — does not
-    touch test_golden.py (shared file, out of this wave's edit scope)."""
-    PROGRAMS = {
-        "families_create_type_full": _prog([_ctype(
-            depth_mm=400.0, material="Бетон")], intent="жб колонна 400x400"),
-        "families_load_family_whole": _prog([_lfam()], intent="загрузить семейство"),
-    }
-
-    def test_golden(self):
-        update = os.environ.get("KIR_UPDATE_GOLDEN") == "1"
-        for name, prog in self.PROGRAMS.items():
-            with self.subTest(name=name):
-                out = compile_program(prog, snapshot=SNAPSHOT)
-                self.assertTrue(out.ok, name)
-                path = GOLDEN_DIR / f"{name}.golden.cs"
-                if update:
-                    path.write_text(out.csharp, encoding="utf-8")
-                    continue
-                self.assertTrue(path.exists(),
-                                f"{path} missing — run once with KIR_UPDATE_GOLDEN=1 and review")
-                self.assertEqual(path.read_text(encoding="utf-8"), out.csharp,
-                                 f"{name}: emit drifted from reviewed golden "
-                                 f"(intentional? update via KIR_UPDATE_GOLDEN=1 + review)")
+# ГОЛДЕН-КОРПУС ЭТОЙ ВОЛНЫ СНЯТ 13.08.2026, И ПРИЧИНА НЕ «ЭМИТТЕР УЕХАЛ».
+#
+# Здесь стоял класс `Golden` с двумя программами — `families_create_type_full`
+# и `families_load_family_whole`, — писавшими в ОБЩИЙ каталог `golden/`. Его
+# докстринг утверждал дословно: «Own files in the SHARED golden/ dir
+# (families_*.golden.cs — no filename collision with any other wave's
+# programs)». Утверждение перестало быть верным, и НИЧТО этого не заметило:
+# позднейшая волна завела ТЕ ЖЕ ДВА ИМЕНИ в `test_golden.PROGRAMS`.
+#
+# ЗАМЕР 13.08 на сведённой линии `integration/kir-2026-08-13`:
+#
+#     имя                          test_families        test_golden
+#     families_create_type_full    259 симв. программы  277 симв. — РАЗНЫЕ
+#     families_load_family_whole   134 симв. программы  263 симв. — РАЗНЫЕ
+#     каталог голденов             один и тот же        один и тот же
+#     снимок заземления            один и тот же        один и тот же
+#
+# Один файл не может удовлетворить обе программы. Байты на диске совпадают с
+# `test_golden` — значит `test_families` краснел не «дрейфом эмиссии», а тем,
+# что у артефакта ДВА ВЛАДЕЛЬЦА. Перезаморозка сделала бы красным другой тест,
+# и так по кругу: это не дрейф, а колебание без сходимости.
+#
+# Коллизия ПРЕДШЕСТВОВАЛА сведению — она есть на базе `ba36f7bc` и на всех
+# четырёх ветках одинаково (проверено `git show` по каждой).
+#
+# ПОКРЫТИЕ НЕ ПОТЕРЯНО, и это замерено, а не заявлено: набор полей опа в обеих
+# редакциях СОВПАДАЕТ поимённо (`create_type`: category/depth_mm/material/
+# new_name/source_type/width_mm; `load_family`: path), различаются только
+# значения `intent` и `path`, ни одно из которых не выбирает ветку эмиттера.
+# Богаче — редакция `test_golden`, она и осталась единственным владельцем.
+#
+# Чтобы утверждение из старого докстринга перестало быть прозой, заведён
+# сторож: `test_golden_files_have_one_owner.py` требует, чтобы каждый файл
+# `golden/*.golden.cs` заявлялся РОВНО ОДНИМ корпусом.
 
 
 class NegativeCorpus(unittest.TestCase):

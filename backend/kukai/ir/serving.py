@@ -28,6 +28,7 @@ import math
 import os
 import re
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -43,11 +44,16 @@ from kukai.llm.envelope import ErrCode, attach_err
 from kukai.ir.contracts import (CommitReceipt, DocumentFingerprint,
                                 RevisionProof, RunId)
 from kukai.ir.bridge_result import extract_error as _extract_error
+from kukai.ir import revit_version as _rv
 from kukai.ir.acceptance_journal import AcceptanceJournalError
 from kukai.ir.acceptance_runtime import (
     AcceptanceRuntimeError,
     AcceptanceSession,
     prepare_acceptance,
+)
+from kukai.ir.acceptance_evidence import (
+    REGULAR_WRITE_EXECUTION_LANE,
+    ExecutionArtifactBinding,
 )
 from kukai.ir.open_model import (
     GROUND_SNAPSHOT_CS as _OPEN_MODEL_SNAPSHOT_CS,
@@ -107,6 +113,32 @@ _WRITE_TIMEOUT_MS = 120_000
 _SNAPSHOT_TIMEOUT_MS = 30_000
 
 
+def _diagnostics_total(diagnostics, shown: int) -> dict:
+    """`{"diagnostics_total": N}` — либо ПУСТО, когда всё влезло.
+
+    ЗАЧЕМ. Квитанция отказа везла срез `[:8]`/`[:4]` и НЕ говорила, сколько
+    диагностик было. Модель чинит показанные и шлёт заново, не зная про
+    остаток, — то есть решение принимается по усечённому множеству, которое
+    выглядит полным. Это третья валюта одного приёма за сутки: там резалась
+    проза контракта, там — имена категорий переписи, здесь — список того, что
+    надо починить.
+
+    РАДИУС ЗАМЕРЕН, А НЕ ПРЕДПОЛОЖЕН (`data/telemetry/kir_rejections.jsonl`,
+    1 496 событий, 16.07–11.08): попытки несли 1 диагностику в 16 случаях и
+    **12 диагностик** ещё в одном — то есть порог `[:8]` в проде уже
+    превышался, и когда это случалось, модель видела 8 из 12 без единого
+    признака, что было больше.
+
+    ПУСТО, КОГДА ВЛЕЗЛО — намеренно: поле в КАЖДОЙ квитанции приучило бы его
+    игнорировать, а платится оно токенами каждого отказа.
+    """
+    try:
+        total = len(diagnostics)
+    except TypeError:                                          # noqa: PERF203
+        return {}
+    return {"diagnostics_total": total} if total > shown else {}
+
+
 def _turn_device_id() -> Optional[str]:
     try:
         from kukai.llm import turn_context
@@ -140,8 +172,54 @@ def is_admin_device(device_id: Optional[str]) -> bool:
     return device_id in admin_devices()
 
 
-def admin_gate_message_ru(instrument: str) -> str:
-    """Отказ гейта, который НАЗЫВАЕТ, что настраивать (§18.5, B2 аудита)."""
+def admin_gate_message_ru(instrument: str, *, flag: str = _FLAG,
+                          needs_mode: bool = True) -> str:
+    """Отказ гейта, который НАЗЫВАЕТ, что настраивать (§18.5, B2 аудита).
+
+    ПРИЧИН ТРИ, И ОТКАЗ ОБЯЗАН НАЗВАТЬ ТУ, КОТОРАЯ ОТКАЗАЛА. До 13.08.2026
+    текст был один на все три и указывал на СПИСОК УСТРОЙСТВ. После того как
+    гейт получил третье условие (`kir_mode_active`), отказ по режиму приходил
+    как «добавь id устройства в KUKAI_ADMIN_DEVICES» — и всякий, кто это
+    прочтёт, добавит id, а ничего не изменится.
+
+    Найдено ВОРОТАМИ 13.08 при разборе 110 красных: они первым делом пошли
+    проверять `admin_devices()`, потому что сообщение указывает туда, и
+    потратили на невиновный модуль отдельный заход. Это наш именованный класс
+    в канале диагностики: величина, назвавшая причину, — не та, что решила.
+
+    Порядок проверок здесь ТОТ ЖЕ, что в гейте, и это не совпадение:
+    разойдись они — сообщение снова начнёт называть не то. Условие пересмотра:
+    **добавится условие гейта — оно обязано появиться и здесь**, иначе
+    диагностика молча вернётся к прежнему дефекту.
+
+    ГЕЙТОВ ДВА, И ЭТО НЕ ОДИН ГЕЙТ С ДВУМЯ ИМЕНАМИ. Первая редакция этой
+    починки (13.08) вшила сюда условия `revit_ir_enabled` — флаг
+    `KUKAI_KIR_TOOL` и режим, — а функцию делят ПЯТЬ площадок двух разных
+    гейтов: `revit_decompile`/`revit_rebuild`/`revit_idempotence` стоят за
+    `revit_decompile_enabled` (флаг `KUKAI_KIR_DECOMPILE`, режима НЕТ).
+    Отказ декомпиляции стал называть чужой флаг и несуществующее для неё
+    условие. **Починка совершила ровно тот дефект, который чинила, этажом
+    выше: сообщение утверждало гейт, которого не спрашивало.** Поймано
+    ВОРОТАМИ через `test_gate_refusal_names_the_env_variable`.
+
+    Поэтому гейт называет ВЫЗЫВАЮЩИЙ — теми же константами, которыми
+    охраняется сам. Умолчание (`_FLAG`, режим нужен) описывает гейт `revit_ir`
+    и потому безопасно для его площадок.
+    """
+    if os.environ.get(flag, "off") != "stage2":
+        return (f"{instrument} недоступен: режим не включён — "
+                f"{flag}=stage2")
+    mode = True
+    if needs_mode:
+        try:
+            from kukai.llm.turn_context import kir_mode_active
+            mode = kir_mode_active()
+        except Exception:  # noqa: BLE001 — не спросили ⇒ считаем «не режим»
+            mode = False
+    if not mode:
+        return (f"{instrument} — отдельный РЕЖИМ, а не инструмент обычного "
+                f"чата: в этом ходе признак режима не выставлен. Открывается "
+                f"кнопкой КИР, не переменной окружения")
     if not admin_devices():
         return (f"{instrument} недоступен: список допущенных устройств пуст — "
                 f"задай {_ADMIN_DEVICES_ENV} (id устройств через запятую)")
@@ -149,9 +227,38 @@ def admin_gate_message_ru(instrument: str) -> str:
             f"{_ADMIN_DEVICES_ENV}")
 
 
+def _kir_hold_active() -> bool:
+    """Держится ли ход на плане. Не смогли спросить — считаем, что НЕТ.
+
+    Умолчание выбрано в сторону ПРЕЖНЕГО поведения: непрочитанный признак не
+    имеет права молча превратить рабочую запись в рисунок. Ошибка в другую
+    сторону («не записали, хотя просили») тише и потому опаснее — её видно
+    только по отсутствию элементов.
+    """
+    try:
+        from kukai.llm.turn_context import kir_hold_active
+        return kir_hold_active()
+    except Exception:  # noqa: BLE001 — признак не имеет права уронить ход
+        return False
+
+
 def revit_ir_enabled() -> bool:
-    """Stage-2 gate: flag AND admin device. Any doubt -> tool absent."""
+    """Гейт: флаг stage2 И админское устройство И ЯВНЫЙ РЕЖИМ КИР на этом ходе.
+    Любое сомнение — инструмента нет.
+
+    Третье условие добавлено 13.08 по решению оператора: КИР — отдельный режим
+    (кнопка, отдельное окно), а не инструмент обычного чата. Обычный ход этот
+    признак не ставит никогда, поэтому в обычной работе с Ревитом КИР
+    недоступен ПО ПОСТРОЕНИЮ, а не по настройке — возврат флага сам по себе его
+    больше не открывает.
+    """
     if os.environ.get(_FLAG, "off") != "stage2":
+        return False
+    try:
+        from kukai.llm.turn_context import kir_mode_active
+        if not kir_mode_active():
+            return False
+    except Exception:  # noqa: BLE001 — не смогли спросить ⇒ считаем, что не режим
         return False
     return is_admin_device(_turn_device_id())
 
@@ -292,9 +399,23 @@ async def _run_declarative(llm_client, bridge_callback, code: str, op: str,
                            timeout_ms: int) -> Any:
     from kukai.llm.revit_execution_pipeline import RevitExecutionPipeline
     pipe = RevitExecutionPipeline.from_llm_client(llm_client, bridge_callback)
+    binding = _REGULAR_WRITE_ARTIFACT_BINDING.get()
     record = await pipe.run_declarative(
-        code, tool="revit_ir", op=op, args={}, timeout_ms=timeout_ms)
+        code,
+        tool="revit_ir",
+        op=op,
+        args={},
+        timeout_ms=timeout_ms,
+        execution_artifact_binding=binding,
+        execution_lane=(
+            REGULAR_WRITE_EXECUTION_LANE if op == "write" else None),
+    )
     return record.to_tool_result()
+
+
+_REGULAR_WRITE_ARTIFACT_BINDING: ContextVar[
+    ExecutionArtifactBinding | None
+] = ContextVar("_kir_regular_write_artifact_binding", default=None)
 
 
 # ── v1.1: runtime-outcome translation (SACTOR, SPEC 12.7) ────────────────────
@@ -613,6 +734,7 @@ _KIR_A_TO_ERRCODE = {
     "KIR-A002": ErrCode.KIR_PRECONDITION_UNMET,
     "KIR-A005": ErrCode.KIR_PRECONDITION_UNMET,
     "KIR-A009": ErrCode.KIR_PRECONDITION_UNMET,
+    "KIR-A010": ErrCode.KIR_PRECONDITION_UNMET,
     # The write is already committed; retrying would duplicate effects.
     "KIR-A003": ErrCode.KIR_UNCONFIRMED,
     "KIR-A004": ErrCode.KIR_UNCONFIRMED,
@@ -874,6 +996,54 @@ def _classify_refusal(res: dict) -> tuple[ErrCode, Optional[dict]]:
     if isinstance(flat, str) and flat:
         return ErrCode.KIR_PROGRAM_REFUSED, lead
     return ErrCode.KIR_PROGRAM_REFUSED, lead
+
+
+def _resolved_revit_version(llm_client: Any) -> "_rv.Resolved":
+    """Версия ЭТОГО хода плюс происхождение — один вопрос, один ответ.
+
+    До 13.08.2026 здесь стояли ДВА скопированных блока, каждый с тремя
+    независимыми путями к литералу «2026» (пусто / исключение / регексп не
+    нашёл года), и ни один из шести не оставлял следа. Чтения `_revit_version`
+    это не меняет: `getattr` под `except` держит тот же fail-open. Меняется
+    ровно то, что умолчание перестаёт быть МОЛЧАЛИВЫМ.
+
+    Почему не отказ на неизвестном — `write/create_element.py:340`:
+    `_revit_version` пуст в КАЖДОЙ сессии, которая ни разу не сообщила об
+    открытом документе, и гард, отказывающий на неизвестном, ломает их все.
+    """
+    try:
+        raw = getattr(llm_client, "_revit_version", None)
+    except Exception:  # noqa: BLE001 — чужой объект, чтение не смеет ломать ход
+        raw = None
+    return _rv.resolve(raw)
+
+
+def _stamp_revit_version(res: Any, llm_client: Any) -> Any:
+    """Поставить происхождение версии на ЛЮБОЙ исход. Аддитивно и fail-open.
+
+    Обёрткой, а не правкой каждого `return`, по той же причине, что и `err`
+    (см. `handle_revit_ir`): путей выхода больше десятка и они растут.
+
+    Стоит на успехе И на отказе НАМЕРЕННО. Отказ «оп недоступен на Revit 2021»
+    читается совершенно по-разному в зависимости от того, СООБЩИЛ ли мост эту
+    версию или мы её подставили: в первом случае работа у автора программы, во
+    втором — у канала. Промолчать здесь значило бы оставить читателю ровно ту
+    развилку, ради которой модуль и написан.
+
+    На честно сообщенной версии поле `revit_version_provenance` НЕ появляется
+    (`Resolved.as_receipt`), поэтому обычный ход байт в байт прежний.
+    """
+    try:
+        if not isinstance(res, dict):
+            return res
+        resolved = _resolved_revit_version(llm_client)
+        if not resolved.is_guess:
+            return res
+        for key, value in resolved.as_receipt().items():
+            res.setdefault(key, value)
+    except Exception:  # noqa: BLE001 — диагностика не может ломать ход
+        logger.debug("revit version provenance stamp failed", exc_info=True)
+    return res
 
 
 def _stamp_refusal(res: Any) -> Any:
@@ -1952,7 +2122,7 @@ async def handle_revit_ir(args: Any, llm_client, bridge_callback,
     program = authored.args.get("program") if isinstance(
         authored.args, dict) else None
     if isinstance(program, dict) and program.get("phases") is not None:
-        return _stamp_refusal(_stamp_authorship(
+        return _stamp_revit_version(_stamp_refusal(_stamp_authorship(
             await _stamp_building_verdict(
                 await _run_plan(program, llm_client, bridge_callback,
                                 query_id=query_id, authored=authored,
@@ -1960,8 +2130,8 @@ async def handle_revit_ir(args: Any, llm_client, bridge_callback,
                                 query_fingerprint=query_fingerprint,
                                 source_kind=source_kind),
                 watch),
-            authored))
-    return _stamp_refusal(_stamp_authorship(
+            authored)), llm_client)
+    return _stamp_revit_version(_stamp_refusal(_stamp_authorship(
         await _stamp_building_verdict(
             await _handle_revit_ir_inner(
                 authored.args, llm_client, bridge_callback,
@@ -1973,7 +2143,7 @@ async def handle_revit_ir(args: Any, llm_client, bridge_callback,
                 author_digest=authored.author_digest,
                 env_digest=authored.env_digest),
             watch),
-        authored))
+        authored)), llm_client)
 
 
 async def handle_revit_ir_bulk(args: Any, llm_client, bridge_callback,
@@ -2018,7 +2188,7 @@ async def handle_revit_ir_bulk(args: Any, llm_client, bridge_callback,
     # будет (автор — материализатор, читателя у квитанции нет), а АУДИТ
     # КОЛЛИЗИЙ есть: это разные вещи, и разведены они в `live/verdict.py`.
     watch = _building_watch()
-    return _stamp_refusal(_stamp_authorship(
+    return _stamp_revit_version(_stamp_refusal(_stamp_authorship(
         await _stamp_building_clash(
             await _handle_revit_ir_inner(
                 authored.args, llm_client, bridge_callback,
@@ -2030,7 +2200,7 @@ async def handle_revit_ir_bulk(args: Any, llm_client, bridge_callback,
                 author_digest=authored.author_digest,
                 env_digest=authored.env_digest),
             watch),
-        authored))
+        authored)), llm_client)
 
 
 async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
@@ -2136,18 +2306,13 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         except Exception:  # noqa: BLE001 — экран не может ломать стройку
             logger.debug("live plan publish failed (fail-open)", exc_info=True)
 
-        try:
-            revit_version = llm_client._revit_version or "2026"
-        except Exception:  # noqa: BLE001
-            revit_version = "2026"
-        import re as _re
-        m = _re.search(r"20\d\d", str(revit_version))
-        revit_version = m.group(0) if m else "2026"
+        revit_version = _resolved_revit_version(llm_client).version
 
         snapshot = None
         open_model = None
         document_fingerprint = None
         model_preflight = None
+        ground_context = None
         if _program_writes(
                 routed_plan if routed_plan is not None else program,
                 bulk=pre_macro_bulk):
@@ -2209,6 +2374,20 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 else:
                     return _typed_error(
                         "ground", "не удалось получить снапшот модели для ground-стадии")
+                from kukai.ir.midend import GroundingContext
+                ground_context = GroundingContext.from_snapshot(
+                    snapshot,
+                    source="trusted_bridge",
+                    trusted_source=True,
+                    profile_digest=(
+                        open_model.digest if open_model is not None else None),
+                    profile_authoritative=(
+                        open_model.authoritative
+                        if open_model is not None else False),
+                    revision_proof=(
+                        open_model.revision_proof
+                        if open_model is not None else None),
+                )
                 # ГЕОМЕТРИЯ ТИПОВ — В ЖУРНАЛ СЕССИИ. Толщина стены и сечение
                 # колонны живут в ТИПЕ и знаемы ровно здесь, на живом
                 # документе; читателю (вердикт о здании, проверка коллизий)
@@ -2227,6 +2406,53 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 logger.debug("KIR snapshot fetch failed", exc_info=True)
                 return _typed_error(
                     "ground", "снапшот модели недоступен (мост не ответил)")
+
+        # ═════ СТРОИМ В КИР, А НЕ В РЕВИТЕ ═══════════════════════════════════
+        #
+        # РАЗРЕЗ ПЕРЕЕХАЛ СЮДА 14.08, И ПЕРЕЕХАЛ ПО ЗАМЕРУ, А НЕ ПО ВКУСУ.
+        # Стоял он строкой после публикации замысла — до заземления. Логика
+        # была верной («не начинать запись»), а следствие — нет: снимок типов
+        # документа берётся ИМЕННО в заземлении, а без него вьюер не строит
+        # телá почти ни у кого. Живьём это выглядело так: владелец нажал
+        # кнопку, увидел пустое окно, и «строить в КИР» оказалось несовместимо
+        # с «видеть построенное». Две половины замысла отменяли друг друга.
+        #
+        # Заземление — ЧТЕНИЕ документа. Оно ничего не меняет в модели, зато
+        # даёт сцене типы, а программе — реальные id. Поэтому удержание стоит
+        # ПОСЛЕ него и ДО компиляции с исполнением: читаем, показываем, не
+        # пишем.
+        # УДЕРЖИВАТЬ МОЖНО ТОЛЬКО ТО, ЧТО СОСТОЯЛОСЬ.
+        #
+        # Первая редакция удерживала ЛЮБОЙ ход и отвечала «программа принята и
+        # показана». Замерено 14.08 на живой сессии: программа с полем
+        # `outline_mm` вместо `outline` была ОТВЕРГНУТА планировщиком, план
+        # получился `None`, в журнал не легло ничего — и квитанция всё равно
+        # сказала `ok: true`. Молчаливо-неверный результат в коде, написанном
+        # против молчаливо-неверных результатов.
+        #
+        # `plan_program` глотает отказ намеренно: «compile_program owns the
+        # refusal» — отвергнутая программа обязана пройти компиляцию, чтобы
+        # человек увидел ТИПИЗИРОВАННЫЙ отказ с полем и исправлением. Удержание
+        # эту дорогу перерезало. Теперь без плана оно просто не срабатывает:
+        # исполнения всё равно не будет — компиляция откажет раньше.
+        if _kir_hold_active() and routed_plan is not None:
+            _held_ops = getattr(routed_plan, "ops", None)
+            if _held_ops is None and isinstance(routed_plan, dict):
+                _held_ops = routed_plan.get("ops")
+            held = {
+                "ok": True,
+                "kir": True,
+                "stage": "planned",
+                "held_in_kir": True,
+                "ops": len(_held_ops or []),
+                "message_ru": (
+                    "Программа принята и показана в окне КИР. "
+                    "В Revit НИЧЕГО НЕ ЗАПИСАНО и свидетеля нет — "
+                    "исполнения не было. Перенос в Revit — отдельное действие: "
+                    "кнопка «Отправить в Revit» в окне КИР."),
+                "handoff": None,
+            }
+            return _with_outcome(held, program_not_started())
 
         expected_document = (
             document_fingerprint.compiler_guard()
@@ -2262,6 +2488,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                     query_fingerprint=query_fingerprint,
                     source_kind=source_kind,
                     snapshot=snapshot,
+                    ground_context=ground_context,
                     expected_document=expected_document,
                     expected_identities=identity_proofs,
                     open_model_profile=open_profile,
@@ -2271,6 +2498,7 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 revit_version=revit_version,
                 query_id=query_id,
                 snapshot=snapshot,
+                ground_context=ground_context,
                 turn_id=turn_id,
                 action_id=action_id,
                 query_fingerprint=query_fingerprint,
@@ -2287,7 +2515,8 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         out = _compile_for_serving(expected_identities)
         if not out.ok:
             res: dict = {"ok": False, "refused": True,
-                         "diagnostics": [d.as_dict() for d in out.diagnostics][:8]}
+                         "diagnostics": [d.as_dict() for d in out.diagnostics][:8],
+                         **_diagnostics_total(out.diagnostics, 8)}
             if out.handoff:
                 res["handoff"] = out.handoff["route"]
                 res["message_ru"] = ("запрос вне покрытия KIR — выполни обычным "
@@ -2372,8 +2601,9 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
             try:
                 assert snapshot is not None
                 assert document_fingerprint is not None
+                assert out.grounded is not None
                 acceptance_session = await prepare_acceptance(
-                    out.planned,
+                    out.grounded,
                     snapshot,
                     document_fingerprint,
                     _acceptance_reader,
@@ -2452,7 +2682,11 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 # здесь, на пути отказа, значило бы поставить новый замок в
                 # месте, где он ещё ни разу не проверялся живьём. Пробел
                 # назван словом, а не закрыт видимостью.
-                if guarded_out is None or not guarded_out.ok:
+                if (guarded_out is None
+                        or not guarded_out.ok
+                        or guarded_out.grounded is None
+                        or guarded_out.grounded.ground_digest
+                        != acceptance_session.registration.ground_digest):
                     outcome = program_not_started()
                     registration = acceptance_session.registration_wire()
                     detail = {
@@ -2463,6 +2697,13 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                         detail["compiler_diagnostics"] = [
                             item.as_dict() for item in guarded_out.diagnostics[:8]
                         ]
+                        detail.update(
+                            _diagnostics_total(guarded_out.diagnostics, 8))
+                    elif (guarded_out is not None
+                          and (guarded_out.grounded is None
+                               or guarded_out.grounded.ground_digest
+                               != acceptance_session.registration.ground_digest)):
+                        detail["ground_digest_mismatch"] = True
                     try:
                         acceptance_session.finalize(
                             outcome, evidence=None, detail=detail)
@@ -2534,23 +2775,123 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
 
         import time as _time
         _t0 = _time.perf_counter()
+        artifact_token = None
         if family == "write":
+            assert acceptance_session is not None
+            from kukai.llm.revit_execution_pipeline import wrap_user_code
+            try:
+                # ``out`` is already the identity-guarded re-lowering.  Bind
+                # the pipeline's FINAL wrapper, fsync it, then recompute the
+                # complete typed binding immediately before the only dispatch.
+                wrapped_source = wrap_user_code(out.csharp)
+                execution_binding = (
+                    acceptance_session.bind_execution_artifact(
+                        wrapped_source,
+                        execution_lane=REGULAR_WRITE_EXECUTION_LANE,
+                        tool="revit_ir",
+                        op="write",
+                    )
+                )
+                acceptance_session.require_execution_artifact(
+                    wrap_user_code(out.csharp),
+                    execution_lane=REGULAR_WRITE_EXECUTION_LANE,
+                    tool="revit_ir",
+                    op="write",
+                )
+            except AcceptanceRuntimeError as exc:
+                outcome = program_not_started()
+                registration = acceptance_session.registration_wire()
+                try:
+                    acceptance_session.finalize(
+                        outcome,
+                        evidence=None,
+                        detail={
+                            "stage": "execution_artifact_bind",
+                            "diagnostic_code": exc.code,
+                        },
+                    )
+                    registration["journal_finalized"] = True
+                    registration["journal_checksum"] = (
+                        acceptance_session.journal.state.checksum)
+                except AcceptanceJournalError as journal_exc:
+                    registration["journal_finalized"] = False
+                    registration["journal_error"] = str(journal_exc)
+                _record_pre_effect(
+                    "execution_artifact_bind",
+                    [exc.diagnostic()],
+                    getattr(out, "grounded_ops", ()) or (),
+                    query_id=query_id,
+                    turn_id=turn_id,
+                    action_id=action_id,
+                    query_fingerprint=query_fingerprint,
+                    source_kind=source_kind,
+                    revit_version=revit_version,
+                )
+                return _with_outcome({
+                    "ok": False,
+                    "kir": True,
+                    "refused": True,
+                    "stage": "execution_artifact_bind",
+                    "diagnostics": [exc.diagnostic()],
+                    "message_ru": exc.message_ru,
+                    "handoff": None,
+                    "acceptance_registration": registration,
+                }, outcome)
+            artifact_token = _REGULAR_WRITE_ARTIFACT_BINDING.set(
+                execution_binding)
             write_execution_started = True
-        exec_res = await _run_declarative(
-            llm_client, bridge_callback, out.csharp, family, timeout)
+        try:
+            exec_res = await _run_declarative(
+                llm_client, bridge_callback, out.csharp, family, timeout)
+        finally:
+            if artifact_token is not None:
+                _REGULAR_WRITE_ARTIFACT_BINDING.reset(artifact_token)
         _dur_ms = (_time.perf_counter() - _t0) * 1000.0
+        # СЛЕД СОЗДАННОГО — ЗДЕСЬ И НИГДЕ ПОЗЖЕ.  Ниже по телу исход ещё
+        # может стать неуспехом (`KIR-A006`/`KIR-A007`: приёмка разошлась или
+        # не завершилась при СОСТОЯВШЕЙСЯ записи), а вместе с ним пропадали
+        # и номера: 13.08 два элемента остались в живой модели, и ни
+        # свидетель, ни журнал приёмки, ни отказы их id не хранят. Пишем до
+        # приёмки, читаем ПАВЛОАД, а не программу, и не смотрим на `ok`.
+        # Подробности и границы — в докстринге `created_ledger`.
+        try:
+            from kukai.ir import created_ledger as _cl
+            _cl.record_created(
+                exec_res,
+                query_id=query_id, turn_id=turn_id, action_id=action_id,
+                revit_version=revit_version, family=family,
+                plan_digest=getattr(out.planned, "plan_digest", "") or "")
+        except Exception:  # noqa: BLE001 — запись в Revit уже состоялась
+            logger.exception("created_ledger: след созданного не записан")
         from kukai.ir import witness_feed as _wf   # волна A6: fail-open корпус
         err = _extract_error(exec_res)
         if err is not None:
-            diag = _translate_runtime(err)
+            artifact_refused_pre_effect = bool(
+                isinstance(exec_res, Mapping)
+                and exec_res.get("execution_artifact_refused_pre_effect") is True
+            )
+            if artifact_refused_pre_effect:
+                diag = {
+                    "code": "KIR-A010",
+                    "message_ru": (
+                        "точный исполняемый артефакт не совпал с "
+                        "зарегистрированным — запись не запускалась"),
+                    "detail": str(exec_res.get("message", ""))[:300],
+                }
+            else:
+                diag = _translate_runtime(err)
             # Only structured refusals emitted after an explicit RollBack()
             # prove rollback. A timeout, query error, or generic bridge/API
             # error does not; claiming `true` there turns uncertainty into a
             # false safety guarantee.
-            rolled_back = (True if family == "write"
+            rolled_back = (True if not artifact_refused_pre_effect
+                           and family == "write"
                            and diag["code"] in _ROLLBACK_PROVEN_CODES
                            else None)
-            if rolled_back:
+            if artifact_refused_pre_effect:
+                outcome = program_not_started()
+                write_execution_started = False
+            elif rolled_back:
                 outcome = write_rolled_back(
                     witness=(WitnessState.VIOLATED
                              if diag["code"] == "KIR-X004"
@@ -2579,6 +2920,16 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                     acceptance_registration["journal_error"] = str(journal_exc)
             _wf.record_witness(
                 program=out.planned, family=family,
+                # Изоляция ТРАНЗАКЦИИ РЕВИТА, под которой эмитирован C#.
+                # Различение с одноимённым полем ПЕСОЧНИЦЫ — в докстринге
+                # `CompileOutput.txn_isolation`, а НЕ здесь: тело этой
+                # функции структурно не вправе поминать слой скрипта,
+                # и обе первые редакции этого комментария сломали
+                # того стража — сперва одним запретным словом,
+                # потом вторым, названным в имени самого стража.
+                # Без поля корпус смешивает две популяции: под `per_op`
+                # корзины «сопутствующий» не бывает ПО ПОСТРОЕНИЮ.
+                txn_isolation=getattr(out, "txn_isolation", None),
                 revit_version=revit_version,
                 ok=False, witness=_derive_witness(False, family, diag),
                 duration_ms=_dur_ms, diag_code=diag["code"],
@@ -2592,7 +2943,10 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 outcome=outcome.to_dict(),
                 author_digest=author_digest,
                 env_digest=env_digest,
-                acceptance_evidence=acceptance_registration)
+                acceptance_evidence=acceptance_registration,
+                ground_context=(
+                    out.grounded.context
+                    if out.grounded is not None else None))
             # Доклад на экран и об ОТКАЗЕ тоже. Первая версия рапортовала
             # только об успехе — и живой ход 29.07 это сразу поймал: программа
             # упала (`state: failed`), а человек не увидел ничего, то есть
@@ -2609,7 +2963,8 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                  "witness": _derive_witness(False, family, diag),
                  "message_ru": diag["message_ru"],
                  "rolled_back": rolled_back,
-                 "handoff": (None if diag["code"] == "KIR-X007"
+                 "handoff": (None if artifact_refused_pre_effect
+                             or diag["code"] == "KIR-X007"
                              else "recipe-path")}
             if acceptance_registration is not None:
                 result["acceptance_registration"] = acceptance_registration
@@ -2669,6 +3024,16 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                             acceptance_journal_error)
             _wf.record_witness(
                 program=out.planned, family=family,
+                # Изоляция ТРАНЗАКЦИИ РЕВИТА, под которой эмитирован C#.
+                # Различение с одноимённым полем ПЕСОЧНИЦЫ — в докстринге
+                # `CompileOutput.txn_isolation`, а НЕ здесь: тело этой
+                # функции структурно не вправе поминать слой скрипта,
+                # и обе первые редакции этого комментария сломали
+                # того стража — сперва одним запретным словом,
+                # потом вторым, названным в имени самого стража.
+                # Без поля корпус смешивает две популяции: под `per_op`
+                # корзины «сопутствующий» не бывает ПО ПОСТРОЕНИЮ.
+                txn_isolation=getattr(out, "txn_isolation", None),
                 revit_version=revit_version,
                 ok=False, witness=_derive_witness(False, family, contract_diag),
                 duration_ms=_dur_ms, diag_code=contract_diag["code"],
@@ -2680,7 +3045,10 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 author_digest=author_digest,
                 env_digest=env_digest,
                 result_payload=(payload if commit_confirmed else None),
-                acceptance_evidence=acceptance_wire)
+                acceptance_evidence=acceptance_wire,
+                ground_context=(
+                    out.grounded.context
+                    if out.grounded is not None else None))
             diagnostics = [contract_diag]
             if acceptance_journal_error is not None:
                 diagnostics.append(_acceptance_diagnostic(
@@ -2752,6 +3120,16 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         )
         _wf.record_witness(
             program=out.planned, family=family,
+            # Изоляция ТРАНЗАКЦИИ РЕВИТА, под которой эмитирован C#.
+            # Различение с одноимённым полем ПЕСОЧНИЦЫ — в докстринге
+            # `CompileOutput.txn_isolation`, а НЕ здесь: тело этой
+            # функции структурно не вправе поминать слой скрипта,
+            # и обе первые редакции этого комментария сломали
+            # того стража — сперва одним запретным словом,
+            # потом вторым, названным в имени самого стража.
+            # Без поля корпус смешивает две популяции: под `per_op`
+            # корзины «сопутствующий» не бывает ПО ПОСТРОЕНИЮ.
+            txn_isolation=getattr(out, "txn_isolation", None),
             revit_version=revit_version,
             ok=_accepted, witness=_witness,
             duration_ms=_dur_ms, violations=_violations or None,
@@ -2759,7 +3137,10 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
             outcome=_outcome.to_dict(),
             author_digest=author_digest,
             env_digest=env_digest,
-            acceptance_evidence=_acceptance_wire)
+            acceptance_evidence=_acceptance_wire,
+            ground_context=(
+                out.grounded.context
+                if out.grounded is not None else None))
         # The turn's end-of-turn review reads what was actually built, so only
         # a program that reached this point — compiled, executed, witnessed —
         # is recorded. A refused or rolled-back program never happened.
@@ -2796,6 +3177,22 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                       "witness": _witness,
                       "result": exec_res,
                       "outcome": _outcome.to_dict()}
+        if out.grounded is not None:
+            context = out.grounded.context
+            out_result["ground_context"] = {
+                "schema": "kir-grounding-context/1",
+                "context_digest": context.context_digest,
+                "snapshot_digest": context.snapshot_digest,
+                "document_digest": context.document_digest,
+                "revision_digest": context.revision_digest,
+                "profile_digest": context.profile_digest,
+                "execution_bound": context.execution_bound,
+                "authoritative": context.authoritative,
+                "selector_resolution_replayed": (
+                    out.grounded.selector_resolution_replayed),
+                "derived_artifacts_verified": (
+                    out.grounded.derived_artifacts_verified),
+            }
         # НАЗВАННОЕ УМОЛЧАНИЕ: выбор, сделанный компилятором за промолчавшего
         # автора, обязан быть ПРЕДЪЯВЛЕН. Выбор, которого вызывающий не видит,
         # неотличим от `.FirstOrDefault()` — а именно им плечо C# 02.08.2026
@@ -3024,7 +3421,11 @@ async def handle_revit_decompile(args: Any, llm_client, bridge_callback,
     """
     try:
         if not revit_decompile_enabled():
-            return _typed_error("gate", admin_gate_message_ru("revit_decompile"))
+            return _typed_error("gate", admin_gate_message_ru(
+                "revit_decompile",
+                # Гейт называет ВЫЗЫВАЮЩИЙ: эти три стоят за
+                # `revit_decompile_enabled` — другой флаг, режима нет.
+                flag=_DECOMPILE_FLAG, needs_mode=False))
         from kukai.ir.decompile import pipeline as _pipe
 
         action = args.get("action") if isinstance(args, dict) else None
@@ -3243,6 +3644,377 @@ def _resolve_base_from_journal(
     return stamp, None
 
 
+_REBUILD_SUMMARY_SCHEMA = "rebuild-summary/2"
+_MATERIALIZATION_ACCOUNTING_SCHEMA = "materialization-accounting/2"
+_ACCOUNTING_FIELDS = frozenset({
+    "schema_version", "input_digest", "programs_digest", "counts",
+    "records", "receipt_digest",
+})
+_ACCOUNTING_COUNT_FIELDS = frozenset({
+    "input_leaves", "emitted_semantic_ops", "atom_escrows",
+    "datum_policy_pins", "typed_residuals", "programs", "emitted_ops",
+})
+_ACCOUNTING_RECORD_FIELDS = frozenset({
+    "source_id", "leaf_id", "leaf_kind", "category", "disposition",
+    "reason", "op_id", "program_index", "element_id", "evidence_state",
+})
+
+
+def _canonical_materialization_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _materialization_digest(value: Any) -> str:
+    import hashlib
+    return hashlib.sha256(
+        _canonical_materialization_json(value).encode("utf-8")
+    ).hexdigest()
+
+
+def _materialization_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _normalize_materialization_skip(record: Any) -> dict[str, str]:
+    if isinstance(record, Mapping):
+        if set(record) != {"source_id", "category", "reason"}:
+            raise ValueError("skip record has an unknown or missing field")
+        source_id = record.get("source_id")
+        category = record.get("category")
+        reason = record.get("reason")
+    else:
+        source_id = getattr(record, "source_id", None)
+        category = getattr(record, "category", None)
+        reason = getattr(record, "reason", None)
+    if not all(isinstance(value, str) and value
+               for value in (source_id, category, reason)):
+        raise ValueError("skip record must contain three non-empty strings")
+    return {
+        "source_id": source_id,
+        "category": category,
+        "reason": reason,
+    }
+
+
+def _accounting_stat(stats: Any, name: str) -> int:
+    value = stats.get(name) if isinstance(stats, Mapping) \
+        else getattr(stats, name, None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"materialization stats.{name} is missing or untyped")
+    return value
+
+
+def _verify_materialization_accounting(
+    leaves: Sequence[Mapping[str, Any]],
+    programs: Any,
+    materialized: Any,
+) -> dict[str, Any]:
+    """Independently verify the v2 total-accounting receipt at the wire seam."""
+
+    from kukai.ir.decompile.geom_extract import GeometryFailureReason
+    from kukai.ir.decompile.l1_schema import AtomReason
+
+    atom_reason_codes = frozenset(reason.value for reason in AtomReason)
+    atom_residual_reasons = frozenset({
+        *("atom:" + reason for reason in atom_reason_codes),
+        "atom_escrow:not_selected",
+        "atom_escrow:missing_geometry_evidence",
+        "atom_escrow:tier_a_no_geometry",
+        "atom_escrow:category_identity_mismatch",
+        "atom_escrow:geometry_refused",
+        "atom_escrow:mesh_refused",
+        *("atom_escrow:geometry_failure:" + reason.value
+          for reason in GeometryFailureReason),
+        "atom_escrow:geometry_failure:unavailable",
+    })
+
+    accounting = getattr(materialized, "accounting", None)
+    if hasattr(accounting, "as_dict"):
+        accounting = accounting.as_dict()
+    if not isinstance(accounting, Mapping):
+        raise ValueError("typed materialization accounting is missing")
+    payload = dict(accounting)
+    if set(payload) != _ACCOUNTING_FIELDS:
+        raise ValueError("materialization accounting has an unknown or missing field")
+    if payload["schema_version"] != _MATERIALIZATION_ACCOUNTING_SCHEMA:
+        raise ValueError("materialization accounting schema version is unsupported")
+    if (not _materialization_sha256(payload["input_digest"])
+            or not _materialization_sha256(payload["programs_digest"])
+            or not _materialization_sha256(payload["receipt_digest"])):
+        raise ValueError("materialization accounting digest is untyped")
+    unsigned = {key: payload[key] for key in (
+        "schema_version", "input_digest", "programs_digest", "counts",
+        "records",
+    )}
+    if payload["receipt_digest"] != _materialization_digest(unsigned):
+        raise ValueError("materialization accounting receipt digest mismatch")
+
+    counts = payload["counts"]
+    if not isinstance(counts, Mapping) or set(counts) != _ACCOUNTING_COUNT_FIELDS:
+        raise ValueError("materialization accounting counts have wrong shape")
+    counts = dict(counts)
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+           for value in counts.values()):
+        raise ValueError("materialization accounting counts must be integers")
+
+    canonical_leaves: list[Mapping[str, Any]] = []
+    leaves_by_source: dict[str, Mapping[str, Any]] = {}
+    leaf_ids: set[str] = set()
+    for index, leaf in enumerate(leaves):
+        if not isinstance(leaf, Mapping):
+            raise ValueError(f"input leaf {index} is not an object")
+        source_id = leaf.get("source_element_id")
+        leaf_id = leaf.get("_id")
+        kind = leaf.get("kind")
+        if (not isinstance(source_id, str) or not source_id
+                or not isinstance(leaf_id, str) or not leaf_id
+                or kind not in {"op", "atom"}):
+            raise ValueError("input leaf identity or kind is untyped")
+        if source_id in leaves_by_source:
+            raise ValueError("input repeats source_element_id")
+        if leaf_id in leaf_ids:
+            raise ValueError("input repeats L1 _id")
+        if kind == "op":
+            if (not isinstance(leaf.get("op_name"), str)
+                    or not leaf["op_name"]):
+                raise ValueError("input op leaf has no typed op_name")
+        else:
+            reason = leaf.get("reason")
+            reason_code = (
+                reason.get("code") if isinstance(reason, Mapping) else None)
+            if reason_code not in atom_reason_codes:
+                raise ValueError("input atom reason is outside the closed set")
+            if (not isinstance(leaf.get("category"), str)
+                    or not leaf["category"]):
+                raise ValueError("input atom category is untyped")
+        leaves_by_source[source_id] = leaf
+        leaf_ids.add(leaf_id)
+        canonical_leaves.append(leaf)
+    canonical_leaves.sort(key=lambda leaf: (
+        leaf["source_element_id"], leaf["_id"]))
+    if payload["input_digest"] != _materialization_digest(canonical_leaves):
+        raise ValueError("materialization accounting is bound to other leaves")
+
+    if (isinstance(programs, (str, bytes, bytearray))
+            or not isinstance(programs, Sequence)):
+        raise ValueError("materialized programs are not a sequence")
+    programs = list(programs)
+    if payload["programs_digest"] != _materialization_digest(programs):
+        raise ValueError("materialization accounting is bound to other programs")
+    wire_ops: dict[str, tuple[int, Mapping[str, Any]]] = {}
+    for program_index, program in enumerate(programs):
+        if not isinstance(program, Mapping) \
+                or not isinstance(program.get("ops"), list):
+            raise ValueError("materialized program has an untyped ops wire")
+        for op in program["ops"]:
+            if not isinstance(op, Mapping):
+                raise ValueError("materialized op is not an object")
+            op_id = op.get("id")
+            if not isinstance(op_id, str) or not op_id:
+                raise ValueError("materialized op id is untyped")
+            if op_id in wire_ops:
+                raise ValueError("materialized wire repeats an op id")
+            wire_ops[op_id] = (program_index, op)
+
+    raw_records = payload["records"]
+    if not isinstance(raw_records, list):
+        raise ValueError("materialization accounting records must be a list")
+    records: list[dict[str, Any]] = []
+    records_by_source: dict[str, dict[str, Any]] = {}
+    record_leaf_ids: set[str] = set()
+    accounted_op_ids: set[str] = set()
+    for raw_record in raw_records:
+        if not isinstance(raw_record, Mapping) \
+                or set(raw_record) != _ACCOUNTING_RECORD_FIELDS:
+            raise ValueError("materialization accounting record has wrong shape")
+        record = dict(raw_record)
+        source_id = record["source_id"]
+        leaf_id = record["leaf_id"]
+        leaf_kind = record["leaf_kind"]
+        category = record["category"]
+        disposition = record["disposition"]
+        reason = record["reason"]
+        op_id = record["op_id"]
+        program_index = record["program_index"]
+        element_id = record["element_id"]
+        evidence_state = record["evidence_state"]
+        if (not isinstance(source_id, str) or not source_id
+                or not isinstance(leaf_id, str) or not leaf_id
+                or not isinstance(category, str) or not category
+                or leaf_kind not in {"op", "atom"}
+                or disposition not in {
+                    "emitted_semantic_op", "atom_escrow",
+                    "datum_policy_pin", "typed_residual"}):
+            raise ValueError("materialization accounting record is untyped")
+        if source_id in records_by_source or leaf_id in record_leaf_ids:
+            raise ValueError("materialization accounting repeats a leaf")
+        leaf = leaves_by_source.get(source_id)
+        if leaf is None or leaf.get("_id") != leaf_id \
+                or leaf.get("kind") != leaf_kind:
+            raise ValueError("materialization accounting record is unbound")
+        expected_category = (
+            leaf.get("op_name") if leaf_kind == "op" else leaf.get("category"))
+        if category != expected_category:
+            raise ValueError("materialization accounting category mismatch")
+        expected_op_id = "e" + source_id
+        location = wire_ops.get(expected_op_id)
+
+        if disposition == "emitted_semantic_op":
+            if (leaf_kind != "op" or op_id != expected_op_id
+                    or isinstance(program_index, bool)
+                    or not isinstance(program_index, int)
+                    or program_index < 0 or reason is not None
+                    or element_id is not None or evidence_state is not None
+                    or location is None or location[0] != program_index
+                    or location[1].get("op") != category):
+                raise ValueError("emitted semantic accounting is not exact")
+            accounted_op_ids.add(expected_op_id)
+        elif disposition == "atom_escrow":
+            if (leaf_kind != "atom" or op_id != expected_op_id
+                    or isinstance(program_index, bool)
+                    or not isinstance(program_index, int)
+                    or program_index < 0 or reason is not None
+                    or element_id is not None
+                    or evidence_state != "pending_runtime_witness"
+                    or location is None or location[0] != program_index
+                    or location[1].get("op") != "create_directshape"):
+                raise ValueError("atom escrow accounting is not exact")
+            accounted_op_ids.add(expected_op_id)
+        elif disposition == "datum_policy_pin":
+            try:
+                source_element_id = int(source_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("datum pin source is not an ElementId") from exc
+            if (leaf_kind != "op"
+                    or leaf.get("op_name") not in {"create_level", "create_grid"}
+                    or op_id is not None or program_index is not None
+                    or reason != "datum_pinned_existing"
+                    or isinstance(element_id, bool)
+                    or element_id != source_element_id
+                    or evidence_state != "same_document_unproven"
+                    or location is not None):
+                raise ValueError("datum pin accounting is not exact")
+        else:
+            if (op_id is not None or program_index is not None
+                    or element_id is not None or evidence_state is not None
+                    or not isinstance(reason, str) or not reason
+                    or location is not None):
+                raise ValueError("typed residual accounting is not exact")
+            if leaf_kind == "atom":
+                if reason not in atom_residual_reasons:
+                    raise ValueError("atom residual reason is outside closed set")
+                if reason.startswith("atom:") and reason.split(":", 1)[1] != \
+                        leaf["reason"]["code"]:
+                    raise ValueError("atom residual reason disagrees with leaf")
+            elif (not reason.startswith("host_unmaterialized:")
+                  or not reason.split(":", 1)[1]):
+                raise ValueError("semantic residual reason is untyped")
+        records_by_source[source_id] = record
+        record_leaf_ids.add(leaf_id)
+        records.append(record)
+
+    if set(records_by_source) != set(leaves_by_source):
+        raise ValueError("materialization accounting is missing an input leaf")
+    if accounted_op_ids != set(wire_ops):
+        raise ValueError("materialized wire has a missing or duplicate source")
+    if records != sorted(
+            records, key=lambda row: (row["source_id"], row["leaf_id"])):
+        raise ValueError("materialization accounting record order is non-canonical")
+
+    derived_counts = {
+        "input_leaves": len(records),
+        "emitted_semantic_ops": sum(
+            row["disposition"] == "emitted_semantic_op" for row in records),
+        "atom_escrows": sum(
+            row["disposition"] == "atom_escrow" for row in records),
+        "datum_policy_pins": sum(
+            row["disposition"] == "datum_policy_pin" for row in records),
+        "typed_residuals": sum(
+            row["disposition"] == "typed_residual" for row in records),
+        "programs": len(programs),
+        "emitted_ops": len(wire_ops),
+    }
+    if counts != derived_counts:
+        raise ValueError("materialization accounting counts disagree with wire")
+
+    skip_rows = [
+        _normalize_materialization_skip(record)
+        for record in (getattr(materialized, "skipped", ()) or ())
+    ]
+    if len({row["source_id"] for row in skip_rows}) != len(skip_rows):
+        raise ValueError("skip evidence repeats a source")
+    expected_skips = sorted(
+        (row["source_id"], row["category"], row["reason"])
+        for row in records
+        if row["disposition"] in {"datum_policy_pin", "typed_residual"})
+    actual_skips = sorted(
+        (row["source_id"], row["category"], row["reason"])
+        for row in skip_rows)
+    if expected_skips != actual_skips:
+        raise ValueError("skip evidence disagrees with accounting")
+
+    escrow_evidence = list(getattr(materialized, "escrowed", ()) or ())
+    escrow_by_source: dict[str, Any] = {}
+    for evidence in escrow_evidence:
+        source_id = (evidence.get("source_id")
+                     if isinstance(evidence, Mapping)
+                     else getattr(evidence, "source_id", None))
+        if not isinstance(source_id, str) or not source_id \
+                or source_id in escrow_by_source:
+            raise ValueError("escrow evidence identity is missing or duplicate")
+        escrow_by_source[source_id] = evidence
+    expected_escrow_sources = {
+        row["source_id"] for row in records
+        if row["disposition"] == "atom_escrow"}
+    if set(escrow_by_source) != expected_escrow_sources:
+        raise ValueError("escrow evidence disagrees with accounting")
+    for source_id in expected_escrow_sources:
+        evidence = escrow_by_source[source_id]
+        get_value = evidence.get if isinstance(evidence, Mapping) \
+            else lambda name: getattr(evidence, name, None)
+        record = records_by_source[source_id]
+        if (get_value("op_id") != record["op_id"]
+                or get_value("program_index") != record["program_index"]
+                or get_value("acceptance_state") != "pending_runtime_witness"):
+            raise ValueError("escrow pending evidence is not bound to its op")
+
+    expected_stats = {
+        "op_leaves": sum(row["leaf_kind"] == "op" for row in records),
+        "materialized_ops": len(wire_ops),
+        "programs": len(programs),
+        "atoms_skipped": sum(
+            row["leaf_kind"] == "atom"
+            and row["disposition"] == "typed_residual" for row in records),
+        "atoms_escrowed": len(expected_escrow_sources),
+        "datums_skipped": sum(
+            row["disposition"] == "datum_policy_pin" for row in records),
+        "semantic_ops_skipped": sum(
+            row["leaf_kind"] == "op"
+            and row["disposition"] == "typed_residual" for row in records),
+    }
+    stats = getattr(materialized, "stats", None)
+    for name, expected in expected_stats.items():
+        if _accounting_stat(stats, name) != expected:
+            raise ValueError(f"materialization stats.{name} mismatch")
+
+    return {
+        "payload": payload,
+        "records": records,
+        "skip_rows": skip_rows,
+        "escrow_evidence": escrow_evidence,
+    }
+
+
 async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
                                query_id: str = "") -> dict:
     """Admin rebuild driver (thin).  NEVER raises; typed dict only.
@@ -3256,7 +4028,11 @@ async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
     """
     try:
         if not revit_decompile_enabled():
-            return _typed_error("gate", admin_gate_message_ru("revit_rebuild"))
+            return _typed_error("gate", admin_gate_message_ru(
+                "revit_rebuild",
+                # Гейт называет ВЫЗЫВАЮЩИЙ: эти три стоят за
+                # `revit_decompile_enabled` — другой флаг, режима нет.
+                flag=_DECOMPILE_FLAG, needs_mode=False))
         try:
             from kukai.ir.decompile.materialize import (  # type: ignore
                 leaves_to_program,
@@ -3571,20 +4347,81 @@ async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
             materialize_kwargs["offset_mm"] = offset_mm
         materialized = leaves_to_program(leaves, **materialize_kwargs)
         programs = materialized.programs
-        # New materializers retain the exact immutable plan accepted at the
-        # reverse boundary.  getattr keeps older/mocked MaterializeResult
-        # shapes compatible; a missing/refused plan is safely replanned by the
-        # compiler and cannot bypass validation.
-        materialized_plans = getattr(materialized, "plans", ()) or ()
-
-        from kukai.ir.compiler import compile_rebuild_chunk
         try:
-            revit_version = str(llm_client._revit_version or "2026")
-        except Exception:  # noqa: BLE001
-            revit_version = "2026"
-        import re as _re
-        m = _re.search(r"20\d\d", revit_version)
-        revit_version = m.group(0) if m else "2026"
+            verified_accounting = _verify_materialization_accounting(
+                leaves, programs, materialized)
+        except Exception as exc:  # noqa: BLE001 — untrusted result boundary
+            return {
+                "schema_version": _REBUILD_SUMMARY_SCHEMA,
+                "ok": False,
+                "refused": True,
+                "complete": False,
+                "partial": False,
+                "error": "materialization_accounting_invalid",
+                "materialize_mode": materialize_mode,
+                "message_ru": (
+                    "пересборка отказана: versioned materialization receipt "
+                    "не доказывает ровно один исход для каждого входного листа"),
+                "detail": f"{type(exc).__name__}: {exc}"[:400],
+            }
+
+        accounting_payload = verified_accounting["payload"]
+        accounting_records = verified_accounting["records"]
+        skip_rows = verified_accounting["skip_rows"]
+        escrow_evidence = verified_accounting["escrow_evidence"]
+        skip_by_source = {row["source_id"]: row for row in skip_rows}
+        policy_records = [
+            row for row in accounting_records
+            if row["disposition"] == "datum_policy_pin"]
+        atom_residual_records = [
+            row for row in accounting_records
+            if (row["leaf_kind"] == "atom"
+                and row["disposition"] == "typed_residual")]
+        semantic_residual_records = [
+            row for row in accounting_records
+            if (row["leaf_kind"] == "op"
+                and row["disposition"] == "typed_residual")]
+        escrow_records = [
+            row for row in accounting_records
+            if row["disposition"] == "atom_escrow"]
+        policy_skips = [
+            skip_by_source[row["source_id"]] for row in policy_records]
+        atom_residuals = [
+            skip_by_source[row["source_id"]]
+            for row in atom_residual_records]
+        blocking_skips = [
+            skip_by_source[row["source_id"]]
+            for row in semantic_residual_records]
+
+        # ``all([])`` is true.  Therefore zero programs are acceptable only
+        # when there was no materializable semantic op (an empty model, datum
+        # policy pins, or atom-only residual input).  This is the exact bug
+        # that previously made a disappeared create_dimension look green.
+        materializable_intent = sum(
+            row["leaf_kind"] == "op"
+            and row["disposition"] != "datum_policy_pin"
+            for row in accounting_records)
+        empty_chunk_indices = [
+            index for index, program in enumerate(programs)
+            if not isinstance(program, dict)
+            or not isinstance(program.get("ops"), list)
+            or not program["ops"]
+        ]
+        emitted_ops = accounting_payload["counts"]["emitted_ops"]
+        empty_materialization = (
+            materializable_intent > 0 and emitted_ops == 0)
+        # A retained plan is only an optimisation.  The raw program remains
+        # authoritative: replan it here, then reuse a retained immutable plan
+        # only when source receipt, plan check and freshly derived plan digest
+        # all agree.  A positional tuple can no longer compile a sibling raw
+        # program by accident.
+        materialized_plans = getattr(materialized, "plans", ()) or ()
+        materialized_plan_checks = (
+            getattr(materialized, "plan_checks", ()) or ())
+
+        from kukai.ir.compiler import compile_rebuild_chunk, plan_program
+        from kukai.ir.midend import PlannedProgram
+        revit_version = _resolved_revit_version(llm_client).version
 
         # Каталог источника для СУХОГО гейта — одна общая функция, см. её
         # докстринг: без каталога гейт отказывал целым чанкам (KIR-G103).
@@ -3599,8 +4436,39 @@ async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
                 if index < len(materialized_plans)
                 else None
             )
+            retained_check = (
+                materialized_plan_checks[index]
+                if index < len(materialized_plan_checks)
+                else None
+            )
+            plan_binding = "replanned_raw"
+            try:
+                exact_plan = plan_program(program, bulk=True)
+            except Exception:  # compile raw below for its typed diagnostics
+                compile_input = program
+                plan_binding = "raw_plan_refused"
+            else:
+                def _check_value(name: str) -> Any:
+                    if isinstance(retained_check, Mapping):
+                        return retained_check.get(name)
+                    return getattr(retained_check, name, None)
+
+                source_digest = _materialization_digest(program)
+                retained_is_exact = (
+                    isinstance(retained_plan, PlannedProgram)
+                    and _check_value("program_index") == index
+                    and _check_value("accepted") is True
+                    and _check_value("source_digest") == source_digest
+                    and _check_value("plan_digest") == exact_plan.plan_digest
+                    and retained_plan.plan_digest == exact_plan.plan_digest
+                )
+                if retained_is_exact:
+                    compile_input = retained_plan
+                    plan_binding = "retained_verified"
+                else:
+                    compile_input = exact_plan
             out = compile_rebuild_chunk(
-                retained_plan if retained_plan is not None else program,
+                compile_input,
                 revit_version=revit_version,
                 snapshot=dry_snapshot,
             )
@@ -3610,27 +4478,90 @@ async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
                 "refused": not out.ok,
                 "diagnostics": ([d.as_dict() for d in out.diagnostics][:4]
                                 if not out.ok else []),
+                **(_diagnostics_total(out.diagnostics, 4) if not out.ok else {}),
+                "plan_binding": plan_binding,
             }
             if out.planned is not None:
                 chunk["plan_digest"] = out.planned.plan_digest
             chunks.append(chunk)
         ok_count = sum(1 for c in chunks if c["ok"])
-        summary = {"ok": all(c["ok"] for c in chunks) if chunks else True,
+        chunks_compile_ok = all(c["ok"] for c in chunks)
+        summary_ok = (
+            chunks_compile_ok
+            and not blocking_skips
+            and not empty_chunk_indices
+            and not empty_materialization
+        )
+        summary = {"schema_version": _REBUILD_SUMMARY_SCHEMA,
+                   "ok": summary_ok,
                    "dry_run": dry_run, "chunks_total": len(chunks),
                    "chunks_ok": ok_count, "chunks": chunks[:50],
                    "materialize_mode": materialize_mode,
                    "offset_mm": (list(offset_mm)
                                  if offset_mm is not None else None)}
-        materialize_stats = getattr(materialized, "stats", None)
-        summary["atoms_escrowed"] = int(
-            getattr(materialize_stats, "atoms_escrowed", 0) or 0)
-        summary["atoms_skipped"] = int(
-            getattr(materialize_stats, "atoms_skipped", 0) or 0)
-        escrow_evidence = getattr(materialized, "escrowed", ()) or ()
+        summary["refused"] = not summary_ok
+        summary["materializable_intent"] = materializable_intent
+        summary["materialized_ops"] = emitted_ops
+        summary["skips_total"] = len(skip_rows)
+        summary["semantic_skips"] = len(blocking_skips)
+        summary["policy_skips"] = len(policy_skips)
+        summary["residual_skips"] = len(atom_residuals)
+        summary["atom_residuals"] = len(atom_residuals)
+        pending_acceptance = len(escrow_records)
+        datum_binding_unproven = bool(policy_records)
+        partial_reasons: list[str] = []
+        if atom_residuals:
+            partial_reasons.append("atom_residuals")
+        if pending_acceptance:
+            partial_reasons.append("pending_runtime_witness")
+        if partial_read["is_partial_read"]:
+            partial_reasons.append("partial_read")
+        summary["complete"] = bool(
+            summary_ok
+            and not partial_reasons
+            and not datum_binding_unproven)
+        # A datum pin with unproved active-document identity is incomplete but
+        # is not a partial semantic model.  Atoms, escrow awaiting runtime and
+        # a permitted partial read are genuinely partial.
+        summary["partial"] = bool(partial_reasons)
+        summary["partial_reasons"] = partial_reasons
+        summary["datum_binding_state"] = (
+            "same_document_unproven"
+            if datum_binding_unproven else "not_applicable")
+        summary["pending_acceptance_evidence"] = bool(pending_acceptance)
+        summary["pending_acceptance_evidence_count"] = pending_acceptance
+        summary["fidelity_state"] = (
+            "refused" if not summary_ok
+            else "partial" if partial_reasons
+            else "incomplete_unproven_binding" if datum_binding_unproven
+            else "complete"
+        )
+        summary["skips"] = skip_rows[:50]
+        summary["skips_truncated"] = len(skip_rows) > 50
+        summary["empty_chunks"] = empty_chunk_indices[:50]
+        if blocking_skips:
+            summary["error"] = "semantic_skips"
+        elif empty_materialization:
+            summary["error"] = "empty_materialization"
+        elif empty_chunk_indices:
+            summary["error"] = "empty_chunk"
+        elif not chunks_compile_ok:
+            summary["error"] = "compile_refused"
+        summary["atoms_escrowed"] = accounting_payload["counts"][
+            "atom_escrows"]
+        summary["atoms_skipped"] = len(atom_residuals)
         summary["escrow_evidence"] = [
-            record.as_dict() for record in escrow_evidence[:50]
-            if hasattr(record, "as_dict")
+            (record.as_dict() if hasattr(record, "as_dict") else dict(record))
+            for record in escrow_evidence[:50]
+            if hasattr(record, "as_dict") or isinstance(record, Mapping)
         ]
+        summary["materialization_accounting"] = {
+            "schema_version": accounting_payload["schema_version"],
+            "receipt_digest": accounting_payload["receipt_digest"],
+            "input_digest": accounting_payload["input_digest"],
+            "programs_digest": accounting_payload["programs_digest"],
+            "counts": dict(accounting_payload["counts"]),
+        }
         # §18.4: производный артефакт частичного чтения несёт пометку — и
         # тогда, когда оператор явно разрешил карваут, и тогда, когда чтение
         # было полным (False, а не отсутствие ключа: «не помечено» и «не
@@ -3652,9 +4583,42 @@ async def handle_revit_rebuild(args: Any, llm_client, bridge_callback,
             summary["partial_read_note_ru"] = (
                 "результат построен на ЧАСТИЧНОМ чтении: закрытых рабочих "
                 f"наборов {partial_read['worksets_closed']}")
-        if dry_run:
+        if summary_ok and (atom_residuals or pending_acceptance):
+            summary["message_ru"] = (
+                f"dry-run компайл-гейт: {ok_count}/{len(chunks)} чанков ok; "
+                "результат ЧАСТИЧНЫЙ: "
+                f"atom residual={len(atom_residuals)}, "
+                f"pending runtime witness={pending_acceptance}")
+        elif summary_ok and partial_read["is_partial_read"]:
+            summary["message_ru"] = (
+                f"dry-run компайл-гейт: {ok_count}/{len(chunks)} чанков ok; "
+                "результат ЧАСТИЧНЫЙ из-за неполного чтения")
+        elif summary_ok and policy_skips:
+            summary["message_ru"] = (
+                f"dry-run компайл-гейт: {ok_count}/{len(chunks)} чанков ok; "
+                f"{len(policy_skips)} datum-листьев явно pinned existing, "
+                "но binding активного документа не доказан; complete=false")
+        elif summary_ok:
             summary["message_ru"] = (
                 f"dry-run компайл-гейт: {ok_count}/{len(chunks)} чанков ok")
+        elif blocking_skips:
+            summary["message_ru"] = (
+                "пересборка отказана: материализатор не выразил "
+                f"{len(blocking_skips)} семантических листьев; причины в skips")
+        elif empty_materialization:
+            summary["message_ru"] = (
+                "пересборка отказана: вход содержал "
+                f"{materializable_intent} материализуемых листьев, но ни один "
+                "исполняемый оп не получен")
+        elif empty_chunk_indices:
+            summary["message_ru"] = (
+                "пересборка отказана: материализатор вернул пустой чанк")
+        else:
+            summary["message_ru"] = (
+                f"dry-run компайл-гейт: {ok_count}/{len(chunks)} чанков ok")
+        if not summary_ok:
+            return summary
+        if dry_run:
             return summary
         # Live execution stays behind the same admin gate.
         return {"ok": False, "refused": True, "error": "live_rebuild_unimplemented",
@@ -3828,7 +4792,11 @@ async def handle_revit_idempotence(
     lease: Optional[A5Lease] = None
     try:
         if not revit_decompile_enabled():
-            return _typed_error("gate", admin_gate_message_ru("revit_idempotence"))
+            return _typed_error("gate", admin_gate_message_ru(
+                "revit_idempotence",
+                # Гейт называет ВЫЗЫВАЮЩИЙ: эти три стоят за
+                # `revit_decompile_enabled` — другой флаг, режима нет.
+                flag=_DECOMPILE_FLAG, needs_mode=False))
         try:
             from kir_idempotence import (  # type: ignore
                 SafetyContext, build_reextract_cs, run_idempotence)
@@ -4338,8 +5306,14 @@ def _metadata_from_passport(passport: Any, doc_stamp: str):
     try:
         return L0Document.from_dict({
             "doc_name": meta.get("doc_name") or passport.get("doc_name") or "doc",
-            "revit_version": (meta.get("revit_version")
-                              or passport.get("revit_version") or "2026"),
+            # СЕДЬМАЯ ПЛОЩАДКА, найдена собственным тестом 13.08.2026. Она
+            # выглядела «про сохранённый паспорт, а не про живой канал», и это
+            # было неверно: `metadata.revit_version` уходит параметром прямо в
+            # компиляцию перестройки (`:4993`, `:5046`). Паспорт без записанной
+            # версии давал «2026» без следа — та же дыра на пути rebuild.
+            "revit_version": _rv.resolve(
+                meta.get("revit_version")
+                or passport.get("revit_version")).version,
             "units": "mm",
             "change_stamp": doc_stamp,
             "levels": meta.get("levels", []),
@@ -4424,7 +5398,8 @@ def _a5_runners(llm_client, bridge_callback, revit_version: str, *,
             snapshot=ground_snapshot)
         if not out.ok:
             return {"ok": False, "refused": True,
-                    "diagnostics": [d.as_dict() for d in out.diagnostics][:4]}
+                    "diagnostics": [d.as_dict() for d in out.diagnostics][:4],
+                    **_diagnostics_total(out.diagnostics, 4)}
         await lease.ensure_held()
         effect_id = _next_effect("rebuild")
         journal.start_effect(effect_id, {
@@ -4580,7 +5555,8 @@ def _a5_runners(llm_client, bridge_callback, revit_version: str, *,
             expected_document=document_fingerprint.compiler_guard())
         if not out.ok:
             return {"ok": False, "refused": True,
-                    "diagnostics": [d.as_dict() for d in out.diagnostics][:4]}
+                    "diagnostics": [d.as_dict() for d in out.diagnostics][:4],
+                    **_diagnostics_total(out.diagnostics, 4)}
         await lease.ensure_held()
         effect_id = _next_effect("delete")
         journal.start_effect(effect_id, {

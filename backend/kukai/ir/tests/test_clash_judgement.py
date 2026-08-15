@@ -19,9 +19,12 @@
 """
 from __future__ import annotations
 
+import copy
+import math
 import unittest
 
 from kukai.clash import detect as D
+from kukai.clash import geom as G
 from kukai.clash import hulls as H
 from kukai.ir import clash_judgement as J
 from kukai.ir.decompile.extract import _SPEC_BY_NAME
@@ -43,7 +46,8 @@ def side(element_id: str, category: str, label: str, *,
 def finding(a: dict, b: dict, *, relation: str = "overlap",
             depth: float = 80.0, grade: str = "conservative",
             pair_kind: str = "interference",
-            translation: list[float] | None = None) -> dict:
+            translation: list[float] | None = None,
+            verdict: str | None = None) -> dict:
     return {
         "finding_id": f"{a['source_element_id']}~{b['source_element_id']}",
         "a": a, "b": b,
@@ -52,7 +56,8 @@ def finding(a: dict, b: dict, *, relation: str = "overlap",
         "clearance_mm": 0.0, "clearance_deficit_mm": depth,
         "ranking_tol_mm": H.TOL_GRADE_MM[grade], "ranking_significant": True,
         "hull_grade": grade, "pair_kind": pair_kind,
-        "hull_relation": relation, "verdict": "possible",
+        "hull_relation": relation,
+        "verdict": verdict or ("confirmed" if grade == "exact" else "possible"),
         "certified_separating_translation_mm": translation,
         "translation_unavailable_reason": None,
     }
@@ -69,8 +74,50 @@ EQUIP = side("p5/eq1", "OST_MechanicalEquipment", "equipment",
              hull_source="bbox")
 
 
+def exact(s: dict) -> dict:
+    """Точная сторона для позитивного контракта будущей геометрии."""
+    return {**s, "hull_grade": "exact"}
+
+
 def one(*args, **kwargs) -> J.Judged:
     return J.judge([finding(*args, **kwargs)]).judged[0]
+
+
+def sealed_exact_duplicate() -> dict:
+    """Future exact producer fixture issued through the real detector.
+
+    Production currently emits no ``grade=exact`` body.  The positive branch
+    still needs an executable contract, otherwise a permanently-false safety
+    predicate could look safe while silently disabling the feature forever.
+    """
+
+    def record(source_id: str) -> H.HullRecord:
+        hull = G.Prism(
+            ((0.0, 0.0), (1000.0, 0.0),
+             (1000.0, 100.0), (0.0, 100.0)),
+            0.0, 100.0)
+        inner = H.certify_analytic_inner_for_test(
+            inner=hull,
+            body=hull,
+            outer=hull,
+            subject_source_id=source_id,
+            body_source_digest=H.analytic_hull_digest(hull),
+            body_source_revision=f"fixture:{source_id}:body-r1",
+        )
+        return H.HullRecord(
+            source_id=source_id,
+            category="OST_PipeCurves",
+            label="pipe",
+            mvp_side="mep",
+            hull=hull,
+            grade="exact",
+            hull_source="future_exact_body",
+            inner=inner,
+        )
+
+    detected = D.evaluate(record("p1/exact-a"), record("p1/exact-b"))
+    assert detected is not None
+    return detected.as_dict()
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -139,7 +186,8 @@ class TheRulesAreFacts(unittest.TestCase):
         item = one(PIPE, WALL)
         self.assertEqual((item.kind, item.rule_id),
                          ("penetration", "run_through_envelope"))
-        self.assertIn("create_opening", item.next_move_ru)
+        self.assertNotIn("create_opening", item.next_move_ru)
+        self.assertIn("менять или удалять", item.next_move_ru)
 
     def test_a_duct_through_a_beam_is_a_collision(self):
         """Отверстие в балке — расчёт и согласование, а не типовой узел."""
@@ -246,10 +294,43 @@ class TheRungIsAContract(unittest.TestCase):
         self.assertEqual(item.rung, "look")
         self.assertIsNone(item.proven)
 
-    def test_the_same_pair_on_proven_hulls_does_reach_it(self):
-        item = one(DUCT, DUCT2, depth=900.0, grade="conservative")
-        self.assertEqual(item.rung, "fix")
-        self.assertIs(item.proven, True)
+    def test_an_exact_outer_word_without_inner_proof_does_not_reach_repair(self):
+        item = one(exact(DUCT), exact(DUCT2), depth=900.0, grade="exact")
+        self.assertEqual(item.rung, "look")
+        self.assertIsNone(item.proven)
+
+    def test_rectangular_duct_outer_capsules_do_not_become_a_proven_clash(self):
+        """РЕГРЕССИЯ proof-firebreak.
+
+        У двух воздуховодов 100×100 мм зазор между телами 20 мм. Сечение
+        сейчас поднимается капсулой радиуса полудиагонали; капсулы
+        перекрываются на 21.421 мм, хотя прямоугольные тела разделены.
+        Детектор честно говорит `possible`; judgement прежде повышал это до
+        `proven=True`, `rung=fix` и предлагал исполнимый перенос.
+        """
+        radius = math.hypot(50.0, 50.0)
+
+        def duct_record(element_id: str, y: float) -> H.HullRecord:
+            return H.HullRecord(
+                source_id=element_id,
+                category="OST_DuctCurves", label="duct", mvp_side="run",
+                hull=G.Capsule(((0.0, y, 0.0), (1000.0, y, 0.0)), radius),
+                grade="conservative", hull_source="axis_section",
+                section_radius_mm=radius, section_round=False,
+                section_source="width+height")
+
+        raw = D.evaluate(duct_record("p1/a", 0.0),
+                         duct_record("p1/b", 120.0))
+        self.assertIsNotNone(raw)
+        self.assertEqual(raw.verdict, "possible")
+        self.assertAlmostEqual(raw.hull_overlap_depth_mm, 21.421356, places=5)
+
+        item = J.judge([raw.as_dict()]).judged[0]
+        self.assertEqual(item.geometry_verdict, "possible")
+        self.assertIs(item.proven, False)
+        self.assertEqual(item.rung, "look")
+        self.assertNotIn("сдвинуть", item.next_move_ru)
+        self.assertIn("менять или удалять", item.next_move_ru)
 
     def test_an_overlap_inside_the_grades_own_tolerance_is_not_a_repair(self):
         """Единственный порог глубины здесь — ЧУЖОЙ: допуск собственного
@@ -283,6 +364,25 @@ class TheRungIsAContract(unittest.TestCase):
 
 class TheDestructiveInstructionIsGated(unittest.TestCase):
 
+    def test_real_sealed_exact_equality_still_requires_semantic_review(self):
+        item = J.judge([sealed_exact_duplicate()]).judged[0]
+        self.assertEqual(item.kind, "duplicate")
+        self.assertIs(item.proven, True)
+        self.assertEqual(item.rung, "look")
+        self.assertNotIn("удалить ОДИН", item.next_move_ru)
+        self.assertIn("автоматически удалять нельзя", item.next_move_ru)
+
+    def test_tampered_exact_equality_cannot_keep_the_delete_capability(self):
+        forged = copy.deepcopy(sealed_exact_duplicate())
+        forged["exact_body_equality_proof"]["a"]["hull_source"] = "bbox"
+        item = J.judge([forged]).judged[0]
+        # Physical overlap remains independently proven; only the equality
+        # capability is revoked.  Conflating the axes would hide this exact
+        # class of proof tamper.
+        self.assertIs(item.proven, True)
+        self.assertNotIn("удалить ОДИН", item.next_move_ru)
+        self.assertIn("удалять по такой находке нельзя", item.next_move_ru)
+
     def test_a_duplicate_seen_through_two_bounding_boxes_never_orders_deletion(self):
         """ДЕФЕКТ, ПОЧИНЕННЫЙ НА СОСЕДНЕЙ ВЕТКЕ (`c9d21573`): у двух диагоналей
         квадрата ОДИН габарит, и совет «удалить одну из них» стирал живой
@@ -295,9 +395,14 @@ class TheDestructiveInstructionIsGated(unittest.TestCase):
         self.assertNotIn("удалить", item.next_move_ru)
         self.assertIn("сверить", item.next_move_ru)
 
-    def test_a_duplicate_proven_by_two_axes_may_order_deletion(self):
+    def test_an_exact_outer_word_alone_never_orders_deletion(self):
+        item = one(exact(DUCT), exact(DUCT2),
+                   pair_kind="coincident_duplicate", grade="exact")
+        self.assertNotIn("удалить ОДИН", item.next_move_ru)
+
+    def test_two_outer_axes_never_order_deletion(self):
         item = one(DUCT, DUCT2, pair_kind="coincident_duplicate")
-        self.assertIn("удалить", item.next_move_ru)
+        self.assertNotIn("удалить ОДИН", item.next_move_ru)
 
     def test_the_box_is_refused_by_its_own_name_not_only_by_the_grade(self):
         """ЗАЩИТА В ГЛУБИНУ. Сегодня `hulls.py` выдаёт `bbox` только с грейдом
@@ -321,7 +426,8 @@ class TheDestructiveInstructionIsGated(unittest.TestCase):
         """Тот же закон, что у `detect.hulls_coincide`: `None` значит «сказать
         нечего», и путать его с `False` нельзя ни в одну сторону."""
         self.assertIsNone(one(DUCT, BEAM, grade="coarse").proven)
-        self.assertIs(one(DUCT, DUCT2).proven, True)
+        self.assertIs(one(DUCT, DUCT2).proven, False)
+        self.assertIsNone(one(exact(DUCT), exact(DUCT2), grade="exact").proven)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -387,7 +493,7 @@ class TheSlackWeAddedIsNotEvidence(unittest.TestCase):
                        profiles=profiles, slack=slack).judged[0]
         self.assertEqual(item.slack, ())
         self.assertNotEqual(item.kind, "unproven")
-        self.assertIs(item.proven, True)
+        self.assertIs(item.proven, False)
         self.assertEqual(item.rule_id, "structure_meets_structure_overlap")
 
     # ── ∃ ходит по ДИАГОНАЛИ прочтений, а не по их квадрату ───────────────
@@ -562,17 +668,19 @@ class NothingIsSilent(unittest.TestCase):
                           "structure_meets_structure_overlap"])
 
     def test_the_next_move_names_the_op_the_author_can_edit(self):
-        """Ход, выводимый из ПРОГРАММЫ: адрес операции и её операнд, а не совет."""
+        """Программа не правится по outer-only находке."""
         ops = {"p1/pipe1": {"op": "create_pipe", "id": "pipe1",
                             "diameter_mm": 110},
                "p3/w1": {"op": "create_wall", "id": "w1"}}
         item = J.judge([finding(PIPE, WALL)], ops=ops).judged[0]
-        self.assertIn("p3/w1", item.next_move_ru)
-        self.assertIn("110", item.next_move_ru)
+        self.assertNotIn("create_opening", item.next_move_ru)
+        self.assertIn("менять или удалять", item.next_move_ru)
 
-    def test_a_certified_translation_becomes_the_move_verbatim(self):
-        item = one(DUCT, DUCT2, translation=[0.0, 0.0, -84.0])
-        self.assertIn("-84", item.next_move_ru)
+    def test_an_outer_translation_without_inner_proof_is_not_executable(self):
+        item = one(exact(DUCT), exact(DUCT2), grade="exact",
+                   translation=[0.0, 0.0, -84.0])
+        self.assertNotIn("-84", item.next_move_ru)
+        self.assertIn("менять или удалять", item.next_move_ru)
 
     def test_judging_nothing_says_nothing_rather_than_all_clear(self):
         verdict = J.judge([])

@@ -69,6 +69,7 @@ MODEL_BINDING_GUARD_VERSION = "kir-model-binding-guard/1"
 # historical names from this module so compiler/tests and external KIR users
 # keep the same import contract while dependencies flow validator -> emitter.
 from kukai.ir.authoring_validation import (
+    PLACE_FAMILY_WORK_PLANE_UNSUPPORTED,
     _ARC_ENDPOINT_TOL_MM,
     _COORD_LIMIT_MM,
     _arc_endpoints_mm,
@@ -972,6 +973,33 @@ def _target_res(op: dict, s: str, ver: str, oid: str,
             f"if (__tg_{s} == null) {{ {refuse_stmt(oid, _cs('элемент не найден (модель изменилась после grounding)'), isolation)} }}")
 
 
+#: ЧЕГО ЭТА ТАБЛИЦА НЕ ПОКРЫВАЕТ, СКАЗАНО ПЕРВЫМ, потому что добавить сюда
+#: строку дешевле, чем проверить, можно ли: **род, который задаётся НЕ через
+#: `Parameter.Set(ElementId)`, сюда не относится.**
+#:
+#: Замерено по индексу ловушек 13.08.2026 на шести версиях: у `Parameter.Set`
+#: ровно четыре перегрузки — `ElementId`, `Double`, `Int32`, `String`, — и
+#: `Set(WorksetId)` среди них НЕТ. Рабочий набор (`Workset`) не наследует
+#: `Element`, не имеет `.Id`, собирается СВОИМ коллектором
+#: (`FilteredWorksetCollector`) и адресуется `WorksetId.IntegerValue`. То есть
+#: приём отсюда не применим к нему НИ В ОДНОМ из четырёх шагов — ни разрешение,
+#: ни запись, ни свидетель, ни коллектор.
+#:
+#: ЦЕНА ОБОБЩЕНИЯ — ПРОВЕРКА ПРИМЕНИМОСТИ ПЕРЕД КАЖДЫМ ПРИМЕНЕНИЕМ. Эта таблица
+#: сделала второй род дешёвым; ровно поэтому она опасна на третьем: строка,
+#: добавленная по аналогии, дала бы способность, которая ВЫГЛЯДИТ как две уже
+#: доказанные. Похожая на рабочую хуже несобирающейся.
+#:
+#: Род ссылки -> (класс Ревита, слово для отказа, причастие). Таблица закрыта
+#: НАМЕРЕННО:
+#: новый род заводится здесь И в нормализаторе И в схеме одной правкой, иначе
+#: программа, законная для одного, отвергается другим.
+_REF_POOLS = {
+    "materials": ("Material", "материал", "найден"),
+    "phases": ("Phase", "фаза", "найдена"),
+}
+
+
 def _emit_setparam(op: dict, ver: str, stamp: str,
                    isolation: str = "atomic") -> tuple[str, str, str, str]:
     oid = op["id"]
@@ -980,7 +1008,48 @@ def _emit_setparam(op: dict, ver: str, stamp: str,
     val = op["value"]
     decl = f"Element __tg_{s} = null; Parameter __pp_{s} = null;"
     res = _target_res(op, s, ver, oid, isolation).replace(f"Element __tg_{s} =", f"__tg_{s} =")
-    if val["type"] == "str":
+    ref_res = ""
+    if val["type"] == "int_ref":
+        # РАБОЧИЙ НАБОР. НЕ ветка `ref` и не строка в `_REF_POOLS`: `Workset`
+        # не наследует `Element`, коллектор свой, запись ЦЕЛЫМ, свидетель
+        # `AsInteger()`. Все четыре шага другие — сложить его к ссылкам значило
+        # бы получить способность, которая ВЫГЛЯДИТ как две доказанные.
+        #
+        # ДВА ПРЕДУСЛОВИЯ, ОБА СПРАШИВАЮТСЯ ДО ЗАПИСИ (замер ВОРОТ 13.08):
+        # `Parameter.Set` документирует `InvalidOperationException` «The
+        # parameter is read-only» у ВСЕХ четырёх перегрузок — но `IsReadOnly`
+        # существует и спрашивается, значит это ПРЕДУСЛОВИЕ, а не ловушка
+        # класса. Разделённость документа индекс не покрывает вовсе — это
+        # названная неизвестность, и она закрывается тем же способом:
+        # спросить `IsWorkshared` и отказать типизированно.
+        ref_res = (
+            f"\nif (!doc.IsWorkshared) {{ "
+            f"{refuse_stmt(oid, _cs('документ не разделён на рабочие наборы — набор задать некуда'), isolation)} }}\n"
+            f"int __ws_{s} = -1;\n"
+            f"foreach (Workset __wcand_{s} in new FilteredWorksetCollector(doc).ToWorksets())\n"
+            f"    if (__wcand_{s}.Name == {_cs(val['v'])}) {{ __ws_{s} = __wcand_{s}.Id.IntegerValue; break; }}\n"
+            f"if (__ws_{s} < 0) {{ "
+            f"{refuse_stmt(oid, _cs('рабочий набор «' + val['v'] + '» не найден в документе'), isolation)} }}")
+        set_expr = f"__pp_{s}.Set(__ws_{s})"
+    elif val["type"] == "ref":
+        # РОД ССЫЛКИ РЕШАЕТ ТОЛЬКО КЛАСС РЕВИТА И СЛОВО В ОТКАЗЕ. Всё
+        # остальное — разрешение, отказ, `Set(<el>.Id)`, свидетель — ОДНО для
+        # всех родов: второй способ делать то же разошёлся бы с первым на роде,
+        # который придёт третьим.
+        cls, word, found = _REF_POOLS[val.get("pool", "materials")]
+        # ССЫЛКА. Приём взят ДОСЛОВНО у `_emit_create_type` (материал в
+        # `create_type`, строки 3648-3672): разрешение коллектором, типизированный
+        # отказ, `Set(<el>.Id)`, свидетель через `AsElementId()`. Второй способ
+        # делать то же самое — будущее расхождение, и за эту ночь их было
+        # достаточно.
+        ref_res = (
+            f"\n{cls} __rf_{s} = new FilteredElementCollector(doc)"
+            f".OfClass(typeof({cls})).Cast<{cls}>()\n"
+            f"    .FirstOrDefault(__m => __m.Name == {_cs(val['v'])});\n"
+            f"if (__rf_{s} == null) {{ "
+            f"{refuse_stmt(oid, _cs(word + ' «' + val['v'] + '» не ' + found + ' в документе'), isolation)} }}")
+        set_expr = f"__pp_{s}.Set(__rf_{s}.Id)"
+    elif val["type"] == "str":
         set_expr = f"__pp_{s}.Set({_cs(val['v'])})"
     elif val["type"] == "mm":
         set_expr = f"__pp_{s}.Set(U({val['v']}))"
@@ -989,7 +1058,7 @@ def _emit_setparam(op: dict, ver: str, stamp: str,
     else:  # raw double
         set_expr = f"__pp_{s}.Set({val['v']})"
     create = (
-        f"// set_param {cs_line_comment_fragment(oid)}\n{res}\n"
+        f"// set_param {cs_line_comment_fragment(oid)}\n{res}{ref_res}\n"
         f"var __matches_{s} = __tg_{s}.GetParameters({_cs(pname)});\n"
         f"if (__matches_{s} == null || __matches_{s}.Count == 0) {{ {refuse_stmt(oid, _cs('параметр «' + pname + '» не найден у элемента'), isolation)} }}\n"
         f"if (__matches_{s}.Count != 1) {{ {refuse_stmt(oid, _cs('параметр «' + pname + '» неоднозначен: найдено несколько параметров с этим именем'), isolation)} }}\n"
@@ -1003,7 +1072,18 @@ def _emit_setparam(op: dict, ver: str, stamp: str,
     # repr дал бы `1e-06` и сдвинул бы корпус эталонных эмиссий).
     stol = tolerances("set_param")
     vtol = None
-    if val["type"] == "str":
+    if val["type"] == "int_ref":
+        # СВИДЕТЕЛЬ НАБОРА — целое, а не ссылка. Способность без своего
+        # свидетеля запрещена, и свидетель обязан быть ТОГО ЖЕ рода, что запись.
+        chk = f"__pp_{s}.AsInteger() != __ws_{s}"
+    elif val["type"] == "ref":
+        # СВИДЕТЕЛЬ ССЫЛКИ. Способность, добавленная БЕЗ своего свидетеля, не
+        # «неполная» — она запрещённая: исполнение совершено, подтвердить
+        # нечем. Поэтому ветка записи и ветка перечитывания заводятся ОДНОЙ
+        # правкой, а не одна за другой.
+        chk = (f"__pp_{s}.AsElementId() == null || "
+               f"__pp_{s}.AsElementId().ToString() != __rf_{s}.Id.ToString()")
+    elif val["type"] == "str":
         chk = f"(__pp_{s}.AsString() ?? \"\") != {_cs(val['v'])}"
     elif val["type"] == "mm":
         vtol = stol["length_mm"]
@@ -1289,6 +1369,24 @@ def _level_chain_check(el_var: str, oid: str, id_expr: str) -> str:
 def _symbol_res(op: dict, s: str, oid: str, ver: str,
                 isolation: str = "atomic") -> str:
     g = _gid(op, "symbol")
+    if g.get("via") == "ref":
+        # A8, 13.08.2026: СИМВОЛ, СОЗДАННЫЙ ЭТОЙ ЖЕ ПРОГРАММОЙ.
+        #
+        # Ветка скопирована с `_level_expr` — единственного рода ссылки,
+        # который потреблялся годами, — и не изобретает механизма: оба
+        # производителя (`create_type`, `load_family`) объявляют
+        # `FamilySymbol __el_<oid>` и кладут символ именно туда, так что
+        # приведение не нужно. `doc.GetElement` здесь НЕ зовётся сознательно:
+        # у свежесозданного символа нет id в снимке, снятом ДО исполнения, и
+        # спрашивать снимок значило бы искать то, чего в нём быть не может.
+        #
+        # Проверки на null тоже нет, и это не небрежность: отказ производящего
+        # опа гасит зависимый через `__ok_<s>` (типизированный «опорный оп
+        # отказан»), ровно как у уровня. Второй null-guard дал бы ДРУГОЕ
+        # сообщение на ту же причину.
+        rv = "__el_" + _safe(g["ref"])
+        return (f"FamilySymbol __sy_{s} = {rv};\n"
+                f"if (!__sy_{s}.IsActive) {{ __sy_{s}.Activate(); doc.Regenerate(); }}")
     return (f"FamilySymbol __sy_{s} = doc.GetElement({_eid(g['id'], ver, oid)}) as FamilySymbol;\n"
             f"if (__sy_{s} == null) {{ {refuse_stmt(oid, _cs('типоразмер не найден (модель изменилась после grounding)'), isolation)} }}\n"
             f"if (!__sy_{s}.IsActive) {{ __sy_{s}.Activate(); doc.Regenerate(); }}")
@@ -1709,7 +1807,7 @@ def _emit_hosted(op: dict, ver: str, stamp: str, kind: str,
     if host_sel.get("by") == "ref":
         host_ref = host_sel["value"]
         hv = "__el_" + _safe(host_ref)
-        wall = op["__host_wall__"]                 # attached by the plan stage
+        wall = op[spec.SYNTHETIC_HOST_WALL]        # attached by the plan stage
         # Касательная (третий-четвёртый элементы) была нужна только
         # плоскости зеркала; сам вызов остаётся — он же проверяет,
         # что у хоста есть касательная в плане, и отказывает иначе.
@@ -2233,6 +2331,27 @@ def _emit_place_work_plane(op: dict, ver: str, stamp: str,
     сообщении коммита, чтобы следующий замер не переоткрывал это как находку.
     """
     oid = op["id"]
+    unsupported = [field for field in PLACE_FAMILY_WORK_PLANE_UNSUPPORTED
+                   if field in op]
+    if unsupported:
+        # Defence in depth for trusted callers which invoke an emitter with a
+        # pre-normalised op and therefore bypass authoring_validation.validate.
+        # Every accepted operand must be emitted+witnessed or refused; the
+        # WorkPlaneBased branch currently has no measured lowering for these.
+        raise KirRefusal([
+            Diagnostic(
+                code=PARSE_EXCLUSIVE_FIELDS,
+                op_id=oid,
+                field_name=field,
+                expected=(f"{field} без ref_dir или ref_dir без "
+                          f"{field}"),
+                got=op[field],
+                message_ru=(
+                    f"place_family на рабочей плоскости: {field} "
+                    "не имеет доказанного совместного lowering с "
+                    "ref_dir"))
+            for field in unsupported
+        ])
     s = _safe(oid)
     x, y, z = _pt3(op["xyz"])
     dx, dy, dz = _pt3(op["ref_dir"])
@@ -4591,7 +4710,15 @@ def _emit_tag(op: dict, ver: str, stamp: str,
     pt_cs = docspace.emit_view2d_to_xyz_cs(f"__vw_{s}", u, w)
     leader = "true" if op.get("leader") else "false"
     g_tagtype = op.get("tag_type")
-    decl = (f"IndependentTag __el_{s} = null; Element __tg_{s} = null;\n"
+    # ДВА КЛАССА МАРОК, И РАЗЛИЧАЕТ ИХ ЦЕЛЬ, А НЕ АВТОР (13.08.2026).
+    # `__el_` перестал быть `IndependentTag`: марка помещения, площади и
+    # пространства — `SpatialElementTag`, у которого другой создатель и
+    # другая поверхность чтения. Ветка стоит В C#, а не здесь, и это не
+    # выбор стиля: у `create_tag.target` НЕТ пула (`ref_kinds=ELEMENT`),
+    # цель приходит как `element_id`/`ref`, и класс цели питону на эмиссии
+    # НЕИЗВЕСТЕН ПО ПОСТРОЕНИЮ. Спрашивать про него автора значило бы
+    # завести второй источник истины, способный разойтись с целью.
+    decl = (f"Element __el_{s} = null; Element __tg_{s} = null;\n"
             f"View __vw_{s} = null;")
     if g_tagtype is not None:
         if ver <= "2021":
@@ -4610,9 +4737,91 @@ def _emit_tag(op: dict, ver: str, stamp: str,
         create_call = (
             f"__el_{s} = IndependentTag.Create(doc, __vw_{s}.Id, new Reference(__tg_{s}), "
             f"{leader}, TagMode.TM_ADDBY_CATEGORY, TagOrientation.Horizontal, {pt_cs});")
+    # ═══ ПРОСТРАНСТВЕННАЯ МАРКА ═══════════════════════════════════════════
+    #
+    # ЗАЧЕМ. Замерено 13.08.2026 на `len_ar_me_r24_v1` (второе жилое здание,
+    # чтение полное, все десять стадий): 7 067 элементов — марки рода
+    # `spatial`, крупнейшая причина `unsupported_forward_signature` на этом
+    # здании. Обратный ход снимал их с 30.07 и честно отказывал в подъёме
+    # (`lift.py`: «прямой ход строит марку единственным способом»). Это была
+    # дыра ПРЯМОГО хода, а не чтения.
+    #
+    # ЧЕМ СТРОИТСЯ — установлено КОМПИЛЯЦИЕЙ против эталонных сборок, а не
+    # документацией, и в этом семействе это принципиально: `tag_extract`
+    # несёт случай #78, где `SpatialElementTag.SpatialElement` описан в шести
+    # XML и отсутствует в шести DLL. Индекса ловушек в дереве НЕТ вовсе —
+    # сказано именно так, потому что «индекса нет» и «члена нет» разные
+    # факты. Замер 13.08, все шесть версий:
+    #
+    #     NewRoomTag(LinkElementId, UV, ElementId)   6/6   контроль:
+    #     NewSpaceTag(Space, UV, View)               6/6     NewRoomTag(UV)
+    #     NewAreaTag(ViewPlan, Area, UV)             6/6     6/6 CS7036
+    #     RoomTag.HasLeader (чтение И запись)        6/6     NewNonesuchTagZZZ
+    #     RoomTag.ChangeTypeId · Room.Location       6/6     6/6 CS1061
+    #
+    # ЧЕГО МЫ НЕ ЗНАЕМ И ГДЕ ЭТО СТОРОЖИТСЯ. В КАКИХ ОСЯХ `UV` у
+    # `NewRoomTag` — компиляцией не устанавливается, живьём не проверено.
+    # Догадка здесь была бы молча смещённой маркой, поэтому точка НЕ
+    # додумывается: свидетель `head_at` читает `TagHeadPosition` обратно ТЕМ
+    # ЖЕ базисом вида, каким она клалась, и неверная ось даёт ТИПИЗИРОВАННОЕ
+    # НАРУШЕНИЕ, а не тихий сдвиг. Оп уезжает НЕПРОВЕРЕННЫМ живьём, и это
+    # сказано вслух, а не спрятано.
+    spatial_create = (
+        f"    var __se_{s} = __tg_{s} as SpatialElement;\n"
+        f"    if (__se_{s} != null)\n    {{\n"
+        # ОТКАЗ 1: маркировать нечего. Неразмещённое помещение Ревит
+        # маркирует МУСОРОМ, а не ошибкой — потому проверка наша.
+        f"        if (__se_{s}.Location == null || __se_{s}.Area <= 0.0)\n"
+        f"            {{ {refuse_stmt(oid, _cs('цель — пространственный элемент, который НЕ РАЗМЕЩЁН (нет Location или нулевая площадь): маркировать нечего'), isolation)} }}\n"
+        # ОТКАЗ 2: выноска. Причина унесена дословно из lift.py — у марки С
+        # выноской точка означает КОНЕЦ ВЫНОСКИ, а мы храним и сверяем
+        # ГОЛОВУ. Молчаливый увод головы на длину выноски по умолчанию
+        # сравнением по голове не ловится.
+        # СТОРОЖ ВЫНОСКИ ИСПУСКАЕТСЯ ТОЛЬКО КОГДА ВЫНОСКА ЗАПРОШЕНА.
+        # Первая редакция писала `if (false)` при `leader` по умолчанию —
+        # константно-ложный сторож, то есть мёртвая ветка по построению.
+        # Ровно та форма, которую `translation_cert.analyze_witness_cs`
+        # отвергает у свидетелей; здесь она стояла бы в создании, куда
+        # сертификат не смотрит, и жила бы незамеченной.
+        + (f"        {refuse_stmt(oid, _cs('leader:true у пространственной марки в этой волне отказан: точка означала бы КОНЕЦ ВЫНОСКИ, а сверяется ГОЛОВА (дословно RevitAPI.xml про седьмой аргумент) — молчаливый сдвиг вместо марки'), isolation)}\n"
+           if op.get("leader") else "")
+        + (
+        f"        var __uv_{s} = new UV({round(u, 4)}, {round(w, 4)});\n"
+        f"        var __rm_{s} = __se_{s} as Autodesk.Revit.DB.Architecture.Room;\n"
+        f"        var __ar_{s} = __se_{s} as Area;\n"
+        f"        var __sc_{s} = __se_{s} as Autodesk.Revit.DB.Mechanical.Space;\n"
+        f"        if (__rm_{s} != null)\n"
+        f"            __el_{s} = doc.Create.NewRoomTag(new LinkElementId(__rm_{s}.Id), __uv_{s}, __vw_{s}.Id);\n"
+        f"        else if (__sc_{s} != null)\n"
+        f"            __el_{s} = doc.Create.NewSpaceTag(__sc_{s}, __uv_{s}, __vw_{s});\n"
+        f"        else if (__ar_{s} != null)\n"
+        f"        {{\n"
+        # ОТКАЗ 3: площадь маркируется ТОЛЬКО на плане, и отказ называет
+        # фактический род вида, а не «неверный вид».
+        f"            var __vp_{s} = __vw_{s} as ViewPlan;\n"
+        f"            if (__vp_{s} == null)\n"
+        f"                {{ {refuse_stmt(oid, '"марка площади требует вид-план (ViewPlan), а in_view — " + __vw_' + s + '.ViewType.ToString()', isolation)} }}\n"
+        f"            __el_{s} = doc.Create.NewAreaTag(__vp_{s}, __ar_{s}, __uv_{s});\n"
+        f"        }}\n"
+        # ОТКАЗ 4: род пространственного элемента, которого мы не знаем.
+        # Молчать нельзя — иначе `__el_` останется null и причина потеряется.
+        f"        else\n"
+        f"            {{ {refuse_stmt(oid, '"цель — SpatialElement рода " + __se_' + s + '.GetType().Name + ", а марки строятся только для помещения, площади и пространства"', isolation)} }}\n"
+        # ТИП МАРКИ у пространственной ставится ПОСЛЕ создания
+        # (`ChangeTypeId`, 6/6): у `NewRoomTag`/`NewSpaceTag`/`NewAreaTag`
+        # слота под тип нет ни на одной версии. На 2021 `tag_type` отказан
+        # ВЫШЕ, на эмиссии, и здесь его просто нет — поведение 2021 не
+        # тронуто ни на байт, и место отказа по версии осталось одно.
+        + (f"        if (__el_{s} != null)\n"
+           f"            {{ try {{ __el_{s}.ChangeTypeId(__ttel_{s}.Id); }}\n"
+           f"              catch (Exception __tex_{s}) {{ {refuse_stmt(oid, '"тип марки не принят пространственной маркой: " + __tex_' + s + '.Message', isolation)} }} }}\n"
+           if g_tagtype is not None else "")
+        + (
+        f"    }}\n    else\n    {{\n        {create_call}\n    }}\n")))
+
     create = (
         f"// create_tag {cs_line_comment_fragment(oid)}\n{view_res}\n{tgt_res}\n{type_decl}\n"
-        f"try {{ {create_call} }}\n"
+        f"try {{\n{spatial_create}}}\n"
         f"catch (Exception __ex_{s}) {{ {refuse_stmt(oid, f'\"IndependentTag.Create: \" + __ex_{s}.Message', isolation)} }}\n"
         f"if (__el_{s} == null) {{ {refuse_stmt(oid, _cs('IndependentTag.Create вернул null'), isolation)} }}\n"
         + _stamp_block(f"__el_{s}", f"{stamp}:{oid}"))
@@ -4636,12 +4845,12 @@ def _emit_tag(op: dict, ver: str, stamp: str,
         # question. See `kukai/ir/decompile/tag_extract.py:_TAG_TARGET_2022_CS`.
         bound_expr = (
             f"    try\n    {{\n"
-            f"        foreach (Element __tel in __el_{s}.GetTaggedLocalElements())\n"
+            f"        foreach (Element __tel in __itg_{s}.GetTaggedLocalElements())\n"
             f"            if (__tel != null && __tel.Id.ToString() == __tg_{s}.Id.ToString()) {{ __bound_{s} = true; break; }}\n"
             f"    }} catch {{ }}\n")
     else:  # <=2021: the multi-target readback does not exist yet
         bound_expr = (
-            f"    try {{ __bound_{s} = __el_{s}.TaggedLocalElementId.ToString() == __tg_{s}.Id.ToString(); }}\n"
+            f"    try {{ __bound_{s} = __itg_{s}.TaggedLocalElementId.ToString() == __tg_{s}.Id.ToString(); }}\n"
             f"    catch {{ }}\n")
     htol = tolerance("create_tag", "head_mm")
     post = [
@@ -4653,7 +4862,25 @@ def _emit_tag(op: dict, ver: str, stamp: str,
             message="tag belongs to wrong view (topology)", style="guard"),
         WitnessCheck(
             obligation_key="target_bound",
-            reader_cs=f"    bool __bound_{s} = false;\n" + bound_expr,
+            # СВЯЗЬ ЧИТАЕТСЯ У ТОГО КЛАССА, КОТОРЫЙ ЕЁ НЕСЁТ. У базы
+            # `SpatialElementTag` свойства цели НЕТ в поставляемых сборках
+            # (случай #78: описано в шести XML, CS1061 в шести DLL), поэтому
+            # цель берётся у подкласса — ровно так же, как это сделала
+            # боковая стадия чтения 30.07.
+            reader_cs=(f"    bool __bound_{s} = false;\n"
+                       f"    var __itg_{s} = __el_{s} as IndependentTag;\n"
+                       f"    var __rtg_{s} = __el_{s} as Autodesk.Revit.DB.Architecture.RoomTag;\n"
+                       f"    var __atg_{s} = __el_{s} as AreaTag;\n"
+                       f"    var __stg_{s} = __el_{s} as Autodesk.Revit.DB.Mechanical.SpaceTag;\n"
+                       f"    if (__rtg_{s} != null)\n"
+                       f"    {{ try {{ __bound_{s} = __rtg_{s}.Room != null && __rtg_{s}.Room.Id.ToString() == __tg_{s}.Id.ToString(); }} catch {{ }} }}\n"
+                       f"    else if (__atg_{s} != null)\n"
+                       f"    {{ try {{ __bound_{s} = __atg_{s}.Area != null && __atg_{s}.Area.Id.ToString() == __tg_{s}.Id.ToString(); }} catch {{ }} }}\n"
+                       f"    else if (__stg_{s} != null)\n"
+                       f"    {{ try {{ __bound_{s} = __stg_{s}.Space != null && __stg_{s}.Space.Id.ToString() == __tg_{s}.Id.ToString(); }} catch {{ }} }}\n"
+                       f"    else if (__itg_{s} != null)\n" + bound_expr +
+                       f"    else\n"
+                       f"    {{ }}\n"),
             verdict_cs=(
                 f"    if (!__bound_{s})\n"
                 f"        __post.Add({_cs(oid + ': марка не связана с target (semantic, VIEW-BINDING LAW: target не виден в in_view?)')});\n"),
@@ -4664,8 +4891,11 @@ def _emit_tag(op: dict, ver: str, stamp: str,
                 f"    try\n    {{\n"
                 # ОДИН закон обратного хода на всё семейство (docspace):
                 # байты те же, что были набраны здесь руками.
+                + f"        XYZ __head_{s} = (__el_{s} as IndependentTag) != null\n"
+                  f"            ? ((IndependentTag)__el_{s}).TagHeadPosition\n"
+                  f"            : ((SpatialElementTag)__el_{s}).TagHeadPosition;\n"
                 + docspace.emit_xyz_to_view2d_cs(
-                    f"__vw_{s}", f"__el_{s}.TagHeadPosition", f"__rel_{s}",
+                    f"__vw_{s}", f"__head_{s}", f"__rel_{s}",
                     f"__ou_{s}", f"__ow_{s}", indent=" " * 8) +
                 f"        if (Math.Abs(__ou_{s} - {round(u, 2)}) > {htol} || Math.Abs(__ow_{s} - {round(w, 2)}) > {htol})\n"
                 f"            __post.Add({_cs(oid + ': tag head differs from at (geometry)')});\n"
@@ -4930,7 +5160,24 @@ def _emit_filled_region(op: dict, ver: str, stamp: str,
         for p0, _p1, _b in edges:
             docspace.check_pt_view2d(list(p0), oid, label, bound_diags)
     if bound_diags:
-        raise KirRefusal(bound_diags[:1])
+        # СРЕЗ УБРАН 13.08, и он был ЕДИНСТВЕННЫМ на 76 мест `raise
+        # KirRefusal` во всём дереве. Остальные 75 отдают список целиком, а
+        # квитанция ограничивает показ САМА и называет остаток
+        # (`_diagnostics_total(out.diagnostics, 8)` в `serving.py:115`).
+        #
+        # ЧЕМ ЭТОТ СРЕЗ БЫЛ ХУЖЕ ОБЫЧНОГО УСЕЧЕНИЯ: лекарство от этого класса
+        # уже написано (12.08, `23be2d1f`) и стоит У ПОТРЕБИТЕЛЯ — оно считает,
+        # сколько диагностик ЕМУ ДАЛИ. Срез стоял У ПРОИЗВОДИТЕЛЯ, поэтому
+        # потребитель честно видел одну из одной и молчал об остатке ПРАВИЛЬНО.
+        # Модель получала «точка вне границ», чинила её, слала заново и
+        # получала следующую — по одному ходу на точку, без единого признака,
+        # что их было больше.
+        #
+        # Контур может дать много таких точек сразу: проверяется КАЖДАЯ вершина
+        # внешнего обхода и каждого отверстия, а вылет обычно системный (не та
+        # система координат), то есть валит их все разом — именно тот случай,
+        # где показать одну дороже всего.
+        raise KirRefusal(bound_diags)
     g_type = _gid(op, "type") if isinstance(op.get("type"), dict) \
         and "__grounded__" in op["type"] else None
     if g_type and g_type.get("in_emit") == IN_EMIT_DEFAULT:
@@ -5381,8 +5628,29 @@ def _emit_group(op: dict, ver: str, stamp: str,
     member_id_vars: list[str] = []
     member_readbacks: list[str] = []
     member_witnesses: list[WitnessCheck] = []
+    #: Имена членов внутри группы: `{oid}__m__{id}`. Ссылка одного члена на
+    #: другого обязана ехать в ТОМ ЖЕ имени, иначе эмиссия даст `__el_<сырое>`,
+    #: которого в этом scope нет. `authoring_validation` уже доказал, что все
+    #: ссылки указывают на членов ЭТОЙ группы и только назад по списку.
+    _member_ns = {str(m0["id"]): f"{oid}__m__{m0['id']}"
+                  for m0 in members if isinstance(m0, dict) and "id" in m0}
+
+    def _rename_refs(node):
+        if isinstance(node, dict):
+            out = {}
+            for key, val in node.items():
+                if (key == "value" and node.get("by") == "ref"
+                        and str(val) in _member_ns):
+                    out[key] = _member_ns[str(val)]
+                else:
+                    out[key] = _rename_refs(val)
+            return out
+        if isinstance(node, list):
+            return [_rename_refs(x) for x in node]
+        return node
+
     for mi, member in enumerate(members):
-        m = dict(member)
+        m = _rename_refs(dict(member))
         m["id"] = f"{oid}__m__{member['id']}"
         ms = _safe(m["id"])
         try:
@@ -5553,6 +5821,44 @@ def _emit_group(op: dict, ver: str, stamp: str,
 # `__CC_S__` — суффикс уникальности: в одной программе может быть несколько
 # опов, а преамбула эмиттера заморожена голденами и общие хелперы туда не
 # добавить.
+#
+# СТРАЖ `if (__ccEl == null) continue;` В `__ccPanelAt` — ДОКАЗУЕМОСТЬ, А НЕ
+# ПОЧИНКА ПОВЕДЕНИЯ, и разница названа здесь, чтобы завтра не искали
+# несуществующий инцидент в данных.
+#
+# Поведение было ВЕРНЫМ и до 13.08.2026: `__ccAddress` начинается с
+# `__ccPanelEl as Panel`, `as` на null даёт null, и следующая строка
+# возвращает null. Шаблон удовлетворял СВОЙСТВУ, не удовлетворяя
+# ДОКАЗАТЕЛЬСТВУ.
+#
+# 13.08 в прод приехали анализаторы KUKAI001-006 (`08f711f6`), и KUKAI002
+# требует доказательства. Цена включения померена автором честно — «2 отказа
+# = 1.8%» — но НА КОРПУСЕ ТОГО, ЧТО ПИШЕТ МОДЕЛЬ: ворота компилируют её
+# программы, а серверные шаблоны через них не проходят вовсе. Эта строка в ту
+# популяцию не входила, и с 14:28 `revit_ir/decompile_read` умирал в чате:
+# `internal.template_failed` НЕРЕПРАЙАБЕЛЕН по замыслу, то есть инструмент не
+# деградировал, а умирал — 38 ходов за час. Обход всех 16 серверных шаблонов
+# через живую службу: падал РОВНО ЭТОТ.
+#
+# НАСТОЯЩЕЕ ЛЕКАРСТВО — не эта строка, а шаблоны В КОРПУСЕ ВОРОТ, чтобы
+# следующий анализатор не приземлился мимо них.
+#
+# ГРАНИЦА: неразрешимый id панели НИГДЕ НЕ ЗАПИСЫВАЕТСЯ, и это намеренно.
+# `__ccPanelAt` есть `Func<…, Element>` — чистый поиск; «id не разрешается»
+# значит «это не та панель», и `continue` тут ПРАВИЛЬНЫЙ ответ, а не
+# молчаливая потеря. Канал отказа сменил бы тип лямбды и всех потребителей
+# ради факта, которого никто не запрашивал.
+#
+# УСЛОВИЕ ПЕРЕСМОТРА ГРАНИЦЫ. Молчание верно ровно пока неразрешимый id
+# значит «это не та панель». Оно станет ПОТЕРЕЙ, если `GetPanelIds` начнёт
+# выдавать id панелей, которые в документе ЕСТЬ, но не читаются этим `doc` —
+# например при чтении СВЯЗАННОГО файла, где id принадлежит другому документу.
+# Наблюдаемый признак: непустая сетка, у которой найдено НОЛЬ ячеек при
+# ненулевом `GetPanelIds`.
+#
+# И ПРОЗА ЖИВЁТ ЗДЕСЬ, А НЕ В ШАБЛОНЕ: первая редакция этой правки положила
+# тридцать строк объяснения ВНУТРЬ C#, и они поехали бы в Revit с каждой
+# витражной программой — голден вырос на 111 строк вместо трёх.
 CURTAIN_CELL_ADDRESS_CS = r"""
 Func<double, double> __ccMM__CC_S__ = (__ccFeet) =>
     UnitUtils.ConvertFromInternalUnits(__ccFeet, UnitTypeId.Millimeters);
@@ -5671,6 +5977,9 @@ Func<CurtainGrid, List<ElementId>, List<ElementId>, int, int, Element>
     foreach (ElementId __ccPid in __ccPanelIds)
     {
         Element __ccEl = __CC_DOC__.GetElement(__ccPid);
+        // Страж доказуемости KUKAI002; обоснование и границы — в
+        // комментарии Python над этим шаблоном, чтобы проза не ехала в Revit.
+        if (__ccEl == null) continue;
         int[] __ccAddr = __ccAddress__CC_S__(__ccEl, __ccU, __ccV);
         if (__ccAddr != null && __ccAddr[0] == __ccWantU
             && __ccAddr[1] == __ccWantV)
@@ -6415,6 +6724,20 @@ _SPATIAL_ENCLOSURE_OPS = frozenset(
     name for name, cats in spec.OP_RESULT_CATEGORIES.items()
     if set(cats) & set(ops_room.SPATIAL_ENCLOSURE_CATEGORIES))
 
+#: Строка регенерации перед пространственным опом. ИМЕНОВАНА, ПОТОМУ ЧТО ЕЁ
+#: ЧИТАЮТ СНАРУЖИ. `tests/test_regen_before_spatial.py` искал её в испущенном
+#: C# по СВОЕЙ копии текста — и та копия отстала: тест держал `// finalize`,
+#: эмиттер писал `// realise everything…`, `find` возвращал -1, и три теста
+#: правила падали сутки с сообщением «−1 не больше 2633», которое не называет
+#: причину вовсе. Величина объявлялась здесь и читалась там, и ничто не
+#: заставляло их совпасть — тот же класс, что весь остальной день.
+#: Комментарий В СТРОКЕ обязателен: в одной программе `doc.Regenerate()`
+#: встречается дважды (второй — коммит-гейт после всех создателей), и без
+#: текста отличить их в испущенном C# нечем.
+SPATIAL_REGEN_CS = (
+    "doc.Regenerate();  // realise everything created above "
+    "before the enclosure is resolved")
+
 _EMITTERS = {"create_wall": _emit_wall, "create_pipe": _emit_pipe,
              "create_grid": _emit_grid, "create_level": _emit_level,
              "create_floor": _emit_floor, "create_column": _emit_column,
@@ -6894,7 +7217,7 @@ def _op_refs(node) -> set:
                         and isinstance(element.get("of"), str):
                     refs.add(element["of"])
         for key, value in node.items():
-            if key == "__host_wall__":
+            if key in spec.SYNTHETIC_FIELDS:  # власть — registry_base
                 continue
             refs |= _op_refs(value)
     elif isinstance(node, (list, tuple)):
@@ -7127,7 +7450,7 @@ def emit_program(grounded_ops: list[dict], revit_version: str, intent: str = "",
         # падает, если в реестре появился пространственный оп, которого там
         # нет.
         if op["op"] in _SPATIAL_ENCLOSURE_OPS and writes_since_regen:
-            c = "doc.Regenerate();  // realise everything created above before the enclosure is resolved\n" + c
+            c = SPATIAL_REGEN_CS + "\n" + c
             writes_since_regen = False
         elif spec.OPS[op["op"]].writes_model:
             writes_since_regen = True

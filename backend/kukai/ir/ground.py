@@ -37,6 +37,14 @@ GROUND_NOT_FOUND = "KIR-G101"
 GROUND_AMBIGUOUS = "KIR-G102"
 GROUND_NO_SNAPSHOT = "KIR-G103"
 GROUND_EMPTY_POOL = "KIR-G104"
+
+#: Слово рода ссылки для человекочитаемого отказа.
+#: Род ссылки -> (слово, причастие). Причастие отдельно, потому что
+#: «фаза не найден» — не опечатка, а сообщение, написанное для
+#: английской грамматики в русском продукте.
+_REF_WORD = {"materials": ("материал", "найден"),
+             "phases": ("фаза", "найдена"),
+             "worksets": ("рабочий набор", "найден")}
 GROUND_BAD_SNAPSHOT = "KIR-G106"
 
 # Sentinel a grounded op carries when the default is resolved in-emit
@@ -359,15 +367,90 @@ def _most_used(pool: list[dict], pool_name: str,
     }
 
 
+#: Сколько кандидатов едет в отказе. Пять — сознательный размер: отказ
+#: платится токенами каждого хода, а список, который нельзя прочесть глазом,
+#: не помогает выбрать.
+_CANDIDATES_SHOWN = 5
+
+
 def _candidate_rows(pool: list[dict]) -> list[dict]:
     rows = []
-    for item in pool[:5]:
+    for item in pool[:_CANDIDATES_SHOWN]:
         row = {"id": int(item["id"]), "name": str(item.get("name"))}
         for key in ("category", "family_name", "type_name"):
             if isinstance(item.get(key), str):
                 row[key] = item[key]
         rows.append(row)
     return rows
+
+
+def _shown_of(pool: list[dict], pool_name: str) -> str:
+    """«Показаны 5 из 185, весь список — query_types(...)» либо ПУСТО.
+
+    ЗАЧЕМ ЭТО СУЩЕСТВУЕТ (замер 12.08.2026). Отказ везёт пять кандидатов и
+    предлагает «уточни через element_id из candidates». Пул при этом бывает
+    сильно больше пяти: по 69 сохранённым профилям корпуса **43.6% всех
+    наблюдений пула — больше пяти**, а `family_symbols` и `levels` превышают
+    пятёрку в 69 профилях из 69 (максимумы 741 и 122; `wall_types` — 185 при
+    59 профилях из 69). До этой строки модель не могла отличить «пять из
+    пяти» от «пять из семисот сорока одного» и выбирала тип из усечённого
+    множества, считая его полным.
+
+    СРЕЗ ИДЁТ ПО ПОРЯДКУ ПРИБЫТИЯ (пул отсортирован по ElementId, то есть по
+    порядку создания в документе) — по величине, не связанной с вопросом. Там,
+    где имя ЕСТЬ, рядом в этом же файле уже стоит правильная идиома —
+    `_nearest()` режет по РЕЛЕВАНТНОСТИ (`difflib`). Здесь имени нет по
+    построению (ветка `by=default`), поэтому релевантность взять неоткуда, и
+    честный ход один: НАЗВАТЬ ОСТАТОК И ДАТЬ СПОСОБ ЕГО ПРОЧЕСТЬ. Число
+    говорит, сколько ты не видишь; следующий ход говорит, что делать.
+
+    Пул, помещающийся целиком, не платит ни символа: приписка появляется
+    только когда есть чему не влезть.
+    """
+    total = len(pool)
+    if total <= _CANDIDATES_SHOWN:
+        return ""
+    return (f" ПОКАЗАНЫ {_CANDIDATES_SHOWN} ИЗ {total} — остальные не видны; "
+            f"весь список: query_types(pool=\"{pool_name}\")")
+
+
+def _producers_of(kind_value: str) -> list[str]:
+    """Опы, ПОРОЖДАЮЩИЕ ссылку этого рода. Спрашиваем реестр, не список."""
+    return sorted(
+        name for name, op in spec.OPS.items()
+        if op.result.reference_kind is not None
+        and op.result.reference_kind.value == kind_value)
+
+
+def _empty_pool_next_move(op_name: str, param: str) -> str:
+    """Следующий ход при ПУСТОМ пуле — и только ВЫПОЛНИМЫЙ.
+
+    ПОЧЕМУ ЭТО НЕ ОДНА ФРАЗА НА ВСЕХ. Отказ, называющий невыполнимый ход, хуже
+    отказа, не называющего никакого: он выглядит помощью и стоит раунда,
+    который не мог удаться. Замер 13.08 на настоящем здании: из 22 пустых пулов
+    ход выполним у **двух** (`create_column.symbol`, `create_foundation.symbol`
+    — оба принимают `family_symbol`, который язык умеет породить), и НЕ выполним
+    у двадцати: их параметры не принимают ссылку вовсе, а язык порождает всего
+    четыре рода (`element`, `family_symbol`, `level`, `wall`).
+
+    Различает не мой список, а РЕЕСТР: пересекается ли `ref_kinds` параметра с
+    родами, у которых есть производитель. Заведут производителя завтра — фраза
+    сменится сама.
+    """
+    op = spec.OPS.get(op_name)
+    pspec = next((p for p in op.params if p.name == param), None) if op else None
+    for kind in (pspec.ref_kinds if pspec else ()):
+        producers = _producers_of(kind.value)
+        if producers:
+            how = " или ".join(f"`{name}`" for name in producers)
+            return (f"Создай его В ЭТОЙ ЖЕ программе: поставь {how} выше, затем "
+                    f"{param}: {{\"by\": \"ref\", \"value\": \"<id того опа>\"}}. "
+                    f"Снимок переснимать не нужно — ссылка разрешается внутри "
+                    f"программы")
+    return ("Ни одна операция KIR не создаёт этот род, поэтому в программе "
+            "сделать нечего: тип обязан появиться в документе иначе (шаблон "
+            "проекта или загрузка семейства пользователем), и только после "
+            "этого — НОВОЕ чтение модели")
 
 
 def _resolve_one(sel: Any, pool_name: str, pool: list[dict], op_index: int,
@@ -506,7 +589,8 @@ def _resolve_one(sel: Any, pool_name: str, pool: list[dict], op_index: int,
                     if disambiguate_by is not None else
                     f"{pool_name}: «{want}» неоднозначен — "
                     f"{len(exact)} совпадений; уточни через "
-                    f"{{\"by\": \"element_id\", \"value\": <id из candidates>}}")))
+                    f"{{\"by\": \"element_id\", \"value\": <id из candidates>}}"
+                    + _shown_of(exact, pool_name))))
         return None
     # by == "default"
     if (op_name == "create_wall" and param == "type"
@@ -521,7 +605,8 @@ def _resolve_one(sel: Any, pool_name: str, pool: list[dict], op_index: int,
             code=GROUND_AMBIGUOUS, op_index=op_index, op_id=op_id,
             field_name=param, candidates=_candidate_rows(initial_pool),
             message_ru=(f"{pool_name}: снапшот-пул обрезан коллектором — "
-                        "default/sole-entry невозможен, укажите element_id")))
+                        "default/sole-entry невозможен, укажите element_id"
+                        + _shown_of(initial_pool, pool_name))))
         return None
     pool = _narrow_by_parameter(pool, disambiguate_by)
     if len(pool) == 1:
@@ -549,11 +634,19 @@ def _resolve_one(sel: Any, pool_name: str, pool: list[dict], op_index: int,
         candidates=_candidate_rows(
             pool if pool or disambiguate_by is None else initial_pool),
         message_ru=(
-            f"{pool_name}: пусто в модели" if not initial_pool else
+            f"{pool_name}: пусто в модели. {_empty_pool_next_move(op_name, param)}"
+            if not initial_pool else
             f"{pool_name}: после disambiguate_by осталось {len(pool)} вариантов"
+            + _shown_of(pool, pool_name)
             if disambiguate_by is not None else
-            f"{pool_name}: несколько вариантов — default невозможен, уточните "
-            f"через {{\"by\": \"element_id\", \"value\": <id из candidates>}}")))
+            # ЧИСЛА ЗДЕСЬ НЕ БЫЛО ВОВСЕ — ветка говорила «несколько вариантов»
+            # и предлагала выбрать из candidates, не назвав ни сколько их, ни
+            # что показаны не все. Это худший из трёх случаев в этом файле:
+            # усечение без величины и без имени остатка.
+            f"{pool_name}: {len(pool)} вариантов — default невозможен, "
+            f"уточните через "
+            f"{{\"by\": \"element_id\", \"value\": <id из candidates>}}"
+            + _shown_of(pool, pool_name))))
     return None
 
 
@@ -796,55 +889,37 @@ def describe_choices_ru(report: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _is_grounded(member: Any) -> bool:
-    """Already carries the internal shape — the component-library bridge builds
-    members pre-grounded, and re-resolving them would be both wasted work and a
-    chance to change bytes the rebuild path depends on."""
-    if not isinstance(member, dict):
-        return False
-    ospec = spec.OPS.get(member.get("op"))
-    if ospec is None:
-        return False
-    present = [member.get(p) for p, _pool, _req in ospec.grounded
-               if member.get(p) is not None]
-    return bool(present) and all(
-        isinstance(sel, dict) and "__grounded__" in sel for sel in present)
-
-
 def _ground_members(members: list, snapshot: Any, gid: str,
-                    diags: list[Diagnostic]) -> list:
-    """Ground a group's members like any other ops.
+                    diags: list[Diagnostic], *, group_index: int) -> list:
+    """Plan, then ground every group member through the ordinary pipeline.
 
-    `create_group` was authored for the rebuild bridge, which hands it members
-    that are already grounded, so `ground()` never looked inside `members` — and
-    the emitter, which requires the internal `{"__grounded__": ...}` shape,
-    raised a bare KeyError on anything else. That was reported as "члены должны
-    быть pre-grounded", blaming the caller for a shape no caller can write: the
-    form the message recommends (`by: element_id`) failed identically. Measured
-    2026-07-27 — it is why `create_group` was called 0 times in 51 574 lifted
-    ops. Grounding them makes the op reachable, which matters beyond the bug:
-    members + placements is KIR's only way to say "this cluster, repeated",
-    and without it a lattice is N literal beams the model must unroll by hand.
+    A legacy pre-grounded marker is decoded by the member planner into an
+    explicit selector and validated; it is never accepted as executable shape
+    merely because a component bridge supplied it.  The repeat validation here
+    is an intentional defence at the legacy ``ground(list[dict])`` boundary:
+    production ``ground_program`` already owns a typed parent, while direct
+    callers must not regain the historical member bypass.
     """
-    raw = [m for m in members if not _is_grounded(m)]
-    if not raw:
-        return members
+    from kukai.ir.compiler import _plan_group_members
+
     try:
-        resolved = {id(m): g for m, g in zip(raw, ground(raw, snapshot))}
+        member_plans = _plan_group_members(
+            members, group_id=gid, group_index=group_index)
     except KirRefusal as refusal:
-        # Re-badge so a member failure points at the group op the model wrote,
-        # naming the member by ITS id — an op index into a nested list is not
-        # something the author can address.
-        index_of = {m.get("id"): i for i, m in enumerate(raw) if isinstance(m, dict)}
+        diags.extend(refusal.diagnostics)
+        return members
+    raw = [item.to_dict() for item in member_plans]
+    try:
+        return ground(raw, snapshot)
+    except KirRefusal as refusal:
         for d in refusal.diagnostics:
             member_id = d.op_id
             d.op_id = gid
-            d.op_index = index_of.get(member_id)
+            d.op_index = group_index
             d.field_name = (f"members[{member_id or '?'}]"
                             f"{'.' + d.field_name if d.field_name else ''}")
         diags.extend(refusal.diagnostics)
         return members
-    return [resolved.get(id(m), m) for m in members]
 
 
 def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
@@ -1008,7 +1083,8 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
             if region is not None:
                 g["__region__"] = region
         if ospec.name == "create_group" and isinstance(op.get("members"), list):
-            g["members"] = _ground_members(op["members"], snapshot, op["id"], diags)
+            g["members"] = _ground_members(
+                op["members"], snapshot, op["id"], diags, group_index=i)
         if ospec.name == "create_pipe_system":
             from kukai.ir import connect as connect_mod
             graph = connect_mod.graph_validate(
@@ -1029,6 +1105,95 @@ def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
                 if graph is not None:
                     g["__graph__"] = graph
                     g["__slope_reqs__"] = slope_reqs
+        # ССЫЛОЧНОЕ ЗНАЧЕНИЕ `set_param` СВЕРЯЕТСЯ С ПУЛОМ ЗДЕСЬ, А НЕ В
+        # РАНТАЙМЕ. Оно не селектор и потому не проходит по `ospec.grounded`
+        # ниже, но проверка ему нужна ровно та же — и РАНЬШЕ, чем эмиссия.
+        #
+        # Образец (`create_type.material`) разрешает имя коллектором ВНУТРИ
+        # транзакции: отказ честный и типизированный, но приходит там, где
+        # круг стоит дороже всего. Пул переносит ту же проверку на АВТОРСТВО —
+        # неверное имя материала отказывается офлайн, до всякого Ревита.
+        # Живая проверка при этом ОСТАЁТСЯ: пул — снимок, между снятием и
+        # исполнением документ мог измениться, и снимать живого свидетеля
+        # ради офлайнового было бы обменом доказательства на удобство.
+        val = op.get("value")
+        if (op.get("op") == "set_param" and isinstance(val, dict)
+                and val.get("type") in ("ref", "int_ref")):
+            pool_name = val.get("pool") or "materials"
+            if pool_name == "worksets":
+                # НАБОРЫ ЧИТАЮТСЯ НЕ КАК ПУЛ ЭЛЕМЕНТОВ, И ЭТО НЕ ОБХОД
+                # ПРОВЕРКИ, А ЕЁ ПРИЗНАНИЕ. `snapshot_pool` требует
+                # `1 <= id <= ELEMENT_ID_MAX`, потому что «пул» в этом
+                # компиляторе означает ПУЛ ЭЛЕМЕНТОВ. У рабочего набора id —
+                # `WorksetId.IntegerValue`, целое, начинающееся с НУЛЯ, и
+                # `Workset` не наследует `Element`. Проверка была права, а
+                # неверна была моя попытка объявить набор пулом: тот же урок,
+                # что этажом ниже — «работа та же по форме, механизм другой».
+                raw = snapshot.get("worksets")
+                pool = []
+                if raw is None:
+                    pass
+                elif not isinstance(raw, list):
+                    diags.append(Diagnostic(
+                        code=GROUND_BAD_SNAPSHOT, op_index=i, op_id=op["id"],
+                        field_name="worksets", expected="список {id, name}",
+                        got=type(raw).__name__,
+                        message_ru="снапшот: worksets должен быть списком"))
+                else:
+                    for n, row in enumerate(raw):
+                        wid = row.get("id") if isinstance(row, dict) else None
+                        nm = row.get("name") if isinstance(row, dict) else None
+                        if (isinstance(wid, bool) or not isinstance(wid, int)
+                                or wid < 0 or not isinstance(nm, str)):
+                            diags.append(Diagnostic(
+                                code=GROUND_BAD_SNAPSHOT, op_index=i,
+                                op_id=op["id"], field_name=f"worksets[{n}]",
+                                expected="{id: целое >= 0, name: строка}",
+                                got=row,
+                                message_ru=(f"снапшот: worksets[{n}].id — "
+                                            f"неотрицательное целое "
+                                            f"(WorksetId.IntegerValue)")))
+                        else:
+                            pool.append(row)
+            else:
+                pool = snapshot_pool(pool_name)
+            wanted = val.get("v")
+            if pool_name == "worksets" and not snapshot.get(
+                    "worksets__workshared", False):
+                # НЕ «наборов нет», А «ДОКУМЕНТ НЕ РАЗДЕЛЁН». Один пустой пул
+                # на два разных исхода — форма 11; здесь их различает
+                # отдельный факт, который производитель снимает рядом с пулом.
+                diags.append(Diagnostic(
+                    code=GROUND_EMPTY_POOL, op_index=i, op_id=op["id"],
+                    field_name="value", expected=pool_name,
+                    message_ru=("документ не разделён на рабочие наборы — "
+                                "набор задать некуда")))
+            elif not pool:
+                diags.append(Diagnostic(
+                    code=GROUND_EMPTY_POOL, op_index=i, op_id=op["id"],
+                    field_name="value", expected=pool_name,
+                    message_ru=f"{pool_name}: пусто в модели"))
+            else:
+                _w = _REF_WORD.get(pool_name, (pool_name, "найден"))
+                hit = [r for r in pool if r.get("name") == wanted]
+                if not hit:
+                    diags.append(Diagnostic(
+                        code=GROUND_NOT_FOUND, op_index=i, op_id=op["id"],
+                        field_name="value", expected=pool_name, got=wanted,
+                        candidates=sorted(r.get("name") for r in pool)[:8],
+                        message_ru=(f"{_w[0]} «{wanted}» не {_w[1]} в модели; "
+                                    f"известно {len(pool)}")))
+                elif len(hit) > 1:
+                    diags.append(Diagnostic(
+                        code=GROUND_AMBIGUOUS, op_index=i, op_id=op["id"],
+                        field_name="value", expected=pool_name, got=wanted,
+                        message_ru=(f"{_w[0]} «{wanted}» неоднозначен: "
+                                    f"совпадений {len(hit)}")))
+                # Найдено — и БОЛЬШЕ НИЧЕГО не делаем. Заземление здесь
+                # только ОТКАЗЫВАЕТ; подставлять найденный id в программу
+                # значило бы завести второй источник истины о материале
+                # рядом с живым разрешением в эмиссии, и они разошлись бы на
+                # первом же документе, изменившемся после снятия снимка.
         for param, pool_name, required in ospec.grounded:
             sel = op.get(param)
             pspec = next((pp for pp in ospec.params if pp.name == param), None)
@@ -1291,22 +1456,51 @@ def resolution_report(
 def ground_program(
     planned: "PlannedProgram",
     snapshot: Any,
+    *,
+    context: "GroundingContext | None" = None,
 ) -> "GroundedProgram":
-    """Freeze the unchanged list grounder's exact output.
+    """Freeze output and bind it to the exact snapshot that produced it.
 
-    The current snapshot has no authoritative identity/revision digest, so
-    this adapter intentionally binds resolved output only.  Callers must not
-    treat ``ground_digest`` as proof of which ContextSnapshot was read.
+    Direct compiler callers get a content-addressed, explicitly untrusted
+    ``compiler_argument`` context.  The live serving boundary supplies its
+    own trusted context after the bridge read.  Neither path invents revision
+    evidence when the collector did not provide it.
     """
-    from kukai.ir.midend import GroundedProgram, PlannedProgram
+    from kukai.ir.midend import (
+        GroundedProgram,
+        GroundingContext,
+        PlannedProgram,
+    )
 
     if not isinstance(planned, PlannedProgram):
         raise TypeError("ground_program requires PlannedProgram")
+    if context is None:
+        context = GroundingContext.from_snapshot(
+            snapshot,
+            source="compiler_argument",
+            trusted_source=False,
+        )
+    elif not isinstance(context, GroundingContext):
+        raise TypeError("context must be GroundingContext or None")
+    else:
+        observed = GroundingContext.from_snapshot(
+            snapshot,
+            source="context_recheck",
+            trusted_source=False,
+        )
+        if context.snapshot_digest != observed.snapshot_digest:
+            raise ValueError(
+                "grounding context is bound to another snapshot payload")
+        if context.document_digest != observed.document_digest:
+            raise ValueError(
+                "grounding context is bound to another document identity")
     grounded_ops = ground(planned.to_ops(), snapshot)
     return GroundedProgram.from_ops(
         planned,
         grounded_ops,
         resolution_report(grounded_ops),
+        context=context,
+        snapshot=snapshot,
     )
 
 

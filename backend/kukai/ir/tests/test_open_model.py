@@ -6,7 +6,8 @@ import json
 import unittest
 
 from kukai.ir.contracts import RevisionProof
-from kukai.ir.compiler import _TYPE_POOL_COLLECTOR_CS
+from kukai.ir.compiler import _TYPE_POOL_COLLECTOR_CS, compile_program
+from kukai.ir.midend import GroundingContext
 from kukai.ir.open_model import (
     GROUND_SNAPSHOT_CS,
     OpenModelProfile,
@@ -265,6 +266,112 @@ class OpenModelProfileContractTests(unittest.TestCase):
 
 
 class OpenModelPreflightTests(unittest.TestCase):
+    def test_compiler_refuses_profile_from_another_snapshot(self) -> None:
+        source_snapshot = _live_snapshot()
+        source_profile = _profile(source_snapshot)
+        other_snapshot = _live_snapshot()
+        other_snapshot["__document_fingerprint"]["project_uid"] = "other"
+
+        result = compile_program(
+            _wall_program(),
+            snapshot=other_snapshot,
+            open_model_profile=source_profile,
+            revit_version="2026",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.diagnostics[0].code, "KIR-G107")
+        self.assertIn(
+            "другому профилю открытой модели",
+            result.diagnostics[0].message_ru,
+        )
+
+    def test_compiler_refuses_ground_context_from_another_snapshot(self) -> None:
+        snapshot = _live_snapshot()
+        profile = _profile(snapshot)
+        other = copy.deepcopy(snapshot)
+        other["levels"][0]["name"] = "Other level"
+        context = GroundingContext.from_snapshot(
+            other,
+            source="trusted_bridge",
+            trusted_source=True,
+            profile_digest=profile.digest,
+            profile_authoritative=profile.authoritative,
+            revision_proof=profile.revision_proof,
+        )
+
+        result = compile_program(
+            _wall_program(), snapshot=snapshot,
+            open_model_profile=profile, ground_context=context,
+            revit_version="2026",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.diagnostics[0].code, "KIR-G107")
+        self.assertNotEqual(result.diagnostics[0].code, "KIR-P000")
+
+    def test_compiler_refuses_context_with_foreign_profile_digest(self) -> None:
+        snapshot = _live_snapshot()
+        profile = _profile(snapshot)
+        context = GroundingContext.from_snapshot(
+            snapshot,
+            source="trusted_bridge",
+            trusted_source=True,
+            profile_digest="0" * 64,
+            profile_authoritative=profile.authoritative,
+            revision_proof=profile.revision_proof,
+        )
+
+        result = compile_program(
+            _wall_program(), snapshot=snapshot,
+            open_model_profile=profile, ground_context=context,
+            revit_version="2026",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.diagnostics[0].code, "KIR-G107")
+
+    def test_compiler_refuses_context_with_foreign_revision_digest(self) -> None:
+        snapshot = _live_snapshot()
+        profile = _profile(snapshot)
+        context = GroundingContext.from_snapshot(
+            snapshot,
+            source="trusted_bridge",
+            trusted_source=True,
+            profile_digest=profile.digest,
+            profile_authoritative=profile.authoritative,
+            revision_proof=RevisionProof(
+                "other-revision",
+                "1201:aaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbb"),
+        )
+
+        result = compile_program(
+            _wall_program(), snapshot=snapshot,
+            open_model_profile=profile, ground_context=context,
+            revit_version="2026",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.diagnostics[0].code, "KIR-G107")
+
+    def test_compiler_refuses_profile_claim_without_typed_profile(self) -> None:
+        snapshot = _live_snapshot()
+        context = GroundingContext.from_snapshot(
+            snapshot,
+            source="trusted_bridge",
+            trusted_source=True,
+            profile_digest="1" * 64,
+            profile_authoritative=True,
+        )
+
+        result = compile_program(
+            _wall_program(), snapshot=snapshot,
+            ground_context=context, revit_version="2026",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.diagnostics[0].code, "KIR-G107")
+
     def test_pinned_level_and_type_are_bound_before_transaction(self) -> None:
         report = preflight_programs(
             _wall_program(), _profile(), require_exact_identity=True)
@@ -371,6 +478,69 @@ class OpenModelPreflightTests(unittest.TestCase):
 
         self.assertTrue(report.ready)
         self.assertFalse(report.bindings)
+
+
+class GateModelBindingGuardTests(unittest.TestCase):
+    """The GATE's own guard inputs — the consumer nobody measured.
+
+    `test_compiler_refuses_profile_from_another_snapshot` above proves the
+    compiler catches an incoherent (profile, snapshot) pair. Nothing proved
+    that the gate does not HAND it one, and from before `aecf6cff` until
+    2026-08-11 it did: the profile came from a mutated copy and the
+    unmutated original was passed to `compile_program`. The refusal was
+    correct; the harness was wrong; and because the gate `continue`s on a
+    refusal, the open-model transaction guard body — explicitly outside the
+    legacy byte corpus — was compiled on ZERO of the six versions while the
+    gate counted six checks for it.
+
+    A green here is only worth what its mutant is worth: replace the
+    returned snapshot with the unmutated `GROUND_SNAPSHOT` and this test
+    must go red on all six versions.
+    """
+
+    def test_gate_guard_inputs_compile_on_every_version(self) -> None:
+        from kukai.ir import spec
+        from kukai.ir.gate_runner import model_binding_guard_inputs
+        # The gate's own `auth_wall`, not this module's `_wall_program`:
+        # the latter pins a wall `type`, which demands an exact
+        # `wall_types` pool the guard profile never stamps, and would
+        # refuse for a reason that has nothing to do with the pair. A test
+        # of the harness must compile what the harness compiles.
+        from kukai.ir.tests.test_authoring import _prog, _wall
+
+        snapshot, profile, document = model_binding_guard_inputs()
+
+        for version in spec.REVIT_VERSIONS:
+            with self.subTest(version=version):
+                result = compile_program(
+                    _prog([_wall()], intent="стена 6м"),
+                    revit_version=version,
+                    snapshot=snapshot,
+                    expected_document=document,
+                    open_model_profile=profile,
+                )
+                codes = [d.code for d in result.diagnostics]
+                self.assertTrue(
+                    result.ok,
+                    f"the gate's own guard inputs refuse on {version}: "
+                    f"{codes} — the body it reports six checks for is "
+                    f"never compiled",
+                )
+                self.assertNotIn("KIR-G107", codes)
+
+    def test_guard_profile_is_derived_from_the_returned_snapshot(self) -> None:
+        """The pair cannot be split: one is computable from the other."""
+        from kukai.ir.gate_runner import model_binding_guard_inputs
+
+        snapshot, profile, _ = model_binding_guard_inputs()
+
+        recomputed = OpenModelProfile.from_ground_snapshot(
+            snapshot,
+            revision_proof=profile.revision_proof,
+            required_pools=profile.required_pools,
+        )
+
+        self.assertEqual(recomputed.digest, profile.digest)
 
 
 if __name__ == "__main__":

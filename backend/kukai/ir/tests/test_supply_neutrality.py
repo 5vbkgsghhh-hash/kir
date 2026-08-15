@@ -24,6 +24,7 @@ from unittest import mock
 
 from kukai.ir import coverage_feed, serving
 from kukai.ir.decompile import extract
+from kukai.ir.tests.gate_fixture import enter_kir_mode
 
 
 def _run(coro):
@@ -58,6 +59,16 @@ class AdminDeviceAllowList(_EnvGuard):
         self.assertFalse(serving.is_admin_device(None))
 
     def test_env_present_but_empty_disables_the_live_path(self) -> None:
+        """РЕЖИМ СТАВИТСЯ ЗДЕСЬ НАРОЧНО, И ЭТО УСИЛЕНИЕ, А НЕ ПОСЛАБЛЕНИЕ.
+
+        Предмет теста — ПУСТОЙ СПИСОК устройств. С 13.08 гейт имеет третье
+        условие, и без режима `revit_ir_enabled()` ложен по ДВУМ причинам
+        сразу — то есть зелёный получен без акта различения: тест прошёл бы и
+        при полностью сломанной проверке устройств. Включив режим, оставляем
+        ровно одну возможную причину отказа, ту самую, ради которой тест
+        написан.
+        """
+        enter_kir_mode(self)
         os.environ["KUKAI_ADMIN_DEVICES"] = "   "
         os.environ["KUKAI_KIR_TOOL"] = "stage2"
         os.environ["KUKAI_KIR_DECOMPILE"] = "stage2"
@@ -70,6 +81,11 @@ class AdminDeviceAllowList(_EnvGuard):
     def test_unset_env_keeps_this_installation_working(self) -> None:
         # Миграционный фолбэк: прод-.env трогать нельзя, поэтому «переменная не
         # задана» обязана сохранить ровно прежнее поведение этой установки.
+        #
+        # Предмет — ФОЛБЭК СПИСКА УСТРОЙСТВ, а не гейт целиком; режим ставится
+        # явно, чтобы последнее утверждение проверяло устройство, а не молчание
+        # третьего условия.
+        enter_kir_mode(self)
         os.environ.pop("KUKAI_ADMIN_DEVICES", None)
         self.assertEqual(
             serving.admin_devices(), (serving._MIGRATION_ADMIN_DEVICE,))

@@ -31,6 +31,61 @@ Action<Element, Dictionary<string, object>> __PutGeometry = (__e, __row) =>
     __row["bbox_min_mm"] = null;
     __row["bbox_max_mm"] = null;
 
+    // ПРИНАДЛЕЖНОСТЬ ЛИНИИ: вид против плоскости построения.
+    //
+    // ЗАЧЕМ. Замерено 13.08.2026 на `k2_ar_rd_v7`: 9 407 элементов категории
+    // `OST_Lines`, у ВСЕХ до единого пустой `type_name` и отсутствует
+    // `level_name`; геометрия ЕСТЬ — 9 256 несут кривую с концами, 151
+    // остались габаритом. То есть недостаёт РОВНО принадлежности, а не
+    // формы: у линии есть где, но неизвестно ЧЬЯ. Модельная линия живёт на
+    // плоскости построения, чертёжная — на виде; L0 не доносил НИ ТОГО, НИ
+    // ДРУГОГО, и различить их было нечем НИ В КАКУЮ сторону. Из-за этого
+    // главное число проекта публикуется полосой 72.70…89.24 вместо точки:
+    // отнести 9 407 линий к модели или к отложенной документации нельзя.
+    //
+    // ТРИ СОСТОЯНИЯ, И ОНИ РАЗЛИЧИМЫ ПО ПОСТРОЕНИЮ — в этом весь смысл поля:
+    //     ключа НЕТ          не снималось (не `CurveElement`, старый прогон)
+    //     "view"/"sketch_plane"  снято и определено
+    //     "none"             снято и НЕ определено: ни вида, ни плоскости
+    //     "read_failed"      попытка была и бросила
+    // «Не определено» обязано отличаться от «не спрашивали»: иначе пустое
+    // поле читалось бы как факт о линии, а оно факт о нашем чтении.
+    //
+    // ПЕРЕСМОТР: если "none" окажется заметной долей, значит различитель не
+    // тот — тогда искать у `CurveElementType`/`LineStyle`, а не расширять
+    // молчание. Условие названо здесь, чтобы не выводить его заново.
+    //
+    // `OwnerViewId` объявлен у `Element`, `SketchPlane` — у `CurveElement`;
+    // оба на 2021-2026, ловушек ни у того, ни у другого (индекс, 13.08).
+    // Идентификатор берётся `ToString()` — единственная идиома, безопасная на
+    // всех шести.
+    try
+    {
+        var __ce = __e as CurveElement;
+        if (__ce != null)
+        {
+            __row["line_owner_kind"] = "none";
+            __row["line_owner_id"] = null;
+            var __ov = __e.OwnerViewId;
+            if (__ov != null && __ov != ElementId.InvalidElementId)
+            {
+                __row["line_owner_kind"] = "view";
+                __row["line_owner_id"] = __ov.ToString();
+            }
+            else
+            {
+                SketchPlane __sp = null;
+                try { __sp = __ce.SketchPlane; } catch { }
+                if (__sp != null)
+                {
+                    __row["line_owner_kind"] = "sketch_plane";
+                    __row["line_owner_id"] = __sp.Id.ToString();
+                }
+            }
+        }
+    }
+    catch { __row["line_owner_kind"] = "read_failed"; }
+
     // The bbox attempt is independent of location extraction: a malformed
     // Location object must not suppress a valid bounding box.
     try

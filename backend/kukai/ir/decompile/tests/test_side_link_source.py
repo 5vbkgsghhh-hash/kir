@@ -225,7 +225,7 @@ class SideStageSourceWiringTests(unittest.TestCase):
     #: а не тихо унести ещё полторы тысячи id в квитанции.
     REGISTERED = {
         "curve", "curtain", "sketch", "family_placement", "group",
-        "annotation", "tag", "mep_system", "geometry",
+        "annotation", "dimension", "tag", "mep_system", "geometry",
     }
 
     def test_the_factory_hands_the_source_to_every_registered_stage(self):

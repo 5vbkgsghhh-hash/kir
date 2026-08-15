@@ -39,6 +39,7 @@ import json
 from typing import Any, Iterable
 
 from kukai.ir import macros, spec
+from kukai.ir import revit_version as _rv
 from kukai.ir.compiler import compile_program
 
 __all__ = [
@@ -459,11 +460,21 @@ class Program(_OpSink):
     def to_json(self, **kw: Any) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, **kw)
 
-    def compile(self, *, version: str = "2023", snapshot: Any = None, **kw: Any):
+    def compile(self, *, version: str = _rv.DEFAULT_VERSION,
+                snapshot: Any = None, **kw: Any):
         """Офлайн-компиляция. Сети нет, Revit нет, диагностики отдаются как
         есть — питон-объектами `Diagnostic`, а не текстом: скрипт, который
         чинит сам себя, должен читать `code` и `candidates`, а не парсить
-        сообщение."""
+        сообщение.
+
+        Умолчание было `"2023"` до 13.08.2026 — ЧЕТВЁРТЫЙ ответ дома на «не
+        сказали, какая версия», отличный от `compile_program`'s «2026» этажом
+        ниже. Один и тот же вопрос, два ответа, один слой между ними. Теперь
+        оба берут `revit_version.DEFAULT_VERSION`.
+
+        Версиезависимых программ в корпусе голденов 12 из 69, поэтому выбор
+        одной версии здесь — решение, а не формальность: если ответ нужен по
+        всем шести, зови `compile_all`, она для этого и есть."""
         return compile_program(self.to_dict(), revit_version=version,
                                snapshot=snapshot, **kw)
 

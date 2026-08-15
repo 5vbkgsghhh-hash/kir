@@ -57,7 +57,8 @@ from kukai.ir.emit_model import WitnessCheck, tolerances
 from kukai.ir.emit_utils import cs_line_comment_fragment, refuse_stmt
 from kukai.ir.diag import (
     Diagnostic, EMIT_UNSUPPORTED_ENUM, KirRefusal, PARSE_MISSING_FIELD)
-from kukai.ir.ops_site import TOPOGRAPHY_VARIETIES, TOPOSOLID_MIN_VERSION
+from kukai.ir.ops_site import (
+    TOPOGRAPHY_VARIETIES, TOPOSOLID_MIN_VERSION, toposolid_version_refusal)
 
 #: Разновидность рельефа вне закрытого множества {surface, toposolid}.
 #: Ремень поверх подтяжек, ровно как RAILING_UNSUPPORTED_VARIETY у волны
@@ -422,17 +423,14 @@ def emit_topography(op: dict, ver: str, stamp: str,
     if variety == "surface":
         return _emit_topography_surface(op, ver, stamp, isolation)
     if variety == "toposolid":
-        if ver < TOPOSOLID_MIN_VERSION:
-            raise KirRefusal([Diagnostic(
-                code=EMIT_UNSUPPORTED, op_id=op.get("id"), field_name="variety",
-                got=variety, candidates=["surface"],
-                message_ru=(
-                    f"толща рельефа (Toposolid) не создаётся на Revit {ver}: "
-                    f"тип появился только в {TOPOSOLID_MIN_VERSION} — "
-                    f"замерено компиляцией на шести версиях. Следующий ход: "
-                    f"variety=\"surface\" (TopographySurface, 2021-2026) — но "
-                    f"это ДРУГОЙ элемент другой категории, поэтому подменить "
-                    f"его за вас компилятор не станет"))])
+        # ОДИН текст, ОДИН порог, ДВЕ точки вызова. Эта остаётся, потому что
+        # эмиттер зовут и напрямую; настоящая защита автора стоит ДО
+        # заземления (`compiler`, шов рядом с KIR-E001) — см. докстроку
+        # `toposolid_version_refusal`.
+        refusal = toposolid_version_refusal({**op, "op": "create_topography"},
+                                            ver)
+        if refusal is not None:
+            raise KirRefusal([refusal])
         if op.get("level") is None:
             raise KirRefusal([Diagnostic(
                 code=PARSE_MISSING_FIELD, op_id=op.get("id"),

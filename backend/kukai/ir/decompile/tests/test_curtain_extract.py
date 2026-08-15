@@ -925,14 +925,12 @@ class TheCurtainPanelParameterIsTheWallOne(unittest.TestCase):
     """
 
     XML_CANDIDATES = (
-        os.path.join(
-            os.path.expanduser("~/.nuget/packages/revit_all_main_versions_api_x64"),
-            "{version}.0.0/lib/net48/RevitAPI.xml",
-        ),
-        os.path.join(
-            os.path.expanduser("~/.nuget/packages/revit_all_main_versions_api_x64"),
-            "{version}.0.0/lib/net8.0/RevitAPI.xml",
-        ),
+        os.path.expanduser(
+            "~/.nuget/packages/revit_all_main_versions_api_x64/"
+            "{version}.0.0/lib/net48/RevitAPI.xml"),
+        os.path.expanduser(
+            "~/.nuget/packages/revit_all_main_versions_api_x64/"
+            "{version}.0.0/lib/net8.0/RevitAPI.xml"),
     )
 
     def _api_doc(self, version: str) -> str | None:

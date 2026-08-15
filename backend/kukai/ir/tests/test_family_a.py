@@ -7,6 +7,7 @@ import unittest
 os.environ.setdefault("KIR_REJECTIONS_PATH",
                       os.path.join(tempfile.gettempdir(), "kir_test_queue.jsonl"))
 
+from kukai.ir import authoring  # noqa: E402
 from kukai.ir.compiler import compile_program  # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
 
@@ -220,7 +221,13 @@ class RoomOrderingRule(unittest.TestCase):
         self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics][:3])
         cs = out.csharp
         i_wall = cs.index("= Wall.Create(doc")
-        i_regen = cs.index("finalize wall enclosures")
+        # ЧЕТВЁРТАЯ КОПИЯ ОДНОЙ СТРОКИ В НАБОРЕ, И ЧЕТВЁРТАЯ ОТСТАВШАЯ.
+        # `test_regen_before_spatial` держал `"doc.Regenerate();  // finalize"`,
+        # `test_space` — `"finalize wall enclosures"`, здесь то же самое, а
+        # эмиттер пишет пятое. `index` вдобавок бросает `ValueError: substring
+        # not found` — сообщение, не называющее ни строки, ни причины.
+        # Спрашиваем эмиттер (`authoring.SPATIAL_REGEN_CS`).
+        i_regen = cs.index(authoring.SPATIAL_REGEN_CS)
         i_room = cs.index("NewRoom")
         self.assertLess(i_wall, i_regen)
         self.assertLess(i_regen, i_room)
@@ -230,7 +237,14 @@ class RoomOrderingRule(unittest.TestCase):
             {"op": "create_room", "id": "R1", "xy": [3000, 1000], "level": LVL},
         ]), snapshot=GROUND_SNAPSHOT)
         self.assertTrue(out.ok)
-        self.assertNotIn("finalize wall enclosures", out.csharp)
+        # ПЯТАЯ КОПИЯ, И ЕДИНСТВЕННАЯ ОПАСНАЯ: она в ОТРИЦАТЕЛЬНОМ
+        # утверждении. Эмиттер этой строки не пишет с тех пор, как текст
+        # сменился, поэтому `assertNotIn` был истинен ПО ПОСТРОЕНИЮ и не мог
+        # упасть никогда — проверка, которая не может сработать, хуже
+        # отсутствующей: она занимает место настоящей и считается в наборе.
+        # Соседний положительный тест (`i_regen = cs.index(...)`) падал
+        # ГРОМКО, а этот молчал зелёным на той же самой устаревшей строке.
+        self.assertNotIn(authoring.SPATIAL_REGEN_CS, out.csharp)
 
     def test_room_witness_rejects_unplaced_or_unenclosed_room(self):
         out = compile_program(_prog([

@@ -187,8 +187,25 @@ OPS = [
             ParamSpec("tag_type", "target_w"),
         ),
         capability=(("create", "tag"),),
-        post=("tag exists in in_view, TaggedLocalElementId == target (semantic, "
-              "VIEW-BINDING LAW: target must be visible in in_view); at "
+        # ПРОЗА ОБЯЗАНА НАЗЫВАТЬ ГРАНИЦУ, А НЕ НАМЕРЕНИЕ (13.08.2026).
+        # Здесь стояло «TaggedLocalElementId == target» — верно для
+        # `IndependentTag` и МОЛЧА неверно для марки помещения, площади и
+        # пространства: у них связь читается у своего подкласса
+        # (`RoomTag.Room` / `AreaTag.Area` / `SpaceTag.Space`), а свойства
+        # базы `SpatialElementTag.SpatialElement` в поставляемых сборках НЕТ
+        # ни на одной из шести версий. Обязательство одно и то же — «марка
+        # связана с целью», — но член, которым оно проверяется, зависит от
+        # класса, и прозе не позволено называть один из двух.
+        # ТОЧКА С ЗАПЯТОЙ ЗДЕСЬ — РАЗДЕЛИТЕЛЬ ОБЯЗАТЕЛЬСТВ, а не знак
+        # препинания: `translation_cert` бьёт `post` по ней и требует
+        # свидетеля на КАЖДЫЙ кусок. Пояснение про класс марки поэтому едет
+        # ВНУТРИ обязательства, запятой. Первая редакция этой правки
+        # поставила «;» и тут же получила «promised clause not witnessed by
+        # any obligation» — прибор поймал автора за руку в ту же минуту.
+        post=("tag exists in in_view, marked element == target (semantic, "
+              "VIEW-BINDING LAW: target must be visible in in_view, связь "
+              "читается у КЛАССА марки — IndependentTag свои цели, "
+              "RoomTag/AreaTag/SpaceTag свой подкласс); at "
               "reproduced ±tol in view-space (geometry)"),
         writes_model=True,
         # 03.08: «±tol» получил адрес — головка марки сверяется в осях вида

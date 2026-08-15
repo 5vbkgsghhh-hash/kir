@@ -5,6 +5,21 @@ uses and drives the live kukai-compile.service (:52412) across all six Revit
 versions. Exit code != 0 on any failure. Run:
 
     PYTHONPATH=backend backend/venv/bin/python -m kukai.ir.gate_runner
+
+ЧТО ЭТИ ЧИСЛА УТВЕРЖДАЮТ, И ЧЕГО НЕ УТВЕРЖДАЮТ (12.08.2026). Вопрос ворот —
+**собирается ли эмитированный C# на шести версиях Revit**, и ответ на него
+честный: арбитр здесь — настоящие reference-сборки Autodesk, их sha256 печатается
+рядом с итогом. Но всё, что требует заземления, заземляется против СИНТЕТИЧЕСКОЙ
+фикстуры (`GROUND_SNAPSHOT_ORIGIN` ниже), а не против настоящего документа.
+Значит «OK» у такой программы есть утверждение о фикстуре, и доля таких
+компиляций теперь ПЕЧАТАЕТСЯ вместе с числом, а не помнится.
+
+Почему это не педантизм: зона НАБОР померила 12.08, что у фикстуры не хватало
+пула `roof_types`, и `create_roof`/`create_extrusion_roof` не заземлялись по
+умолчанию нигде. Обошлось одним красным только потому, что пул объявлен
+НЕОБЯЗАТЕЛЬНЫМ; обязательный в той же позиции обрушил бы ворота целиком — и
+выглядело бы это как «оп сломан», а не как «модель бедна». Полнота фикстуры есть
+свойство ВОРОТ, а не только набора.
 """
 from __future__ import annotations
 
@@ -22,11 +37,23 @@ from kukai.compile_client import CompileClient                     # noqa: E402
 from kukai.llm.revit_execution_pipeline import wrap_user_code      # noqa: E402
 from kukai.ir import spec                                          # noqa: E402
 from kukai.ir.compiler import compile_program                      # noqa: E402
+from kukai.ir.op_contract import audit_contract_kernel             # noqa: E402
 from kukai.ir.tests.test_golden import PROGRAMS                    # noqa: E402
 from kukai.ir.tests.test_pbt import gen_program                    # noqa: E402
 
 N_PBT = 25
 SEED = 62026
+
+#: Откуда ворота берут снимок для заземления. Синтетическая ФИКСТУРА, а не
+#: настоящий документ: у неё заведомо меньше типов, пулов и элементов. Для
+#: вопроса ворот («собирается ли C# на шести версиях») это законно, потому что
+#: вопрос про КОМПИЛЯЦИЮ. Но любое «OK» у программы, требующей снимка, есть
+#: утверждение о фикстуре, и печатать это обязано само число — см. итоговый
+#: блок `main()`. Круговая сверка разворота фикстурой заземляться НЕ ВПРАВЕ:
+#: там вопрос «воспроизводит ли разворот ЭТО здание», и бедность модели дала
+#: бы расхождения от себя самой (решение директора 12.08 — снимок того
+#: прогона, `open_model.profile.json`, есть в 70 прогонах из 77).
+GROUND_SNAPSHOT_ORIGIN = "kukai.ir.tests.fixtures.GROUND_SNAPSHOT"
 
 SIZED_CABLE_TRAY_GATE_NAME = "auth_cable_tray_sized"
 SIZED_CABLE_TRAY_GATE_MARKERS = (
@@ -82,6 +109,14 @@ E003_EXPECTED_BELOW: dict[str, str] = {
     "auth_contour_l": "2022",
     "struct_foundation_slab_holes_2021": "2022",
     "struct_foundation_slab": "2022",
+    # Пришёл со сведением 13.08.2026 и уронил ворота: программа новая, список
+    # её не знал. Добавлено ПО СТРОЕНИЮ, а не по имени — имя тут обманчиво
+    # похоже на соседа, и этого мало. Замерено: обе программы суть ОДИН
+    # `create_foundation` с одинаковым набором параметров, включая `holes`;
+    # обе отказывают на 2021 и обе зелены на 2022; текст диагностики совпадает
+    # побайтно — «отверстия в фундаментной плите не поддержаны на Revit 2021».
+    # Граница одна и та же, потому и число одно и то же.
+    "struct_foundation_slab_two_holes": "2022",
     # 2022: Ceiling.Create; legacy doc.Create.NewCeiling не существует ни на
     # одной из шести версий (замерено), то есть сворачивать некуда.
     "arch_ceiling": "2022",
@@ -90,6 +125,16 @@ E003_EXPECTED_BELOW: dict[str, str] = {
     # компиляцией 09.08). Поверхность рельефа (site_topography_surface) сюда
     # НЕ входит: она строится 6/6, и это разные элементы разных категорий.
     "site_topography_toposolid": "2024",
+    # 2025: и эта граница ЕДИНСТВЕННАЯ, чья причина лежит НЕ в Revit API, а в
+    # замыкании ссылок РАЗВЁРНУТОГО плагина (12.08.2026). Члены существуют на
+    # всех шести, и ворота компилировали тело 6/6 зелёным — но весь API
+    # многоэтажного марша типизирован `ISet<ElementId>`, а deployed/net48 не
+    # ссылается на `System.dll` и `ISet` в его замыкании нет
+    # (declared 43 сборки / 3003 типа, deployed 42 / 2007 — разница РОВНО в
+    # System.dll). Тело собиралось у нас и давало бы CS0012 у пользователя.
+    # Отказ снимается вместе с причиной: судья — не память, а
+    # tests/test_emitted_csharp_client_closure.py, профиль deployed.
+    "datums_multistory_stairs": "2025",
 }
 
 #: Стадии, чей C# едет в Revit, но которых НЕТ в реестре конвейера. Tier G
@@ -211,7 +256,111 @@ def mutation_acceptance_gate_body(revit_version: str) -> str:
     )
 
 
+
+#: The Revit assemblies the compile service actually references, hashed here
+#: so a gate number stops being a number without an address. "1938 live
+#: compile checks" says nothing about WHAT it compiled against, and until
+#: now the service could not answer: prod `/health` returns COUNTS only —
+#: no names, no digests — while the canary carries a `referenceManifestDigest`
+#: and per-version digests prod does not know as concepts.
+#:
+#: Computed SIDEWAYS, from the same NuGet package the service loads
+#: (`RoslynCompiler.LoadAllRevitVersions`), so this needs no endpoint, no
+#: rebuild and no restart of a deployed service.
+#:
+#: BOUNDARY, stated here rather than in a report: this is a manifest of the
+#: REVIT references only. The system (net8/net48) references are NOT in it
+#: and cannot be, sideways: they come from the service process's own
+#: TRUSTED_PLATFORM_ASSEMBLIES, a property of the runtime it was started
+#: under — which is also why prod reads 48 and the canary 47. Their role is
+#: PARITY WITH THE BRIDGE, and that is guarded separately by drift guards on
+#: both sides (`AssemblyWhitelistSyncTests.cs`, `test_assembly_whitelist_sync.py`),
+#: not by this manifest. Their absence here is a gap in DESCRIPTION, not in
+#: protection. Approximating them would be worse than omitting them: an empty
+#: column is visible, a substituted one is not.
+_REVIT_REF_DLLS = ("RevitAPI.dll", "RevitAPIUI.dll", "AdWindows.dll",
+                   "UIFramework.dll")
+
+
+def revit_reference_manifest() -> tuple[dict[str, str], list[str]]:
+    """(version -> digest, problems). Mirrors the service's own path logic."""
+    # `os` берётся МОДУЛЬНЫЙ (строка 13). Локальный `import os` здесь был, и
+    # его ловил test_authority_boundaries: затенение модульного имени
+    # функциональным — та самая форма, где два имени одного модуля живут в
+    # одном файле и расходятся молча при правке одного из них.
+    import hashlib
+
+    root = os.environ.get("NUGET_PACKAGES") or os.path.expanduser(
+        "~/.nuget/packages")
+    base = os.path.join(root, "revit_all_main_versions_api_x64")
+    manifest: dict[str, str] = {}
+    problems: list[str] = []
+    if not os.path.isdir(base):
+        return manifest, [f"NuGet package dir absent: {base}"]
+    for ver in spec.REVIT_VERSIONS:
+        lib = os.path.join(base, f"{ver}.0.0", "lib",
+                           "net8.0" if ver >= "2025" else "net48")
+        if not os.path.isdir(lib):
+            problems.append(f"{ver}: lib dir absent ({lib})")
+            continue
+        h = hashlib.sha256()
+        missing = []
+        for dll in _REVIT_REF_DLLS:          # order is part of the digest
+            path = os.path.join(lib, dll)
+            if not os.path.isfile(path):
+                missing.append(dll)
+                continue
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+        if missing:
+            problems.append(f"{ver}: missing {', '.join(missing)}")
+            continue
+        manifest[ver] = h.hexdigest()
+    return manifest, problems
+
+
+def model_binding_guard_inputs() -> tuple[dict, object, dict]:
+    """The (snapshot, profile, expected_document) triple the guard compiles.
+
+    ONE source. The profile and the snapshot must be derived from the same
+    object, because `compiler.py` recomputes the profile from whatever
+    snapshot it is handed and refuses `KIR-G107` when the digests differ.
+    Until 2026-08-11 this block built the profile from a mutated copy and
+    passed the UNMUTATED original to `compile_program` — the pair was
+    asserted in one place and read in another, and nothing forced them to
+    agree. The gate then counted six checks for a body it never compiled.
+
+    Returned as a triple rather than left inline so a test can compile the
+    gate's OWN inputs; the harness is the consumer that went unmeasured.
+    """
+    import copy
+
+    from kukai.ir.open_model import OpenModelProfile
+    from kukai.ir.tests.fixtures import GROUND_SNAPSHOT
+
+    snapshot = copy.deepcopy(GROUND_SNAPSHOT)
+    for level in snapshot["levels"]:
+        element_id = int(level["id"])
+        level["unique_id"] = f"gate-level-{element_id}"
+        level["version_guid"] = f"{element_id:032x}"
+    snapshot["levels__total"] = len(snapshot["levels"])
+    return (
+        snapshot,
+        OpenModelProfile.from_ground_snapshot(snapshot),
+        {"title": "KIR gate COPY", "path_name": "",
+         "project_uid": "kir-gate-project"},
+    )
+
+
 async def main() -> int:
+    contract_problems = audit_contract_kernel()
+    if contract_problems:
+        print("FATAL: KIR operation contract kernel is inconsistent")
+        for problem in contract_problems:
+            print(f"  - {problem}")
+        return 3
+
     client = CompileClient()
     if not await client.health():
         print("FATAL: compile service :52412 unavailable")
@@ -376,13 +525,6 @@ async def main() -> int:
             {"op": "delete", "id": "D1",
              "target": {"by": "element_id", "value": 8888}},
         ]}
-    programs["auth_contour_l"] = {"ir_version": "1.0", "intent": "Г-плита по контуру с проёмом",
-        "ops": [{"op": "create_floor_by_contour", "id": "F1",
-                 "contour": {"outer": {"shape": "l", "origin": [0, 0],
-                                       "size_mm": [16000, 10000], "cut_mm": [6000, 4000]},
-                             "holes": [{"shape": "rect", "origin": [1000, 1000],
-                                        "size_mm": [3000, 6000]}]},
-                 "level": {"by": "name", "value": "Этаж 1"}}]}
     programs["auth_contour_arc"] = {"ir_version": "1.0", "intent": "контур с дугой",
         "ops": [{"op": "create_floor_by_contour", "id": "F1",
                  "contour": {"outer": {"shape": "poly",
@@ -403,12 +545,6 @@ async def main() -> int:
                                        "arcs": [{"edge": 2, "bulge": 0.2874}]}},
                  "level": {"by": "element_id", "value": 42},
                  "height_offset_mm": -700.0}]}
-    programs["auth_pipe_system_chain"] = {"ir_version": "1.0", "intent": "стояк ВК с отводом",
-        "ops": [{"op": "create_pipe_system", "id": "SYS1", "level": {"by": "element_id", "value": 42},
-                 "nodes": [{"id": "N1", "xyz_mm": [0, 0, 0]}, {"id": "N2", "xyz_mm": [0, 0, 15000]},
-                           {"id": "N3", "xyz_mm": [3000, 0, 15000]}],
-                 "segments": [{"from": "N1", "to": "N2", "diameter_mm": 100},
-                              {"from": "N2", "to": "N3", "diameter_mm": 50}]}]}
     programs["auth_pipe_system_tee"] = {"ir_version": "1.0", "intent": "тройник",
         "ops": [{"op": "create_pipe_system", "id": "SYS1", "level": {"by": "element_id", "value": 42},
                  "diameter_mm": 100,
@@ -470,16 +606,6 @@ async def main() -> int:
     # типов, и пинованный element_id). Адрес (0,0) — не «пустой», а сетка
     # 1×1: ровно тот частный случай, который дизайн запретил считать
     # оправданием отсутствия адреса.
-    programs["auth_curtain_cell_named_type"] = {"ir_version": "1.0",
-        "intent": "витраж: стеклопакет в единственную ячейку",
-        "ops": [
-            {"op": "create_wall", "id": "WC", "p0_mm": [0, 0],
-             "p1_mm": [6000, 0], "level": {"by": "element_id", "value": 42},
-             "height_mm": 3000},
-            {"op": "set_curtain_panel", "id": "CP1",
-             "host": {"by": "ref", "value": "WC"}, "u": 0, "v": 0,
-             "panel_type": {"by": "name", "value": "Стеклопакет 30мм"}},
-        ]}
     programs["auth_curtain_cell_grid"] = {"ir_version": "1.0",
         "intent": "витраж: разные типы в ячейках сетки существующей стены",
         "ops": [
@@ -497,22 +623,6 @@ async def main() -> int:
     # формы носителя (ref на стену этой же программы и пинованный element_id)
     # и ОБА направления — isUGridLine у AddGridLine булев, и перепутанная
     # ветка не видна ничем, кроме живой модели.
-    programs["auth_curtain_grid_lines"] = {"ir_version": "1.0",
-        "intent": "витраж: раскладка сетки — своя линия на каждый шаг",
-        "ops": [
-            {"op": "create_wall", "id": "WG", "p0_mm": [0, 0],
-             "p1_mm": [6000, 0], "level": {"by": "element_id", "value": 42},
-             "height_mm": 3000},
-            {"op": "create_curtain_grid_line", "id": "GL1",
-             "host": {"by": "ref", "value": "WG"}, "direction": "u",
-             "position_mm": [2000.0, 0.0, 1500.0]},
-            {"op": "create_curtain_grid_line", "id": "GL2",
-             "host": {"by": "ref", "value": "WG"}, "direction": "v",
-             "position_mm": [3000.0, 0.0, 2100.0]},
-            {"op": "create_curtain_grid_line", "id": "GL3",
-             "host": {"by": "element_id", "value": 8145901},
-             "direction": "u", "position_mm": [4000.0, 120.0, 900.0]},
-        ]}
     # RELATE, АДРЕС (волна 09.08). Ворота обязаны гонять ОБА семейства узлов
     # на всех шести версиях, и вот зачем именно ворота: адрес разрешается на
     # компиляции в ЛИТЕРАЛ, поэтому дефект в резолвере выглядит не как
@@ -582,11 +692,6 @@ async def main() -> int:
         return verts, tris
 
     _ds_verts, _ds_tris = _twisted_tower_mesh()
-    programs["auth_directshape_tower"] = {
-        "ir_version": "1.0", "intent": "витая башня мешем",
-        "ops": [{"op": "create_directshape", "id": "D1",
-                 "mesh": {"vertices_mm": _ds_verts, "triangles": _ds_tris},
-                 "category": "mass", "name": "витая башня"}]}
     # wave/solid (09.08): параметрическое тело. ТРИ программы, потому что у
     # эмиссии три необязательные ветки, и ворота обязаны собрать каждую:
     # отметка основания включает преобразование контура, дуга в профиле —
@@ -618,13 +723,6 @@ async def main() -> int:
     # обе: масса, которая УЖЕ СТОИТ (`element_id` — главный сценарий), и
     # масса, размещённая этой же программой (`ref` на place_family). Ворота,
     # собравшие одну ветку из двух, — это «прибор на часть диапазона».
-    programs["auth_face_wall_existing_mass"] = {
-        "ir_version": "1.0", "intent": "стена по скату существующей массы",
-        "ops": [{"op": "create_face_wall", "id": "FW1",
-                 "host": {"by": "element_id", "value": 900001},
-                 "face_normal": [0.6, 0.0, 0.8],
-                 "location_line": "core_exterior",
-                 "type": {"by": "name", "value": "Кирпич 250"}}]}
     programs["auth_face_wall_placed_mass"] = {
         "ir_version": "1.0", "intent": "стена по скату размещённой массы",
         "ops": [{"op": "place_family", "id": "M1",
@@ -666,32 +764,6 @@ async def main() -> int:
     # expected_refusals below) surfaced that this whole op family had never
     # been driven through the real compile service, atomic OR per_op, at
     # all. in_view here stays element_id (the only legal form after the fix).
-    programs["auth_annotation"] = {"ir_version": "1.0", "intent": "аннотации",
-        "ops": [
-            {"op": "create_wall", "id": "W1", "p0_mm": [0, 0],
-             "p1_mm": [6000, 0], "level": {"by": "element_id", "value": 42},
-             "height_mm": 3000},
-            {"op": "create_dimension", "id": "DIM1",
-             "in_view": {"by": "element_id", "value": 900},
-             "refs": [{"by": "ref", "value": "W1"},
-                      {"by": "element_id", "value": 12345}],
-             "line_at": [3000, 500]},
-            # 09.08: угловой размер въезжает в тот же корпус, а не в свой —
-            # он делит с линейным весь резольвер ссылок, и разводить их по
-            # разным программам значило бы проверять одну поверхность дважды,
-            # а вторую (dim_type по умолчанию из документа) — ни разу.
-            {"op": "create_angular_dimension", "id": "ANG1",
-             "in_view": {"by": "element_id", "value": 900},
-             "refs": [{"by": "ref", "value": "W1"},
-                      {"by": "element_id", "value": 12345}],
-             "at": [1500, 1500]},
-            {"op": "create_tag", "id": "TAG1",
-             "in_view": {"by": "element_id", "value": 900},
-             "target": {"by": "ref", "value": "W1"}, "at": [3000, 800]},
-            {"op": "create_text", "id": "TXT1",
-             "in_view": {"by": "element_id", "value": 900},
-             "at": [1000, 1000], "content": "Проверка"},
-        ]}
     # host: element_id (28.07, audit's most frequent external scenario:
     # «поставь окно в МОЮ стену»). No wall op in this program on purpose —
     # the whole point is a host the program never creates. Runtime frame
@@ -711,39 +783,56 @@ async def main() -> int:
              "offset_mm": 3000, "sill_mm": 900,
              "symbol": {"by": "name", "value": "Окно 1200x1500"}},
         ]}
+    # A8 (13.08.2026): СИМВОЛ, СОЗДАННЫЙ ЭТОЙ ЖЕ ПРОГРАММОЙ, ПОТРЕБЛЯЕТСЯ ЕЮ ЖЕ.
+    #
+    # До этой правки `family_symbol` был ЕДИНСТВЕННЫМ родом ссылки во всём
+    # языке, у которого есть производители и НОЛЬ потребителей: производят 2
+    # опа (`create_type`, `load_family`), потребляет никто. Три других рода
+    # потребляются десятками (`level` 33, `element` 16, `wall` 7) — то есть это
+    # было не «мало покрыто», а НЕЗАМКНУТОЕ РЕБРО в графе языка, и увидеть его
+    # можно было только переписью производителей против потребителей.
+    #
+    # Следствие было не академическим: здание нельзя авторить в документе, где
+    # его каталога ещё нет. Отказ `KIR-G104` («пул пуст») не мог назвать
+    # выполнимый следующий ход, потому что загрузить семейство и сослаться на
+    # него в одной программе было НЕЛЬЗЯ.
+    #
+    # Программа ниже — доказательство, что теперь можно, и она в воротах именно
+    # потому, что офлайн-компиляция шести версий и есть единственное, что здесь
+    # проверяемо: живая транзакция (примет ли Revit свежезагруженный символ
+    # сразу) остаётся заряженной для живого окна.
+    programs["auth_load_family_then_place"] = {"ir_version": "1.0",
+        "intent": "загрузить семейство и поставить его экземпляр в один ход",
+        "ops": [
+            {"op": "load_family", "id": "LF",
+             "path": "C:\\Lib\\Doors\\M_Дверь.rfa",
+             "type_name": "Дверь 900x2100"},
+            {"op": "create_wall", "id": "W1",
+             "p0_mm": [0, 0], "p1_mm": [6000, 0], "height_mm": 3000,
+             "level": {"by": "element_id", "value": 42},
+             "type": {"by": "element_id", "value": 100}},
+            {"op": "create_door", "id": "D1",
+             "host": {"by": "ref", "value": "W1"}, "offset_mm": 2000,
+             "symbol": {"by": "ref", "value": "LF"}},
+        ]}
     # CLASH-починка (28.07, оператор: ранний честный релиз): move_elements +
     # change_type. targets mixes ref (this program's own wall+pipe, so
     # ElementTransformUtils.MoveElements is proven on a LocationCurve pair
     # created in the SAME transaction) with element_id (an existing
     # element); change_type runs on the same created wall, byref, proving
     # the target_w path independent of host/type selector kind.
-    programs["auth_move_and_change_type"] = {"ir_version": "1.0",
-        "intent": "перенос связки стена+труба, смена типа стены",
-        "ops": [
-            {"op": "create_wall", "id": "MW", "p0_mm": [0, 0],
-             "p1_mm": [6000, 0], "level": {"by": "element_id", "value": 42}},
-            {"op": "create_pipe", "id": "MP", "p0_mm": [0, 0, 2700],
-             "p1_mm": [3000, 0, 2900], "level": {"by": "element_id", "value": 42},
-             "diameter_mm": 50},
-            {"op": "move_elements", "id": "ME1",
-             "targets": [{"by": "ref", "value": "MW"},
-                         {"by": "ref", "value": "MP"},
-                         {"by": "element_id", "value": 8145901}],
-             "delta_mm": [1000.0, 0.0, 500.0]},
-            {"op": "change_type", "id": "CT1",
-             "target": {"by": "ref", "value": "MW"},
-             "type": {"by": "element_id", "value": 5001}},
-        ]}
+    # auth_move_and_change_type is NOT set here: it lives in `PROGRAMS`
+    # and arrives through the seed above, so the golden pins exactly the
+    # program the gate compiles.
+    # families_create_type_full / families_load_family_whole are NOT set
+    # here any more: they live in `PROGRAMS` and arrive through the seed
+    # above. Keeping a literal here too would mean the gate compiles one
+    # program while the golden pins another — silently — the moment the
+    # name exists in both. One source.
     # ops_families gate (wave/families, 2026-07-17): create_type (FamilySymbol
     # duplication — the exact prod incident this wave fixes, RC columns coming
     # in as steel because no create_type existed) + load_family (Document.
     # LoadFamily/LoadFamilySymbol, wiki family-load-place.md FAM-034 pattern).
-    programs["families_create_type_full"] = {"ir_version": "1.0",
-        "intent": "жб колонна 400x400 из существующего типа",
-        "ops": [{"op": "create_type", "id": "T1",
-                 "source_type": {"by": "element_id", "value": 500},
-                 "category": "structural", "new_name": "ЖБ 400x400",
-                 "width_mm": 400, "depth_mm": 400, "material": "Бетон"}]}
     programs["families_create_type_by_name_custom_params"] = {"ir_version": "1.0",
         "intent": "тип по имени источника с нестандартными именами параметров",
         "ops": [{"op": "create_type", "id": "T1",
@@ -766,10 +855,6 @@ async def main() -> int:
             {"op": "set_param", "id": "S1", "target": {"by": "ref", "value": "T1"},
              "param": "Комментарии типа", "value": "создан KIR"},
         ]}
-    programs["families_load_family_whole"] = {"ir_version": "1.0",
-        "intent": "загрузить семейство целиком (первый типоразмер)",
-        "ops": [{"op": "load_family", "id": "F1",
-                 "path": r"C:\ProgramData\Autodesk\RVT 2024\Libraries\Russian\Конструкции\Колонны\Бетонные\M_Бетонная-Прямоугольная-Колонна.rfa"}]}
     programs["families_load_family_named_type"] = {"ir_version": "1.0",
         "intent": "загрузить один именованный типоразмер",
         "ops": [{"op": "load_family", "id": "F1",
@@ -850,26 +935,6 @@ async def main() -> int:
                  "direction_edge": 0,
                  "level": {"by": "name", "value": "Этаж 1"},
                  "symbol": {"by": "name", "value": "Балка 200x400"}}]}
-    programs["struct_framing_bay"] = {"ir_version": "1.0",
-        "intent": "пролёт: две балочные системы, две фермы и балка",
-        "ops": [
-            {"op": "create_beam_system", "id": "BS1",
-             "profile": {"outer": {"shape": "rect", "origin": [0, 0],
-                                   "size_mm": [12000, 6000]}},
-             "level": {"by": "element_id", "value": 42}},
-            {"op": "create_beam_system", "id": "BS2",
-             "profile": {"outer": {"shape": "l", "origin": [0, 7000],
-                                   "size_mm": [12000, 8000],
-                                   "cut_mm": [4000, 3000], "corner": "ne"}},
-             "level": {"by": "element_id", "value": 42}},
-            {"op": "create_truss", "id": "TR1", "p0_mm": [0, 16000],
-             "p1_mm": [12000, 16000], "level": {"by": "element_id", "value": 42},
-             "type": {"by": "name", "value": "Ферма стропильная 12м"}},
-            {"op": "create_truss", "id": "TR2", "p0_mm": [0, 19000],
-             "p1_mm": [12000, 19000], "level": {"by": "element_id", "value": 42}},
-            {"op": "create_beam", "id": "B1", "p0_mm": [0, 22000, 3000],
-             "p1_mm": [12000, 22000, 3000], "level": {"by": "element_id", "value": 42}},
-        ]}
     # wave/reinforcement (2026-08-10): армирование по области. Оси версий у
     # него НЕТ (обе перегрузки AreaReinforcement.Create компилируются 6/6),
     # поэтому ворота стерегут не развилку по версиям, а ровно то, чего
@@ -878,23 +943,6 @@ async def main() -> int:
     # (документное умолчание и by:name), обе ветки крюка (пропуск = без
     # крюков и by:name) и НЕСКОЛЬКО таких опов в одной транзакции — так
     # ловится столкновение имён между соседями.
-    programs["struct_area_reinforcement_slabs"] = {"ir_version": "1.0",
-        "intent": "армирование двух плит одной программой",
-        "ops": [
-            {"op": "create_floor", "id": "SL1",
-             "outline": [[0, 0], [9000, 0], [9000, 6000], [0, 6000]],
-             "level": {"by": "element_id", "value": 42}, "structural": True},
-            {"op": "create_area_reinforcement", "id": "AR1",
-             "host": {"by": "ref", "value": "SL1"},
-             "direction_deg": 0.0,
-             "bar_type": {"by": "name", "value": "Ø12 A500C"}},
-            {"op": "create_area_reinforcement", "id": "AR2",
-             "host": {"by": "element_id", "value": 8145901},
-             "direction_deg": 90.0,
-             "type": {"by": "name", "value": "Армирование по области 2"},
-             "bar_type": {"by": "element_id", "value": 1902},
-             "hook_type": {"by": "name", "value": "Крюк 90"}},
-        ]}
     rnga_reinf = random.Random(SEED + 7)
     for i in range(4):
         # УГОЛ — СЛУЧАЙНЫЙ И ВНЕ 0..360 ТОЖЕ. Направление периодично, границ у
@@ -997,6 +1045,29 @@ async def main() -> int:
     known_gaps = 0
     failures = 0
     sized_cable_tray_branch_checks = 0
+    #: Bodies the Roslyn service actually answered about. DERIVED from the
+    #: calls themselves (`_compile_check` below is the only door), never
+    #: incremented beside an attempt — so a check that is skipped cannot
+    #: inflate it. `checks` counts ATTEMPTS and the two differ by exactly
+    #: `not_compiled`; the summary prints all three, because a number that
+    #: cannot tell "passed" from "never attempted" is not a measurement.
+    compiled = 0
+    #: reason -> how many attempts ended without any C# reaching Roslyn.
+    #: A skipped check is a named category in the summary, never absent.
+    not_compiled: dict[str, int] = {}
+
+    def _skip(reason: str) -> None:
+        not_compiled[reason] = not_compiled.get(reason, 0) + 1
+
+    async def _compile_check(wrapped: str, ver: str):
+        """The ONLY path to the compile service, so `compiled` cannot lie."""
+        nonlocal compiled
+        res = await client.check(wrapped, ver)
+        if res is None:
+            _skip("compile-service-no-answer")
+        else:
+            compiled += 1
+        return res
 
     async def _gate_row(name: str, prog: dict, snapshot, isolation: str) -> list[str]:
         nonlocal checks, known_gaps, failures, sized_cable_tray_branch_checks
@@ -1019,6 +1090,7 @@ async def main() -> int:
                     and not out.ok \
                     and any(d.code == "KIR-E003" for d in out.diagnostics):
                 row.append(f"{ver}:E003-EXPECTED")
+                _skip("e003-expected-refusal")
                 continue
             # wave/analysis (09.08): та же мысль, но ось версий смотрит В
             # ДРУГУЮ СТОРОНУ. Свободная (нехостированная) нагрузка ЕСТЬ на
@@ -1029,16 +1101,19 @@ async def main() -> int:
             if not out.ok and name in ANALYSIS_LOAD_PROGRAMS and ver >= "2024" \
                     and any(d.code == "KIR-E003" for d in out.diagnostics):
                 row.append(f"{ver}:E003-EXPECTED")
+                _skip("e003-expected-refusal")
                 continue
             if not out.ok:
                 if name in PER_OP_KNOWN_GAPS:
                     row.append(f"{ver}:KNOWN-GAP")
                     known_gaps += 1
+                    _skip("known-gap-refusal")
                     continue
                 print(f"FAIL {name}@{ver} [{isolation}]: KIR refused: "
                       f"{[d.code for d in out.diagnostics][:3]}")
                 failures += 1
                 row.append(f"{ver}:REFUSED")
+                _skip("compiler-refused")
                 continue
             if name == SIZED_CABLE_TRAY_GATE_NAME:
                 if not sized_cable_tray_branch_reached(out.csharp):
@@ -1046,10 +1121,11 @@ async def main() -> int:
                           "emitter branch was not reached")
                     failures += 1
                     row.append(f"{ver}:BRANCH?")
+                    _skip("emitter-branch-not-reached")
                     continue
                 sized_cable_tray_branch_checks += 1
             wrapped = wrap_user_code(out.csharp)
-            res = await client.check(wrapped, ver)
+            res = await _compile_check(wrapped, ver)
             if res is None:
                 row.append(f"{ver}:SVC?")
                 failures += 1
@@ -1071,9 +1147,19 @@ async def main() -> int:
         return row
 
     write_program_count = 0
+    # Заземление — свойство ВОРОТ, а не только набора (найдено зоной НАБОР
+    # 12.08). Всё, что требует снимка, заземляется против ФИКСТУРЫ, и потому
+    # каждое такое «OK» есть утверждение о фикстуре, а не о настоящем
+    # документе. Считаем долю здесь, чтобы напечатать её вместе с числом, а
+    # не оставить в чьей-то памяти.
+    program_compilations = 0
+    fixture_grounded = 0
     for name, prog in programs.items():
         needs_snapshot = _needs_snapshot(prog)
         snapshot = GROUND_SNAPSHOT if needs_snapshot else None
+        program_compilations += 1
+        if needs_snapshot:
+            fixture_grounded += 1
         atomic_row = await _gate_row(name, prog, snapshot, "atomic")
         print(f"{name:24s} {' '.join(atomic_row)}")
         # per_op is only a DIFFERENT emission for write-family programs (the
@@ -1084,6 +1170,8 @@ async def main() -> int:
         # docstring), so it doubles as the per_op eligibility check.
         if needs_snapshot:
             write_program_count += 1
+            program_compilations += 1
+            fixture_grounded += 1
             per_op_row = await _gate_row(
                 name, prog, snapshot, "per_op")
             print(f"{name + '_per_op':24s} {' '.join(per_op_row)}")
@@ -1156,7 +1244,7 @@ async def main() -> int:
     row = []
     for ver in spec.REVIT_VERSIONS:
         checks += 1
-        res = await client.check(wrapped_snap, ver)
+        res = await _compile_check(wrapped_snap, ver)
         if res is None:
             row.append(f"{ver}:SVC?"); failures += 1
         elif res.success:
@@ -1171,34 +1259,31 @@ async def main() -> int:
     # legacy byte corpus, so compile it explicitly on all versions.  This also
     # proves the document guard and identity guard remain separated by valid
     # newlines before the first mutation.
-    import copy as _copy
-    from kukai.ir.open_model import OpenModelProfile
-    _guard_snapshot = _copy.deepcopy(GROUND_SNAPSHOT)
-    for _level in _guard_snapshot["levels"]:
-        _element_id = int(_level["id"])
-        _level["unique_id"] = f"gate-level-{_element_id}"
-        _level["version_guid"] = f"{_element_id:032x}"
-    _guard_snapshot["levels__total"] = len(_guard_snapshot["levels"])
-    _guard_profile = OpenModelProfile.from_ground_snapshot(_guard_snapshot)
+    _guard_snapshot, _guard_profile, _guard_document = (
+        model_binding_guard_inputs())
     row = []
     for ver in spec.REVIT_VERSIONS:
         checks += 1
         guarded = compile_program(
             programs["auth_wall"],
             revit_version=ver,
-            snapshot=GROUND_SNAPSHOT,
-            expected_document={
-                "title": "KIR gate COPY",
-                "path_name": "",
-                "project_uid": "kir-gate-project",
-            },
+            snapshot=_guard_snapshot,
+            expected_document=_guard_document,
             open_model_profile=_guard_profile,
         )
         if not guarded.ok:
             row.append(f"{ver}:REFUSED")
             failures += 1
+            _skip("compiler-refused")
+            # A refusal here used to print NOTHING while a Roslyn error
+            # printed three lines, so the one failure mode the reader could
+            # not see was the one that fired — and every reader guessed it
+            # as a compile failure. Say the reason.
+            print(f"FAIL model_binding_guard@{ver}: KIR refused: "
+                  + "; ".join(f"{d.code} {d.message_ru}"
+                              for d in guarded.diagnostics[:3]))
             continue
-        res = await client.check(wrap_user_code(guarded.csharp), ver)
+        res = await _compile_check(wrap_user_code(guarded.csharp), ver)
         if res is None:
             row.append(f"{ver}:SVC?"); failures += 1
         elif res.success:
@@ -1210,6 +1295,101 @@ async def main() -> int:
                       f"{e.message[:100]}")
     print(f"{'model_binding_guard':24s} {' '.join(row)}")
 
+    # Name<->ordinal tables, pinned against AUTODESK rather than against
+    # ourselves. `WALL_LOCATION_LINE_ORDINALS` is read by BOTH the emitter
+    # (authoring.py, `.Set(ORDINALS[name])`) and its witness (same lookup),
+    # so the two cannot disagree: swap a name/ordinal PAIR and the user asks
+    # for `wall_centerline`, Revit receives `CoreCenterline`, and the witness
+    # confirms the value it just wrote. Measured 2026-08-12: that mutation
+    # survives the whole test suite AND a green 6/6 gate. Every guard the
+    # table had reads the table — including one that inverts a dict derived
+    # by inverting it, which is a tautology true of any permutation.
+    #
+    # "Ask the authority" is our usual remedy and it fails here, because the
+    # authority WAS our table. So ask an authority outside the repository:
+    # the real RevitAPI assemblies. C# has no static_assert, but two `case`
+    # labels with the same constant value is CS0152 — so a compile FAILURE
+    # proves the equality, and a clean compile proves inequality. Both
+    # directions are decidable, which is why this can also fail.
+    #
+    # SCOPE, measured, so this is not quoted later as a general shield:
+    # `WALL_LOCATION_LINE_ORDINALS` is the ONLY such table in the registry
+    # today. The form generalises; the coverage is one table.
+    from kukai.ir.ops_authoring import WALL_LOCATION_LINE_ORDINALS
+
+    #: our name -> the enum member Autodesk must agree it equals. CLOSED: a
+    #: row added to the table without a member here fails the stage rather
+    #: than being skipped, so the next addition forces a decision.
+    _WALL_LL_CS_MEMBERS = {
+        "wall_centerline": "WallCenterline",
+        "core_centerline": "CoreCenterline",
+        "finish_face_exterior": "FinishFaceExterior",
+        "finish_face_interior": "FinishFaceInterior",
+        "core_exterior": "CoreExterior",
+        "core_interior": "CoreInterior",
+    }
+
+    def _enum_probe_cs(member: str, ordinal: int) -> str:
+        return (
+            "using Autodesk.Revit.DB;\n"
+            "namespace Kukai { class UserCode { public void Execute() {\n"
+            "    switch (0) {\n"
+            f"        case (int)WallLocationLine.{member}: break;\n"
+            f"        case {ordinal}: break;\n"
+            "    }\n"
+            "} } }\n")
+
+    unmapped = sorted(set(WALL_LOCATION_LINE_ORDINALS) - set(_WALL_LL_CS_MEMBERS))
+    if unmapped:
+        print("FAIL wall-location-line enum pin: table rows with no Revit "
+              f"member declared: {unmapped}")
+        failures += 1
+    row = []
+    for ver in spec.REVIT_VERSIONS:
+        agreed = 0
+        for name, ordinal in sorted(WALL_LOCATION_LINE_ORDINALS.items()):
+            member = _WALL_LL_CS_MEMBERS.get(name)
+            if member is None:
+                continue
+            checks += 1
+            res = await _compile_check(_enum_probe_cs(member, ordinal), ver)
+            if res is None:
+                print(f"FAIL wall_ll_enum@{ver} {name}: compile service "
+                      "gave no answer")
+                failures += 1
+                continue
+            if any(e.code == "CS0152" for e in res.errors):
+                agreed += 1            # Autodesk says the pair is right
+            elif res.success:
+                print(f"FAIL wall_ll_enum@{ver}: Autodesk disagrees — "
+                      f"{name} is NOT {ordinal} "
+                      f"(WallLocationLine.{member} compiled beside case "
+                      f"{ordinal} without a duplicate-label error)")
+                failures += 1
+            else:
+                print(f"FAIL wall_ll_enum@{ver} {name}: inconclusive, "
+                      f"{sorted({e.code for e in res.errors})}")
+                failures += 1
+        # The stage must be able to say NO: a deliberately wrong pair has to
+        # COMPILE CLEANLY. Without this, "did not build" degrades into "did
+        # not build for any reason" and the pin stops being an instrument.
+        # The wrong ordinal is taken OUTSIDE the enum's value range, not from
+        # a sibling row: a control drawn from the table stops being wrong the
+        # moment the table is permuted, which is the coupling this whole stage
+        # exists to break. 9999 is wrong under every permutation.
+        checks += 1
+        wrong = await _compile_check(
+            _enum_probe_cs("WallCenterline", 9999), ver)
+        if wrong is None or not wrong.success:
+            print(f"FAIL wall_ll_enum@{ver}: CONTROL — a deliberately wrong "
+                  "pair did not compile cleanly, so a passing pin proves "
+                  f"nothing ({'no answer' if wrong is None else sorted({e.code for e in wrong.errors})})")
+            failures += 1
+            row.append(f"{ver}:CONTROL?")
+            continue
+        row.append(f"{ver}:{agreed}/{len(_WALL_LL_CS_MEMBERS)}")
+    print(f"{'wall_ll_enum_pin':24s} {' '.join(row)}")
+
     # The independent acceptance body is not emitted by compile_program, so it
     # needs an explicit 6/6 proof just like the ground snapshot and decompile
     # side stages.  A Python shape test cannot detect a Revit API member drift.
@@ -1217,7 +1397,7 @@ async def main() -> int:
     row = []
     for ver in spec.REVIT_VERSIONS:
         checks += 1
-        res = await client.check(wrap_user_code(_acceptance_body), ver)
+        res = await _compile_check(wrap_user_code(_acceptance_body), ver)
         if res is None:
             row.append(f"{ver}:SVC?"); failures += 1
         elif res.success:
@@ -1235,7 +1415,7 @@ async def main() -> int:
     row = []
     for ver in spec.REVIT_VERSIONS:
         checks += 1
-        res = await client.check(
+        res = await _compile_check(
             wrap_user_code(mutation_acceptance_gate_body(ver)), ver)
         if res is None:
             row.append(f"{ver}:SVC?"); failures += 1
@@ -1259,7 +1439,7 @@ async def main() -> int:
     for ver in spec.REVIT_VERSIONS:
         for _stage, _body in sorted(side_stage_gate_bodies(ver).items()):
             checks += 1
-            res = await client.check(wrap_user_code(_body), ver)
+            res = await _compile_check(wrap_user_code(_body), ver)
             if res is None:
                 _side_rows[_stage].append(f"{ver}:SVC?"); failures += 1
             elif res.success:
@@ -1291,7 +1471,7 @@ async def main() -> int:
         _body = build_category_batch_cs(_cat)
         for ver in spec.REVIT_VERSIONS:
             checks += 1
-            res = await client.check(wrap_user_code(_body), ver)
+            res = await _compile_check(wrap_user_code(_body), ver)
             if res is None:
                 _row.append(f"{ver}:SVC?"); failures += 1
             elif res.success:
@@ -1328,7 +1508,7 @@ async def main() -> int:
             _prefix, delete=_delete, document_fingerprint=_fp)
         for ver in spec.REVIT_VERSIONS:
             checks += 1
-            res = await client.check(wrap_user_code(_body), ver)
+            res = await _compile_check(wrap_user_code(_body), ver)
             if res is None:
                 _row.append(f"{ver}:SVC?"); failures += 1
             elif res.success:
@@ -1341,13 +1521,66 @@ async def main() -> int:
         print(f"{'уборка ' + _label:24s} {' '.join(_row)}")
 
     await client.close()
-    print(f"\n{'PASS' if failures == 0 else 'FAIL'}: "
+    # Reconcile BEFORE the PASS/FAIL word is chosen, or the gate can print
+    # PASS on the same line that records an accounting failure.
+    if checks - compiled != sum(not_compiled.values()):
+        print("FAIL gate accounting: attempts minus compiled "
+              f"({checks - compiled}) does not equal the named skips "
+              f"({sum(not_compiled.values())}) — a skip is going unnamed")
+        failures += 1
+    # `checks` counts ATTEMPTS; `compiled` counts bodies Roslyn answered.
+    # They differ by exactly the skips, and every skip is named. Printing
+    # only the attempt count is how "1896 live compile checks" came to
+    # include 30 attempts that compiled nothing at all.
+    #
+    # THIS LINE GOES FIRST, AND THAT ORDER IS THE POINT. When it was printed
+    # LAST, `tail -1` returned it — and it is byte-identical whether the gate
+    # passed or failed, because a semantic failure (a wrong ordinal, a refused
+    # program) changes no count here. A reader taking the last line got a
+    # sentence that cannot say "no", and one of us nearly filed a red run as
+    # green from exactly that. The VERDICT is now last, so the cheapest
+    # possible reading is also the truthful one.
+    print(f"\n      {checks} attempts = {compiled} compiled + "
+          f"{checks - compiled} not compiled"
+          + (" (" + ", ".join(f"{reason}: {count}" for reason, count
+                              in sorted(not_compiled.items())) + ")"
+             if not_compiled else ""))
+    # The address of every number above. Printed BEFORE the verdict so the
+    # verdict stays last, and printed even when incomplete — a manifest that
+    # silently omits a version would be the defect this exists to close.
+    _manifest, _mproblems = revit_reference_manifest()
+    if _manifest:
+        print("      Revit refs (" + ", ".join(_REVIT_REF_DLLS) + "), sha256/12:")
+        print("        " + "  ".join(f"{v}:{d[:12]}"
+                                     for v, d in sorted(_manifest.items())))
+    for _p in _mproblems:
+        print(f"      Revit refs UNAVAILABLE — {_p}")
+    if not _manifest and not _mproblems:
+        print("      Revit refs: manifest empty and no reason given — "
+              "treat every count above as unaddressed")
+    print("      system refs: NOT in this manifest (they belong to the "
+          "service runtime); their role is Bridge parity, guarded by the "
+          "drift guards on both sides")
+    # ПРЕДМЕТ каждого числа выше, а не только его адрес. Печатается ПЕРЕД
+    # вердиктом по тому же правилу, что и манифест: вердикт остаётся
+    # последним. Найдено зоной НАБОР 12.08 — у фикстуры не хватало пула
+    # `roof_types`, и обошлось дёшево лишь потому, что пул объявлен
+    # необязательным; обязательный в той же позиции обрушил бы ворота
+    # целиком, а выглядело бы это как «оп сломан». Полнота пулов фикстуры
+    # пинится сверкой МНОЖЕСТВ у `spec.OPS` (зона НАБОР), не сверкой длин:
+    # у производителя и у фикстуры было по 35 пулов при 34 совпадающих
+    # именах, и любая проверка «сколько» подтвердила бы полноту.
+    print(f"      заземление: {fixture_grounded} из {program_compilations} "
+          f"компиляций программ идут против ФИКСТУРЫ "
+          f"{GROUND_SNAPSHOT_ORIGIN} — не против настоящего документа. "
+          f"Их «OK» есть утверждение о фикстуре")
+    print(f"{'PASS' if failures == 0 else 'FAIL'}: "
           f"{len(programs)} programs (atomic) "
           f"+ {write_program_count} write programs (per_op), "
           f"x {len(spec.REVIT_VERSIONS)} versions each "
           f"+ {len(expected_refusals)} expected-refusal check(s), "
           f"{sized_cable_tray_branch_checks} sized-tray branch emission(s), "
-          f"{checks} live compile checks, "
+          f"{compiled} live compile checks, "
           f"{known_gaps} known per_op gap(s) tracked separately, "
           f"{failures} failures")
     return 0 if failures == 0 else 1

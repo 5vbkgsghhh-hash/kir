@@ -16,12 +16,16 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 from kukai.ir.decompile.l1_schema import FidelityReason
-from kukai.ir.decompile.schema import L0Document, NamedReference
+from kukai.ir.decompile.schema import (
+    FederationTransformEvidence,
+    L0Document,
+    NamedReference,
+)
 
 
 DEPENDENCY_MANIFEST_SCHEMA_VERSION = "1.0"
 FAMILY_IDENTITY_NOTE = "family_name_unavailable_l0_1_0"
-LINK_IDENTITY_NOTE = "link_path_and_fingerprint_unavailable_l0_1_0"
+LINK_IDENTITY_NOTE = "resource_path_and_content_fingerprint_unavailable"
 TYPE_FINGERPRINT_SCHEMA_VERSION = "type-fingerprint/1"
 
 TYPE_FINGERPRINT_SCOPE = (
@@ -439,7 +443,7 @@ class ExternalResource:
     discipline: str
     identity_note: str
     attachment_mode: str | None = None
-    transform: tuple[float, ...] | None = None
+    transform: FederationTransformEvidence | None = None
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -469,9 +473,10 @@ class ExternalResource:
                 or not self.attachment_mode):
             raise DependencyManifestError(
                 "external resource attachment_mode must be non-empty or null")
-        if self.transform is not None:
+        if (self.transform is not None
+                and not isinstance(self.transform, FederationTransformEvidence)):
             raise DependencyManifestError(
-                "current manifest cannot claim a link transform absent from L0")
+                "external resource transform must be validated evidence or null")
         if self.resolution in _RESOLVED and self.fingerprint is None:
             raise DependencyManifestError(
                 "resolved external resource requires a fingerprint")
@@ -493,7 +498,9 @@ class ExternalResource:
             "discipline": self.discipline,
             "identity_note": self.identity_note,
             "attachment_mode": self.attachment_mode,
-            "transform": self.transform,
+            "transform": (
+                self.transform.to_dict()
+                if self.transform is not None else None),
         }
 
 
@@ -746,6 +753,12 @@ def _family_axis_by_type(
     element in 242 020 of them.  All 20 disagreements sit in ONE run --
     `snowdon_elec_v1`, whose stage reported 1837 `element_unresolved`
     failures and returned 20 rows belonging to a DIFFERENT model: an
+    -- and this is the GENUINE sense of that code, narrowed on 2026-08-12 to
+    mean exactly "the requested id was not found in the document (it may have
+    come from a foreign parse)".  A stage that merely does not READ an element
+    now says `element_not_claimed` instead, so this measurement stays
+    distinguishable from a scope boundary rather than sharing one word with it.
+    The rows themselves: an
     OST_LightingFixtures element carrying the family "Round Elbow", an
     OST_ElectricalFixtures element carrying "Bend - PVC - Sch 40 - DWV".
     Those rows would have attached plumbing families to electrical fixtures
@@ -1043,6 +1056,7 @@ def build_dependency_manifest(
             loaded=link.loaded,
             discipline=link.discipline,
             identity_note=LINK_IDENTITY_NOTE,
+            transform=link.transform,
         ))
         unresolved.append(UnresolvedDependency(
             key=key,

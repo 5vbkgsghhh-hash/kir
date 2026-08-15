@@ -124,7 +124,10 @@ class ReverseContractTests(unittest.TestCase):
         # компонентах-площадках не знает вовсе, поэтому каждая площадка
         # разобранного здания теряется молча. Переснято прогоном на ЭТОМ
         # дереве, а не сложено с числом чужой ветки.
-        self.assertEqual(len(REVERSE_CONTRACTS), 64)
+        # 64 -> 65 (10.08.2026): create_space is a named LIFTER_GAP.  The
+        # writer exists, while reverse capture is not yet strong enough to
+        # recreate it; omitting the op from this denominator hid that gap.
+        self.assertEqual(len(REVERSE_CONTRACTS), 65)
         # 23 -> 24 (03.08.2026): create_railing переведён из capture_gap в
         # direct. Захват путей ограждений едет с 29.07, и k2_ar_rd_v9 несёт
         # 31 строку захвата — прежняя формулировка «L0 has neither a railing
@@ -137,7 +140,7 @@ class ReverseContractTests(unittest.TestCase):
         self.assertEqual(
             sum(contract.direct_same_op_lift
                 for contract in REVERSE_CONTRACTS.values()),
-            26,
+            27,
         )
         with self.assertRaises(TypeError):
             REVERSE_CONTRACTS["delete"] = REVERSE_CONTRACTS["create_wall"]  # type: ignore[index]
@@ -169,16 +172,67 @@ class ReverseContractTests(unittest.TestCase):
                     }
                     self.assertIn(op_name, string_literals)
 
-    def test_l1_emission_guard_refuses_non_direct_operations(self):
-        self.assertEqual(assert_lift_emission("create_wall").op_name,
-                         "create_wall")
-        # create_railing уехал отсюда 03.08 вместе с подключением захвата;
-        # на его месте — create_dimension, последний оставшийся capture_gap
-        # (вида-владельца и Dimension.References чтение не снимает).
-        for op_name in ("create_dimension", "delete", "load_family"):
-            with self.subTest(op=op_name), self.assertRaises(
-                    ReverseContractError):
-                assert_lift_emission(op_name)
+    def test_l1_emission_guard_agrees_with_the_manifest_on_every_op(self):
+        """Страж обязан согласиться с таблицей — на КАЖДОЙ записи, без имён.
+
+        ЗДЕСЬ СТОЯЛИ ИМЕНА ОПОВ, И ОНИ СГНИЛИ (11.08.2026). Тест перечислял
+        `create_dimension` как «последний оставшийся capture_gap»; захват
+        ссылок размера (`a51e31c2`) перевёл его в bounded DIRECT, и тест
+        покраснел — не потому, что страж сломался, а потому, что список имён
+        был КОПИЕЙ таблицы, а не проверкой на неё. Замена имени на
+        `create_space` починила бы день и сгнила бы снова в день, когда у
+        `create_space` появится лифтер.
+
+        Поэтому здесь больше нет ни одного имени опа. Тест выводит ожидание
+        из `REVERSE_CONTRACTS` во время прогона: режим `DIRECT` обязан
+        подняться, любой другой — отказать типизированно. Это первое из двух
+        наших лекарств — СПРОСИТЬ АВТОРИТЕТ вместо того, чтобы объявлять то,
+        что он держит, — применённое к тесту.
+
+        Что тест по-прежнему НЕ проверяет, чтобы никто не принял его за
+        большее: он сверяет страж с манифестом, а НЕ манифест с
+        действительностью. Что режим объявлен верно, доказывают захват и
+        лифтер, а не эта функция; за движением режима стоит замок счётчиков
+        выше и запись в истории файла.
+
+        ЗЕЛЁНЫЙ С ПЕРВОГО ПРОГОНА ДОКАЗАН МУТАЦИЕЙ, А НЕ ПРЕДЪЯВЛЕН
+        (11.08.2026). Подмена `create_beam` с `direct` на `capture_gap` —
+        и ничего больше — роняет ровно этот тест с «create_beam объявлен
+        capture_gap, а страж его пропустил»; без подмены отказов ноль. Тест
+        падать УМЕЕТ.
+
+        ГРАНИЦА МУТАНТА, потому что две попытки из трёх сам манифест не
+        принял, и это факт о нём, а не о тесте: `direct` без точки входа
+        неконструируем (`ValueError: direct reverse contract needs an
+        entrypoint`), `capture_gap` без `decided_on`/`due` тоже
+        (`record_ratchet`), а сама `REVERSE_CONTRACTS` — `MappingProxyType`
+        и на запись не отдаётся. Подделать движение режима пришлось подменой
+        ИМЕНИ в модуле теста. Манифест фейл-клоузед в обе стороны; здешняя
+        проверка сторожит шов между ним и стражем, а не его собственную
+        грамматику.
+        """
+        seen_modes: Counter[ReverseMode] = Counter()
+        for op_name, contract in sorted(REVERSE_CONTRACTS.items()):
+            seen_modes[contract.mode] += 1
+            with self.subTest(op=op_name, mode=contract.mode.value):
+                if contract.mode is ReverseMode.DIRECT:
+                    self.assertEqual(
+                        assert_lift_emission(op_name).op_name, op_name,
+                        "объявленный DIRECT не поднимается")
+                else:
+                    with self.assertRaises(
+                            ReverseContractError,
+                            msg=(f"{op_name} объявлен {contract.mode.value}, "
+                                 "а страж его пропустил")):
+                        assert_lift_emission(op_name)
+
+        # Обе стороны обязаны быть НЕПУСТЫ, иначе проверка, которая не может
+        # упасть, выглядела бы зелёной: манифест без единого DIRECT или без
+        # единого не-DIRECT прошёл бы цикл выше молча.
+        direct = seen_modes[ReverseMode.DIRECT]
+        self.assertTrue(direct, "в манифесте не осталось ни одного DIRECT")
+        self.assertTrue(sum(seen_modes.values()) - direct,
+                        "в манифесте не осталось ни одного не-DIRECT")
 
     def test_composed_group_emission_has_a_checked_entrypoint(self):
         """Сторожит ГРАММАТИКУ составного контракта, а НЕ достижимость.
@@ -270,12 +324,12 @@ class ReverseContractTests(unittest.TestCase):
         # компонентах-площадках не знает вовсе, поэтому каждая площадка
         # разобранного здания теряется молча. Переснято прогоном на ЭТОМ
         # дереве, а не сложено с числом чужой ветки.
-        self.assertEqual(report["write_ops"], 64)
-        self.assertEqual(report["direct_same_op_lifts"], 26)
+        self.assertEqual(report["write_ops"], 65)
+        self.assertEqual(report["direct_same_op_lifts"], 27)
         self.assertEqual(
             report["modes"],
             {
-                "direct": 26,
+                "direct": 27,
                 # 1 -> 2: create_opening объявлен capture_gap честно — L0 1.0
                 # не несёт ни Opening.Host, ни границы проёма, и DIRECT здесь
                 # обещал бы подъём, которого нет.
@@ -339,8 +393,10 @@ class ReverseContractTests(unittest.TestCase):
                 # нет. И у площадки этот пробел стоит дороже, чем кажется:
                 # марш-то читается, поэтому разобранное здание выглядит
                 # ПОЛНЫМ, потеряв каждую промежуточную площадку.
-                "capture_gap": 26,
-                "lifter_gap": 1,
+                # create_dimension moved from capture_gap to bounded direct;
+                # create_space entered separately as a named lifter gap.
+                "capture_gap": 25,
+                "lifter_gap": 2,
                 "decomposed": 4,
                 "composed": 1,
                 "state_transition": 4,

@@ -518,11 +518,31 @@ class ReverseAndCensus(unittest.TestCase):
     def test_clash_declares_the_blind_spot_with_a_reason(self):
         """Тело настоящее, оболочки нет, и причина ИМЕННАЯ: оболочка стены
         строится из `LocationCurve`, а `FaceWall` — не `Wall` (замерено,
-        CS0029 на всех шести) и `LocationCurve` не имеет вовсе."""
-        from kukai.ir.clash_bundle import OP_NO_BODY, category_of
+        CS0029 на всех шести) и `LocationCurve` не имеет вовсе.
+
+        СЛЕПОЕ ПЯТНО СПРАШИВАЕТСЯ У ТОГО, КТО ЕГО ДЕРЖИТ (правка 11.08.2026).
+        Здесь стояло `assertIsNone(category_of({"op": OP}))` — утверждение о
+        ТЕЛЕ, прочитанное через ответ о КАТЕГОРИИ. Две разные величины:
+        `category_of` отвечает «куда результат попадёт в Revit»,
+        `OP_NO_BODY` — «можем ли мы построить оболочку». Стена по грани массы
+        ЕСТЬ стена (`OST_Walls`) и оболочки не имеет; ровно это и написано
+        строкой выше в `test_the_census_key_is_exact_and_single`, которая
+        требует `("OST_Walls",)` — то есть файл утверждал обе половины разом и
+        противоречил сам себе, пока одна из них молчала.
+
+        Из 69 опов реестра это ЕДИНСТВЕННЫЙ, у которого ответы расходятся, и
+        потому единственный, на котором подмена одной величины другой заметна.
+        Замок на 1-из-69 стоит в `test_clash_in_the_receipt`.
+        """
+        from kukai.ir.clash_bundle import OP_NO_BODY, category_of, op_categories
         self.assertIn(OP, OP_NO_BODY)
         self.assertIn("LocationCurve", OP_NO_BODY[OP])
-        self.assertIsNone(category_of({"op": OP}))
+        # Тела нет — и это утверждается ТЕМ, кто про тело знает.
+        self.assertNotIn(OP, __import__(
+            "kukai.ir.clash_bundle", fromlist=["x"]).body_making_ops())
+        # Категория при этом ИЗВЕСТНА, и её знание не отменяет отсутствия тела.
+        self.assertEqual(category_of({"op": OP}), "OST_Walls")
+        self.assertEqual(op_categories(OP), ("OST_Walls",))
 
 
 if __name__ == "__main__":

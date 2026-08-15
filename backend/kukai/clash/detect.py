@@ -17,13 +17,15 @@ AABB, а не в одну по центру. «Соседние ячейки о�
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import math
 import pathlib
 import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Iterable
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping
 
 from kukai.clash import geom as G
 from kukai.clash import hulls as H
@@ -70,6 +72,9 @@ SCOPES: dict[str, str] = {
               "{стена, пол, колонна, балка, фундамент, кровля}",
     "all_physical_diagnostic": "ВСЕ физические пары — диагностика, не MVP: "
                                "внутрираздельные примыкания законны сплошь и рядом",
+    "cross_model_federation": "пары РАЗНЫХ моделей сводной: «мешают ли модели "
+                              "друг другу»; пары внутри одной модели — законные "
+                              "примыкания и в область не входят",
 }
 
 
@@ -82,6 +87,15 @@ class Grid:
     #: На сколько раздувался габарит при раскладке (ревью №9). Кандидаты,
     #: запрошенные с бо́льшим slack, чем построена сетка, — ложный пропуск.
     slack: float = 0.0
+
+
+def _nonnegative_finite(value: object, name: str) -> float:
+    """Validate a geometric distance before it can shape candidate search."""
+
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value)) or float(value) < 0.0):
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return float(value)
 
 
 def choose_cell_size(records: list[H.HullRecord]) -> float:
@@ -107,7 +121,12 @@ def build_grid(records: list[H.HullRecord], cell: float | None = None, *,
     два габарита сходятся в пределах slack, их раздутые версии обязаны
     пересечься, а значит разделить хотя бы одну ячейку.
     """
-    cell = cell or choose_cell_size(records)
+    slack = _nonnegative_finite(slack, "slack")
+    cell = choose_cell_size(records) if cell is None else cell
+    if (isinstance(cell, bool) or not isinstance(cell, (int, float))
+            or not math.isfinite(float(cell)) or float(cell) <= 0.0):
+        raise ValueError("cell must be a finite positive number")
+    cell = float(cell)
     g = Grid(cell=cell, slack=slack)
     cells_per = []
     for idx, r in enumerate(records):
@@ -158,7 +177,9 @@ def candidate_pairs(records: list[H.HullRecord], grid: Grid, *,
     Сетка обязана быть построена с тем же (или бо́льшим) `slack` — иначе
     раскладка не видела зазора и надмножество перестаёт им быть (ревью №9).
     """
-    if slack > grid.slack + 1e-12:
+    slack = _nonnegative_finite(slack, "slack")
+    grid_slack = _nonnegative_finite(grid.slack, "grid.slack")
+    if slack > grid_slack + 1e-12:
         raise ValueError(
             f"сетка построена со slack={grid.slack}, запрошено {slack}: "
             "широкая фаза перестала бы быть надмножеством")
@@ -192,6 +213,7 @@ def candidate_pairs(records: list[H.HullRecord], grid: Grid, *,
 def brute_pairs(records: list[H.HullRecord], *, slack: float = 0.0,
                 pair_filter=None) -> list[tuple[int, int]]:
     """Полный перебор — эталон для property-теста широкой фазы."""
+    slack = _nonnegative_finite(slack, "slack")
     out = []
     for i in range(len(records)):
         for j in range(i + 1, len(records)):
@@ -208,13 +230,195 @@ def mvp_pair_filter(a: H.HullRecord, b: H.HullRecord) -> bool:
     return {a.mvp_side, b.mvp_side} == set(H.MVP_PAIR)
 
 
+def cross_model_pair_filter(a: H.HullRecord, b: H.HullRecord) -> bool:
+    """СВОДНАЯ МОДЕЛЬ: только пары РАЗНЫХ моделей (14.08.2026).
+
+    Владелец: «как в невисе сделал из них федерацию… и чтоб я запускал клеши».
+    Сводная задаётся вопросом «мешают ли модели ДРУГ ДРУГУ»; пара внутри одной
+    модели — законное примыкание и на этот вопрос не отвечает, а шума даёт
+    столько, что ответ в нём тонет.
+
+    МОДЕЛЬ ЖИВЁТ В АДРЕСЕ ЭЛЕМЕНТА (`<модель>::<исходный id>`), и это не
+    украшение: два разбора легко несут одинаковые `source_id`, и без префикса
+    пара разных зданий была бы неотличима от пары внутри одного. Элемент без
+    префикса считается моделью «» — тогда фильтр не пропустит пару, а не
+    выдумает ей принадлежность.
+    """
+    return a.source_id.split("::", 1)[0] != b.source_id.split("::", 1)[0]
+
+
 def any_physical_pair_filter(a: H.HullRecord, b: H.HullRecord) -> bool:
     """Все физические пары — НЕ MVP; годится только для диагностики, потому
     что внутрираздельные примыкания законны сплошь и рядом."""
     return True
 
 
-# ───────────────────────────────────────────────────────────── узкая фаза
+# ─────────────────────────────────────────────────────────── узкая фаза
+
+PHYSICAL_OVERLAP_PROOF_SCHEMA = "clash-certified-inner-overlap/2"
+
+
+def _freeze_proof_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            str(key): _freeze_proof_json(item)
+            for key, item in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_proof_json(item) for item in value)
+    return value
+
+
+def _thaw_proof_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_proof_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_proof_json(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
+class PhysicalOverlapProof:
+    """Pair-level proof kept separate from the outer-hull finding."""
+
+    status: str                   # confirmed | not_proven
+    basis: str | None
+    reason: str | None
+    subject_a: str
+    subject_b: str
+    a: Mapping[str, Any]
+    b: Mapping[str, Any]
+    inner_relation: str | None = None
+    inner_signed_distance_mm: float | None = None
+    inner_overlap_depth_mm: float | None = None
+    required_margin_mm: float | None = None
+    schema_version: str = PHYSICAL_OVERLAP_PROOF_SCHEMA
+    _authority: object | None = field(
+        default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.status not in ("confirmed", "not_proven"):
+            raise ValueError("physical proof status is unsupported")
+        if (self.status == "confirmed"
+                and self._authority is not H._PAIR_PROOF_ISSUANCE_AUTHORITY):
+            raise PermissionError(
+                "confirmed physical proof must be issued by the narrow kernel")
+        object.__setattr__(self, "a", _freeze_proof_json(self.a))
+        object.__setattr__(self, "b", _freeze_proof_json(self.b))
+
+    def as_dict(self) -> dict:
+        def finite_or_none(value: float | None, digits: int = 9):
+            if value is None or not math.isfinite(value):
+                return None
+            return G._norm_zero(round(float(value), digits))
+
+        payload = {
+            "schema_version": self.schema_version,
+            "status": self.status,
+            "basis": self.basis,
+            "reason": self.reason,
+            "subject_a": self.subject_a,
+            "subject_b": self.subject_b,
+            "a": _thaw_proof_json(self.a),
+            "b": _thaw_proof_json(self.b),
+            "inner_relation": self.inner_relation,
+            "inner_signed_distance_mm": finite_or_none(
+                self.inner_signed_distance_mm),
+            "inner_overlap_depth_mm": finite_or_none(
+                self.inner_overlap_depth_mm, 6),
+            "required_margin_mm": finite_or_none(
+                self.required_margin_mm, 6),
+        }
+        # Only a confirmed claim carries authority.  A ``not_proven`` packet
+        # is diagnostic data, not a capability, and keeping it unsigned also
+        # keeps ordinary outer-only production reports deterministic across
+        # process restarts.  The verifier below never accepts that state.
+        if self.status != "confirmed":
+            return payload
+        return H.seal_serialized_pair_proof(
+            payload, authority=self._authority)
+
+
+_PAIR_PROOF_PAYLOAD_KEYS = frozenset({
+    "schema_version", "status", "basis", "reason", "subject_a",
+    "subject_b", "a", "b", "inner_relation",
+    "inner_signed_distance_mm", "inner_overlap_depth_mm",
+    "required_margin_mm",
+})
+_PAIR_SIDE_KEYS = frozenset({
+    "status", "reason", "certificate", "hull_type",
+})
+
+
+def _proof_number(value: object) -> float | None:
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))):
+        return None
+    return float(value)
+
+
+def verify_serialized_physical_overlap_proof(
+        proof: Mapping[str, Any], *, subject_a: str,
+        subject_b: str) -> bool:
+    """Verify a complete confirmed pair chain from untrusted JSON.
+
+    Both certificate HMACs and the pair HMAC are required.  The pair seal
+    binds subjects, the full side payloads (including certificate tags), and
+    every verdict/geometric number.  Replaying a certificate for another
+    element or editing depth/margin therefore fails closed.  Tags are
+    intentionally process-local: persistence across restart is not authority
+    for this test-only producer.
+    """
+
+    if not isinstance(proof, Mapping):
+        return False
+    if not H.verify_serialized_pair_proof_integrity(
+            proof, payload_keys=_PAIR_PROOF_PAYLOAD_KEYS):
+        return False
+    if (proof.get("schema_version") != PHYSICAL_OVERLAP_PROOF_SCHEMA
+            or proof.get("status") != "confirmed"
+            or proof.get("basis") != "certified_inner_overlap"
+            or proof.get("reason") is not None
+            or proof.get("inner_relation") != "overlap"
+            or proof.get("subject_a") != subject_a
+            or proof.get("subject_b") != subject_b):
+        return False
+    for side_name, expected_subject in (
+            ("a", subject_a), ("b", subject_b)):
+        side = proof.get(side_name)
+        if (not isinstance(side, Mapping)
+                or set(side) != _PAIR_SIDE_KEYS
+                or side.get("status") != "valid"
+                or side.get("reason") is not None
+                or side.get("hull_type") not in ("Aabb", "Prism")):
+            return False
+        certificate = side.get("certificate")
+        if (not isinstance(certificate, Mapping)
+                or not H.verify_serialized_inner_certificate(
+                    certificate,
+                    expected_subject_source_id=expected_subject)):
+            return False
+    signed_distance = _proof_number(proof.get("inner_signed_distance_mm"))
+    depth = _proof_number(proof.get("inner_overlap_depth_mm"))
+    margin = _proof_number(proof.get("required_margin_mm"))
+    if (signed_distance is None or depth is None or margin is None
+            or signed_distance >= -EPS_NUMERIC_MM
+            or depth <= margin or margin < EPS_NUMERIC_MM):
+        return False
+    expected_depth = max(0.0, -signed_distance)
+    if not math.isclose(
+            depth, expected_depth, rel_tol=1e-12, abs_tol=1.1e-6):
+        return False
+    expected_margin = EPS_NUMERIC_MM
+    for side_name in ("a", "b"):
+        certificate = proof[side_name]["certificate"]
+        expected_margin += (
+            float(certificate["error_bound_mm"])
+            + float(certificate["tolerance_mm"]))
+    if not math.isclose(
+            margin, expected_margin, rel_tol=1e-12, abs_tol=1.1e-6):
+        return False
+    return True
 
 @dataclass
 class Finding:
@@ -233,14 +437,19 @@ class Finding:
     ranking_tol_mm: float
     hull_grade: str
     #: РОД пары: обычное пересечение или ДУБЛИКАТ (два элемента на одном
-    #: месте). Дубликат — диагностика модели, а не клеш: он чинится удалением,
-    #: а не раздвиганием, и заказчику нужен отдельной строкой.
+    #: месте). Это геометрическая диагностика модели, а не разрешение удалить
+    #: элемент: семантика и зависимости находятся вне этого детектора.
     pair_kind: str
     #: Ось ОТНОШЕНИЯ: overlap | contact | separated.
     hull_relation: str
-    #: Ось ДОКАЗАТЕЛЬНОСТИ: confirmed | possible. `touch` сюда не добавляется
-    #: намеренно — это смешало бы две оси обратно в одну.
+    #: Ось ДОКАЗАТЕЛЬНОСТИ: confirmed | possible. `confirmed` выводится
+    #: ТОЛЬКО из `physical_overlap_proof`, а не из грейда outer hull.
     verdict: str
+    physical_overlap_proof: PhysicalOverlapProof
+    #: Exact-body equality has a separate proof: physical overlap (including
+    #: certified inner overlap) does not imply equality.  Even equality is not
+    #: a BIM-deletion capability.
+    exact_body_equality_proof: dict[str, Any]
     #: Ревью №6: сертифицированный разводящий перенос, НЕ минимальный вектор.
     certified_separating_translation_mm: tuple[float, float, float] | None
     separation_is_lower_bound: bool
@@ -284,6 +493,8 @@ class Finding:
             "pair_kind": self.pair_kind,
             "hull_relation": self.hull_relation,
             "verdict": self.verdict,
+            "physical_overlap_proof": self.physical_overlap_proof.as_dict(),
+            "exact_body_equality_proof": self.exact_body_equality_proof,
             "certified_separating_translation_mm": (
                 None if v is None else [r(c) for c in v]),
             "translation_unavailable_reason": self.translation_unavailable_reason,
@@ -321,8 +532,27 @@ def pair_grade(a: H.HullRecord, b: H.HullRecord) -> str:
 #: миллиметры из того же перевода футов, отдельного порога у них нет и взяться
 #: ему неоткуда.
 DUPLICATE_EPS_MM = 1.0
+# ``DUPLICATE_EPS_MM`` is deliberately a UI/classification tolerance: it may
+# group nearly coincident hulls for review.  Destructive equality is a
+# different proposition.  Reusing one millimetre there would allow deleting
+# an exact body displaced by 0.5 mm, so the sealed capability uses only the
+# numeric kernel epsilon.
+EXACT_BODY_EQUALITY_EPS_MM = EPS_NUMERIC_MM
 
 PAIR_KINDS = ("interference", "coincident_duplicate")
+
+EXACT_BODY_EQUALITY_SCHEMA = "clash-exact-body-equality/1"
+_EXACT_BODY_EQUALITY_PAYLOAD_KEYS = frozenset({
+    "schema_version", "status", "outcome", "reason", "comparison",
+    "tolerance_mm", "subject_a", "subject_b", "a", "b",
+})
+_EXACT_BODY_SIDE_KEYS = frozenset({
+    "subject_source_id", "category", "grade", "hull_source",
+    "hull_evidence", "hull_digest",
+})
+_EXACT_BODY_AUTHORITY_SIDE_KEYS = frozenset({
+    "body_source_digest", "body_source_revision", "certificate_digest",
+})
 
 
 def _points_match(pa, pb, eps: float) -> bool:
@@ -379,6 +609,252 @@ def hulls_coincide(a: H.HullRecord, b: H.HullRecord, *,
     return None
 
 
+def _canonical_exact_hull(hull: G.Hull) -> dict[str, Any] | None:
+    """Canonical evidence for hull types whose equality kernel is explicit."""
+
+    if isinstance(hull, G.Capsule):
+        if (not math.isfinite(float(hull.radius)) or hull.radius <= 0.0
+                or not hull.path):
+            return None
+        path = tuple(tuple(G._norm_zero(float(value)) for value in point)
+                     for point in hull.path)
+        if any(len(point) != 3 or any(not math.isfinite(v) for v in point)
+               for point in path):
+            return None
+        reverse = tuple(reversed(path))
+        canonical_path = min(path, reverse)
+        return {
+            "kind": "capsule",
+            "path_mm": [list(point) for point in canonical_path],
+            "radius_mm": G._norm_zero(float(hull.radius)),
+        }
+    if isinstance(hull, (G.Prism, G.PrismSet)):
+        span = G.z_span(hull)
+        pieces = G.footprint_pieces(hull)
+        if span is None or not pieces or any(
+                not math.isfinite(float(value)) for value in span):
+            return None
+        canonical_pieces = []
+        for piece in pieces:
+            points = [
+                [G._norm_zero(float(x)), G._norm_zero(float(y))]
+                for x, y in piece]
+            if (len(points) < 3
+                    or any(not math.isfinite(v) for point in points
+                           for v in point)):
+                return None
+            canonical_pieces.append(sorted(points))
+        canonical_pieces.sort()
+        return {
+            "kind": "prismatic",
+            "pieces_mm": canonical_pieces,
+            "z0_mm": G._norm_zero(float(span[0])),
+            "z1_mm": G._norm_zero(float(span[1])),
+        }
+    return None
+
+
+def _evidence_digest(evidence: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_evidence_coincides(
+        a: Mapping[str, Any], b: Mapping[str, Any], *, eps: float) -> bool:
+    """Re-evaluate the equality relation over sealed canonical evidence."""
+
+    if a.get("kind") != b.get("kind"):
+        return False
+    if a.get("kind") == "capsule":
+        ra, rb = _proof_number(a.get("radius_mm")), _proof_number(
+            b.get("radius_mm"))
+        pa, pb = a.get("path_mm"), b.get("path_mm")
+        return (ra is not None and rb is not None and abs(ra - rb) <= eps
+                and isinstance(pa, list) and isinstance(pb, list)
+                and _points_match(pa, pb, eps))
+    if a.get("kind") == "prismatic":
+        za0, za1 = _proof_number(a.get("z0_mm")), _proof_number(a.get("z1_mm"))
+        zb0, zb1 = _proof_number(b.get("z0_mm")), _proof_number(b.get("z1_mm"))
+        pa, pb = a.get("pieces_mm"), b.get("pieces_mm")
+        if (None in (za0, za1, zb0, zb1)
+                or not isinstance(pa, list) or not isinstance(pb, list)
+                or len(pa) != len(pb)
+                or abs(za0 - zb0) > eps or abs(za1 - zb1) > eps):
+            return False
+        flat_a = [point for piece in pa for point in piece]
+        flat_b = [point for piece in pb for point in piece]
+        return _points_match(flat_a, flat_b, eps)
+    return False
+
+
+def _exact_body_side(
+        record: H.HullRecord, *, include_evidence: bool) -> dict[str, Any]:
+    evidence = _canonical_exact_hull(record.hull) if include_evidence else None
+    digest = None
+    if evidence is not None:
+        try:
+            digest = _evidence_digest(evidence)
+        except (TypeError, ValueError, OverflowError):
+            evidence = None
+    side = {
+        "subject_source_id": record.source_id,
+        "category": record.category,
+        "grade": record.grade,
+        "hull_source": record.hull_source,
+        "hull_evidence": evidence,
+        "hull_digest": digest,
+    }
+    if include_evidence:
+        assessment = H.assess_inner_hull(record)
+        certificate = assessment.certificate
+        side.update({
+            "body_source_digest": (
+                None if certificate is None
+                else certificate.body_source_digest),
+            "body_source_revision": (
+                None if certificate is None
+                else certificate.body_source_revision),
+            "certificate_digest": (
+                None if certificate is None
+                else certificate.certificate_digest),
+        })
+    return side
+
+
+def _exact_body_authority_reason(record: H.HullRecord) -> str | None:
+    """Require issued evidence that the advertised exact hull is the body."""
+
+    assessment = H.assess_inner_hull(record)
+    if assessment.status == "absent":
+        return "exact_body_authority_absent"
+    if assessment.status != "valid":
+        return f"exact_body_authority_invalid:{assessment.reason}"
+    certificate = assessment.certificate
+    if certificate is None or assessment.hull is None:
+        return "exact_body_authority_invalid"
+    try:
+        outer_digest = H.analytic_hull_digest(record.hull)
+        inner_digest = H.analytic_hull_digest(assessment.hull)
+    except ValueError:
+        return "exact_body_authority_geometry_unsupported"
+    if (inner_digest != outer_digest
+            or certificate.inner_digest != outer_digest
+            or certificate.outer_digest != outer_digest
+            or certificate.body_source_digest != outer_digest):
+        return "exact_body_authority_not_equal_to_hull"
+    return None
+
+
+def exact_body_equality_proof(
+        a: H.HullRecord, b: H.HullRecord, *,
+        eps: float = EXACT_BODY_EQUALITY_EPS_MM) -> dict[str, Any]:
+    """Issue sealed equality only when both hulls are the exact bodies.
+
+    ``grade=exact`` is the producer contract ``Hull == Body``.  Inner-overlap
+    evidence is deliberately irrelevant: two bodies can overlap without
+    being equal.  Ordinary production producers currently emit no exact
+    grade, so destructive duplicate advice remains unreachable there.
+    """
+
+    reason = None
+    if a.grade != "exact" or b.grade != "exact":
+        reason = "exact_body_contract_absent"
+    elif a.category != b.category:
+        reason = "category_mismatch"
+    else:
+        authority_a = _exact_body_authority_reason(a)
+        authority_b = _exact_body_authority_reason(b)
+        if authority_a is not None or authority_b is not None:
+            reason = ";".join(filter(None, (
+                None if authority_a is None else f"a:{authority_a}",
+                None if authority_b is None else f"b:{authority_b}",
+            )))
+    if reason is None and hulls_coincide(a, b, eps=eps) is not True:
+        reason = "exact_hulls_not_equal"
+    # Do not duplicate hull geometry into every ordinary finding.  Canonical
+    # body evidence is materialized only after the cheap exact/category/
+    # equality gates have all passed; current production (no exact producer)
+    # therefore pays only a small named not-proven packet.
+    side_a = _exact_body_side(a, include_evidence=reason is None)
+    side_b = _exact_body_side(b, include_evidence=reason is None)
+    if (reason is None
+            and (side_a["hull_evidence"] is None
+                 or side_b["hull_evidence"] is None)):
+        reason = "exact_hull_evidence_unavailable"
+    elif (reason is None and not _canonical_evidence_coincides(
+            side_a["hull_evidence"], side_b["hull_evidence"], eps=eps)):
+        reason = "canonical_exact_hulls_not_equal"
+    payload = {
+        "schema_version": EXACT_BODY_EQUALITY_SCHEMA,
+        "status": "proven" if reason is None else "not_proven",
+        "outcome": "equal" if reason is None else "unknown",
+        "reason": reason,
+        "comparison": "hulls_coincide/v1",
+        "tolerance_mm": G._norm_zero(float(eps)),
+        "subject_a": a.source_id,
+        "subject_b": b.source_id,
+        "a": side_a,
+        "b": side_b,
+    }
+    if reason is not None:
+        return payload
+    return H.seal_serialized_exact_body_equality_proof(
+        payload, authority=H._EXACT_BODY_EQUALITY_ISSUANCE_AUTHORITY)
+
+
+def verify_serialized_exact_body_equality_proof(
+        proof: Mapping[str, Any], *, subject_a: str, subject_b: str,
+        category_a: str, category_b: str) -> bool:
+    """Verify sealed exact-body equality from untrusted serialized data."""
+
+    if (not isinstance(proof, Mapping)
+            or not H.verify_serialized_exact_body_equality_integrity(
+                proof, payload_keys=_EXACT_BODY_EQUALITY_PAYLOAD_KEYS)):
+        return False
+    tolerance = _proof_number(proof.get("tolerance_mm"))
+    if (proof.get("schema_version") != EXACT_BODY_EQUALITY_SCHEMA
+            or proof.get("status") != "proven"
+            or proof.get("outcome") != "equal"
+            or proof.get("reason") is not None
+            or proof.get("comparison") != "hulls_coincide/v1"
+            or tolerance != EXACT_BODY_EQUALITY_EPS_MM
+            or proof.get("subject_a") != subject_a
+            or proof.get("subject_b") != subject_b
+            or category_a != category_b):
+        return False
+    for side_name, expected_subject, expected_category in (
+            ("a", subject_a, category_a), ("b", subject_b, category_b)):
+        side = proof.get(side_name)
+        if (not isinstance(side, Mapping)
+                or set(side) != (
+                    _EXACT_BODY_SIDE_KEYS | _EXACT_BODY_AUTHORITY_SIDE_KEYS)
+                or side.get("subject_source_id") != expected_subject
+                or side.get("category") != expected_category
+                or side.get("grade") != "exact"
+                or not isinstance(side.get("hull_source"), str)
+                or not side["hull_source"].strip()
+                or not isinstance(side.get("hull_evidence"), Mapping)
+                or not isinstance(side.get("hull_digest"), str)
+                or len(side["hull_digest"]) != 64
+                or not H._is_sha256_digest(side.get("body_source_digest"))
+                or not isinstance(side.get("body_source_revision"), str)
+                or not side["body_source_revision"].strip()
+                or not isinstance(side.get("certificate_digest"), str)
+                or len(side["certificate_digest"]) != 64):
+            return False
+        try:
+            digest = _evidence_digest(side["hull_evidence"])
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if digest != side["hull_digest"]:
+            return False
+    return _canonical_evidence_coincides(
+        proof["a"]["hull_evidence"], proof["b"]["hull_evidence"],
+        eps=tolerance)
+
+
 def pair_kind_of(a: H.HullRecord, b: H.HullRecord, *,
                  eps: float = DUPLICATE_EPS_MM) -> str:
     """Дубликат или обычное пересечение. Замер v19 нашёл две такие пары —
@@ -402,27 +878,33 @@ def pair_kind_of(a: H.HullRecord, b: H.HullRecord, *,
 
 
 def duplicate_claim_is_proven(finding: dict) -> bool:
-    """Доказан ли дубликат ГЕОМЕТРИЕЙ, а не совпадением габаритов.
+    """Whether the geometric duplicate claim has sealed body-equality proof.
 
-    Живёт здесь, а не в обзоре: род пары назначает детектор, ему и отвечать,
-    чем он это обосновал. Нового поля в находке нет намеренно — всё нужное в
-    ней уже лежит (`hull_grade` и `hull_source` обеих сторон), а лишний ключ
-    сдвинул бы канон у находок, которых правка не касается.
-
-    Доказательство есть ровно тогда, когда обе стороны построены ОДНИМ
-    источником тоньше бокса: тогда `hulls_coincide` сравнивал оси с осями либо
-    подошвы с подошвами и вернул `True` (иначе рода `coincident_duplicate` бы
-    не было). Пара, где хоть одна сторона — габаритный бокс, остаётся
-    дубликатом-подозрением: это лучшая догадка, доступная по боксу, но
-    указывать по ней удаление нельзя.
+    Public ``pair_kind``, grades and sources are labels, not authority.  Only
+    a process-local sealed proof issued from two ``grade=exact`` records can
+    return true.  Replayed/tampered JSON and evidence loaded after restart
+    fail closed.  Certified inner *overlap* never proves body equality.  This
+    predicate deliberately says nothing about semantic/dependency equivalence
+    and therefore cannot authorize deletion.
     """
+
     if finding.get("pair_kind") != "coincident_duplicate":
         return False
-    a = finding.get("a") or {}
-    b = finding.get("b") or {}
-    src = a.get("hull_source")
-    return (finding.get("hull_grade") in ("exact", "conservative")
-            and src is not None and src != "bbox" and src == b.get("hull_source"))
+    a = finding.get("a")
+    b = finding.get("b")
+    proof = finding.get("exact_body_equality_proof")
+    if (not isinstance(a, Mapping) or not isinstance(b, Mapping)
+            or not isinstance(proof, Mapping)):
+        return False
+    subject_a, subject_b = a.get("source_element_id"), b.get(
+        "source_element_id")
+    category_a, category_b = a.get("category"), b.get("category")
+    if not all(isinstance(value, str) for value in (
+            subject_a, subject_b, category_a, category_b)):
+        return False
+    return verify_serialized_exact_body_equality_proof(
+        proof, subject_a=subject_a, subject_b=subject_b,
+        category_a=category_a, category_b=category_b)
 
 
 def relation_of(sd: float, *, eps: float = EPS_NUMERIC_MM) -> str:
@@ -432,6 +914,69 @@ def relation_of(sd: float, *, eps: float = EPS_NUMERIC_MM) -> str:
     if sd <= eps:
         return "contact"
     return "separated"
+
+
+def certified_inner_overlap_proof(
+        a: H.HullRecord, b: H.HullRecord) -> PhysicalOverlapProof:
+    """Prove body overlap only through two validated ``Inner ⊆ Body`` hulls.
+
+    A rejected or absent inner witness is evidence about the proof boundary,
+    not a narrow-phase failure: the outer finding remains useful and is
+    downgraded to ``possible`` with the named reason serialized here.
+    """
+
+    aa = H.assess_inner_hull(a)
+    bb = H.assess_inner_hull(b)
+    if aa.status != "valid" or bb.status != "valid":
+        reasons = []
+        if aa.status != "valid":
+            reasons.append(f"a:{aa.reason}")
+        if bb.status != "valid":
+            reasons.append(f"b:{bb.reason}")
+        return PhysicalOverlapProof(
+            status="not_proven", basis=None,
+            reason=";".join(reasons) or "inner_evidence_unavailable",
+            subject_a=a.source_id, subject_b=b.source_id,
+            a=aa.as_dict(), b=bb.as_dict())
+
+    assert aa.hull is not None and bb.hull is not None
+    assert aa.certificate is not None and bb.certificate is not None
+    sd = G.signed_distance(aa.hull, bb.hull)
+    if not math.isfinite(sd):
+        return PhysicalOverlapProof(
+            status="not_proven", basis=None,
+            reason="inner_narrow_unsupported",
+            subject_a=a.source_id, subject_b=b.source_id,
+            a=aa.as_dict(), b=bb.as_dict())
+    relation = relation_of(sd)
+    depth = max(0.0, -sd)
+    # Certificate uncertainty can only make proof harder.  Tolerances are
+    # added rather than used as geometric slack, so no caller can buy a
+    # confirmation by widening one.
+    margin = (
+        float(aa.certificate.error_bound_mm)
+        + float(bb.certificate.error_bound_mm)
+        + float(aa.certificate.tolerance_mm)
+        + float(bb.certificate.tolerance_mm)
+        + EPS_NUMERIC_MM)
+    if relation == "overlap" and depth > margin:
+        return PhysicalOverlapProof(
+            status="confirmed", basis="certified_inner_overlap",
+            reason=None, subject_a=a.source_id, subject_b=b.source_id,
+            a=aa.as_dict(), b=bb.as_dict(),
+            inner_relation=relation, inner_signed_distance_mm=sd,
+            inner_overlap_depth_mm=depth, required_margin_mm=margin,
+            _authority=H._PAIR_PROOF_ISSUANCE_AUTHORITY)
+    reason = {
+        "contact": "certified_inners_touch_only",
+        "separated": "certified_inners_separated",
+    }.get(relation, "certified_inner_overlap_within_error_margin")
+    return PhysicalOverlapProof(
+        status="not_proven", basis=None, reason=reason,
+        subject_a=a.source_id, subject_b=b.source_id,
+        a=aa.as_dict(), b=bb.as_dict(), inner_relation=relation,
+        inner_signed_distance_mm=sd, inner_overlap_depth_mm=depth,
+        required_margin_mm=margin)
 
 
 def evaluate_with_reason(a: H.HullRecord, b: H.HullRecord, *,
@@ -446,6 +991,7 @@ def evaluate_with_reason(a: H.HullRecord, b: H.HullRecord, *,
     оболочек (overlap/contact/separated) — факт геометрии; `ranking_tol_mm`
     остался только для сортировки и UI.
     """
+    clearance_mm = _nonnegative_finite(clearance_mm, "clearance_mm")
     sd = G.signed_distance(a.hull, b.hull)
     if not math.isfinite(sd):
         return None, "narrow_unsupported"
@@ -456,9 +1002,12 @@ def evaluate_with_reason(a: H.HullRecord, b: H.HullRecord, *,
     clearance_violation = sd < clearance_mm - EPS_NUMERIC_MM
     if relation == "separated" and not clearance_violation:
         return None, None
-    verdict = "confirmed" if grade == "exact" else "possible"
     ends = sorted((a, b), key=lambda r: r.source_id)
     lo, hi = ends[0], ends[1]
+    physical_proof = certified_inner_overlap_proof(lo, hi)
+    equality_proof = exact_body_equality_proof(lo, hi)
+    verdict = ("confirmed" if physical_proof.status == "confirmed"
+               else "possible")
     # Перенос не публикуется у грубых пар: направление выхода из габаритного
     # бокса ничего не доказывает про тело.
     vec, why = None, None
@@ -496,6 +1045,8 @@ def evaluate_with_reason(a: H.HullRecord, b: H.HullRecord, *,
         ranking_tol_mm=tol, ranking_significant=(sd < -tol or deficit > tol),
         hull_grade=grade, pair_kind=pair_kind_of(lo, hi),
         hull_relation=relation, verdict=verdict,
+        physical_overlap_proof=physical_proof,
+        exact_body_equality_proof=equality_proof,
         certified_separating_translation_mm=vec,
         translation_unavailable_reason=why), None
 
@@ -509,42 +1060,110 @@ def evaluate(a: H.HullRecord, b: H.HullRecord, *, clearance_mm: float = 0.0
 
 #: Единственные допустимые фильтры пар и их имена в каноне (ревью №13).
 _SCOPE_BY_FILTER = {
-    "mvp_pair_filter": "mvp_v2",
-    "any_physical_pair_filter": "all_physical_diagnostic",
+    mvp_pair_filter: "mvp_v2",
+    any_physical_pair_filter: "all_physical_diagnostic",
+    # Область сводной названа здесь, а не подставлена на месте вызова: отчёт,
+    # не умеющий назвать свой охват, утверждает больше, чем искал.
+    cross_model_pair_filter: "cross_model_federation",
+}
+
+#: Фильтры, чей вердикт зависит ТОЛЬКО от класса записи `(label, mvp_side)`.
+#: Ровно для них законно сокращение `pairs_in_scope` по представителям
+#: классов (см. `detect`). Список — предусловие, а не украшение: фильтр,
+#: решающий по чему-то ещё (например по имени модели в `source_id`), обязан
+#: здесь ОТСУТСТВОВАТЬ, иначе агрегат вернёт правдоподобное неверное число.
+_CLASS_DETERMINED_FILTERS = frozenset({mvp_pair_filter, any_physical_pair_filter})
+
+_GEOMETRY_SCOPE_BY_QUERY = {
+    "mvp_v2": "mvp",
+    "all_physical_diagnostic": "all_eligible",
+    "cross_model_federation": "all_eligible",
 }
 
 
 def scope_id_of(pair_filter) -> str:
     name = getattr(pair_filter, "__name__", "")
-    scope = _SCOPE_BY_FILTER.get(name)
+    # Function names are labels, not capability identity.  A different
+    # callable can freely advertise ``__name__ = 'mvp_pair_filter'`` while
+    # dropping every pair, yielding a green completeness report over an empty
+    # search.  Only the two canonical function objects own these scopes.
+    scope = _SCOPE_BY_FILTER.get(pair_filter)
     if scope is None:
         raise ValueError(
             f"неизвестный фильтр пар {name!r}: область поиска обязана "
-            f"называться в каноне (ревью №13). Допустимо: {sorted(_SCOPE_BY_FILTER)}")
+            "называться в каноне (ревью №13). Допустимо: "
+            f"{sorted(fn.__name__ for fn in _SCOPE_BY_FILTER)}")
     return scope
 
 
-def completeness_of(snapshot: ClashGeometrySnapshot) -> dict:
-    """Полон ли поиск ПО ПОСТРОЕНИЮ (R5 красных).
+def completeness_of(
+        snapshot: ClashGeometrySnapshot, *, scope_id: str = "mvp_v2",
+        candidate_pairs: int | None = None,
+        narrow_evaluations: int | None = None,
+        narrow_refusals: dict[str, int] | None = None) -> dict:
+    """Independent completeness vector for one declared clash query.
 
-    Элемент стороны MVP без оболочки — не строка переписи, а дыра в поиске:
-    стена, которой нет, гарантированно пропустит всё, что сквозь неё проходит.
-    На фасаде v14 таких 783 (15.66 %), и отчёт при этом выглядел исправным.
+    A single boolean used to mean only "no missing MVP hulls".  It therefore
+    stayed green when most of the host document was outside extraction, when
+    linked geometry was not federated, and when the narrow phase refused a
+    candidate.  The four axes below are independent evidence.  The legacy
+    ``complete`` bit remains for readers that cannot consume the vector, but
+    it is now the conservative AND of every axis and can never hide a gap.
 
-    Полнота публикуется УТВЕРЖДЕНИЕМ в обе стороны: «полон» — тоже факт,
-    который надо сказать, иначе молчание читается как успех.
+    Without execution counters ``query_scope`` asserts only that the scope is
+    canonical and named.  ``detect`` calls this again after the narrow phase,
+    proving in the serialized report that every candidate was adjudicated.
     """
+    geometry_scope = _GEOMETRY_SCOPE_BY_QUERY.get(scope_id)
+    if geometry_scope is None:
+        raise ValueError(
+            f"unknown clash scope {scope_id!r}; expected one of "
+            f"{sorted(_GEOMETRY_SCOPE_BY_QUERY)}")
+
     c = snapshot.census
+    axes = snapshot.coverage_axes(geometry_scope=geometry_scope)
+    refusals = dict(sorted((narrow_refusals or {}).items()))
+    refused_pairs = sum(refusals.values())
+    executed = candidate_pairs is not None or narrow_evaluations is not None
+    candidates = 0 if candidate_pairs is None else candidate_pairs
+    evaluations = 0 if narrow_evaluations is None else narrow_evaluations
+    query_complete = (not executed or (
+        candidates == evaluations and refused_pairs == 0))
+    axes["query_scope"] = {
+        "complete": query_complete,
+        "scope_id": scope_id,
+        "scope_definition": SCOPES[scope_id],
+        "declared": True,
+        "evaluation_status": (
+            "not_run" if not executed else
+            "complete" if query_complete else "incomplete"),
+        "candidate_pairs": candidates if executed else None,
+        "narrow_evaluations": evaluations if executed else None,
+        "narrow_refusals": refusals,
+        "refused_pairs": refused_pairs,
+        "note": (
+            "complete means the query boundary is canonical and every "
+            "broad-phase candidate was adjudicated without a narrow-phase "
+            "refusal"),
+    }
+
+    incomplete_axes = sorted(
+        name for name, axis in axes.items() if not axis["complete"])
     without = sum(c.no_hull_mvp_side.values())
     return {
-        "complete": without == 0,
+        "schema_version": "clash-completeness/1",
+        "complete": not incomplete_axes,
+        "incomplete_axes": incomplete_axes,
+        "axes": axes,
+        # Backward-compatible MVP diagnostics.  They are not the full proof;
+        # new callers must inspect ``axes``.
         "without_hull_on_mvp_side": without,
         "by_side": {side: c.no_hull_mvp_side.get(side, 0)
                     for side in ("mep", "struct")},
         "by_category": dict(sorted(c.no_hull_by_category.items())),
-        "note": ("элемент стороны MVP без оболочки не участвует в поиске: "
-                 "любой клеш через него пропущен ПО ПОСТРОЕНИЮ, а не по "
-                 "порогу (R5 красных)."),
+        "note": (
+            "legacy complete is the conservative AND of extraction, "
+            "federation, query_scope and geometry; inspect axes for causes"),
     }
 
 
@@ -561,14 +1180,14 @@ def detect(snapshot: ClashGeometrySnapshot, *, clearance_mm: float = 0.0,
     неполноту громко, но работу не останавливает — иначе сегодняшний фасад
     вообще перестал бы считаться, а вместе с ним и диагностика.
     """
+    clearance_mm = _nonnegative_finite(clearance_mm, "clearance_mm")
     scope = scope_id_of(pair_filter)
     snapshot.validate()
-    completeness = completeness_of(snapshot)
-    if require_complete and not completeness["complete"]:
+    preflight_completeness = completeness_of(snapshot, scope_id=scope)
+    if require_complete and not preflight_completeness["complete"]:
         raise SnapshotIntegrityError(
-            f"поиск неполон по построению: без оболочки "
-            f"{completeness['without_hull_on_mvp_side']} элементов стороны MVP "
-            f"({completeness['by_category']})")
+            "поиск неполон по построению; неполные оси: "
+            f"{preflight_completeness['incomplete_axes']}")
     t0 = time.perf_counter()
     records = snapshot.records
     grid = build_grid(records, cell_mm, slack=clearance_mm)
@@ -587,6 +1206,13 @@ def detect(snapshot: ClashGeometrySnapshot, *, clearance_mm: float = 0.0,
             narrow_refusals[why] = narrow_refusals.get(why, 0) + 1
     t_narrow = time.perf_counter()
     findings.sort(key=lambda f: (f.finding_id, f.pair_class))
+    completeness = completeness_of(
+        snapshot, scope_id=scope, candidate_pairs=len(cands),
+        narrow_evaluations=len(cands), narrow_refusals=narrow_refusals)
+    if require_complete and not completeness["complete"]:
+        raise SnapshotIntegrityError(
+            "поиск неполон после узкой фазы; неполные оси: "
+            f"{completeness['incomplete_axes']}")
 
     # pairs_in_scope агрегатом по классам, НЕ полным перебором: замер
     # приёмки 28.07 — на демо-башне (90 758 элементов, ~50k оболочек)
@@ -594,6 +1220,18 @@ def detect(snapshot: ClashGeometrySnapshot, *, clearance_mm: float = 0.0,
     # ответа за 570 с. Оба фильтра детерминированы классом записи
     # (label/mvp_side) — контракт закреплён тестом против полного
     # перебора; счётчик тот же самый, число в отчёте не меняется.
+    #
+    # 🔴 У СОКРАЩЕНИЯ ЕСТЬ ПРЕДУСЛОВИЕ, И ОНО ТЕПЕРЬ ОБЪЯВЛЕНО (14.08.2026).
+    # Сокращение спрашивает фильтр про ПРЕДСТАВИТЕЛЯ класса, а не про пару
+    # записей, и законно ровно для фильтров, чей вердикт зависит только от
+    # `(label, mvp_side)`. `cross_model_pair_filter` решает по ИМЕНИ МОДЕЛИ в
+    # `source_id`; представители обеих сторон приходят из того разбора, что
+    # оказался первым, — и агрегат честно отвечал НОЛЬ рядом с 58 280
+    # находками и 59 937 рассмотренными парами. Ноль, рождённый нарушенным
+    # предусловием, неотличим от честного нуля: тот самый молчаливо-неверный
+    # результат, против которого построен весь детектор. Поэтому фильтр, не
+    # объявленный классовым, получает `None` и НАЗВАННУЮ причину вместо
+    # числа — читатель обязан увидеть «не считалось», а не «нисколько».
     class_counts: dict = {}
     class_rep: dict = {}
     for r in records:
@@ -601,17 +1239,25 @@ def detect(snapshot: ClashGeometrySnapshot, *, clearance_mm: float = 0.0,
         class_counts[key] = class_counts.get(key, 0) + 1
         class_rep.setdefault(key, r)
     class_keys = sorted(class_counts)
-    eligible_pairs = 0
-    for i, ka in enumerate(class_keys):
-        for kb in class_keys[i:]:
-            if pair_filter is not None and not pair_filter(
-                    class_rep[ka], class_rep[kb]):
-                continue
-            if ka == kb:
-                n = class_counts[ka]
-                eligible_pairs += n * (n - 1) // 2
-            else:
-                eligible_pairs += class_counts[ka] * class_counts[kb]
+    eligible_pairs: int | None = 0
+    eligible_reason: str | None = None
+    if pair_filter is not None and pair_filter not in _CLASS_DETERMINED_FILTERS:
+        eligible_pairs = None
+        eligible_reason = (
+            f"агрегат по классам неприменим к {getattr(pair_filter, '__name__', '?')}: "
+            "его вердикт зависит не только от (label, mvp_side), а полный "
+            "перебор пар на этих объёмах не считается")
+    else:
+        for i, ka in enumerate(class_keys):
+            for kb in class_keys[i:]:
+                if pair_filter is not None and not pair_filter(
+                        class_rep[ka], class_rep[kb]):
+                    continue
+                if ka == kb:
+                    n = class_counts[ka]
+                    eligible_pairs += n * (n - 1) // 2
+                else:
+                    eligible_pairs += class_counts[ka] * class_counts[kb]
     return {
         "schema_version": REPORT_SCHEMA,
         "origin": snapshot.origin,
@@ -667,21 +1313,24 @@ def detect(snapshot: ClashGeometrySnapshot, *, clearance_mm: float = 0.0,
             "МЕЖРАЗДЕЛЬНЫЙ клеш на этом корпусе НЕ ИЗМЕРЕН: для него нужны "
             "связанные модели, а их элементы оболочек не получают "
             "(`census.linked_elements_unscored`).",
-        ],
+        # ПРИЧИНА ЕДЕТ В `notes`, А НЕ ОТДЕЛЬНЫМ КЛЮЧОМ: `search` входит в
+        # канонический отчёт, и новый ключ сдвинул бы эталон у всех читателей
+        # ради поля, которое почти всегда пусто. Пустой причины не бывает
+        # видно — список остаётся байт в байт прежним.
+        ] + ([eligible_reason] if eligible_reason else []),
     }
 
 
 
-#: Почему вердикт недостижим. `confirmed` читается ТОЛЬКО из грейда `exact`
-#: (см. `evaluate_with_reason`), а `exact` не выдаёт ни один источник оболочки
-#: — значит недостижим и он. Это не «пока не встречалось»: это следствие
-#: таблицы `hulls.GRADE_BY_SOURCE`, и оно пересчитывается, а не помнится.
-UNREACHABLE_VERDICT_REASONS: dict[str, str] = {
+#: `confirmed` is structurally reachable through the dual certificate
+#: contract, while automatic production extraction of inner hulls is still a
+#: named gap.  This distinction matters: the word exists and is executable,
+#: but ordinary outer-only snapshots continue to produce zero confirmations.
+VERDICT_REQUIREMENTS: dict[str, str] = {
     "confirmed": (
-        "вердикт выдаётся только при `pair_grade == \"exact\"`, а грейд "
-        "`exact` недостижим (`hulls.grade_reachability`). Пока оболочка не "
-        "равна телу, обвинение в проникании ТЕЛ подписать нечем."
-    ),
+        "requires positive-volume overlap of two validated certified inner "
+        "subsets (`physical_overlap_proof.basis=certified_inner_overlap`); "
+        "production builders do not mint inner certificates yet"),
 }
 
 #: Отношения, достижимые не всегда. `separated` попадает в находку только
@@ -702,12 +1351,10 @@ def vocabulary_audit(*, clearance_mm: float = 0.0) -> dict:
     отличить от невозможности, — это не факт, а украшение.
     """
     grades = H.grade_reachability()
-    verdicts = {}
-    for v in VERDICTS:
-        reachable = grades["exact"]["reachable"] if v == "confirmed" else True
-        verdicts[v] = {"reachable": reachable,
-                       "reason": "" if reachable
-                       else UNREACHABLE_VERDICT_REASONS.get(v, "")}
+    verdicts = {
+        v: {"reachable": True, "reason": VERDICT_REQUIREMENTS.get(v, "")}
+        for v in VERDICTS
+    }
     relations = {}
     for r in HULL_RELATIONS:
         cond = CONDITIONAL_RELATIONS.get(r)
@@ -913,12 +1560,37 @@ def to_markdown(report: dict) -> str:
     comp = (report["search"].get("completeness") or {})
     cov = (report["census"].get("mvp_side_coverage") or {})
     if comp and not comp.get("complete", True):
+        axes = comp.get("axes") or {}
+        gaps = []
+        extraction = axes.get("extraction") or {}
+        federation = axes.get("federation") or {}
+        geometry = axes.get("geometry") or {}
+        query = axes.get("query_scope") or {}
+        if not extraction.get("complete", True):
+            gaps.append(
+                f"extraction: вне L0 {extraction.get('outside_extraction_scope', 0)}")
+        if not federation.get("complete", True):
+            gaps.append(
+                "federation: linked без геометрии "
+                f"{federation.get('linked_elements_unscored', 0)}")
+        if not geometry.get("complete", True):
+            gaps.append(
+                f"geometry: без оболочки {geometry.get('without_hull', 0)}, "
+                f"вырожденных {geometry.get('degenerate_hulls', 0)}")
+        if not query.get("complete", True):
+            gaps.append(
+                f"query_scope: отказано пар {query.get('refused_pairs', 0)}")
+        # Old reports did not contain axes.  Preserve a useful explanation
+        # for them without letting the legacy MVP counter explain new gaps.
+        if not gaps:
+            gaps.append(
+                "geometry: без оболочки MVP "
+                f"{comp.get('without_hull_on_mvp_side', 0)}")
         out += [
-            f"> **ПОИСК НЕПОЛОН ПО ПОСТРОЕНИЮ.** Без оболочки остались "
-            f"{comp['without_hull_on_mvp_side']} элементов стороны MVP "
-            f"({', '.join(f'{k}: {v}' for k, v in comp['by_category'].items())}). "
-            f"Любой клеш через них пропущен не по порогу, а потому что их нет "
-            f"в поиске. Список находок ниже читать как НИЖНЮЮ оценку.",
+            "> **ПОИСК НЕПОЛОН ПО ПОСТРОЕНИЮ.** "
+            + "; ".join(gaps) + ". Неполнота относится к доказанности "
+            "области поиска, а не к порогу. Список находок ниже читать как "
+            "НИЖНЮЮ оценку.",
             "",
         ]
     if cov:

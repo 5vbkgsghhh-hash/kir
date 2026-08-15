@@ -13,9 +13,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import math
+import secrets
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from kukai.clash import decompose as D
 from kukai.clash import geom as G
@@ -134,6 +138,24 @@ SOURCES_PRISM = ("prism", "bbox")
 #: Оба входа лежат вне этого модуля (`kukai/ir/**`), поэтому запись здесь —
 #: не задача, а условие приёмки: день, когда данные придут, обязан стоить одну
 #: правку в `KIND_TABLE` и один прогон ворот, а не проектирование заново.
+#: ГРАНИЦА ПОЛОСЫ, названная числом. Полоса допущена 14.08 ровно для стены,
+#: КОТОРУЮ ОБЪЯВИЛА ПРОГРАММА, и ровно потому, что у неё нет габарита: выбор
+#: там «полоса против ничего». Для стены, разобранной из модели, отказ ниже
+#: остаётся в силе целиком, и разводит эти два случая не намерение, а ДАННЫЕ:
+#: ключ `prism` пишет одно место (`clash_bundle`, авторский путь), а весь
+#: корпус его не несёт.
+WALL_BAND_SCOPE: dict[str, object] = {
+    "admitted_for": "стена, объявленная программой (есть `prism`, нет bbox)",
+    "still_refused_for": "стена, разобранная из модели (есть bbox, нет `prism`)",
+    "measured_on": "2026-08-14",
+    "declared_wall_bodies_before": 0,
+    "declared_wall_bodies_after": 1,
+    "not_promised": (
+        "полоса содержит стену КАК ОБЪЯВЛЕНО, а не тело, которое Revit "
+        "построит после переноса: стыки выносят материал за ось до 250 мм, "
+        "93 стены из 800 шире собственной WallType.Width до 2854 мм"),
+}
+
 WALL_BAND_REFUSAL: dict[str, object] = {
     "measured_on": "2026-08-11",
     "walls_total": 220871,
@@ -282,15 +304,36 @@ class KindRule:
 #: `kind_outside_table`, а не тихий пропуск.
 KIND_TABLE: dict[str, KindRule] = {
     # ── несущее и ограждающее (сторона struct пар MVP)
-    # Стена — только габарит, и это ЗАМЕРЕННЫЙ отказ, а не недоделка.
-    # Разложение по классам, знаменатель 220 871 стена и список того, что
-    # ворота откроет, — в `WALL_BAND_REFUSAL` и в записи над ним. Коротко:
-    # 55.9 % стен полоса не уточняет по построению, 39.3 % диагональных
-    # противоречат сами себе до 587.6 мм, 17.5 % осевыровненных выносят тело
-    # за ось до 250 мм, а габаритные ворота не способны проверить полосу В
-    # ПРИНЦИПЕ. Стена при этом НЕ выпадает из поиска: она в нём коробкой
-    # (замер: 691 оболочка из 695 на `sob62_r23_v5`, вырожденных ноль).
-    "OST_Walls": KindRule(True, "struct", "wall", sources=SOURCES_BBOX),
+    # Стена: СНАЧАЛА полоса, потом габарит. Порядок здесь и есть весь смысл.
+    #
+    # Разобранная из модели стена габарит НЕСЁТ и ключа `prism` не имеет
+    # (`el["prism"]` пишет ровно одно место — `clash_bundle`, авторский путь),
+    # поэтому для всего корпуса `_prism_record` выходит на первой строке и
+    # правило работает как прежде: коробкой. Замеренный отказ полосы
+    # (`WALL_BAND_REFUSAL`, 220 871 стена) касается ИМЕННО этого случая и
+    # остаётся в силе — там полоса спорит с настоящим телом и проигрывает.
+    #
+    # ОБЪЯВЛЕННАЯ стена — другой случай, и прежняя строка его не различала.
+    # У неё габарита нет ВООБЩЕ: программа знает ось, толщину типа и высоту,
+    # но не знает, что из этого построит Revit. Замер 14.08 на стене
+    # «Типовой - 200мм» (полный `prism`: width 200, uniform, blockers пуст):
+    #
+    #     sources=('bbox',)   тел 0, отказ «нет ни контура, ни сечения,
+    #                         ни габаритного бокса»
+    #     sources=('prism',)  тело 1, grade=conservative, источник prism
+    #
+    # То есть выбор здесь не «полоса против габарита», а ПОЛОСА ПРОТИВ НИЧЕГО,
+    # и все шесть пунктов отказа сравнивают полосу с телом, которого у ещё не
+    # построенной стены не существует.
+    #
+    # ЧЕГО ЭТА СТРОКА НЕ ОБЕЩАЕТ, И ЭТО ЧИТАТЬ ВМЕСТЕ С ТЕМ, ЧТО ОНА ДАЁТ.
+    # Полоса содержит стену КАК ОНА ОБЪЯВЛЕНА. Она не содержит тело, которое
+    # Revit построит ПОСЛЕ переноса: стыки выносят материал за ось до 250 мм, а
+    # 93 стены из 800 шире собственной `WallType.Width` вплоть до 2854 мм
+    # (пункты 3–4 записи ниже). Поэтому клеш ЗАЯВЛЕННОГО есть клеш ЗАМЫСЛА, и
+    # переносом он не наследуется: после переноса стену меряет L0 настоящим
+    # габаритом. Граница названа, а не спрятана — `WALL_BAND_SCOPE`.
+    "OST_Walls": KindRule(True, "struct", "wall", sources=SOURCES_PRISM),
     "OST_Floors": KindRule(True, "struct", "floor", sources=SOURCES_SKETCH),
     "OST_StructuralColumns": KindRule(True, "struct", "column", sources=SOURCES_BBOX),
     "OST_Columns": KindRule(True, "struct", "column", sources=SOURCES_BBOX),
@@ -460,6 +503,665 @@ def hull_degeneracy(hull: "G.Hull") -> str:
     zero = sum(1 for k in range(3) if hi[k] - lo[k] <= 0.0)
     return {0: "ok", 1: "aabb_plane", 2: "aabb_line", 3: "aabb_point"}[zero]
 
+INNER_CERTIFICATE_SCHEMA = "kir-certified-inner/2"
+
+# A certificate is authority, not a bag of plausible strings.  The registry
+# binds an issuer to the one proof rule it is allowed to assert.  The only
+# issuer in this first vertical slice is deliberately a fixture producer: it
+# must be handed an explicit analytic body and proves
+# ``Inner ⊆ Body ⊆ Outer`` before minting anything.  Production Revit
+# builders remain outer-only until they have an equally explicit body source.
+ANALYTIC_TEST_INNER_ISSUER = "kir.clash.analytic-test-body/v1"
+ANALYTIC_SUBSET_PROOF_KIND = "analytic-inner-subset/v1"
+ANALYTIC_BODY_PROVENANCE = "explicit-analytic-body/v1"
+INNER_CERTIFICATE_ISSUER_REGISTRY = {
+    ANALYTIC_TEST_INNER_ISSUER: frozenset({ANALYTIC_SUBSET_PROOF_KIND}),
+}
+INNER_CERTIFICATE_PROVENANCE = frozenset({ANALYTIC_BODY_PROVENANCE})
+
+# Process-local issuance authority.  A JSON mapping, dataclass constructor or
+# deserialiser cannot obtain it.  This is an internal proof-capability marker,
+# not a claim that Python can sandbox malicious code already running inside
+# this module's process.
+_INNER_CERTIFICATE_AUTHORITY = object()
+_PAIR_PROOF_ISSUANCE_AUTHORITY = object()
+_EXACT_BODY_EQUALITY_ISSUANCE_AUTHORITY = object()
+
+# Serialized proof data crosses a trust boundary: unlike the in-memory
+# authority marker above, a JSON client can copy every public field and
+# recompute an ordinary SHA-256 content digest.  A per-process HMAC key seals
+# the audit payload after a trusted producer has checked it.  This protects
+# consumers from forged/tampered *serialized data*; it is deliberately not a
+# Python sandbox for code already executing in this process.  The key is not
+# persisted, so evidence loaded after a process restart fails closed.  That is
+# the intended boundary for the current in-process/test-only producer.
+_PROCESS_LOCAL_PROOF_KEY = secrets.token_bytes(32)
+_INNER_CERTIFICATE_TAG_DOMAIN = b"kir-certified-inner-integrity/v1\x00"
+_PAIR_PROOF_TAG_DOMAIN = b"kir-certified-inner-pair-integrity/v1\x00"
+_EXACT_BODY_EQUALITY_TAG_DOMAIN = b"kir-exact-body-equality-integrity/v1\x00"
+
+
+def _safe_certificate_value(certificate: object, name: str) -> Any:
+    """Read even a deliberately malformed ``object.__new__`` fixture safely."""
+
+    try:
+        return getattr(certificate, name)
+    except (AttributeError, TypeError):
+        return None
+
+
+def _sha256_json(payload: object) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_json_bytes(payload: object) -> bytes:
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        allow_nan=False).encode("utf-8")
+
+
+def _process_local_integrity_tag(domain: bytes, payload: object) -> str:
+    """Seal canonical data for an in-process proof consumer.
+
+    This helper is private by design.  Its secrecy boundary is the random key,
+    not the Python function name: arbitrary code in this process is trusted,
+    while arbitrary serialized mappings are not.
+    """
+
+    return hmac.new(
+        _PROCESS_LOCAL_PROOF_KEY, domain + _canonical_json_bytes(payload),
+        hashlib.sha256).hexdigest()
+
+
+def _verify_process_local_integrity_tag(
+        domain: bytes, payload: object, tag: object) -> bool:
+    if not _is_sha256_digest(tag):
+        return False
+    try:
+        expected = _process_local_integrity_tag(domain, payload)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return hmac.compare_digest(expected, tag)
+
+
+def seal_serialized_pair_proof(
+        payload: Mapping[str, Any], *, authority: object
+        ) -> dict[str, Any]:
+    """Attach audit digest + process-local integrity to one pair payload.
+
+    Only ``detect.PhysicalOverlapProof.as_dict`` calls this.  The digest is
+    public and reproducible; the integrity tag is the trust boundary.  They
+    stay separate so tooling can address identical content without mistaking
+    that address for authority.
+    """
+
+    if authority is not _PAIR_PROOF_ISSUANCE_AUTHORITY:
+        raise PermissionError("pair proof must be issued by the narrow kernel")
+    canonical = dict(payload)
+    proof_digest = _sha256_json(canonical)
+    sealed = {**canonical, "proof_digest": proof_digest}
+    return {
+        **sealed,
+        "pair_integrity_tag": _process_local_integrity_tag(
+            _PAIR_PROOF_TAG_DOMAIN, sealed),
+    }
+
+
+def verify_serialized_pair_proof_integrity(
+        proof: Mapping[str, Any], *, payload_keys: frozenset[str]) -> bool:
+    """Verify exactly one canonical pair payload, fail-closed.
+
+    Semantic checks (schema, subjects, geometry relation and certificates)
+    belong to ``detect.verify_serialized_physical_overlap_proof``.  This
+    narrow primitive only proves that the complete mapping named by
+    ``payload_keys`` is byte-for-byte the one sealed in this process.
+    """
+
+    expected_keys = payload_keys | {"proof_digest", "pair_integrity_tag"}
+    if set(proof) != expected_keys:
+        return False
+    payload = {key: proof[key] for key in payload_keys}
+    try:
+        digest = _sha256_json(payload)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (not _is_sha256_digest(proof.get("proof_digest"))
+            or not hmac.compare_digest(digest, proof["proof_digest"])):
+        return False
+    sealed = {**payload, "proof_digest": proof["proof_digest"]}
+    return _verify_process_local_integrity_tag(
+        _PAIR_PROOF_TAG_DOMAIN, sealed, proof.get("pair_integrity_tag"))
+
+
+def seal_serialized_exact_body_equality_proof(
+        payload: Mapping[str, Any], *, authority: object
+        ) -> dict[str, Any]:
+    """Seal an exact-body equality assertion under its own HMAC domain."""
+
+    if authority is not _EXACT_BODY_EQUALITY_ISSUANCE_AUTHORITY:
+        raise PermissionError(
+            "exact-body proof must be issued by the equality kernel")
+    canonical = dict(payload)
+    proof_digest = _sha256_json(canonical)
+    sealed = {**canonical, "proof_digest": proof_digest}
+    return {
+        **sealed,
+        "equality_integrity_tag": _process_local_integrity_tag(
+            _EXACT_BODY_EQUALITY_TAG_DOMAIN, sealed),
+    }
+
+
+def verify_serialized_exact_body_equality_integrity(
+        proof: Mapping[str, Any], *, payload_keys: frozenset[str]) -> bool:
+    """Verify exact-body proof content + process-local authority.
+
+    The process-local key is intentionally lost on restart.  Persisted proof
+    JSON therefore becomes non-authoritative instead of being silently
+    upgraded from its publicly reproducible SHA-256 digest.
+    """
+
+    expected_keys = payload_keys | {"proof_digest", "equality_integrity_tag"}
+    if set(proof) != expected_keys:
+        return False
+    payload = {key: proof[key] for key in payload_keys}
+    try:
+        digest = _sha256_json(payload)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (not _is_sha256_digest(proof.get("proof_digest"))
+            or not hmac.compare_digest(digest, proof["proof_digest"])):
+        return False
+    sealed = {**payload, "proof_digest": proof["proof_digest"]}
+    return _verify_process_local_integrity_tag(
+        _EXACT_BODY_EQUALITY_TAG_DOMAIN, sealed,
+        proof.get("equality_integrity_tag"))
+
+
+def _canonical_analytic_hull(hull: G.Hull) -> dict[str, Any]:
+    """Canonical source material for the supported analytic proof kernel."""
+
+    if _analytic_vertices(hull) is None:
+        raise ValueError("analytic_hull_invalid_or_unsupported")
+    if isinstance(hull, G.Aabb):
+        return {
+            "type": "Aabb",
+            "lo": [G._norm_zero(float(value)) for value in hull.lo],
+            "hi": [G._norm_zero(float(value)) for value in hull.hi],
+        }
+    if isinstance(hull, G.Prism):
+        return {
+            "type": "Prism",
+            "footprint": [[G._norm_zero(float(x)), G._norm_zero(float(y))]
+                          for x, y in hull.footprint],
+            "z0": G._norm_zero(float(hull.z0)),
+            "z1": G._norm_zero(float(hull.z1)),
+        }
+    # `_analytic_vertices` and the two branches above are one closed table.
+    raise ValueError("analytic_hull_type_unsupported")
+
+
+def analytic_hull_digest(hull: G.Hull) -> str:
+    """Content digest used to bind a certificate to explicit body evidence."""
+
+    return _sha256_json(_canonical_analytic_hull(hull))
+
+
+def _certificate_payload(*, issuer: str, proof_kind: str, provenance: str,
+                         revision: str, subject_source_id: str,
+                         body_source_digest: str,
+                         body_source_revision: str, inner_digest: str,
+                         outer_digest: str, error_bound_mm: float,
+                         tolerance_mm: float) -> dict[str, Any]:
+    return {
+        "schema_version": INNER_CERTIFICATE_SCHEMA,
+        "issuer": issuer,
+        "proof_kind": proof_kind,
+        "provenance": provenance,
+        "revision": revision,
+        "subject_source_id": subject_source_id,
+        "body_source_digest": body_source_digest,
+        "body_source_revision": body_source_revision,
+        "inner_digest": inner_digest,
+        "outer_digest": outer_digest,
+        "error_bound_mm": G._norm_zero(float(error_bound_mm)),
+        "tolerance_mm": G._norm_zero(float(tolerance_mm)),
+    }
+
+
+@dataclass(frozen=True, init=False)
+class InnerHullCertificate:
+    """Opaque authority carried by an analytic ``Inner ⊆ Body`` witness.
+
+    Direct construction is forbidden.  The public fields are an audit trail;
+    they are not independently authoritative.  Only a registered producer may
+    attach the process-local issuance marker after checking its proof rule.
+
+    ``error_bound_mm`` is the producer's maximum geometric error and
+    ``tolerance_mm`` the maximum accepted error.  Both only make confirmation
+    harder: the detector requires penetration deeper than their combined sum.
+    """
+
+    issuer: str
+    proof_kind: str
+    provenance: str
+    revision: str
+    subject_source_id: str
+    body_source_digest: str
+    body_source_revision: str
+    inner_digest: str
+    outer_digest: str
+    error_bound_mm: float
+    tolerance_mm: float
+    certificate_digest: str
+    integrity_tag: str
+    schema_version: str
+    _authority: object = field(repr=False, compare=False)
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError(
+            "InnerHullCertificate is opaque; use a registered issuer")
+
+    def as_dict(self) -> dict[str, Any]:
+        def string_or_none(name: str) -> str | None:
+            value = _safe_certificate_value(self, name)
+            return value if isinstance(value, str) else None
+
+        error = _safe_certificate_value(self, "error_bound_mm")
+        tolerance = _safe_certificate_value(self, "tolerance_mm")
+        return {
+            "schema_version": string_or_none("schema_version"),
+            "issuer": string_or_none("issuer"),
+            "proof_kind": string_or_none("proof_kind"),
+            "provenance": string_or_none("provenance"),
+            "revision": string_or_none("revision"),
+            "subject_source_id": string_or_none("subject_source_id"),
+            "body_source_digest": string_or_none("body_source_digest"),
+            "body_source_revision": string_or_none("body_source_revision"),
+            "inner_digest": string_or_none("inner_digest"),
+            "outer_digest": string_or_none("outer_digest"),
+            "error_bound_mm": float(error) if G._finite(error) else None,
+            "tolerance_mm": (float(tolerance)
+                             if G._finite(tolerance) else None),
+            "certificate_digest": string_or_none("certificate_digest"),
+            "integrity_tag": string_or_none("integrity_tag"),
+        }
+
+
+@dataclass(frozen=True)
+class CertifiedInnerHull:
+    """Optional analytic ``Inner ⊆ Body`` witness.
+
+    ``certificate`` is optional in the Python type on purpose: it makes the
+    malformed state representable and therefore testable.  Validation names
+    ``inner_certificate_missing`` and downgrades to ``possible``; it never
+    infers a certificate from the hull type or from an outer grade.
+    """
+
+    hull: G.Hull
+    certificate: InnerHullCertificate | None
+
+
+@dataclass(frozen=True)
+class InnerHullAssessment:
+    status: str                    # absent | valid | rejected
+    reason: str | None
+    hull: G.Hull | None = field(default=None, repr=False)
+    certificate: InnerHullCertificate | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "certificate": (
+                None if self.certificate is None
+                else self.certificate.as_dict()),
+            "hull_type": None if self.hull is None else type(self.hull).__name__,
+        }
+
+
+def _analytic_vertices(hull: G.Hull) -> tuple[G.Pt3, ...] | None:
+    if isinstance(hull, G.Aabb):
+        lo, hi = hull.lo, hull.hi
+        if any(not math.isfinite(v) for v in (*lo, *hi)):
+            return None
+        if any(hi[i] - lo[i] <= G.EPS_MM for i in range(3)):
+            return None
+        return tuple(
+            (x, y, z)
+            for x in (lo[0], hi[0])
+            for y in (lo[1], hi[1])
+            for z in (lo[2], hi[2]))
+    if isinstance(hull, G.Prism):
+        if (len(hull.footprint) < 3
+                or not D.loop_is_convex(hull.footprint)
+                or hull.z1 - hull.z0 <= G.EPS_MM):
+            return None
+        return tuple((x, y, z) for x, y in hull.footprint
+                     for z in (hull.z0, hull.z1))
+    return None
+
+
+def _analytic_inner_is_nested(inner: G.Hull, outer: G.Hull) -> bool:
+    """Exact convex containment check for the first supported kernel types.
+
+    Every vertex of one convex Aabb/Prism lying in the other convex body is
+    necessary and sufficient for containment.  No certificate tolerance is
+    applied here: a tolerance that widened Outer would weaken the invariant.
+    """
+
+    vertices = _analytic_vertices(inner)
+    if vertices is None or _analytic_vertices(outer) is None:
+        return False
+    return all(G.contains_point(outer, point) for point in vertices)
+
+
+def _is_sha256_digest(value: object) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value))
+
+
+_SERIALIZED_INNER_CERTIFICATE_KEYS = frozenset({
+    "schema_version", "issuer", "proof_kind", "provenance", "revision",
+    "subject_source_id", "body_source_digest", "body_source_revision",
+    "inner_digest", "outer_digest", "error_bound_mm", "tolerance_mm",
+    "certificate_digest", "integrity_tag",
+})
+
+
+def verify_serialized_inner_certificate(
+        certificate: Mapping[str, Any], *,
+        expected_subject_source_id: str) -> bool:
+    """Verify authority of a serialized inner certificate, fail-closed.
+
+    The public content digest detects ordinary corruption but is forgeable by
+    anyone who can serialize JSON.  Authority therefore requires the
+    process-local HMAC as well.  A valid tag means this process' registered
+    producer already checked ``Inner ⊆ Body ⊆ Outer``; it is intentionally
+    invalid after restart because the current producer is in-process only.
+    """
+
+    if (not isinstance(certificate, Mapping)
+            or set(certificate) != _SERIALIZED_INNER_CERTIFICATE_KEYS):
+        return False
+    schema = certificate.get("schema_version")
+    issuer = certificate.get("issuer")
+    proof_kind = certificate.get("proof_kind")
+    provenance = certificate.get("provenance")
+    revision = certificate.get("revision")
+    subject = certificate.get("subject_source_id")
+    body_revision = certificate.get("body_source_revision")
+    if (schema != INNER_CERTIFICATE_SCHEMA
+            or not isinstance(issuer, str)
+            or issuer not in INNER_CERTIFICATE_ISSUER_REGISTRY
+            or not isinstance(proof_kind, str)
+            or proof_kind not in INNER_CERTIFICATE_ISSUER_REGISTRY[issuer]
+            or provenance not in INNER_CERTIFICATE_PROVENANCE
+            or not isinstance(revision, str) or not revision.strip()
+            or not isinstance(subject, str) or not subject.strip()
+            or subject != expected_subject_source_id
+            or not isinstance(body_revision, str)
+            or not body_revision.strip()):
+        return False
+    body_digest = certificate.get("body_source_digest")
+    inner_digest = certificate.get("inner_digest")
+    outer_digest = certificate.get("outer_digest")
+    content_digest = certificate.get("certificate_digest")
+    integrity_tag = certificate.get("integrity_tag")
+    if not all(_is_sha256_digest(value) for value in (
+            body_digest, inner_digest, outer_digest, content_digest,
+            integrity_tag)):
+        return False
+    error = certificate.get("error_bound_mm")
+    tolerance = certificate.get("tolerance_mm")
+    if (isinstance(error, bool) or not isinstance(error, (int, float))
+            or isinstance(tolerance, bool)
+            or not isinstance(tolerance, (int, float))
+            or not math.isfinite(float(error))
+            or not math.isfinite(float(tolerance))
+            or float(error) < 0.0 or float(tolerance) < 0.0
+            or float(error) > float(tolerance)):
+        return False
+    payload = _certificate_payload(
+        issuer=issuer, proof_kind=proof_kind, provenance=provenance,
+        revision=revision, subject_source_id=subject,
+        body_source_digest=body_digest,
+        body_source_revision=body_revision, inner_digest=inner_digest,
+        outer_digest=outer_digest, error_bound_mm=float(error),
+        tolerance_mm=float(tolerance))
+    try:
+        expected_digest = _sha256_json(payload)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not hmac.compare_digest(expected_digest, content_digest):
+        return False
+    sealed_payload = {**payload, "certificate_digest": content_digest}
+    return _verify_process_local_integrity_tag(
+        _INNER_CERTIFICATE_TAG_DOMAIN, sealed_payload, integrity_tag)
+
+
+def certify_analytic_inner_for_test(
+        *, inner: G.Hull, body: G.Hull, outer: G.Hull,
+        subject_source_id: str, body_source_digest: str,
+        body_source_revision: str,
+        revision: str = "analytic-test-r1", error_bound_mm: float = 0.0,
+        tolerance_mm: float = 0.0) -> CertifiedInnerHull:
+    """Issue fixture evidence after proving ``Inner ⊆ Body ⊆ Outer``.
+
+    This intentionally is *not* a generic certificate constructor.  It is the
+    sole registered analytic fixture producer until a Revit body extractor can
+    provide equivalent source evidence.  The caller must pass both the body
+    itself and the digest/revision of that same source; contradictory evidence
+    is refused before a certificate exists.
+    """
+
+    issuer = ANALYTIC_TEST_INNER_ISSUER
+    proof_kind = ANALYTIC_SUBSET_PROOF_KIND
+    provenance = ANALYTIC_BODY_PROVENANCE
+    if proof_kind not in INNER_CERTIFICATE_ISSUER_REGISTRY.get(
+            issuer, frozenset()):
+        raise RuntimeError("inner_certificate_issuer_not_registered")
+    if not isinstance(revision, str) or not revision.strip():
+        raise ValueError("inner_certificate_revision_missing")
+    if not isinstance(subject_source_id, str) or not subject_source_id.strip():
+        raise ValueError("inner_certificate_subject_missing")
+    if (not isinstance(body_source_revision, str)
+            or not body_source_revision.strip()):
+        raise ValueError("body_source_revision_missing")
+    if not (G._finite(error_bound_mm) and G._finite(tolerance_mm)):
+        raise ValueError("inner_certificate_error_non_finite")
+    if error_bound_mm < 0.0 or tolerance_mm < 0.0:
+        raise ValueError("inner_certificate_error_negative")
+    if error_bound_mm > tolerance_mm:
+        raise ValueError("inner_certificate_error_exceeds_tolerance")
+
+    # Each digest call also rejects unsupported, non-finite, non-convex and
+    # zero-volume analytic bodies.  No Capsule is silently promoted to an
+    # inner hull merely because its outer approximation has a radius.
+    inner_digest = analytic_hull_digest(inner)
+    actual_body_digest = analytic_hull_digest(body)
+    outer_digest = analytic_hull_digest(outer)
+    if (not _is_sha256_digest(body_source_digest)
+            or body_source_digest != actual_body_digest):
+        raise ValueError("body_source_digest_mismatch")
+    if not _analytic_inner_is_nested(inner, body):
+        raise ValueError("inner_not_contained_in_body")
+    if not _analytic_inner_is_nested(body, outer):
+        raise ValueError("body_not_contained_in_outer")
+
+    payload = _certificate_payload(
+        issuer=issuer, proof_kind=proof_kind, provenance=provenance,
+        revision=revision.strip(), subject_source_id=subject_source_id.strip(),
+        body_source_digest=actual_body_digest,
+        body_source_revision=body_source_revision.strip(),
+        inner_digest=inner_digest, outer_digest=outer_digest,
+        error_bound_mm=float(error_bound_mm),
+        tolerance_mm=float(tolerance_mm))
+    certificate = object.__new__(InnerHullCertificate)
+    for name, value in payload.items():
+        object.__setattr__(certificate, name, value)
+    object.__setattr__(certificate, "certificate_digest",
+                       _sha256_json(payload))
+    sealed_payload = {
+        **payload,
+        "certificate_digest": _safe_certificate_value(
+            certificate, "certificate_digest"),
+    }
+    object.__setattr__(certificate, "integrity_tag",
+                       _process_local_integrity_tag(
+                           _INNER_CERTIFICATE_TAG_DOMAIN, sealed_payload))
+    object.__setattr__(certificate, "_authority",
+                       _INNER_CERTIFICATE_AUTHORITY)
+    return CertifiedInnerHull(inner, certificate)
+
+
+def assess_inner_hull(record: "HullRecord") -> InnerHullAssessment:
+    """Validate optional inner evidence without ever upgrading malformed data."""
+
+    evidence = record.inner
+    if evidence is None:
+        return InnerHullAssessment("absent", "inner_evidence_absent")
+    if not isinstance(evidence, CertifiedInnerHull):
+        return InnerHullAssessment("rejected", "inner_evidence_type_invalid")
+    inner = evidence.hull
+    certificate = evidence.certificate
+    if certificate is None:
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_missing", hull=inner)
+    if not isinstance(certificate, InnerHullCertificate):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_type_invalid", hull=inner)
+    if (_safe_certificate_value(certificate, "_authority")
+            is not _INNER_CERTIFICATE_AUTHORITY):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_not_issued", inner, certificate)
+    schema_version = _safe_certificate_value(certificate, "schema_version")
+    if schema_version != INNER_CERTIFICATE_SCHEMA:
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_schema_unsupported", inner,
+            certificate)
+    issuer = _safe_certificate_value(certificate, "issuer")
+    proof_kind = _safe_certificate_value(certificate, "proof_kind")
+    if (not isinstance(issuer, str)
+            or issuer not in INNER_CERTIFICATE_ISSUER_REGISTRY):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_issuer_untrusted", inner,
+            certificate)
+    if (not isinstance(proof_kind, str)
+            or proof_kind not in INNER_CERTIFICATE_ISSUER_REGISTRY[issuer]):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_proof_kind_unsupported", inner,
+            certificate)
+    provenance = _safe_certificate_value(certificate, "provenance")
+    if (not isinstance(provenance, str)
+            or provenance not in INNER_CERTIFICATE_PROVENANCE):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_provenance_untrusted", inner,
+            certificate)
+    revision = _safe_certificate_value(certificate, "revision")
+    if not isinstance(revision, str) or not revision.strip():
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_revision_missing", inner,
+            certificate)
+    subject_source_id = _safe_certificate_value(
+        certificate, "subject_source_id")
+    if (not isinstance(subject_source_id, str)
+            or not subject_source_id.strip()):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_subject_missing", inner,
+            certificate)
+    if subject_source_id != record.source_id:
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_subject_mismatch", inner,
+            certificate)
+    body_source_revision = _safe_certificate_value(
+        certificate, "body_source_revision")
+    if (not isinstance(body_source_revision, str)
+            or not body_source_revision.strip()):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_body_revision_missing", inner,
+            certificate)
+    body_source_digest = _safe_certificate_value(
+        certificate, "body_source_digest")
+    inner_digest = _safe_certificate_value(certificate, "inner_digest")
+    outer_digest = _safe_certificate_value(certificate, "outer_digest")
+    certificate_digest = _safe_certificate_value(
+        certificate, "certificate_digest")
+    integrity_tag = _safe_certificate_value(certificate, "integrity_tag")
+    if not all(_is_sha256_digest(value) for value in (
+            body_source_digest, inner_digest, outer_digest,
+            certificate_digest, integrity_tag)):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_digest_invalid", inner,
+            certificate)
+    error = _safe_certificate_value(certificate, "error_bound_mm")
+    tolerance = _safe_certificate_value(certificate, "tolerance_mm")
+    if not (G._finite(error) and G._finite(tolerance)):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_error_non_finite", inner,
+            certificate)
+    if error < 0.0 or tolerance < 0.0:
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_error_negative", inner,
+            certificate)
+    if error > tolerance:
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_error_exceeds_tolerance", inner,
+            certificate)
+    if not isinstance(inner, (G.Aabb, G.Prism)):
+        return InnerHullAssessment(
+            "rejected", f"inner_hull_type_unsupported:{type(inner).__name__}",
+            inner, certificate)
+    if not isinstance(record.hull, (G.Aabb, G.Prism)):
+        return InnerHullAssessment(
+            "rejected",
+            f"outer_hull_type_unsupported:{type(record.hull).__name__}",
+            inner, certificate)
+    if _analytic_vertices(inner) is None:
+        return InnerHullAssessment(
+            "rejected", "inner_hull_invalid_or_zero_volume", inner,
+            certificate)
+    try:
+        actual_inner_digest = analytic_hull_digest(inner)
+        actual_outer_digest = analytic_hull_digest(record.hull)
+    except ValueError:
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_geometry_digest_unavailable",
+            inner, certificate)
+    if inner_digest != actual_inner_digest:
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_inner_digest_mismatch", inner,
+            certificate)
+    if outer_digest != actual_outer_digest:
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_outer_digest_mismatch", inner,
+            certificate)
+    payload = _certificate_payload(
+        issuer=issuer, proof_kind=proof_kind, provenance=provenance,
+        revision=revision, subject_source_id=subject_source_id,
+        body_source_digest=body_source_digest,
+        body_source_revision=body_source_revision,
+        inner_digest=inner_digest, outer_digest=outer_digest,
+        error_bound_mm=float(error), tolerance_mm=float(tolerance))
+    if certificate_digest != _sha256_json(payload):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_integrity_mismatch", inner,
+            certificate)
+    sealed_payload = {**payload, "certificate_digest": certificate_digest}
+    if not _verify_process_local_integrity_tag(
+            _INNER_CERTIFICATE_TAG_DOMAIN, sealed_payload, integrity_tag):
+        return InnerHullAssessment(
+            "rejected", "inner_certificate_integrity_tag_mismatch", inner,
+            certificate)
+    if not _analytic_inner_is_nested(inner, record.hull):
+        return InnerHullAssessment(
+            "rejected", "inner_not_contained_in_outer", inner, certificate)
+    return InnerHullAssessment("valid", None, inner, certificate)
+
+
 @dataclass
 class HullRecord:
     """Одна запись снапшота: оболочка и всё, чем она обоснована."""
@@ -482,6 +1184,10 @@ class HullRecord:
     #: ничем не лучше «coarse».
     section_source: str | None = None
     extra: dict = field(default_factory=dict)
+    #: Optional ``Inner ⊆ Body`` evidence.  Existing production builders
+    #: intentionally leave it absent; in particular capsules are never
+    #: promoted to inner merely because they came from a section parameter.
+    inner: CertifiedInnerHull | None = None
 
     def bounds(self):
         return self.hull.bounds()
@@ -691,11 +1397,21 @@ def hull_from_wall_axis(p0: G.Pt3, p1: G.Pt3, *, width_mm: float,
                         offset_mm: float = 0.0) -> G.Prism | None:
     """Полоса вокруг оси стены × [z0, z1] — билдер БУДУЩЕЙ волны.
 
-    Написан по требованию ревью №10 и НЕ ВЫЗЫВАЕТСЯ ни из одного пути:
-    `OST_Walls` остаётся на `SOURCES_BBOX`, пока `wall_prism_blockers` не
-    пуст. Здесь он живёт затем, чтобы день захвата `WALL_CROSS_SECTION` стоил
-    одну строку в таблице, а не проектирования заново, и чтобы закон
-    консервативности полосы был доказан ЗАРАНЕЕ, тестом.
+    Написан по требованию ревью №10 как билдер БУДУЩЕЙ волны — и с 14.08.2026
+    ВЫЗЫВАЕТСЯ: `OST_Walls` переведён на `SOURCES_PRISM`, потому что иначе
+    объявленная стена не получала тела вовсе (`refused_by_hull_gate`), и сцена
+    у владельца оставалась пустой при полностью объявленной программе.
+
+    🔴 ЭТА СТРОКА ДО 15.08 УТВЕРЖДАЛА ОБРАТНОЕ — «не вызывается ни из одного
+    пути, `OST_Walls` остаётся на `SOURCES_BBOX`» — уже после того, как таблица
+    была переведена. Прозу никто не мутирует: ни один прогон не покраснеет
+    оттого, что комментарий врёт, и читатель поверит ему прежде, чем коду.
+    Ставя сюда обещание, ставь и его границу.
+
+    Замер, ради которого перевод сделан: `sources=('bbox',)` → 0 тел,
+    `sources=('prism',)` → 1 тело, оценка `conservative`. Полоса допущена
+    ИМЕННО там, где мерить не с чем, и её консервативность доказана тестом
+    ЗАРАНЕЕ, а не объявлена здесь.
 
     `offset_mm` — смещение тела относительно оси вдоль левой нормали (location
     line: грань вместо осевой). Оно ПРИНИМАЕТСЯ числом, а не выводится из
@@ -1189,7 +1905,16 @@ def build_hull(el: dict, *, profile: dict | None = None,
     # 0. Полоса вокруг оси × [z0, z1] — стена. Числа приходят целиком из
     #    `el["prism"]`, и билдер НИЧЕГО не достраивает: неполный набор — это
     #    названный откат, а не «взяли что было».
-    if "prism" in rule.sources:
+    #
+    #    `box is None` — НЕ оптимизация, а весь допуск полосы, и он стоит
+    #    ЗДЕСЬ, а не в таблице, потому что таблица не знает про данные. Замок
+    #    содержания (`WALL_BAND_REFUSAL`) замерил полосу против НАСТОЯЩЕГО тела
+    #    и отказал: 97 нарушений из 800, до 2854 мм наружу. Там габарит ЕСТЬ, и
+    #    он остаётся телом. Полоса берётся ровно там, где мерить не с чем —
+    #    у стены, объявленной программой и ещё не построенной. Условие на
+    #    ДАННЫХ, а не на намерении: иначе завтрашний разбор L0, начни он нести
+    #    `prism`, тихо унёс бы стены из-под замка, который их не пропускал.
+    if "prism" in rule.sources and box is None:
         pr_rec, why = _prism_record(el, common, z_span)
         if pr_rec is not None:
             return pr_rec, None
@@ -1298,8 +2023,8 @@ def build_hull(el: dict, *, profile: dict | None = None,
         if path:
             # Ревью №4: `exact` не бывает у капсулы НИКОГДА. У прямой трубы
             # торцы плоские, у капсулы — сферические; дуговая капсула вдобавок
-            # раздута стрелкой. `exact` читается вердиктом `confirmed`, то есть
-            # обвинением, которое оболочка не доказывает.
+            # раздута стрелкой. Даже после proof-firebreak грейд обязан быть
+            # честным: он описывает OUTER и не заменяется сертификатом Inner.
             return HullRecord(hull=G.Capsule(tuple(path), float(radius)),
                               grade="conservative", hull_source="axis_section",
                               extra=_extra(), **common), None
@@ -1358,8 +2083,8 @@ def grade_reachability() -> dict[str, dict]:
     """Достижим ли каждый грейд — ВЫВОДОМ из таблицы, а не наблюдением.
 
     Отчёт, печатающий `exact: 0`, не отличает «точных оболочек не нашлось» от
-    «точных оболочек не бывает». Разница решает, читать ли `confirmed` как
-    отсутствующий факт или как несуществующую ось.
+    «точных оболочек не бывает». Это отдельная ось от `confirmed`: последнее
+    теперь требует двух сертифицированных внутренних подмножеств.
     """
     live: set[str] = set()
     for rule in KIND_TABLE.values():

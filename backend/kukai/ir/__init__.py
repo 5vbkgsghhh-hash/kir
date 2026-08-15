@@ -14,6 +14,7 @@ from kukai.ir.compiler import (                                      # noqa: F40
 )
 from kukai.ir.midend import (                                        # noqa: F401
     GroundedProgram,
+    GroundingContext,
     PlannedProgram,
 )
 from kukai.ir.schema_gen import program_schema                        # noqa: F401

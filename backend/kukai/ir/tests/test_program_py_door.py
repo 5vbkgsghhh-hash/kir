@@ -43,6 +43,7 @@ os.environ.setdefault("KIR_REJECTIONS_PATH",
 from kukai.ir import compiler, serving  # noqa: E402
 from kukai.ir.tests.acceptance_fakes import PassingAcceptanceBridge  # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
+from kukai.ir.tests.gate_fixture import enter_kir_mode
 
 
 def _run(coro):
@@ -90,6 +91,8 @@ class _DoorHarness(unittest.TestCase):
         self._prev_feed = os.environ.get("KIR_WITNESS_PATH")
         self.feed_path = os.path.join(self._feed_dir.name, "witness.jsonl")
         os.environ["KIR_WITNESS_PATH"] = self.feed_path
+        # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08): режим КИР ставится ЯВНО.
+        enter_kir_mode(self)
 
     def tearDown(self) -> None:
         self._device.stop()

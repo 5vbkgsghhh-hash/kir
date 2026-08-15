@@ -231,7 +231,13 @@ class TheRuleIsTheRuleAndNotItsDefence(unittest.TestCase):
         rule = self._block()["introduced_rule"]
         self.assertIn("INTRODUCED_RULE_WHY", rule)
         self.assertTrue(CB.INTRODUCED_RULE_WHY)
-        self.assertIn("обнаружил", CB.INTRODUCED_RULE_WHY)
+        # РЕГИСТРОНЕЗАВИСИМО, как у соседнего теста строкой выше (`rule.lower()`).
+        # 12.08 этот тест был красным: защиту переписали, выделив обратное
+        # прочтение капсом («ОБНАРУЖИЛ»), и проверка, привязанная к НАПИСАНИЮ,
+        # доложила УСИЛЕНИЕ текста как его пропажу. Прибор, привязанный к
+        # спеллингу, не отличает усиления от ослабления — первая общая форма.
+        # Проверяем то, что тест обещает именем: защита НАЗВАНА и ЧИТАЕМА.
+        self.assertIn("обнаружил", CB.INTRODUCED_RULE_WHY.lower())
 
     def test_the_addends_still_let_a_reader_count_otherwise(self):
         """Сокращение защиты не имеет права забрать МАТЕРИАЛ: читатель,

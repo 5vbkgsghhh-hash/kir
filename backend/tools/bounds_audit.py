@@ -129,6 +129,26 @@ def module_constants() -> list[dict[str, Any]]:
                             compile(ast.Expression(value_node), "<c>", "eval"),
                             {"__builtins__": {}}, {})
                     except Exception:
+                        # РОД ТРЕТИЙ: граница, выведенная из ДРУГОЙ границы
+                        # (`_CONTOUR_MAX_POINTS = geom.MAX_RING_POINTS`,
+                        # `MIN_RING_POINTS + 1`). Считать её нельзя — значения
+                        # у неё своего нет; но и ПРОПУСТИТЬ нельзя, и это не
+                        # придирка: волна именования 10.08 переписала часть
+                        # литералов в ссылки, и прибор, умеющий только
+                        # `literal_eval`, отчитался бы об УМЕНЬШЕНИИ
+                        # поверхности там, где она просто получила владельца.
+                        # Прибор, который слепнет ровно от той починки, ради
+                        # которой его завели, хуже отсутствующего.
+                        if isinstance(value_node, (ast.Name, ast.Attribute,
+                                                   ast.BinOp)):
+                            for name in names:
+                                rows.append({
+                                    "where": rel, "line": node.lineno,
+                                    "scope": ".".join(self.scope), "id": name,
+                                    "kind": "reference",
+                                    "value": ast.unparse(value_node),
+                                    "boundish": bool(BOUNDISH.search(name)),
+                                })
                         return
                 if not isinstance(value, (int, float)) or isinstance(value, bool):
                     return
@@ -409,12 +429,12 @@ def measure_dump(dump: Dump) -> dict[str, Result]:
     sketch = dump.side("sketch.index.json").get("profile_index") or {}
     res_pts = out.setdefault("lift._CONTOUR_MAX_POINTS", Result(
         "lift._CONTOUR_MAX_POINTS", "len(ring) <= 64  ← кольцо контура"))
-    res_area = out.setdefault("contour._MIN_AREA", Result(
-        "contour._MIN_AREA", ">= 10000 мм²  ← площадь кольца"))
+    res_area = out.setdefault("geom.MIN_RING_AREA_MM2", Result(
+        "geom.MIN_RING_AREA_MM2", ">= 10000 мм²  ← площадь кольца"))
     res_edge = out.setdefault("contour/_EDGE_TOL", Result(
         "contour/geom._EDGE_TOL", ">= 1.0 мм  ← кратчайшее ребро кольца"))
-    res_bulge = out.setdefault("contour._MAX_BULGE", Result(
-        "contour._MAX_BULGE", "|bulge| <= 1.5  ← дуга контура"))
+    res_bulge = out.setdefault("contour.MAX_ARC_BULGE", Result(
+        "contour.MAX_ARC_BULGE", "|bulge| <= 1.5  ← дуга контура"))
     for row in sketch.values():
         if not isinstance(row, dict) or not row.get("profile_available"):
             continue
@@ -456,13 +476,17 @@ def measure_dump(dump: Dump) -> dict[str, Result]:
                 sagitta = -((float(mid[0]) - cx) * nx + (float(mid[1]) - cy) * ny)
                 res_bulge.feed(abs(2.0 * sagitta / chord), None, 1.5)
 
-    # 4.1b ВСТРОЕННЫЕ (не именованные) пределы профиля — lift.py:1118-1120,1688
+    # 4.1b Пределы профиля — с 10.08.2026 ИМЕНОВАННЫЕ и объявленные один раз
+    # в `geom` (`lift._lift_*_by_profile` их читает, а не переписывает).
+    # Адрес держится ИМЕНЕМ, а не номером строки: пометки «lift.py:1118-1120»
+    # стояли здесь с 31.07 и к 10.08 указывали в чужой код — тот же класс,
+    # что file:line в прозе.
     res_holes = out.setdefault("lift: len(holes) <= 8", Result(
-        "lift.py:1119  len(holes) <= 8", "отверстий в профиле <= 8"))
+        "geom.MAX_HOLES  (lift._lift_floor_by_profile)", "отверстий в профиле <= 8"))
     res_hole_pts = out.setdefault("lift: len(hole ring) <= 32", Result(
-        "lift.py:1120  len(кольцо отверстия) <= 32", "точек в отверстии <= 32"))
+        "geom.MAX_HOLE_RING_POINTS", "точек в отверстии <= 32"))
     res_ext_pts = out.setdefault("lift: len(exterior) <= 64", Result(
-        "lift.py:1118  len(внешнее кольцо) <= 64", "точек во внешнем кольце <= 64"))
+        "geom.MAX_RING_POINTS", "точек во внешнем кольце <= 64"))
     for row in sketch.values():
         if not isinstance(row, dict) or not row.get("profile_available"):
             continue
@@ -701,16 +725,117 @@ def _measure_rooms(dump: Dump, out: dict[str, Result]) -> None:
 
 # ─────────────────────────── ВЫВОД ───────────────────────────────────────────
 
-def inline_literals() -> list[dict[str, Any]]:
-    """Числа, работающие границей ПРЯМО В СРАВНЕНИИ, без имени.
+# Ширина машинного типа. Это НЕ выбранный кем-то порог, а край области
+# значений самого типа: ElementId в Revit — int32, а идентификатор дорожки
+# и бюджет в миллисекундах — int64. Такое число нельзя «подвинуть»: его
+# двигает не автор, а платформа.
+_TYPE_WIDTHS = {2**31 - 1, -(2**31), 2**63 - 1, -(2**63)}
+
+
+def _modular_names(tree: ast.AST) -> set[str]:
+    """Имена, получившие значение из остатка от деления (`n % 100`).
+
+    Нужны, чтобы отличить ГРАНИЦУ от ГРАММАТИКИ. `11 <= last_two <= 14` в
+    `name._russian_count` выглядит как диапазон, но 11 и 14 там — правило
+    русского числительного («11..14 плеч»), а не порог, который что-то
+    отвергает. Сравнение с остатком от деления живёт в кольце вычетов;
+    подвинуть такое число значит сломать язык, а не ослабить проверку.
+    """
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        value = getattr(node, "value", None)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(
+                value, ast.BinOp) and isinstance(value.op, ast.Mod):
+            targets = (node.targets if isinstance(node, ast.Assign)
+                       else [node.target])
+            out.update(t.id for t in targets if isinstance(t, ast.Name))
+    return out
+
+
+def _is_modular(node: ast.AST, modular: set[str]) -> bool:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        return True
+    return isinstance(node, ast.Name) and node.id in modular
+
+
+def _calls_named(node: ast.AST, names: set[str]) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            func = sub.func
+            attr = getattr(func, "attr", None) or getattr(func, "id", None)
+            if attr in names:
+                return True
+    return False
+
+
+def _mentions(node: ast.AST, needles: tuple[str, ...]) -> bool:
+    for sub in ast.walk(node):
+        name = None
+        if isinstance(sub, ast.Name):
+            name = sub.id
+        elif isinstance(sub, ast.Attribute):
+            name = sub.attr
+        if name and any(n in name for n in needles):
+            return True
+    return False
+
+
+def _not_a_bound(node: ast.Compare, value: Any, other: ast.AST,
+                 modular: set[str]) -> str | None:
+    """Род ЧЕТВЁРТЫЙ: число в сравнении, которое границей НЕ является.
+
+    Перепись до 10.08 считала границей всё, что стоит справа от `<`, и
+    поэтому объявляла границей ширину int64, длину hex-дайджеста и правило
+    русского множественного числа. Это не придирка к отчёту: пока такие
+    числа лежат в одном списке с настоящими порогами, «разобрать безымянные
+    литералы» означает завести имя тому, у чего происхождения нет, — а имя
+    без происхождения ровно так же безымянно, только длиннее.
+
+    Признак у каждого рода СТРУКТУРНЫЙ, не по списку файлов, чтобы новый
+    такой же случай отсеялся сам.
+    """
+    # 1. Ширина машинного типа — двигает платформа, не автор.
+    if value in _TYPE_WIDTHS:
+        return "ширина типа"
+    # 2. Грамматика: сравнение живёт в кольце вычетов (`n % 100`).
+    if _is_modular(node.left, modular) or any(
+            _is_modular(c, modular) for c in node.comparators):
+        return "грамматика"
+    # 3. Жребий: порог для random() — это ВЕС в смеси генератора ворот,
+    #    а не граница, которую кто-то может нарушить.
+    if _calls_named(node, {"random", "uniform"}):
+        return "вес жребия"
+    # 4. Версия Revit — точка на оси выпусков, а не порог величины.
+    if _mentions(node, ("revit_version", "version_int")):
+        return "версия"
+    # 5. АРНОСТЬ и ФОРМАТ: равенство никогда не является границей. `len(v)
+    #    == 16` — это матрица 4x4, `!= 6` — это bbox из шести чисел, `== 64`
+    #    — это hex-запись sha256. Такое число описывает ФОРМУ значения; его
+    #    нельзя ослабить или ужесточить, только сменить формат целиком.
+    if all(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+        if _calls_named(node, {"len"}):
+            return "арность/формат"
+    return None
+
+
+def inline_literals() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Числа, стоящие ПРЯМО В СРАВНЕНИИ, без имени: границы и не-границы.
 
     Третий род границ, и его нельзя пропустить: `len(exterior) > 64` в
-    lift.py:1118 отвергает 64 элемента башни, а имени у этого числа нет — ни
-    один поиск по именованным константам его бы не нашёл. Тривиальные 0/1/2/3
-    и −1 отброшены как структурные (пустота, единственность, размерность).
+    `lift.py` (строка 1295 на 10.08; в 07-версии этого файла было 1118 —
+    пример того, почему адрес держится именем функции, а не номером)
+    отвергает элементы башни МОЛЧА, превращая их в атом, а имени у этого
+    числа нет — ни один поиск по именованным константам его бы не нашёл.
+    Тривиальные 0/1/2/3 и −1 отброшены как структурные (пустота,
+    единственность, размерность).
+
+    Возвращает ДВА списка, а не один: настоящие границы и отсеянные по
+    происхождению (см. `_not_a_bound`). Отсеянные ПЕЧАТАЮТСЯ — «не нашёл» и
+    «нет» обязаны остаться разными фактами.
     """
     trivial = {0, 1, 2, 3, -1, 0.0, 1.0}
-    rows: list[dict[str, Any]] = []
+    bounds: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
     for path in sorted(IR_ROOT.rglob("*.py")):
         if "tests" in path.parts or "__pycache__" in path.parts:
             continue
@@ -718,30 +843,41 @@ def inline_literals() -> list[dict[str, Any]]:
         tree = ast.parse(src)
         lines = src.splitlines()
         rel = str(path.relative_to(IR_ROOT.parent.parent))
+        modular = _modular_names(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Compare):
                 continue
-            for operand in [node.left] + list(node.comparators):
+            operands = [node.left] + list(node.comparators)
+            for operand in operands:
                 if not (isinstance(operand, ast.Constant)
                         and isinstance(operand.value, (int, float))
                         and not isinstance(operand.value, bool)):
                     continue
                 if operand.value in trivial:
                     continue
-                rows.append({
+                row = {
                     "where": rel, "line": node.lineno,
                     "value": operand.value,
                     "source": lines[node.lineno - 1].strip()[:110],
-                })
-    return rows
+                }
+                reason = _not_a_bound(node, operand.value, operand, modular)
+                if reason:
+                    row["reason"] = reason
+                    dropped.append(row)
+                else:
+                    bounds.append(row)
+    return bounds, dropped
 
 
 def print_census() -> None:
     reg = registry_bounds()
     tol = registry_tolerances()
     consts = module_constants()
-    boundish = [c for c in consts if c["boundish"] and not c["scope"]]
-    other = [c for c in consts if not (c["boundish"] and not c["scope"])]
+    named = [c for c in consts if c["boundish"] and not c["scope"]]
+    boundish = [c for c in named if c["kind"] == "constant"]
+    derived = [c for c in named if c["kind"] == "reference"]
+    other = [c for c in consts if not (c["boundish"] and not c["scope"])
+             and c["kind"] == "constant"]
 
     print(f"РЕЕСТР: границ параметров {len(reg)}")
     for r in reg:
@@ -752,18 +888,31 @@ def print_census() -> None:
     print(f"\nМОДУЛЬНЫЕ КОНСТАНТЫ, похожие на границу: {len(boundish)}")
     for c in boundish:
         print(f"  {c['where']:46s} :{c['line']:<5d} {c['id']:36s} = {c['value']}")
-    inline = inline_literals()
+    print(f"\nИМЕНОВАННЫЕ ССЫЛКИ на другую границу (значения своего нет): "
+          f"{len(derived)}")
+    for c in derived:
+        print(f"  {c['where']:46s} :{c['line']:<5d} {c['id']:36s} = {c['value']}")
+    inline, dropped = inline_literals()
     print(f"\nБЕЗЫМЯННЫЕ ЧИСЛА-ГРАНИЦЫ (литерал прямо в сравнении): {len(inline)}")
     for c in inline:
         print(f"  {c['where']:46s} :{c['line']:<5d} {str(c['value']):>18s}  {c['source']}")
+    print(f"\nВ СРАВНЕНИИ, НО ГРАНИЦЕЙ НЕ ЯВЛЯЕТСЯ: {len(dropped)}")
+    for reason in sorted({c["reason"] for c in dropped}):
+        same = [c for c in dropped if c["reason"] == reason]
+        print(f"  — {reason}: {len(same)}")
+        for c in same:
+            print(f"      {c['where']:44s} :{c['line']:<5d} "
+                  f"{str(c['value']):>20s}  {c['source'][:78]}")
     print(f"\nПРОЧИЕ ЧИСЛОВЫЕ КОНСТАНТЫ (не границы): {len(other)}")
     for c in other:
         scope = f"[{c['scope']}]" if c["scope"] else ""
         print(f"  {c['where']:46s} :{c['line']:<5d} {scope}{c['id']:34s} = {c['value']}")
+    total = len(reg) + len(tol) + len(boundish) + len(derived) + len(inline)
     print(f"\nПОВЕРХНОСТЬ ГРАНИЦ: реестр {len(reg)} + допуски {len(tol)} "
-          f"+ именованные константы {len(boundish)} + безымянные литералы "
-          f"{len(inline)} = {len(reg) + len(tol) + len(boundish) + len(inline)}")
-    print(f"(и ещё {len(other)} числовых констант, границами не являющихся)")
+          f"+ именованные константы {len(boundish)} + ссылки {len(derived)} "
+          f"+ безымянные литералы {len(inline)} = {total}")
+    print(f"(и ещё {len(other)} числовых констант, границами не являющихся; "
+          f"отсеяно по происхождению из сравнений: {len(dropped)})")
 
 
 def print_measurement(dumps: list[pathlib.Path]) -> None:

@@ -17,10 +17,11 @@ Reference-dialect translation (``mode="same_document"``):
   type, a family symbol) -> ``{"by": "element_id", "value": int(ID)}``.  The
   same document is being rebuilt, so the source ElementId pins the existing
   datum/type directly — no name resolution, no snapshot needed.
-* host reference ``{"ref": <host L1 _id>}`` (a door/window's host wall) ->
-  ``{"by": "ref", "value": op_id(host)}`` where ``op_id`` is the DETERMINISTIC
-  ``"e" + host.source_element_id``.  The compiler's DAG walk then requires the
-  host wall op to appear EARLIER in the same program (Д5 host-atomicity).
+* an L1 ``{"ref": <target _id>}`` becomes an intra-program ``by=ref`` when
+  the target is materialized.  With ``include_datums=False``, a ref to a
+  deliberately pinned level/grid instead becomes ``by=element_id`` for that
+  existing source datum.  It is therefore resolved explicitly rather than
+  being mistaken for an orphan dependency and silently dropping its consumer.
 
 Datums (Д3): with ``include_datums=False`` (default) ``create_level`` /
 ``create_grid`` op-leaves are NOT materialized — the levels/grids they name are
@@ -74,6 +75,7 @@ from kukai.ir.decompile.geom_extract import (
     ExtractedGeometryTier,
     GeometryExtraction,
     GeometryExtractionError,
+    GeometryFailureReason,
     GeometryIndexRecord,
     geometry_hash,
 )
@@ -82,7 +84,7 @@ from kukai.ir.decompile.geometry_acceptance import (
     mesh_bbox_mm,
     mesh_surface_digest,
 )
-from kukai.ir.decompile.l1_schema import L1Node
+from kukai.ir.decompile.l1_schema import AtomReason, L1Node
 from kukai.ir.decompile.recompile import GeometrySchemaError, GmMesh
 from kukai.ir.mesh import validate_mesh
 from kukai.ir.ops_shape import DIRECTSHAPE_CATEGORIES
@@ -98,9 +100,304 @@ _SOLO_OPS = spec.SOLO_OPS
 # create_room needs its enclosure already in the model -> trailing chunks (Д5b).
 _TAIL_OPS = frozenset({"create_room"})
 
+MATERIALIZATION_ACCOUNTING_SCHEMA = "materialization-accounting/2"
+
+_DISPOSITION_EMITTED = "emitted_semantic_op"
+_DISPOSITION_ESCROW = "atom_escrow"
+_DISPOSITION_DATUM_PIN = "datum_policy_pin"
+_DISPOSITION_RESIDUAL = "typed_residual"
+_ACCOUNTING_DISPOSITIONS = frozenset({
+    _DISPOSITION_EMITTED,
+    _DISPOSITION_ESCROW,
+    _DISPOSITION_DATUM_PIN,
+    _DISPOSITION_RESIDUAL,
+})
+_ATOM_REASON_CODES = frozenset(reason.value for reason in AtomReason)
+_ATOM_SKIP_REASONS = frozenset({
+    *("atom:" + reason for reason in _ATOM_REASON_CODES),
+    "atom_escrow:not_selected",
+    "atom_escrow:missing_geometry_evidence",
+    "atom_escrow:tier_a_no_geometry",
+    "atom_escrow:category_identity_mismatch",
+    "atom_escrow:geometry_refused",
+    "atom_escrow:mesh_refused",
+    *("atom_escrow:geometry_failure:" + reason.value
+      for reason in GeometryFailureReason),
+    "atom_escrow:geometry_failure:unavailable",
+})
+
+
+def _canonical_json(value: Any, *, label: str) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise MaterializeError(f"{label} is not canonical JSON: {exc}") from exc
+
+
+def _sha256_json(value: Any, *, label: str) -> str:
+    return hashlib.sha256(
+        _canonical_json(value, label=label).encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_input_leaves(leaves: Sequence[Mapping[str, Any]]) -> list[Any]:
+    """Canonical set-order for the exact input leaves committed by a receipt."""
+
+    return sorted(
+        leaves,
+        key=lambda leaf: (leaf["source_element_id"], leaf["_id"]),
+    )
+
+
+def _validate_input_leaves(leaves: Sequence[Any]) -> None:
+    """Validate the identity/kind seam needed for total accounting.
+
+    Full L1 validation deliberately remains the LIFT boundary's job.  This
+    boundary validates every field it uses for accounting before indexing it,
+    so malformed kinds, unknown atom reasons and duplicate identities cannot
+    turn into an overwritten dict entry or an untyped residual.
+    """
+
+    source_ids: list[str] = []
+    leaf_ids: list[str] = []
+    for index, leaf in enumerate(leaves):
+        if not isinstance(leaf, Mapping):
+            raise MaterializeError(f"leaves[{index}] must be an L1 mapping")
+        source_id = leaf.get("source_element_id")
+        leaf_id = leaf.get("_id")
+        kind = leaf.get("kind")
+        if not isinstance(source_id, str) or not source_id:
+            raise MaterializeError(
+                f"leaves[{index}].source_element_id must be non-empty")
+        if not isinstance(leaf_id, str) or not leaf_id:
+            raise MaterializeError(f"leaves[{index}]._id must be non-empty")
+        if kind not in {"op", "atom"}:
+            raise MaterializeError(
+                f"leaves[{index}].kind must be 'op' or 'atom'")
+        if kind == "op":
+            if (not isinstance(leaf.get("op_name"), str)
+                    or not leaf["op_name"]):
+                raise MaterializeError(
+                    f"leaves[{index}].op_name must be non-empty")
+            if not isinstance(leaf.get("params"), dict):
+                raise MaterializeError(
+                    f"leaves[{index}].params must be an object")
+        else:
+            if (not isinstance(leaf.get("category"), str)
+                    or not leaf["category"]):
+                raise MaterializeError(
+                    f"leaves[{index}].category must be non-empty")
+            reason = leaf.get("reason")
+            reason_code = (
+                reason.get("code") if isinstance(reason, Mapping) else None)
+            if reason_code not in _ATOM_REASON_CODES:
+                raise MaterializeError(
+                    "atom residual reason is outside the closed AtomReason "
+                    f"set: {reason_code!r}")
+        source_ids.append(source_id)
+        leaf_ids.append(leaf_id)
+    if len(source_ids) != len(set(source_ids)):
+        raise MaterializeError("duplicate source_element_id in materialization input")
+    if len(leaf_ids) != len(set(leaf_ids)):
+        raise MaterializeError("duplicate L1 _id in materialization input")
+
 
 class MaterializeError(ValueError):
     """The materializer cannot safely translate the supplied L1 input."""
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializationRecord:
+    """Exactly one authoritative disposition for one unique input leaf."""
+
+    source_id: str
+    leaf_id: str
+    leaf_kind: str
+    category: str
+    disposition: str
+    reason: str | None = None
+    op_id: str | None = None
+    program_index: int | None = None
+    element_id: int | None = None
+    evidence_state: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("source_id", self.source_id),
+            ("leaf_id", self.leaf_id),
+            ("category", self.category),
+        ):
+            if not isinstance(value, str) or not value:
+                raise TypeError(f"accounting {field_name} must be non-empty")
+        if self.leaf_kind not in {"op", "atom"}:
+            raise ValueError("accounting leaf_kind must be 'op' or 'atom'")
+        if self.disposition not in _ACCOUNTING_DISPOSITIONS:
+            raise ValueError("unknown materialization disposition")
+        if self.reason is not None and (
+                not isinstance(self.reason, str) or not self.reason):
+            raise TypeError("accounting reason must be non-empty or null")
+        if self.op_id is not None and (
+                not isinstance(self.op_id, str) or not self.op_id):
+            raise TypeError("accounting op_id must be non-empty or null")
+        if self.program_index is not None and (
+                isinstance(self.program_index, bool)
+                or not isinstance(self.program_index, int)
+                or self.program_index < 0):
+            raise TypeError("accounting program_index must be non-negative")
+        if self.element_id is not None and (
+                isinstance(self.element_id, bool)
+                or not isinstance(self.element_id, int)):
+            raise TypeError("accounting element_id must be an int or null")
+
+        if self.disposition == _DISPOSITION_EMITTED:
+            if (self.leaf_kind != "op" or self.op_id is None
+                    or self.program_index is None or self.reason is not None
+                    or self.element_id is not None
+                    or self.evidence_state is not None):
+                raise ValueError("invalid emitted semantic accounting row")
+        elif self.disposition == _DISPOSITION_ESCROW:
+            if (self.leaf_kind != "atom" or self.op_id is None
+                    or self.program_index is None or self.reason is not None
+                    or self.element_id is not None
+                    or self.evidence_state != "pending_runtime_witness"):
+                raise ValueError("invalid atom escrow accounting row")
+        elif self.disposition == _DISPOSITION_DATUM_PIN:
+            if (self.leaf_kind != "op" or self.op_id is not None
+                    or self.program_index is not None
+                    or self.reason != "datum_pinned_existing"
+                    or self.element_id is None
+                    or self.evidence_state != "same_document_unproven"):
+                raise ValueError("invalid datum-policy accounting row")
+        else:
+            if (self.op_id is not None or self.program_index is not None
+                    or self.element_id is not None
+                    or self.evidence_state is not None
+                    or self.reason is None):
+                raise ValueError("invalid typed-residual accounting row")
+            if self.leaf_kind == "atom" \
+                    and self.reason not in _ATOM_SKIP_REASONS:
+                raise ValueError("unknown atom residual accounting reason")
+            if self.leaf_kind == "op" and not self.reason.startswith(
+                    "host_unmaterialized:"):
+                raise ValueError("unknown semantic residual accounting reason")
+            if self.leaf_kind == "op" and not self.reason.split(":", 1)[1]:
+                raise ValueError("semantic residual must name its missing ref")
+
+    def as_dict(self) -> dict[str, Any]:
+        # Deliberately exact: null fields stay present, so a producer cannot
+        # reinterpret an omitted binding as one that was proved elsewhere.
+        return {
+            "source_id": self.source_id,
+            "leaf_id": self.leaf_id,
+            "leaf_kind": self.leaf_kind,
+            "category": self.category,
+            "disposition": self.disposition,
+            "reason": self.reason,
+            "op_id": self.op_id,
+            "program_index": self.program_index,
+            "element_id": self.element_id,
+            "evidence_state": self.evidence_state,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializationAccounting:
+    """Versioned, digest-bound total-accounting receipt for a result."""
+
+    input_digest: str
+    programs_digest: str
+    records: tuple[MaterializationRecord, ...]
+    programs_count: int
+    emitted_ops_count: int
+    schema_version: str = field(
+        default=MATERIALIZATION_ACCOUNTING_SCHEMA, init=False)
+
+    def __post_init__(self) -> None:
+        if not _is_sha256(self.input_digest):
+            raise ValueError("accounting input_digest must be SHA-256")
+        if not _is_sha256(self.programs_digest):
+            raise ValueError("accounting programs_digest must be SHA-256")
+        if (isinstance(self.programs_count, bool)
+                or not isinstance(self.programs_count, int)
+                or self.programs_count < 0):
+            raise TypeError("accounting programs_count must be non-negative")
+        if (isinstance(self.emitted_ops_count, bool)
+                or not isinstance(self.emitted_ops_count, int)
+                or self.emitted_ops_count < 0):
+            raise TypeError("accounting emitted_ops_count must be non-negative")
+        if (not isinstance(self.records, tuple)
+                or any(not isinstance(record, MaterializationRecord)
+                       for record in self.records)):
+            raise TypeError("accounting records must be an immutable typed tuple")
+        source_ids = [record.source_id for record in self.records]
+        leaf_ids = [record.leaf_id for record in self.records]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("accounting repeats a source identity")
+        if len(leaf_ids) != len(set(leaf_ids)):
+            raise ValueError("accounting repeats an L1 identity")
+        expected_order = sorted(
+            self.records, key=lambda record: (record.source_id, record.leaf_id))
+        if list(self.records) != expected_order:
+            raise ValueError("accounting records must use canonical source order")
+        emitted = sum(
+            record.disposition in {_DISPOSITION_EMITTED, _DISPOSITION_ESCROW}
+            for record in self.records)
+        if self.emitted_ops_count != emitted:
+            raise ValueError("accounting emitted count disagrees with records")
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return {
+            "input_leaves": len(self.records),
+            "emitted_semantic_ops": sum(
+                row.disposition == _DISPOSITION_EMITTED
+                for row in self.records),
+            "atom_escrows": sum(
+                row.disposition == _DISPOSITION_ESCROW
+                for row in self.records),
+            "datum_policy_pins": sum(
+                row.disposition == _DISPOSITION_DATUM_PIN
+                for row in self.records),
+            "typed_residuals": sum(
+                row.disposition == _DISPOSITION_RESIDUAL
+                for row in self.records),
+            "programs": self.programs_count,
+            "emitted_ops": self.emitted_ops_count,
+        }
+
+    def _unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "input_digest": self.input_digest,
+            "programs_digest": self.programs_digest,
+            "counts": self.counts,
+            "records": [record.as_dict() for record in self.records],
+        }
+
+    @property
+    def receipt_digest(self) -> str:
+        return _sha256_json(
+            self._unsigned_dict(), label="materialization accounting")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            **self._unsigned_dict(),
+            "receipt_digest": self.receipt_digest,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +502,191 @@ class _EscrowCandidate:
         )
 
 
+def _build_materialization_accounting(
+    leaves: Sequence[L1Node],
+    programs: Sequence[dict[str, Any]],
+    skipped: Sequence[SkipRecord],
+    escrowed: Sequence[EscrowRecord],
+    *,
+    include_datums: bool,
+) -> MaterializationAccounting:
+    """Prove that leaves, wire programs and evidence form one total partition."""
+
+    op_locations: dict[str, tuple[int, Mapping[str, Any]]] = {}
+    emitted_total = 0
+    for program_index, program in enumerate(programs):
+        ops = program.get("ops")
+        if not isinstance(ops, list):
+            raise MaterializeError(
+                f"programs[{program_index}].ops must be a list")
+        for op in ops:
+            if not isinstance(op, Mapping):
+                raise MaterializeError("materialized op must be an object")
+            op_id = op.get("id")
+            if not isinstance(op_id, str) or not op_id:
+                raise MaterializeError("materialized op must have an id")
+            if op_id in op_locations:
+                raise MaterializeError(
+                    f"duplicate emitted op id in accounting: {op_id}")
+            op_locations[op_id] = (program_index, op)
+            emitted_total += 1
+
+    skip_by_source: dict[str, SkipRecord] = {}
+    for record in skipped:
+        if not isinstance(record, SkipRecord):
+            raise MaterializeError("untyped skip cannot enter accounting")
+        if record.source_id in skip_by_source:
+            raise MaterializeError(
+                "one source leaf cannot have duplicate skip accounting")
+        skip_by_source[record.source_id] = record
+    escrow_by_source: dict[str, EscrowRecord] = {}
+    for record in escrowed:
+        if not isinstance(record, EscrowRecord):
+            raise MaterializeError("untyped escrow cannot enter accounting")
+        if record.source_id in escrow_by_source:
+            raise MaterializeError("one atom cannot have duplicate escrow evidence")
+        escrow_by_source[record.source_id] = record
+
+    records: list[MaterializationRecord] = []
+    consumed_op_ids: set[str] = set()
+    consumed_skips: set[str] = set()
+    consumed_escrows: set[str] = set()
+    for leaf in leaves:
+        source_id = leaf["source_element_id"]
+        leaf_id = leaf["_id"]
+        leaf_kind = leaf["kind"]
+        category = (
+            leaf["op_name"] if leaf_kind == "op" else leaf["category"])
+        op_id = _op_id(source_id)
+        location = op_locations.get(op_id)
+        skip = skip_by_source.get(source_id)
+        escrow = escrow_by_source.get(source_id)
+
+        if leaf_kind == "op" and leaf["op_name"] in _DATUM_OPS \
+                and not include_datums:
+            if location is not None or escrow is not None or skip is None \
+                    or skip.category != category \
+                    or skip.reason != "datum_pinned_existing":
+                raise MaterializeError(
+                    f"datum source {source_id} is not accounted exactly once")
+            try:
+                element_id = int(source_id)
+            except (TypeError, ValueError) as exc:
+                raise MaterializeError(
+                    "datum pin is not a source ElementId") from exc
+            consumed_skips.add(source_id)
+            records.append(MaterializationRecord(
+                source_id=source_id,
+                leaf_id=leaf_id,
+                leaf_kind="op",
+                category=category,
+                disposition=_DISPOSITION_DATUM_PIN,
+                reason="datum_pinned_existing",
+                element_id=element_id,
+                evidence_state="same_document_unproven",
+            ))
+            continue
+
+        if leaf_kind == "op" and skip is not None:
+            if (location is not None or escrow is not None
+                    or skip.category != category
+                    or not skip.reason.startswith("host_unmaterialized:")
+                    or not skip.reason.split(":", 1)[1]):
+                raise MaterializeError(
+                    f"semantic source {source_id} has invalid residual accounting")
+            consumed_skips.add(source_id)
+            records.append(MaterializationRecord(
+                source_id=source_id,
+                leaf_id=leaf_id,
+                leaf_kind="op",
+                category=category,
+                disposition=_DISPOSITION_RESIDUAL,
+                reason=skip.reason,
+            ))
+            continue
+
+        if leaf_kind == "op":
+            if location is None or skip is not None or escrow is not None:
+                raise MaterializeError(
+                    f"semantic source {source_id} is missing or multiply accounted")
+            program_index, op = location
+            if op.get("op") != category:
+                raise MaterializeError(
+                    f"semantic source {source_id} emitted the wrong op")
+            consumed_op_ids.add(op_id)
+            records.append(MaterializationRecord(
+                source_id=source_id,
+                leaf_id=leaf_id,
+                leaf_kind="op",
+                category=category,
+                disposition=_DISPOSITION_EMITTED,
+                op_id=op_id,
+                program_index=program_index,
+            ))
+            continue
+
+        if escrow is not None:
+            if location is None or skip is not None:
+                raise MaterializeError(
+                    f"atom source {source_id} has incomplete escrow accounting")
+            program_index, op = location
+            if (op.get("op") != "create_directshape"
+                    or escrow.op_id != op_id
+                    or escrow.program_index != program_index
+                    or escrow.source_category != category
+                    or escrow.acceptance_state != "pending_runtime_witness"):
+                raise MaterializeError(
+                    f"atom source {source_id} escrow evidence disagrees with wire")
+            consumed_op_ids.add(op_id)
+            consumed_escrows.add(source_id)
+            records.append(MaterializationRecord(
+                source_id=source_id,
+                leaf_id=leaf_id,
+                leaf_kind="atom",
+                category=category,
+                disposition=_DISPOSITION_ESCROW,
+                op_id=op_id,
+                program_index=program_index,
+                evidence_state="pending_runtime_witness",
+            ))
+            continue
+
+        if (location is not None or skip is None
+                or skip.category != category
+                or skip.reason not in _ATOM_SKIP_REASONS):
+            raise MaterializeError(
+                f"atom source {source_id} has unknown or incomplete residual accounting")
+        consumed_skips.add(source_id)
+        records.append(MaterializationRecord(
+            source_id=source_id,
+            leaf_id=leaf_id,
+            leaf_kind="atom",
+            category=category,
+            disposition=_DISPOSITION_RESIDUAL,
+            reason=skip.reason,
+        ))
+
+    if consumed_op_ids != set(op_locations):
+        raise MaterializeError("emitted wire contains an op with no source leaf")
+    if consumed_skips != set(skip_by_source):
+        raise MaterializeError("skip evidence contains an unbound source")
+    if consumed_escrows != set(escrow_by_source):
+        raise MaterializeError("escrow evidence contains an unbound source")
+
+    records.sort(key=lambda record: (record.source_id, record.leaf_id))
+    return MaterializationAccounting(
+        input_digest=_sha256_json(
+            _canonical_input_leaves(leaves),
+            label="materialization input leaves",
+        ),
+        programs_digest=_sha256_json(
+            programs, label="materialized raw programs"),
+        records=tuple(records),
+        programs_count=len(programs),
+        emitted_ops_count=emitted_total,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class MaterializeStats:
     """Counters for a materialization run (all deterministic)."""
@@ -215,6 +697,7 @@ class MaterializeStats:
     atoms_skipped: int = 0
     atoms_escrowed: int = 0
     datums_skipped: int = 0
+    semantic_ops_skipped: int = 0
     solo_programs: int = 0
     tail_ops: int = 0
     #: Группы, вынесенные в отдельную программу по требованию вызывающего
@@ -232,6 +715,7 @@ class MaterializeStats:
             "atoms_skipped": self.atoms_skipped,
             "atoms_escrowed": self.atoms_escrowed,
             "datums_skipped": self.datums_skipped,
+            "semantic_ops_skipped": self.semantic_ops_skipped,
             "solo_programs": self.solo_programs,
             "tail_ops": self.tail_ops,
             "isolated_groups": self.isolated_groups,
@@ -319,6 +803,8 @@ class MaterializeResult:
     _escrowed: tuple[EscrowRecord, ...] = field(
         default_factory=tuple, repr=False)
     stats: MaterializeStats = field(default_factory=MaterializeStats)
+    accounting: MaterializationAccounting | None = field(
+        default=None, repr=False)
     plans: tuple[PlannedProgram | None, ...] = field(
         default_factory=tuple, repr=False, compare=False)
     plan_checks: tuple[ProgramPlanCheck, ...] = field(default_factory=tuple)
@@ -329,6 +815,7 @@ class MaterializeResult:
         skipped: Sequence[SkipRecord] = (),
         escrowed: Sequence[EscrowRecord] = (),
         stats: MaterializeStats | None = None,
+        accounting: MaterializationAccounting | None = None,
         plans: Sequence[PlannedProgram | None] = (),
         plan_checks: Sequence[ProgramPlanCheck] = (),
     ) -> None:
@@ -359,6 +846,7 @@ class MaterializeResult:
         object.__setattr__(self, "_escrowed", tuple(escrowed))
         object.__setattr__(
             self, "stats", stats if stats is not None else MaterializeStats())
+        object.__setattr__(self, "accounting", accounting)
         object.__setattr__(self, "plans", tuple(plans))
         object.__setattr__(self, "plan_checks", tuple(plan_checks))
         self.__post_init__()
@@ -389,6 +877,92 @@ class MaterializeResult:
             raise TypeError("escrowed must contain EscrowRecord values")
         if not isinstance(self.stats, MaterializeStats):
             raise TypeError("stats must be MaterializeStats")
+        if not isinstance(self.accounting, MaterializationAccounting):
+            raise ValueError("typed materialization accounting is required")
+        programs = self.programs
+        if self.accounting.programs_digest != _sha256_json(
+                programs, label="materialized raw programs"):
+            raise ValueError("accounting digest disagrees with raw programs")
+        if self.accounting.programs_count != len(programs):
+            raise ValueError("accounting program count disagrees with wire")
+        wire_ops: dict[str, tuple[int, Mapping[str, Any]]] = {}
+        for program_index, program in enumerate(programs):
+            ops = program.get("ops")
+            if not isinstance(ops, list):
+                raise ValueError("materialized program ops must be a list")
+            for op in ops:
+                if not isinstance(op, Mapping):
+                    raise ValueError("materialized wire op must be an object")
+                op_id = op.get("id")
+                if not isinstance(op_id, str) or not op_id:
+                    raise ValueError("materialized wire op needs an id")
+                if op_id in wire_ops:
+                    raise ValueError("materialized wire repeats an op id")
+                wire_ops[op_id] = (program_index, op)
+        if self.accounting.emitted_ops_count != len(wire_ops):
+            raise ValueError("accounting emitted count disagrees with wire")
+        accounted_op_ids: set[str] = set()
+        for record in self.accounting.records:
+            if record.disposition not in {
+                    _DISPOSITION_EMITTED, _DISPOSITION_ESCROW}:
+                continue
+            assert record.op_id is not None
+            location = wire_ops.get(record.op_id)
+            if (location is None
+                    or location[0] != record.program_index
+                    or record.op_id in accounted_op_ids):
+                raise ValueError("accounting op binding disagrees with wire")
+            expected_op = (
+                record.category
+                if record.disposition == _DISPOSITION_EMITTED
+                else "create_directshape")
+            if location[1].get("op") != expected_op:
+                raise ValueError("accounting op category disagrees with wire")
+            accounted_op_ids.add(record.op_id)
+        if accounted_op_ids != set(wire_ops):
+            raise ValueError("wire op has no accounting record")
+
+        expected_skips = sorted(
+            (record.source_id, record.category, record.reason)
+            for record in self.accounting.records
+            if record.disposition in {
+                _DISPOSITION_DATUM_PIN, _DISPOSITION_RESIDUAL})
+        actual_skips = sorted(
+            (record.source_id, record.category, record.reason)
+            for record in self._skipped)
+        if expected_skips != actual_skips:
+            raise ValueError("accounting skips disagree with skip evidence")
+        expected_escrows = sorted(
+            record.source_id for record in self.accounting.records
+            if record.disposition == _DISPOSITION_ESCROW)
+        actual_escrows = sorted(record.source_id for record in self._escrowed)
+        if expected_escrows != actual_escrows:
+            raise ValueError("accounting escrow rows disagree with evidence")
+
+        expected_stats = {
+            "op_leaves": sum(
+                record.leaf_kind == "op"
+                for record in self.accounting.records),
+            "materialized_ops": len(wire_ops),
+            "programs": len(programs),
+            "atoms_skipped": sum(
+                record.leaf_kind == "atom"
+                and record.disposition == _DISPOSITION_RESIDUAL
+                for record in self.accounting.records),
+            "atoms_escrowed": len(expected_escrows),
+            "datums_skipped": sum(
+                record.disposition == _DISPOSITION_DATUM_PIN
+                for record in self.accounting.records),
+            "semantic_ops_skipped": sum(
+                record.leaf_kind == "op"
+                and record.disposition == _DISPOSITION_RESIDUAL
+                for record in self.accounting.records),
+        }
+        actual_stats = self.stats.as_dict()
+        for key, expected in expected_stats.items():
+            if actual_stats[key] != expected:
+                raise ValueError(
+                    f"materialization stats.{key} disagrees with accounting")
         if self.stats.atoms_escrowed != len(self._escrowed):
             raise ValueError("atoms_escrowed must match escrow evidence")
         escrow_sources = [record.source_id for record in self._escrowed]
@@ -416,7 +990,6 @@ class MaterializeResult:
                 raise ValueError("plan and plan check acceptance disagree")
             if plan is not None and check.plan_digest != plan.plan_digest:
                 raise ValueError("plan check digest disagrees with plan")
-        programs = self.programs
         for record in self._escrowed:
             index = record.program_index
             if index >= len(programs):
@@ -529,21 +1102,28 @@ def _op_id(source_element_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _translate_reference(value: Any, host_op_id_by_l1_id: Mapping[str, str]) -> Any:
+def _translate_reference(
+    value: Any,
+    host_op_id_by_l1_id: Mapping[str, str],
+    pinned_element_id_by_l1_id: Mapping[str, int] | None = None,
+) -> Any:
     """Recursively rewrite frozen L1 reference dialects to compiler selectors.
 
     * ``{"by": "name"|"family_type", ..., "_id": ID}`` -> ``{"by": "element_id",
       "value": int(ID)}`` (same-document: pin the existing datum/type/symbol).
-    * ``{"ref": <host L1 _id>}`` -> ``{"by": "ref", "value": <host op id>}``.
+    * ``{"ref": <materialized L1 _id>}`` -> ``by=ref``.
+    * ``{"ref": <pinned datum L1 _id>}`` -> ``by=element_id``.
 
     Everything else (scalars, coordinate lists) passes through unchanged.  Fails
     closed: an unresolvable host ref or a non-integer ``_id`` raises
     ``MaterializeError`` (never a silently-wrong selector, I2).
     """
 
+    pinned = pinned_element_id_by_l1_id or {}
     if isinstance(value, list):
         return [
-            _translate_reference(item, host_op_id_by_l1_id) for item in value
+            _translate_reference(item, host_op_id_by_l1_id, pinned)
+            for item in value
         ]
     if not isinstance(value, dict):
         return value
@@ -559,12 +1139,16 @@ def _translate_reference(value: Any, host_op_id_by_l1_id: Mapping[str, str]) -> 
     if "ref" in value:
         l1_id = value["ref"]
         op_id = host_op_id_by_l1_id.get(l1_id)
-        if op_id is None:
-            raise MaterializeError(
-                f"host reference {l1_id!r} has no materialized host op")
-        return {"by": "ref", "value": op_id}
+        if op_id is not None:
+            return {"by": "ref", "value": op_id}
+        pinned_id = pinned.get(l1_id)
+        if pinned_id is not None:
+            return {"by": "element_id", "value": pinned_id}
+        raise MaterializeError(
+            f"reference {l1_id!r} has neither a materialized op nor an "
+            "explicit pinned element")
     return {
-        key: _translate_reference(item, host_op_id_by_l1_id)
+        key: _translate_reference(item, host_op_id_by_l1_id, pinned)
         for key, item in value.items()
     }
 
@@ -676,6 +1260,7 @@ def _leaf_to_op(
     leaf: L1Node,
     host_op_id_by_l1_id: Mapping[str, str],
     offset_mm: Vec3 | None,
+    pinned_element_id_by_l1_id: Mapping[str, int] | None = None,
 ) -> dict:
     """Translate one op-leaf into a raw compiler op dict.
 
@@ -686,7 +1271,9 @@ def _leaf_to_op(
     """
 
     placed = _reconcile_arc_endpoints(_offset_leaf(leaf, offset_mm))
-    params = _translate_reference(placed["params"], host_op_id_by_l1_id)
+    params = _translate_reference(
+        placed["params"], host_op_id_by_l1_id,
+        pinned_element_id_by_l1_id)
     op: dict[str, Any] = {"op": placed["op_name"], "id": _op_id(
         placed["source_element_id"])}
     op.update(params)
@@ -718,11 +1305,11 @@ def _atom_escrow_op(
         )
     try:
         mesh = geometry.world_fallback_mesh_for_record(record)
-    except GeometryExtractionError as exc:
+    except GeometryExtractionError:
         return None, None, SkipRecord(
             source_id=source_id,
             category=source_category,
-            reason=f"atom_escrow:geometry_refused:{type(exc).__name__}",
+            reason="atom_escrow:geometry_refused",
         )
 
     # Preserve an already-neutral source category when the forward operation
@@ -752,15 +1339,10 @@ def _atom_escrow_op(
     diagnostics: list[Any] = []
     validated_mesh = validate_mesh(op.get("mesh"), op["id"], "mesh", diagnostics)
     if validated_mesh is None:
-        codes = sorted({
-            diagnostic.code for diagnostic in diagnostics
-            if isinstance(getattr(diagnostic, "code", None), str)
-        })
-        code = "+".join(codes) if codes else "mesh_invalid"
         return None, None, SkipRecord(
             source_id=source_id,
             category=source_category,
-            reason=f"atom_escrow:mesh_refused:{code}",
+            reason="atom_escrow:mesh_refused",
         )
     op["mesh"] = validated_mesh
     assert record.geo_hash is not None
@@ -823,10 +1405,11 @@ def _build_host_groups(op_leaves: Sequence[L1Node]) -> list[_HostGroup]:
     because the whole model fits inside one chunk.
 
     Grouping is undirected on purpose: ORDER inside a chunk is law (d)'s job
-    (``_toposort_chunk``), and only membership belongs here.  A leaf whose ref
-    target is absent from the op-leaf set (the target became an atom) stays a
-    component of its own — its ``ref`` still fails the compiler DAG and the
-    chunk is refused, never silently rehosted (I2).
+    (``_toposort_chunk``), and only membership belongs here.  A ref to a
+    deliberately omitted same-document datum has already been proved external
+    and is translated to ``by=element_id``; it therefore creates no graph
+    edge.  Any other absent target is removed as a typed orphan before this
+    function — never silently rehosted or allowed to disappear (I2).
 
     A component larger than ``chunk_target`` becomes its own oversized chunk
     (``_pack_groups``); past ``MAX_BULK_OPS`` the compiler refuses it by size.
@@ -919,8 +1502,10 @@ def _toposort_chunk(chunk: Sequence[L1Node]) -> list[L1Node]:
     Determinism (I4): ties are broken by ``source_element_id`` exactly as
     before, so identical chunks keep producing byte-identical order.
 
-    Membership (Д5a) guarantees every ref target is in this chunk, so a leaf
-    left unordered means a genuine cycle, not a boundary crossing.
+    Membership (Д5a) guarantees every materialized ref target is in this
+    chunk.  Same-document datum pins are external ``element_id`` selectors and
+    intentionally create no ordering edge.  A leaf left unordered therefore
+    means a genuine cycle, not a boundary crossing.
     """
 
     by_l1_id = {leaf["_id"]: leaf for leaf in chunk}
@@ -976,10 +1561,14 @@ def _materialize_chunk(
     chunk: Sequence[L1Node],
     host_op_id_by_l1_id: Mapping[str, str],
     offset_mm: Vec3 | None,
+    pinned_element_id_by_l1_id: Mapping[str, int] | None = None,
 ) -> dict:
     ordered = _toposort_chunk(chunk)
     return _program([
-        _leaf_to_op(leaf, host_op_id_by_l1_id, offset_mm) for leaf in ordered
+        _leaf_to_op(
+            leaf, host_op_id_by_l1_id, offset_mm,
+            pinned_element_id_by_l1_id)
+        for leaf in ordered
     ])
 
 
@@ -1070,6 +1659,7 @@ def leaves_to_program(
         raise MaterializeError("chunk_target must be a positive integer")
 
     leaf_list = list(leaves)
+    _validate_input_leaves(leaf_list)
     selected_escrow_ids: frozenset[str] | None = None
     if escrow_source_ids is not None:
         if isinstance(escrow_source_ids, (str, bytes, bytearray)):
@@ -1092,6 +1682,25 @@ def leaves_to_program(
             raise MaterializeError(
                 "escrow_source_ids are not atom leaves: " + ", ".join(unknown))
     op_leaves = [leaf for leaf in leaf_list if leaf["kind"] == "op"]
+    input_op_leaves = len(op_leaves)
+
+    # Same-document datum policy does not mean that the datum disappears.
+    # It stays an explicit external dependency pinned by the ElementId from
+    # which its L1 leaf was lifted.  Consumers such as create_dimension may
+    # therefore reference it without forcing a duplicate level/grid create.
+    pinned_element_id_by_l1_id: dict[str, int] = {}
+    if not include_datums:
+        for leaf in op_leaves:
+            if leaf["op_name"] not in _DATUM_OPS:
+                continue
+            raw_id = leaf["source_element_id"]
+            try:
+                element_id = int(raw_id)
+            except (TypeError, ValueError) as exc:
+                raise MaterializeError(
+                    "pinned datum source_element_id is not an integer "
+                    f"ElementId: {raw_id!r}") from exc
+            pinned_element_id_by_l1_id[leaf["_id"]] = element_id
 
     # Host op-id map spans EVERY materialized op-leaf (across all chunks) so a
     # hosted ref can be validated before chunking; the chunker then guarantees
@@ -1120,7 +1729,8 @@ def leaves_to_program(
                 continue
             missing = next(
                 (ref for ref in _iter_refs(leaf["params"])
-                 if ref not in host_op_id_by_l1_id), None)
+                 if ref not in host_op_id_by_l1_id
+                 and ref not in pinned_element_id_by_l1_id), None)
             if missing is None:
                 continue
             orphan_host[l1_id] = missing
@@ -1217,7 +1827,17 @@ def leaves_to_program(
         op_name = leaf["op_name"]
         if op_name in _DATUM_OPS and not include_datums:
             continue
-        if op_name in _SOLO_OPS:
+        if op_name in _SOLO_OPS or spec.is_version_fragile(
+                op_name, leaf.get("params")):
+            # ДВА РОДА СОЛО, И ОНИ НЕ СЛИТЫ. `_SOLO_OPS` — имена, причина своя
+            # (области правки лестницы). `is_version_fragile` — пары (оп, ПОЛЕ),
+            # причина другая: отсутствующая перегрузка API на старой версии.
+            #
+            # ЗАЧЕМ ВТОРОЙ. Отказ эмиссии роняет ПРОГРАММУ, а не оп, и размер
+            # куска назначен нами: замерено 13.08 на `k2_ar_rd_v7` — ТРИ опа,
+            # невыразимых на Revit 2021, унесли 2 742 совместимых, 1 : 914.
+            # Ключить по ИМЕНИ было нельзя: соло уехали бы все 252 перекрытия
+            # вместо 44 с проёмами, и мы разменяли бы потерю на огрызки.
             solo_leaves.append(leaf)
         elif op_name in _TAIL_OPS:
             tail_leaves.append(leaf)
@@ -1234,14 +1854,16 @@ def leaves_to_program(
               if group.anchor_source_id not in isolate]
     for chunk in _pack_groups(packed, chunk_target):
         programs.append(_materialize_chunk(
-            chunk, host_op_id_by_l1_id, offset_mm))
+            chunk, host_op_id_by_l1_id, offset_mm,
+            pinned_element_id_by_l1_id))
 
     # Изолированные группы — каждая своей программой, ПЕРЕД хвостом: помещения
     # хвоста обязаны ставиться после ВСЕХ стен прогона (Д5b), а изолированная
     # группа стены содержит.
     for group in sorted(isolated, key=lambda item: item.anchor_source_id):
         programs.append(_materialize_chunk(
-            list(group.leaves), host_op_id_by_l1_id, offset_mm))
+            list(group.leaves), host_op_id_by_l1_id, offset_mm,
+            pinned_element_id_by_l1_id))
 
     # Tail: rooms after all walls of the whole run (Д5b).  Rooms carry no host
     # ref, so they pack purely by size with a stable source-id order.
@@ -1251,7 +1873,9 @@ def leaves_to_program(
     for start in range(0, len(tail_sorted), tail_chunk_size):
         chunk = tail_sorted[start:start + tail_chunk_size]
         programs.append(_program([
-            _leaf_to_op(leaf, host_op_id_by_l1_id, offset_mm)
+            _leaf_to_op(
+                leaf, host_op_id_by_l1_id, offset_mm,
+                pinned_element_id_by_l1_id)
             for leaf in chunk
         ]))
 
@@ -1260,7 +1884,9 @@ def leaves_to_program(
         solo_leaves, key=lambda node: node["source_element_id"])
     for leaf in solo_sorted:
         programs.append(_program([
-            _leaf_to_op(leaf, host_op_id_by_l1_id, offset_mm)]))
+            _leaf_to_op(
+                leaf, host_op_id_by_l1_id, offset_mm,
+                pinned_element_id_by_l1_id)]))
 
     # Escrow geometry is last and one source atom per program.  It has no BIM
     # dependency edges, while isolation keeps one malformed/heavy mesh from
@@ -1274,12 +1900,13 @@ def leaves_to_program(
 
     materialized_ops = sum(len(program["ops"]) for program in programs)
     stats = MaterializeStats(
-        op_leaves=len(op_leaves),
+        op_leaves=input_op_leaves,
         materialized_ops=materialized_ops,
         programs=len(programs),
         atoms_skipped=atoms_skipped,
         atoms_escrowed=len(escrow_programs),
         datums_skipped=datums_skipped,
+        semantic_ops_skipped=len(orphan_host),
         solo_programs=len(solo_sorted),
         tail_ops=len(tail_sorted),
         isolated_groups=len(isolated),
@@ -1297,11 +1924,19 @@ def leaves_to_program(
             program_index=program_index,
             plan_digest=plan.plan_digest,
         ))
+    accounting = _build_materialization_accounting(
+        leaf_list,
+        programs,
+        skipped,
+        escrowed,
+        include_datums=include_datums,
+    )
     return MaterializeResult(
         programs=programs,
         skipped=skipped,
         escrowed=escrowed,
         stats=stats,
+        accounting=accounting,
         plans=plans,
         plan_checks=plan_checks,
     )
@@ -1310,6 +1945,44 @@ def leaves_to_program(
 # ---------------------------------------------------------------------------
 # Group bridge (KUKAI_IR_NATIVE_GROUP) — optional
 # ---------------------------------------------------------------------------
+
+
+#: Отказы моста групп за последний вызов `component_to_group_program`.
+#:
+#: РОД СПИСКА: **закрытый, но не полный** — состав держится дисциплиной, и
+#: новая причина обязана быть добавлена рукой. Полным по построению он быть не
+#: может: отказ приходит из чужих слоёв (материализатор, заземление, мост), и
+#: перечислить их исходы заранее нельзя.
+#:
+#: ЗАЧЕМ ВООБЩЕ. До 13.08 каждый отказ был `return None`: вызывающий уходил на
+#: N поштучных элементов и не знал, ПОЧЕМУ группа не собралась — «группы нет»
+#: и «группа отказана по названной причине» печатались одинаково. Это тот же
+#: класс, что молчаливая отсечка списка и гашение инверсии покрытия, третий
+#: случай за смену.
+_GROUP_REFUSALS: list[dict[str, str]] = []
+
+
+def _note_group_refusal(place_op: Any, reason: str, detail: str) -> None:
+    """Записать ПРИЧИНУ отказа моста, не меняя его поведения.
+
+    Поведение остаётся прежним и должно остаться: откат на поштучный путь —
+    правильный ответ, геометрия не теряется. Меняется только то, что теперь
+    можно спросить, почему группы не случилось.
+    """
+    _GROUP_REFUSALS.append({
+        "def_hash": getattr(place_op, "def_hash", "?"),
+        "reason": reason,
+        "detail": detail[:300],
+    })
+
+
+def last_group_refusals() -> tuple[dict[str, str], ...]:
+    """Отказы моста с последнего `reset_group_refusals()`."""
+    return tuple(_GROUP_REFUSALS)
+
+
+def reset_group_refusals() -> None:
+    _GROUP_REFUSALS.clear()
 
 
 def component_to_group_program(place_op: Any) -> dict | None:
@@ -1332,6 +2005,7 @@ def component_to_group_program(place_op: Any) -> dict | None:
     """
 
     from kukai.ir.decompile.native_group import (
+        assert_group_matches_place_op,
         group_op_from_place_op,
         native_group_enabled,
         native_group_op_to_ir,
@@ -1339,9 +2013,11 @@ def component_to_group_program(place_op: Any) -> dict | None:
     from kukai.ir.decompile.component import instantiate
 
     if not native_group_enabled():
-        return None
+        return None  # флаг выключен — это не отказ, а покой
     group_op = group_op_from_place_op(place_op)
     if group_op is None:
+        _note_group_refusal(place_op, 'placement_math',
+                            'мост не смог выразить размещения')
         return None
 
     # Occurrence 0's members at their absolute canonical origin.
@@ -1354,9 +2030,15 @@ def component_to_group_program(place_op: Any) -> dict | None:
     # self-contained), else the shape is not faithfully groupable.
     if (member_result.skipped or len(member_result.programs) != 1
             or not member_result.compiler_ready):
+        _note_group_refusal(
+            place_op, 'members_not_one_program',
+            f'пропущено {len(member_result.skipped)}, программ '
+            f'{len(member_result.programs)}, готова '
+            f'{member_result.compiler_ready}')
         return None
     raw_members = member_result.programs[0]["ops"]
     if not raw_members:
+        _note_group_refusal(place_op, 'no_members', 'членов не осталось')
         return None
 
     # Members must be PRE-GROUNDED for _emit_group; element_id/ref selectors
@@ -1368,7 +2050,22 @@ def component_to_group_program(place_op: Any) -> dict | None:
             return None
         normed = member_plan.to_ops()
         grounded_members = ground_mod.ground(normed, None)
-    except Exception:  # noqa: BLE001 — any refusal falls back to N-element path
+    except Exception as exc:  # noqa: BLE001 — откат на поштучный путь
+        _note_group_refusal(place_op, "grounding_refused", str(exc))
+        return None
+
+    # C-RT НА САМОМ МОСТУ (13.08.2026). Проверка написана в `native_group.py`
+    # целиком — сверяет мультимножество абсолютных опов развёртки группы с тем,
+    # что даёт поштучный путь, В ОБЕ СТОРОНЫ, и отдельно требует доказанной
+    # исходной точности, — и до сегодня её не звал НИКТО, кроме тестов.
+    # Мост собирал IR, ни разу не спросив, совпадает ли развёртка.
+    #
+    # Место выбрано перед сборкой IR нарочно: отказ обязан случиться ДО того,
+    # как появится оп, который кто-то может отправить.
+    try:
+        assert_group_matches_place_op(group_op, place_op)
+    except Exception as exc:  # noqa: BLE001 — расхождение = откат на поштучные
+        _note_group_refusal(place_op, "expansion_mismatch", str(exc))
         return None
 
     op_id = "grp_" + group_op.def_hash[:12]
@@ -1381,11 +2078,16 @@ def component_to_group_program(place_op: Any) -> dict | None:
 
 __all__ = [
     "EscrowRecord",
+    "MATERIALIZATION_ACCOUNTING_SCHEMA",
     "MaterializeError",
+    "MaterializationAccounting",
+    "MaterializationRecord",
     "MaterializeResult",
     "MaterializeStats",
     "ProgramPlanCheck",
     "SkipRecord",
     "component_to_group_program",
+    "last_group_refusals",
+    "reset_group_refusals",
     "leaves_to_program",
 ]

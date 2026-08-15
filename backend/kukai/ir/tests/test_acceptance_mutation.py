@@ -35,6 +35,7 @@ from kukai.ir.acceptance_probe import (
     parse_acceptance_observation,
 )
 from kukai.ir.compiler import plan_program
+from kukai.ir.ground import ground_program
 from kukai.ir.contracts import DocumentFingerprint
 from kukai.ir.outcome import AcceptanceState
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT
@@ -483,6 +484,7 @@ def test_mutation_evidence_is_replayed_and_cannot_be_forged():
     registration = AcceptanceRegistration(
         run_id=RUN_ID,
         plan_digest=plan.plan_digest,
+        ground_digest=ground_program(plan, GROUND_SNAPSHOT).ground_digest,
         revit_version="2026",
         expectation=scope,
         mutation_expectation=mutations,
@@ -527,6 +529,7 @@ def test_mixed_create_delete_is_inconclusive_not_false_rejected_or_green():
     registration = AcceptanceRegistration(
         run_id=RUN_ID,
         plan_digest=plan.plan_digest,
+        ground_digest=ground_program(plan, GROUND_SNAPSHOT).ground_digest,
         revit_version="2026",
         expectation=scope,
         mutation_expectation=mutations,

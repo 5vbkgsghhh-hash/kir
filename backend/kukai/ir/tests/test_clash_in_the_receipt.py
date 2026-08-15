@@ -45,6 +45,7 @@ from kukai.ir.tests.acceptance_fakes import PassingAcceptanceBridge  # noqa: E40
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
 from kukai.live import journal as J  # noqa: E402
 from kukai.live import verdict as V  # noqa: E402
+from kukai.ir.tests.gate_fixture import enter_kir_mode
 
 BACKEND = Path(__file__).resolve().parents[3]
 
@@ -162,6 +163,8 @@ class _Door(unittest.TestCase):
         self._set("KIR_WITNESS_PATH", os.path.join(self._feed.name, "w.jsonl"))
         CB._CACHE.clear()
         J.reset()
+        # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08): режим КИР ставится ЯВНО.
+        enter_kir_mode(self)
 
     def _set(self, name: str, value: str | None) -> None:
         self._env.setdefault(name, os.environ.get(name))
@@ -227,20 +230,75 @@ class TheTableIsClosed(unittest.TestCase):
         зданию тела, обязана либо получить категорию, либо назвать причину, по
         которой тела у неё нет, — иначе поиск молча теряет элементы, а отчёт
         остаётся «исправным»."""
-        covered = set(CB.OP_CATEGORY) | set(CB.OP_NO_BODY)
+        # ДВА ИСХОДА, И ОНИ СПРАШИВАЮТСЯ, А НЕ ОБЪЯВЛЯЮТСЯ (11.08.2026).
+        # Здесь стояло `set(CB.OP_CATEGORY) | set(CB.OP_NO_BODY)` — теневая
+        # таблица против реестра. Её сняли, тест упал на `AttributeError` и
+        # ЗАКОН ПЕРЕСТАЛ ИСПОЛНЯТЬСЯ: ровно тогда две операции и выпали из
+        # таблицы молча (`create_space`, `create_curtain_grid_line` — обе
+        # названы в `OP_NO_BODY` при воскрешении этого сторожа).
+        answered = {name for name in CB.body_making_ops()
+                    if CB.op_categories(name)}
+        covered = answered | set(CB.OP_NO_BODY)
         self.assertEqual(covered, set(spec.OPS),
                          f"вне таблицы: {sorted(set(spec.OPS) - covered)}; "
                          f"лишние: {sorted(covered - set(spec.OPS))}")
-        self.assertEqual(set(CB.OP_CATEGORY) & set(CB.OP_NO_BODY), set())
+
+    def test_having_a_category_and_having_a_body_are_independent(self) -> None:
+        """ПРОВЕРКА, КОТОРАЯ НЕ МОГЛА УПАСТЬ, ЗАМЕНЕНА НА ТУ, ЧТО МОЖЕТ
+        (11.08.2026, и находка чужая — её принёс лид красным тестом).
+
+        Здесь стояло `assertEqual(answered & set(CB.OP_NO_BODY), set())`, где
+        `answered` бралось из `body_making_ops()`, а `body_making_ops()` ЕСТЬ
+        `OPS − OP_NO_BODY`. Пересечение пусто ПО ПОСТРОЕНИЮ: утверждение не
+        могло упасть ни при каком состоянии кода. Я заменил мёртвую проверку
+        на непадающую в том же коммите, чьё сообщение — про сторожей, которые
+        не могли исполниться. Проверка, которая не может упасть, ХУЖЕ
+        отсутствующей: она числится в наборе.
+
+        НЕПУСТОЙ ОТВЕТ, снятый по ВСЕМУ реестру, а не по заранее отфильтрованному
+        множеству: `create_face_wall`. Стена по грани массы ЕСТЬ стена
+        (`OST_Walls` — категория известна точно), и оболочки не имеет:
+        `FaceWall` не `Wall` (CS0029 на всех шести) и `LocationCurve` не имеет
+        вовсе. Две величины, и они независимы:
+
+            `category_of`  -> куда результат попадёт в Revit
+            `OP_NO_BODY`   -> можем ли мы построить оболочку
+
+        Один из 69 — и потому единственный, на котором подмена одной величины
+        другой становится видна. Его зеркало — `create_curtain_grid_line`:
+        там категория ОБЪЯВЛЯЛАСЬ строкой `REGISTRY_GAPS` там, где таблица тел
+        её отвергала. Одна и та же независимость с двух сторон.
+
+        Список закрыт: новый оп, у которого нет тела и есть категория, обязан
+        быть вписан сюда РЕШЕНИЕМ, а не приехать молча.
+        """
+        both = {name for name in spec.OPS
+                if name in CB.OP_NO_BODY and CB.op_categories(name)}
+        self.assertEqual(
+            both, {"create_face_wall"},
+            "изменился состав опов, у которых категория известна, а тела нет. "
+            "Это не ошибка сама по себе — но это РЕШЕНИЕ: припишите причину в "
+            "`OP_NO_BODY` и назовите оп здесь")
+        self.assertEqual(CB.op_categories("create_face_wall"), ("OST_Walls",))
+        self.assertIn("LocationCurve", CB.OP_NO_BODY["create_face_wall"])
 
     def test_every_category_named_here_exists_in_the_closed_hull_table(self) -> None:
         """Категория, которой нет в таблице пакета, ушла бы в
         `kind_outside_table` — то есть в тихий пропуск с красивым именем."""
-        named = {c for c in CB.OP_CATEGORY.values() if c}
-        named |= {CB._column_category({"category": v})
-                  for v in ("structural", "architectural")}
-        named |= {CB._directshape_category({"category": v})
-                  for v in ("generic_model", "specialty_equipment", "furniture")}
+        # ТРИ МЁРТВЫЕ ССЫЛКИ, А НЕ ОДНА (замер 11.08.2026). Кроме снятой
+        # `OP_CATEGORY` этот тест читал `_column_category` и
+        # `_directshape_category` — местные разрешатели, снятые ВМЕСТЕ с
+        # таблицей: перечисление опа теперь разбирает сам реестр
+        # (`spec.op_result_categories`), и `op_categories` перебирает его
+        # целиком. Поэтому обе строки не заменены, а СНЯТЫ: их ответ входит
+        # в первую строку по построению, и повторять его значило бы завести
+        # третью копию того же отношения.
+        named = {c for name in CB.body_making_ops()
+                 for c in CB.op_categories(name)}
+        self.assertLessEqual(
+            {"OST_StructuralColumns", "OST_Columns", "OST_Furniture",
+             "OST_GenericModel", "OST_SpecialityEquipment"}, named,
+            "перечисление опа перестало разбираться — ответ реестра сузился")
         missing = sorted(c for c in named if c not in H.KIND_TABLE)
         self.assertEqual(missing, [], missing)
 
@@ -250,8 +308,11 @@ class TheTableIsClosed(unittest.TestCase):
         же, что пишет эмиттер, и обязано быть известно таблице."""
         for op_name, param in CB.SECTION_PARAM_BY_OP.items():
             self.assertIn(param, H.ALL_SECTION_PARAM_NAMES, op_name)
-            category = CB.OP_CATEGORY[op_name]
-            self.assertIn(param, H.SECTION_RULES[category]["round"], op_name)
+            categories = CB.op_categories(op_name)
+            self.assertTrue(categories, op_name)
+            for category in categories:
+                self.assertIn(param, H.SECTION_RULES[category]["round"],
+                              op_name)
 
     def test_the_bundle_address_is_the_same_one_the_verdict_uses(self) -> None:
         """Находка о коллизии и находка вердикта обязаны вести в ОДНУ строку
@@ -287,9 +348,21 @@ class AbsentStaysAbsent(_Door):
 
         self.assertEqual(set(on) - set(off), {"clash"}, sorted(on))
         for field in sorted(off):
-            if field == "message_ru":
+            # `receipt_chars` исключается ПО ТОЙ ЖЕ ПРИЧИНЕ, что и
+            # `message_ru`: это его длина, функция от исключённого поля.
+            # Сверять производную, исключив оригинал, — проверять то же
+            # самое под другим именем. Поле едет при обоих положениях
+            # флага с 13.08: прибор, отвечающий лишь в одной из двух
+            # конфигураций, покрывает часть диапазона.
+            if field in ("message_ru", "receipt_chars"):
                 continue
             self.assertEqual(on[field], off[field], field)
+        self.assertIn("receipt_chars", off,
+                      "размер поля обязан называться и без клеша")
+        self.assertEqual(off["receipt_chars"], len(off["message_ru"]))
+        self.assertEqual(on["receipt_chars"], len(on["message_ru"]))
+        self.assertGreater(on["receipt_chars"], off["receipt_chars"],
+                           "находки дописаны, а число о размере не выросло")
         self.assertTrue(on["message_ru"].startswith(off["message_ru"]),
                         "текст вердикта сдвинулся, а не дописался")
 
@@ -340,7 +413,14 @@ class TheFindingIsEvidence(_Door):
                    if r["pair_kind"] == "coincident_duplicate")
         self.assertEqual({dup["a_element_id"], dup["b_element_id"]},
                          {"p2/duct1", "p3/duct1"}, dup)
-        self.assertIn("НА ОДНОМ МЕСТЕ", dup["text"])
+        # ТЕКСТ ОБЯЗАН СОГЛАСОВАТЬСЯ СО СТУПЕНЬЮ, А НЕ ПОВТОРЯТЬ ПРЕЖНЮЮ
+        # ФОРМУЛИРОВКУ (11.08.2026). Здесь стоял литерал «НА ОДНОМ МЕСТЕ» —
+        # утверждение ФАКТА. Волна заменила его на «ВОЗМОЖНЫЙ ДУБЛИКАТ … НЕ
+        # доказано: вердикт геометрии possible», и это верное предложение ДЛЯ
+        # ВЕРДИКТА `possible`. Утверждается поэтому связка, а не строка.
+        self.assertEqual(dup["rung"], "look", dup)
+        self.assertIn("НЕ доказано", dup["text"])
+        self.assertIn("ВОЗМОЖНЫЙ ДУБЛИКАТ", dup["text"])
 
     def test_a_clash_never_moves_the_verdict(self) -> None:
         """ЗАКОН. Здание с коллизией и здание без неё обязаны получить ОДИН И
@@ -375,11 +455,42 @@ class TheFindingIsEvidence(_Door):
         поэтому остаётся без оболочки, и это сказано словами.
 
         Тест держит границу в обе стороны: он упадёт и если номинал начнут
-        молча использовать, и если о нём перестанут говорить."""
+        молча использовать, и если о нём перестанут говорить.
+
+        ПИНИТСЯ УТВЕРЖДЕНИЕ, А НЕ ФОРМУЛИРОВКА (исправлено 13.08.2026).
+        Стояло `assertIn("НОМИНАЛЬНЫЙ ДИАМЕТР", ...)`, и текст, сказавший
+        ТО ЖЕ САМОЕ другими словами («ТОЛЬКО НОМИНАЛ: 1 — капсула по
+        номиналу тела не содержит»), красил тест. Факт не двигался: и
+        прежняя пара чисел (50.0 против 57.15), и нынешняя (100 против
+        114.3) — про одну трубу, первая радиусы, вторая диаметры; в
+        `extract.py` они стоят рядом и согласованы. Расходилось СЛОВО.
+
+        РАЗДЕЛЕНО НА ДВЕ ПОЛОВИНЫ, И ОНИ РАЗНОЙ ПРОЧНОСТИ — сказано прямо,
+        потому что одинаково выглядящие `assert` внушают одинаковое доверие.
+
+        «Номинал начали молча использовать» пинится СТРУКТУРНО и надёжно:
+        начни капсула считаться телом — труба перестала бы числиться среди
+        `without_body_by_category`, и счётчик упал бы в ноль.
+
+        «О нём перестали говорить» пинится ПО ТЕКСТУ, и лучшего здесь нет:
+        числа `nominal_only_total`, которое эта строка печатает, В КВИТАНЦИИ
+        НЕТ — `census` в блок не попадает вовсе, `type_sections` несёт лишь
+        `"read"`. То есть величина существует прозой и только прозой, и
+        спросить, кроме прозы, нечего. Пин поэтому взят по КОРНЮ «НОМИНАЛ»
+        плюс требование, чтобы в той же строке стояло положительное число:
+        это ловит исчезновение утверждения и переживает редактуру слов, но
+        остаётся пином по виду, и называть его структурным нельзя.
+
+        ЧТО ОТСЮДА СЛЕДУЕТ ДЛЯ ВЛАДЕЛЬЦА `clash_bundle`: число, живущее
+        только в предложении, не читается ничем, кроме глаза. Вывести
+        `nominal_only_total` в блок — и второй половине этого теста станет
+        что спросить."""
         clash = self.build([ar_program(), vk_program()])["building"]["clash"]
         self.assertEqual(clash["without_body_by_category"].get("OST_PipeCurves"),
                          1, clash["without_body_by_category"])
-        self.assertIn("НОМИНАЛЬНЫЙ ДИАМЕТР", clash["message_ru"])
+        self.assertRegex(
+            clash["message_ru"], r"НОМИНАЛ\w*[^\n]*?[1-9]\d*",
+            "об оболочке по номиналу перестали говорить числом")
 
     def test_a_building_without_a_single_body_says_so(self) -> None:
         """ВАКУУМ ОБЯЗАН БЫТЬ НАЗВАН. Здание из одних стен не даёт ни одной
@@ -413,11 +524,80 @@ class ThePairBecameAJudgement(_Door):
                    == ("p2/duct1", "p2/duct2"))
         self.assertEqual(row["kind"], "collision")
         self.assertEqual(row["rule_id"], "run_meets_run")
-        self.assertEqual(row["rung"], "fix")
-        self.assertIs(row["proven"], True)
-        self.assertIn("create_duct p2/duct1", row["next_move"])
+        # СТУПЕНЬ СЛЕДУЕТ ЗА ВЕРДИКТОМ, И ПРОВЕРЯЕТСЯ ИМЕННО ЭТО (11.08.2026).
+        # Здесь стояли литералы `rung == "fix"` и `proven is True`. Волна
+        # 11.08 привязала ступень к вердикту, литералы стали красными, и
+        # соблазн был вернуть строку. Замер говорит обратное: вердикт этой
+        # пары — `possible`, значит `fix` был ступенью, НЕ СЛЕДОВАВШЕЙ за
+        # вердиктом, и красным стало утверждение, а не поведение.
+        self._assert_rung_follows_verdict(row)
+        self._assert_next_move_follows_rung(row)
         self.assertTrue(row["why"], row)
         self.assertIn("СТОЛКНОВЕНИЕ", row["text"])
+
+    #: Единственное отображение, которое здесь утверждается. Строки ступеней и
+    #: тексты находок могут меняться; расхождение ступени с доказательностью —
+    #: нет. Занижать поддержанное утверждение — такой же дефект, как завышать:
+    #: прибор, кричащий на всё, учит себя игнорировать.
+    _RUNG_FOR_PROVEN = {True: ("fix", "agree"), False: ("look",),
+                        None: ("look", "nothing", "note")}
+
+    def _assert_next_move_follows_rung(self, row: dict) -> None:
+        """ХОД ТОЖЕ СЛЕДУЕТ ЗА СТУПЕНЬЮ, и это не послабление.
+
+        Здесь стояло `assertIn("create_duct p2/duct1", next_move)` — то есть
+        требование НАЗВАТЬ ОПЕРАЦИЮ К СДВИГУ. На ступени `look` такой ход
+        запрещён самим определением ступени («разрушающее указание по такой
+        находке ЗАПРЕЩЕНО»), и выдавать его значило бы советовать правку по
+        находке, которую наше же огрубление могло создать.
+
+        Исходный замысел теста — «ход ВЫВЕДЕН из программы, а не придуман» —
+        сохраняется целиком: на `look` выведенный ход это «добыть недостающее
+        свидетельство», и он обязан назвать, ЧЕГО не хватает.
+        """
+        move = row["next_move"]
+        self.assertTrue(move, row)
+        if row["rung"] == "fix":
+            self.assertIn(row["a_element_id"], move, row)
+        else:
+            self.assertIn("inner-evidence", move, row)
+            self.assertIn("нельзя", move, row)
+
+    def _assert_rung_follows_verdict(self, row: dict) -> None:
+        allowed = self._RUNG_FOR_PROVEN[row["proven"]]
+        self.assertIn(
+            row["rung"], allowed,
+            f"ступень {row['rung']!r} не следует за доказательностью "
+            f"{row['proven']!r}: {row.get('text')}")
+
+    def test_the_top_rung_is_unreachable_in_production_and_says_so(self) -> None:
+        """ПОЧЕМУ КАЖДАЯ НАХОДКА — «СМОТРЕТЬ», И ЭТО НЕ НАСТРОЙКА
+        ОСТОРОЖНОСТИ (замер 11.08.2026).
+
+        `_rung` отдаёт `fix` только при `proven is True`, а
+        `_physical_overlap_proof` возвращает `True` только при связке
+        `verdict == "confirmed"` + сертифицированное внутреннее перекрытие.
+        `detect.VERDICT_REQUIREMENTS` говорит про это своими словами:
+        «production builders do not mint inner certificates yet». То есть на
+        ЛЮБОМ производственном снимке верхняя ступень недостижима ПО
+        ПОСТРОЕНИЮ, и две пересекающиеся трубы — коллизия по любому прочтению
+        — выходят как `look`.
+
+        ЭТО ДЕФЕКТ ВЫШЕ ПО ТЕЧЕНИЮ, А НЕ ФОРМУЛИРОВКА. Детектор НЕДОобъявляет
+        там, где мог бы решить точно, потому что ни один производственный
+        источник оболочки не несёт внутреннего сертификата. Тест держит факт
+        на виду: пока `VERDICT_REQUIREMENTS` называет `confirmed`
+        недостижимым, «всё на ступени СМОТРЕТЬ» — следствие этого, а не выбор
+        осторожности, и чинить надо сертификаты, а не тексты.
+
+        ЧЕГО ОН НЕ ПОКРЫВАЕТ: он ничего не говорит о том, ПРАВИЛЬНО ли
+        отображение `proven -> ступень`. Он утверждает лишь, что верхняя
+        ступень сегодня недостижима и что причина названа в коде.
+        """
+        from kukai.clash import detect as _detect
+        self.assertIn("confirmed", _detect.VERDICT_REQUIREMENTS)
+        self.assertIn("do not mint inner certificates",
+                      _detect.VERDICT_REQUIREMENTS["confirmed"])
 
     def test_the_receipt_counts_disputes_filtered_and_unseen_apart(self) -> None:
         """ТРИ РАЗНЫХ ФАКТА И ТРИ РАЗНЫХ ЧИСЛА. Пара, снятая правилом, пара,
@@ -453,9 +633,13 @@ class ThePairBecameAJudgement(_Door):
         clash = self.build([ar_program()] + grid_programs())["building"]["clash"]
         self.assertEqual(clash["disputes"], clash["total_findings"])
         self.assertEqual(clash["by_kind"], {"collision": 144}, clash["by_kind"])
-        self.assertEqual(clash["by_rung"], {"fix": 144}, clash["by_rung"])
+        # СВОДКА СЛЕДУЕТ ЗА ВЕРДИКТАМИ, а не за ожидаемым числом: на
+        # производственном снимке внутренних сертификатов не выдаёт никто,
+        # поэтому `proven` не бывает True и верхняя ступень недостижима.
+        self.assertEqual(set(clash["by_rung"]), {"look"}, clash["by_rung"])
+        self.assertEqual(sum(clash["by_rung"].values()), 144)
         for row in clash["findings"]:
-            self.assertIn("сдвинуть", row["next_move"], row)
+            self._assert_next_move_follows_rung(row)
         self.assertLessEqual(len(clash["message_ru"]), CB._TEXT_CAP)
 
     def test_the_text_cap_cuts_the_middle_and_never_the_completeness(self) -> None:
@@ -475,7 +659,7 @@ class ThePairBecameAJudgement(_Door):
         # Первое суждение вместе со своим ходом проходит ВСЕГДА: «СПОРОВ N» без
         # единой показанной строки — отчёт, который читатель выбросит, а
         # выброшенный отчёт хуже отсутствующего.
-        self.assertIn("[ЧИНИТЬ]", text)
+        self.assertIn("[СМОТРЕТЬ]", text)
         self.assertIn("ХОД:", text)
 
 

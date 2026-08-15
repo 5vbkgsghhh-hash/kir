@@ -12,6 +12,7 @@ from kukai.ir.ground import ground, ground_program
 from kukai.ir.midend import (
     GroundedOp,
     GroundedProgram,
+    GroundingContext,
     PlanEncodingError,
 )
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT
@@ -78,6 +79,8 @@ class GroundedProgramContractTests(unittest.TestCase):
         assert out.grounded is not None
         self.assertIs(out.grounded.planned, out.planned)
         self.assertRegex(out.grounded.ground_digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(out.grounded.to_evidence_dict()["schema"],
+                         "kir-grounded-program/3")
         self.assertEqual(out.as_dict()["ground_digest"],
                          out.grounded.ground_digest)
 
@@ -137,26 +140,29 @@ class GroundedProgramContractTests(unittest.TestCase):
                 resolutions=tuple(reversed(out.grounded.resolutions)),
             )
 
-    def test_resolved_id_name_and_rule_each_change_ground_digest(self) -> None:
+    def test_resolution_identity_changes_digest_but_rule_cannot_be_rewritten(self) -> None:
         out = compile_program(copy.deepcopy(WALL_PROGRAM),
                               snapshot=GROUND_SNAPSHOT)
         self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
         assert out.grounded is not None and out.planned is not None
-        original = out.grounded.ground_digest
+        changed = out.grounded.to_ops()
+        changed[0]["level"]["__grounded__"]["id"] = 424242
+        rebuilt = GroundedProgram.from_ops(out.planned, changed)
+        self.assertNotEqual(rebuilt.ground_digest, out.grounded.ground_digest)
 
         for field_name, replacement in (
-            ("id", 424242),
             ("name", "Другой уровень"),
             ("via", "element_id"),
         ):
             with self.subTest(field_name=field_name):
                 changed = out.grounded.to_ops()
                 changed[0]["level"]["__grounded__"][field_name] = replacement
-                rebuilt = GroundedProgram.from_ops(out.planned, changed)
-                self.assertNotEqual(rebuilt.ground_digest, original)
+                with self.assertRaisesRegex(
+                        ValueError, "declared selector did not lower"):
+                    GroundedProgram.from_ops(out.planned, changed)
 
     def test_non_resolution_output_drift_cannot_keep_the_same_digest(self) -> None:
-        """The type freezes trusted-grounder output; it is not its validator."""
+        """Ordinary authored values are outside the lowering surface."""
         out = compile_program(copy.deepcopy(WALL_PROGRAM),
                               snapshot=GROUND_SNAPSHOT)
         self.assertTrue(out.ok, [d.as_dict() for d in out.diagnostics])
@@ -164,14 +170,10 @@ class GroundedProgramContractTests(unittest.TestCase):
 
         changed = out.grounded.to_ops()
         changed[0]["p1_mm"] = [6000, 0]
-        rebound = GroundedProgram.from_ops(out.planned, changed)
+        with self.assertRaisesRegex(ValueError, "ordinary planned value changed"):
+            GroundedProgram.from_ops(out.planned, changed)
 
-        # The constructor deliberately accepts a same-shape output from the
-        # trusted grounder, but the output cannot masquerade under the old id.
-        self.assertNotEqual(rebound.ground_digest,
-                            out.grounded.ground_digest)
-
-    def test_ground_digest_does_not_claim_snapshot_identity_or_revision(self) -> None:
+    def test_ground_digest_binds_exact_snapshot_and_document_identity(self) -> None:
         planned = plan_program(copy.deepcopy(WALL_PROGRAM))
         first_snapshot = copy.deepcopy(GROUND_SNAPSHOT)
         second_snapshot = copy.deepcopy(GROUND_SNAPSHOT)
@@ -184,12 +186,39 @@ class GroundedProgramContractTests(unittest.TestCase):
         first = ground_program(planned, first_snapshot)
         second = ground_program(planned, second_snapshot)
 
-        # Resolved output is identical, therefore the digest is identical.
-        # This is a named residual boundary, not snapshot attestation.
-        self.assertEqual(first.ground_digest, second.ground_digest)
+        # Resolved ids/names are identical, but the model read is not.
+        self.assertNotEqual(first.ground_digest, second.ground_digest)
+        self.assertNotEqual(first.context.context_digest,
+                            second.context.context_digest)
+        self.assertNotEqual(first.context.document_digest,
+                            second.context.document_digest)
         evidence = first.to_evidence_dict()
-        self.assertNotIn("snapshot_digest", evidence)
-        self.assertNotIn("document_fingerprint", evidence)
+        self.assertEqual(
+            evidence["context"]["snapshot_digest"],
+            first.context.snapshot_digest,
+        )
+        self.assertTrue(evidence["context"]["identity_bound"])
+        self.assertFalse(evidence["context"]["execution_bound"])
+        self.assertFalse(evidence["context"]["authoritative"])
+
+    def test_trusted_context_cannot_be_reused_for_another_snapshot(self) -> None:
+        planned = plan_program(copy.deepcopy(WALL_PROGRAM))
+        context = GroundingContext.from_snapshot(
+            GROUND_SNAPSHOT,
+            source="trusted_bridge",
+            trusted_source=True,
+        )
+        grounded = ground_program(
+            planned, GROUND_SNAPSHOT, context=context)
+        self.assertTrue(grounded.context.execution_bound)
+        # No revision/profile proof was supplied: identity binding must not be
+        # promoted to full snapshot authority.
+        self.assertFalse(grounded.context.authoritative)
+
+        other = copy.deepcopy(GROUND_SNAPSHOT)
+        other["levels"][0]["name"] = "Подменённый уровень"
+        with self.assertRaisesRegex(ValueError, "another snapshot payload"):
+            ground_program(planned, other, context=context)
 
     def test_removed_reordered_and_extra_ops_cannot_rebind_parent(self) -> None:
         program = copy.deepcopy(WALL_PROGRAM)

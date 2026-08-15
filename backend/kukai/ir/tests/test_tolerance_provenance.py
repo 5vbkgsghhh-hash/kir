@@ -139,6 +139,12 @@ def _full_instances():
         forced = dict(op)
         for field, value in _FORCE.items():
             forced.setdefault(field, value)
+        # The WorkPlaneBased place_family overload deliberately refuses the
+        # TwoLevelsBased offsets.  The generic branch-forcing corpus must not
+        # manufacture a combination the public planner cannot express.
+        if name == "place_family" and "ref_dir" in forced:
+            forced.pop("base_offset_mm", None)
+            forced.pop("top_offset_mm", None)
         out.append((name, forced, ver))
     return out
 

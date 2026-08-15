@@ -236,7 +236,7 @@ void __dimGeom_A1(Element __el, XYZ __want, out Reference __gr, out XYZ __gp, ou
     }
     if (__gr == null && __fr != null) { __gr = __fr; __gp = __fp; __gn = __fn; }
 }
-IndependentTag __el_T1 = null; Element __tg_T1 = null;
+Element __el_T1 = null; Element __tg_T1 = null;
 View __vw_T1 = null;
 TextNote __el_X1 = null;
 View __vw_X1 = null;
@@ -348,7 +348,35 @@ using (Transaction __t = new Transaction(doc, "KIR: полный набор ан
         if (__vw_T1 == null) { __t.RollBack(); return __Refuse("T1", "in_view: вид не найден (модель изменилась после grounding, либо id — не View)"); }
         __tg_T1 = (Element)__el_W1;
 
-        try { __el_T1 = IndependentTag.Create(doc, __vw_T1.Id, new Reference(__tg_T1), false, TagMode.TM_ADDBY_CATEGORY, TagOrientation.Horizontal, (__vw_T1.Origin + __vw_T1.RightDirection.Multiply(U(3000.0)) + __vw_T1.UpDirection.Multiply(U(800.0)))); }
+        try {
+            var __se_T1 = __tg_T1 as SpatialElement;
+            if (__se_T1 != null)
+            {
+                if (__se_T1.Location == null || __se_T1.Area <= 0.0)
+                    { __t.RollBack(); return __Refuse("T1", "цель — пространственный элемент, который НЕ РАЗМЕЩЁН (нет Location или нулевая площадь): маркировать нечего"); }
+                var __uv_T1 = new UV(3000.0, 800.0);
+                var __rm_T1 = __se_T1 as Autodesk.Revit.DB.Architecture.Room;
+                var __ar_T1 = __se_T1 as Area;
+                var __sc_T1 = __se_T1 as Autodesk.Revit.DB.Mechanical.Space;
+                if (__rm_T1 != null)
+                    __el_T1 = doc.Create.NewRoomTag(new LinkElementId(__rm_T1.Id), __uv_T1, __vw_T1.Id);
+                else if (__sc_T1 != null)
+                    __el_T1 = doc.Create.NewSpaceTag(__sc_T1, __uv_T1, __vw_T1);
+                else if (__ar_T1 != null)
+                {
+                    var __vp_T1 = __vw_T1 as ViewPlan;
+                    if (__vp_T1 == null)
+                        { __t.RollBack(); return __Refuse("T1", "марка площади требует вид-план (ViewPlan), а in_view — " + __vw_T1.ViewType.ToString()); }
+                    __el_T1 = doc.Create.NewAreaTag(__vp_T1, __ar_T1, __uv_T1);
+                }
+                else
+                    { __t.RollBack(); return __Refuse("T1", "цель — SpatialElement рода " + __se_T1.GetType().Name + ", а марки строятся только для помещения, площади и пространства"); }
+            }
+            else
+            {
+                __el_T1 = IndependentTag.Create(doc, __vw_T1.Id, new Reference(__tg_T1), false, TagMode.TM_ADDBY_CATEGORY, TagOrientation.Horizontal, (__vw_T1.Origin + __vw_T1.RightDirection.Multiply(U(3000.0)) + __vw_T1.UpDirection.Multiply(U(800.0))));
+            }
+        }
         catch (Exception __ex_T1) { __t.RollBack(); return __Refuse("T1", "IndependentTag.Create: " + __ex_T1.Message); }
         if (__el_T1 == null) { __t.RollBack(); return __Refuse("T1", "IndependentTag.Create вернул null"); }
         try { Parameter __cm = __el_T1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:6610b7b2:T1"); } catch { }
@@ -451,16 +479,32 @@ using (Transaction __t = new Transaction(doc, "KIR: полный набор ан
             if (__el_T1.OwnerViewId.ToString() != __vw_T1.Id.ToString())
                 __post.Add("T1: tag belongs to wrong view (topology)");
             bool __bound_T1 = false;
+            var __itg_T1 = __el_T1 as IndependentTag;
+            var __rtg_T1 = __el_T1 as Autodesk.Revit.DB.Architecture.RoomTag;
+            var __atg_T1 = __el_T1 as AreaTag;
+            var __stg_T1 = __el_T1 as Autodesk.Revit.DB.Mechanical.SpaceTag;
+            if (__rtg_T1 != null)
+            { try { __bound_T1 = __rtg_T1.Room != null && __rtg_T1.Room.Id.ToString() == __tg_T1.Id.ToString(); } catch { } }
+            else if (__atg_T1 != null)
+            { try { __bound_T1 = __atg_T1.Area != null && __atg_T1.Area.Id.ToString() == __tg_T1.Id.ToString(); } catch { } }
+            else if (__stg_T1 != null)
+            { try { __bound_T1 = __stg_T1.Space != null && __stg_T1.Space.Id.ToString() == __tg_T1.Id.ToString(); } catch { } }
+            else if (__itg_T1 != null)
             try
             {
-                foreach (Element __tel in __el_T1.GetTaggedLocalElements())
+                foreach (Element __tel in __itg_T1.GetTaggedLocalElements())
                     if (__tel != null && __tel.Id.ToString() == __tg_T1.Id.ToString()) { __bound_T1 = true; break; }
             } catch { }
+            else
+            { }
             if (!__bound_T1)
                 __post.Add("T1: марка не связана с target (semantic, VIEW-BINDING LAW: target не виден в in_view?)");
             try
             {
-                var __rel_T1 = __el_T1.TagHeadPosition - __vw_T1.Origin;
+                XYZ __head_T1 = (__el_T1 as IndependentTag) != null
+                    ? ((IndependentTag)__el_T1).TagHeadPosition
+                    : ((SpatialElementTag)__el_T1).TagHeadPosition;
+                var __rel_T1 = __head_T1 - __vw_T1.Origin;
                 double __ou_T1 = MM(__rel_T1.DotProduct(__vw_T1.RightDirection));
                 double __ow_T1 = MM(__rel_T1.DotProduct(__vw_T1.UpDirection));
                 if (Math.Abs(__ou_T1 - 3000.0) > 10.0 || Math.Abs(__ow_T1 - 800.0) > 10.0)

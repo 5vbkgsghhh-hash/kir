@@ -131,7 +131,7 @@ class TheFixedPartHasANamedBudget(unittest.TestCase):
             block = CB._report(_worst_case_pack(), new_from=2)
         text = block["message_ru"]
         for must in ("БЕЗ ТЕЛА", "ВНЕСЛА ЭТА ПАЧКА", "НЕ ВИДИТ",
-                     "ТОЛЬКО НОМИНАЛЬНЫЙ", "ВНЕ ПРОВЕРКИ"):
+                     "ТОЛЬКО НОМИНАЛ", "ВНЕ ПРОВЕРКИ"):
             self.assertIn(must, text, must)
 
     def test_at_least_the_guaranteed_number_of_findings_is_shown(self):
@@ -178,3 +178,65 @@ class TheCapDocstringDescribesTodayNotYesterday(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheNoticeCountsTheSameThingThePayloadDoes(unittest.TestCase):
+    """Квитанция обязана называть ТО ЖЕ число, что едет в ответе.
+
+    Замер 12.08.2026: при трёх показанных находках текст писал «показано 6».
+    `kept` копит СТРОКИ, а у каждой находки их две — `[СМОТРЕТЬ]` и `ХОД`, —
+    поэтому счёт строк уезжал ровно вдвое и назывался счётом СУЖДЕНИЙ. Тот же
+    класс, что `_max_bodies` в каноне: объявлен «потолок на ТЕЛА», прочитан
+    `len(elements)`.
+
+    Почему это дефект продукта, а не опечатка: главный читатель квитанции —
+    модель, и та, которой сказали «показано шесть», за остальными не придёт.
+    Молчаливо-неверный исход ровно там, где инвариант обязан звучать громче
+    всего.
+    """
+
+    def test_the_truncation_notice_agrees_with_the_payload(self):
+        import re
+        with _Flag():
+            block = CB._report(_worst_case_pack(), new_from=2)
+        text = block["message_ru"]
+        match = re.search(r"обрезан, показано (\d+)", text)
+        if match is None:
+            self.skipTest("на этой пачке список не обрезался — нечего сверять")
+        self.assertEqual(
+            int(match.group(1)), block["text_budget"]["shown"],
+            "текст квитанции и её же payload называют РАЗНОЕ число показанных "
+            "суждений; читатель верит тексту")
+
+
+    def test_the_cost_of_a_finding_is_re_measured_not_recalled(self):
+        """`COST_PER_FINDING` — ЗАМЕР, а замер протухает. Сторожим вход.
+
+        Деривация `FIXED_TEXT_BUDGET` всё время считала верно и честно
+        разносила устаревшее число: цену мерили 09.08 (330), а строку потом
+        удлинили грейдом, допуском и разделом — 388. Формула была права,
+        её вход — нет, и падала от этого ДОСТАВКА, а не арифметика.
+
+        Поэтому цена берётся из настоящей отрисовки худшей пачки и
+        сверяется с записанной. Растянули текст суждения — падает ЭТА
+        строка, с числом в руках, а не «показано 3 вместо 4» через два
+        файла.
+        """
+        with _Flag():
+            block = CB._report(_worst_case_pack(), new_from=2)
+        lines = block["message_ru"].split("\n")
+        costs, i = [], 0
+        while i < len(lines):
+            if lines[i].startswith("  ["):
+                cost = len(lines[i]) + 1
+                if i + 1 < len(lines) and lines[i + 1].lstrip().startswith("ХОД"):
+                    cost += len(lines[i + 1]) + 1
+                    i += 1
+                costs.append(cost)
+            i += 1
+        self.assertTrue(costs, "худшая пачка не отрисовала ни одного суждения")
+        self.assertLessEqual(
+            max(costs), CB.COST_PER_FINDING,
+            f"суждение подорожало: настоящая цена {max(costs)} против "
+            f"записанной {CB.COST_PER_FINDING}. Перемерь и обнови константу "
+            f"вместе с гарантией — иначе бюджет пообещает то, чего не доставит")

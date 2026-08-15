@@ -54,7 +54,11 @@ from kukai.ir.tests.fixtures import GROUND_SNAPSHOT as SNAPSHOT  # noqa: E402
 
 LVL = {"by": "name", "value": SNAPSHOT["levels"][0]["name"]}
 RING = [[0, 0], [4000, 0], [4000, 3000], [0, 3000], [0, 0]]
-REGEN = "doc.Regenerate();  // finalize"
+#: НЕ КОПИЯ, А АВТОРИТЕТ. Раньше здесь стоял литерал `"doc.Regenerate();  //
+#: finalize"`, эмиттер писал другой текст, и `cs.find` возвращал -1 — три
+#: теста падали с «−1 не больше 2633», сообщением, которое не называет
+#: причину. Спрашиваем эмиттер, а не пересказываем его.
+REGEN = authoring.SPATIAL_REGEN_CS
 
 
 def _emit(ops, ver="2026"):

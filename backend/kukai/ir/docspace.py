@@ -138,7 +138,7 @@ def emit_xyz_to_view2d_cs(view_var: str, point_cs: str, rel_var: str,
 
     ``rel = P - Origin; u = MM(rel·Right); v = MM(rel·Up)`` — ровно обращение
     ``Origin + u*Right + v*Up`` в ортонормированном базисе вида. Закон записан
-    в инварианте KIR «An inverse must be identical, not similar»; до 09.08 он
+    в инженерных правилах KIR («An inverse must be identical, not similar»); до 09.08 он
     держался тем, что обе стороны были набраны руками в двух эмиттерах — марки
     и текста, — и сюда они переехали БАЙТ В БАЙТ (эталоны не двинулись).
     """

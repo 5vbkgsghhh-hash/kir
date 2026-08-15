@@ -1039,6 +1039,29 @@ def build_program_preview(
             continue
         buckets.setdefault(level_key, []).append(drawn)
 
+    # 🔴 СТЕНЫ-ДУБЛИ ИЩУТСЯ И НА ПУТИ ПРОГРАММЫ, А НЕ ТОЛЬКО НА ПУТИ МОДЕЛИ.
+    #
+    # `AnomalyReason.COINCIDENT_WALLS` объявлен в словаре аномалий и до
+    # 15.08.2026 выставлялся РОВНО в одном месте — в `build_model_preview`, то
+    # есть по РАЗОБРАННОМУ зданию. Программа, объявившая две стены с одними и
+    # теми же концами, не помечалась ничем (замер: две стены (0,0)-(6000,0) —
+    # аномалий нет).
+    #
+    # Это тот же перекос входа, что был у замкнутости: способность есть на
+    # одном источнике и отсутствует на другом. А дубль стены — дефект именно
+    # АВТОРСКИЙ: его чинит тот, кто пишет программу, и узнать о нём он обязан
+    # ДО того, как это станет двумя стенами в модели.
+    #
+    # Личность стены считает ТОТ ЖЕ `_wall_identity`, что и путь модели: он
+    # знает то, чего не знает пересказ (одних концов недостаточно — две разные
+    # дуги с общей хордой это две разные стены).
+    _dupes = _coincident_wall_ids(walls)
+    if _dupes:
+        for _key, _elements in buckets.items():
+            buckets[_key] = [_with_anomaly(e, AnomalyReason.COINCIDENT_WALLS)
+                             if e.element_id in _dupes else e
+                             for e in _elements]
+
     wanted = set(levels) if levels is not None else None
     plans: list[FloorPlan] = []
     for level_key in sorted(per_level):
@@ -1322,6 +1345,34 @@ class _WallGeom:
     p1: Pt
     thickness_mm: float | None
     arc: dict[str, Any] | None
+
+
+def _coincident_wall_ids(walls: Mapping[str, Mapping[str, Any]]) -> set[str]:
+    """Идентификаторы стен, у которых есть двойник с той же личностью.
+
+    Личность берётся у `_wall_identity` — общей с путём модели. Пересказать её
+    здесь значило бы потерять решение, которое она уже содержит: дуга входит в
+    личность, потому что две разные дуги с общей хордой — не дубли.
+    """
+    seen: dict[tuple[int, ...], list[str]] = {}
+    for wall_id, geom in walls.items():
+        try:
+            key = _wall_identity(_WallGeom(
+                p0=geom["p0"], p1=geom["p1"],
+                thickness_mm=None, arc=geom.get("arc")))
+        except (KeyError, TypeError, ValueError):
+            continue
+        seen.setdefault(key, []).append(str(wall_id))
+    return {wall_id for ids in seen.values() if len(ids) > 1 for wall_id in ids}
+
+
+def _with_anomaly(element: DrawnElement, reason: AnomalyReason) -> DrawnElement:
+    """Тот же элемент плюс аномалия. Порядок аномалий стабилен по значению."""
+    return DrawnElement(
+        element.element_id, element.category, element.layer, element.shapes,
+        element.approx,
+        tuple(sorted(set(element.anomalies) | {reason}, key=lambda r: r.value)),
+        element.label)
 
 
 def build_model_preview(

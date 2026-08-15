@@ -86,14 +86,39 @@ if __name__ == "__main__":
 
 
 class TheOrdinalTable(unittest.TestCase):
-    def test_the_two_directions_are_exact_inverses(self):
+    def test_the_reverse_table_loses_no_row(self):
+        """То же утверждение, названное своим именем (переписано 12.08.2026).
+
+        Здесь стояло `test_the_two_directions_are_exact_inverses`: сверка
+        ORDINALS с обращением NAMES, где NAMES ПОСТРОЕН обращением ORDINALS
+        (`ops_authoring.py:22`).  Сила у него РОВНО ТА ЖЕ, что у строки ниже,
+        и это измерено, а не выведено:
+
+            чистая таблица         старый зелён   новый зелён
+            ПЕРЕСТАНОВКА пары      старый зелён   новый зелён
+            ДУБЛИКАТ ординала      старый КРАСНЫЙ новый КРАСНЫЙ
+
+        Так что менялась НЕ мощность, а честность имени.  Прежнее обещало
+        «две таблицы — точные обращения друг друга», то есть звучало как
+        проверка ПАР; проверяло же оно единственное, что обращение способно
+        не сохранить, — что ординалы попарно различны.  Два имени с одним
+        ординалом схлопывают обратную таблицу, и лифт молча читает чужое
+        слово; вот это и стоит здесь, прямо.
+
+        Оговорка, чтобы не сползти в обратную крайность: тест НЕ вакуумен —
+        на неинъективной таблице он краснеет.  Он вакуумен ровно на том
+        классе, который нам сегодня и важен, — на ПЕРЕСТАНОВКАХ.
+
+        ПАРУ имя-ординал этот файл НЕ ПИННИТ И НЕ МОЖЕТ — см. блок над самой
+        таблицей: оба конца компилятора берут число оттуда же, поэтому
+        свидетель не способен возразить таблице.
+        """
         from kukai.ir.ops_authoring import (
             WALL_LOCATION_LINE_NAMES, WALL_LOCATION_LINE_ORDINALS)
 
-        self.assertEqual(
-            WALL_LOCATION_LINE_ORDINALS,
-            {name: ordinal
-             for ordinal, name in WALL_LOCATION_LINE_NAMES.items()})
+        self.assertEqual(len(WALL_LOCATION_LINE_NAMES),
+                         len(WALL_LOCATION_LINE_ORDINALS),
+                         "обращение потеряло строку: два имени делят ординал")
 
     def test_every_offered_choice_has_an_ordinal(self):
         from kukai.ir.ops_authoring import WALL_LOCATION_LINE_ORDINALS

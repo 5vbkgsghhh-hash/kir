@@ -135,7 +135,20 @@ class RegistryResultSemantics(unittest.TestCase):
         # 67 -> 68 (10.08.2026): площадка лестницы по эскизу.
         # CREATE/RESULT_UNREFERENCED_ELEMENT, пишущая, соло-оп;
         # добавлены acceptance, clash, reverse и certificate contracts.
-        self.assertEqual(len(spec.OPS), 68)
+        # 68 -> 69 (11.08.2026): `create_space` (коммит `1095cb13`).
+        # ЗДЕСЬ ВИНОВАТ НЕ КОД, А ЗАПИСЬ О НЁМ — оп приехал УКОМПЛЕКТОВАННЫМ,
+        # проверено на дереве `aecf6cff`: строка в `OP_RESULT_CATEGORIES`
+        # есть, обратный контракт есть, строка в таблице уточнений есть, и
+        # судья приёмки по нему НЕ слеп (в `_OPS_BLIND` его нет). Отстала
+        # ровно эта строка храповика, и она держала набор красным сутки.
+        # ВТОРЫМ КОНЦОМ тот же оп выпал из закрытой таблицы категорий клеша
+        # (`clash_bundle`) — вместе с `create_curtain_grid_line`, и это
+        # заметили только 11.08, когда воскресили мёртвого стража
+        # (`fix/kir-op-category-authority`, `e986d24d`). Один оп, два
+        # независимых учётных пробела, и один из сторожей в тот момент был
+        # мёртв: закрытый список стоит ровно столько, сколько стоит
+        # проверка, что он ещё закрыт.
+        self.assertEqual(len(spec.OPS), 69)
         for name, op in spec.OPS.items():
             with self.subTest(op=name):
                 self.assertIsInstance(op.effect, EffectKind)

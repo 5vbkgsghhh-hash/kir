@@ -356,3 +356,67 @@ class ExistingEmissionDidNotMove(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheRefusalNamesEveryOutOfBoundsPoint(unittest.TestCase):
+    """Отказ по границам отдаёт ВСЕ точки, а не первую (13.08.2026).
+
+    Здесь стоял `raise KirRefusal(bound_diags[:1])` — ЕДИНСТВЕННЫЙ срез на
+    76 мест `raise KirRefusal` во всём дереве; остальные 75 отдают список
+    целиком.
+
+    ЧЕМ ОН БЫЛ ХУЖЕ ОБЫЧНОГО УСЕЧЕНИЯ. Лекарство от этого класса написано
+    12.08 (`23be2d1f`) и стоит У ПОТРЕБИТЕЛЯ: квитанция показывает 8 и
+    называет `diagnostics_total`, когда их было больше. Срез стоял У
+    ПРОИЗВОДИТЕЛЯ — потребителю доставалась одна из одной, и он молчал об
+    остатке ПРАВИЛЬНО. Усечение, которое обманывает собственное лекарство,
+    дороже усечения, у которого лекарства нет.
+
+    Цена в ходах: вылет координат почти всегда системный (не та система
+    координат), то есть валит ВСЕ вершины сразу. Модель чинила по одной за
+    ход.
+    """
+
+    #: заведомо за пределами docspace — числа берутся у самого предела,
+    #: а не назначаются здесь, иначе тест переживёт изменение границы
+    FAR = 10 ** 9
+
+    def _far_rect(self):
+        """ПРЯМОУГОЛЬНИК, а не выдуманная форма.
+
+        Первая редакция этого теста подавала `shape: "poly"` с `pts` — такой
+        формы у CONTOUR НЕТ, и оп отвергался схемой (`KIR-T001: неизвестные
+        поля формы`) ДО цикла границ. Тест был красным, а предмет — не
+        затронут: зонд смотрел не на тот вход.
+        """
+        f = self.FAR
+        return {"outer": {"shape": "rect", "origin": [f, f],
+                          "size_mm": [3000, 1200]}}
+
+    def test_all_offending_points_are_reported_not_the_first(self):
+        out = compile_program(_prog([_fr(contour=self._far_rect())]),
+                              revit_version="2026", snapshot=SNAPSHOT)
+        self.assertFalse(out.ok, "программа с вылетевшим контуром прошла")
+        bound = [d for d in out.diagnostics
+                 if d.field_name and d.field_name.startswith("contour")]
+        self.assertGreater(
+            len(bound), 1,
+            "отказ назвал одну точку из четырёх вылетевших — модель будет "
+            "чинить их по одной за ход, не зная, что их больше")
+
+    def test_a_contour_inside_the_limit_yields_no_bounds_diagnostics(self):
+        """КОНТРОЛЬ-PASS: годный контур не даёт НИ ОДНОГО отказа по границам.
+
+        Без него первый тест зелен на приборе, который отказывает всегда.
+        """
+        f = self.FAR
+        # прямоугольник целиком в пределах — контроль обязан дать НОЛЬ
+        one_bad = {"outer": {"shape": "rect", "origin": [500, 500],
+                             "size_mm": [3000, 1200]}}
+        out = compile_program(_prog([_fr(contour=one_bad)]),
+                              revit_version="2026", snapshot=SNAPSHOT)
+        bound = [d for d in out.diagnostics
+                 if d.field_name and d.field_name.startswith("contour")]
+        self.assertEqual(
+            [], bound,
+            f"годный контур дал отказы по границам: {bound}")

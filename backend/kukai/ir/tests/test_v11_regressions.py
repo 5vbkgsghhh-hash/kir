@@ -18,6 +18,7 @@ from kukai.ir import serving  # noqa: E402
 from kukai.ir.compiler import compile_program  # noqa: E402
 from kukai.ir.tests.acceptance_fakes import PassingAcceptanceBridge  # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT  # noqa: E402
+from kukai.ir.tests.gate_fixture import enter_kir_mode
 
 OUTLINE = [[0, 0], [16000, 0], [16000, 10000], [0, 10000]]
 LVL = {"by": "name", "value": "Этаж 1"}
@@ -45,6 +46,8 @@ class Nahodka1OkOverError(unittest.TestCase):
         self._prev_acceptance_dir = os.environ.get(
             "KIR_ACCEPTANCE_EVIDENCE_DIR")
         os.environ["KIR_ACCEPTANCE_EVIDENCE_DIR"] = self._acceptance_dir.name
+        # ТРЕТЬЕ УСЛОВИЕ ГЕЙТА (13.08): режим КИР ставится ЯВНО.
+        enter_kir_mode(self)
 
     def tearDown(self):
         self._dev.stop()

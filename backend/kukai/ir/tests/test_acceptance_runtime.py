@@ -1,22 +1,29 @@
 """Ordering contract for the regular-write independent acceptance session."""
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from kukai.ir.acceptance import derive_expectation, symbol_rows_from_snapshot
-from kukai.ir.acceptance_evidence import AcceptanceReason
+from kukai.ir.acceptance_evidence import (
+    REGULAR_WRITE_EXECUTION_LANE,
+    AcceptanceReason,
+)
 from kukai.ir.acceptance_journal import AcceptanceJournal
 from kukai.ir.acceptance_live import observation_from_census
 from kukai.ir.acceptance_probe import ACCEPTANCE_OBSERVATION_SCHEMA_VERSION
 from kukai.ir.acceptance_runtime import (
     AcceptanceRuntimeError,
-    prepare_acceptance,
+    prepare_acceptance as _prepare_acceptance,
 )
 from kukai.ir.compiler import plan_program
 from kukai.ir.contracts import DocumentFingerprint
+from kukai.ir.diag import KirRefusal
+from kukai.ir.ground import ground_program
+from kukai.ir.midend import GroundedProgram, GroundingContext
 from kukai.ir.outcome import (
     AcceptanceState,
     WitnessState,
@@ -28,6 +35,25 @@ from kukai.ir.tests.acceptance_fakes import PassingAcceptanceBridge
 
 
 RUN_ID = "c" * 32
+
+
+async def prepare_acceptance(
+    plan,
+    snapshot,
+    document,
+    reader,
+    *,
+    ground_context=None,
+    **kwargs,
+):
+    """Keep test call-sites terse while exercising the strict v2 boundary."""
+
+    grounded = (
+        plan if isinstance(plan, GroundedProgram)
+        else ground_program(plan, snapshot, context=ground_context)
+    )
+    return await _prepare_acceptance(
+        grounded, snapshot, document, reader, **kwargs)
 
 
 def _document():
@@ -67,6 +93,15 @@ def _family_plan():
     })
 
 
+def _bind_execution(session, source="wrapped final C#"):
+    return session.bind_execution_artifact(
+        source,
+        execution_lane=REGULAR_WRITE_EXECUTION_LANE,
+        tool="revit_ir",
+        op="write",
+    )
+
+
 def _payload(plan, census, *, phase, snapshot=GROUND_SNAPSHOT):
     # Справочники обязаны совпадать с prepare_acceptance: ожидание участвует
     # в подписи, и лишний либо недостающий пул тут же ломает строгий разбор.
@@ -96,6 +131,8 @@ def _payload(plan, census, *, phase, snapshot=GROUND_SNAPSHOT):
 async def test_pre_read_and_fsync_precede_write_authority(tmp_path: Path):
     plan = _wall_plan()
     calls = []
+    context = GroundingContext.from_snapshot(
+        GROUND_SNAPSHOT, source="trusted_bridge", trusted_source=True)
 
     async def reader(_code, phase, _timeout):
         calls.append(phase)
@@ -111,17 +148,43 @@ async def test_pre_read_and_fsync_precede_write_authority(tmp_path: Path):
         session = await prepare_acceptance(
             plan, GROUND_SNAPSHOT, _document(), reader,
             revit_version="2026",
-            timeout_ms=1000, evidence_root=tmp_path)
+            timeout_ms=1000, ground_context=context,
+            evidence_root=tmp_path)
 
     assert calls == ["acceptance_before"]
     assert session.journal.path.exists()
     assert not session.journal.state.finalized
     assert session.registration.before is not None
     assert session.registration.expectation.rows[0].level == "Этаж 1"
+    assert session.registration.ground_context_digest == context.context_digest
+    assert session.registration.ground_context_execution_bound is True
+    assert session.registration.ground_context_authoritative is False
+    assert session.registration.ground_selector_resolution_replayed is False
+    assert session.registration.ground_derived_artifacts_verified is True
+    assert session.registration.ground_digest == ground_program(
+        plan, GROUND_SNAPSHOT, context=context).ground_digest
+    assert (session.registration_wire()["ground_digest"]
+            == session.registration.ground_digest)
+    assert (session.registration_wire()["ground_context_digest"]
+            == context.context_digest)
+    assert (session.registration_wire()[
+        "ground_selector_resolution_replayed"] is False)
+    assert (session.registration_wire()[
+        "ground_derived_artifacts_verified"] is True)
+    assert replace(
+        session.registration,
+        ground_selector_resolution_replayed=True,
+    ).registration_digest != session.registration.registration_digest
+    assert replace(
+        session.registration,
+        ground_derived_artifacts_verified=False,
+    ).registration_digest != session.registration.registration_digest
 
+    binding = _bind_execution(session)
     evidence = await session.assess_after(reader, timeout_ms=1000)
     assert calls == ["acceptance_before", "acceptance_after"]
     assert evidence.state is AcceptanceState.ACCEPTED
+    assert evidence.execution_artifact_binding_digest == binding.binding_digest
     outcome = independently_assessed(
         write_committed(witness=WitnessState.SATISFIED),
         session.outcome_state(evidence, WitnessState.SATISFIED),
@@ -130,6 +193,40 @@ async def test_pre_read_and_fsync_precede_write_authority(tmp_path: Path):
     reopened = AcceptanceJournal.open(session.journal.path)
     assert reopened.state.finalized
     assert session.evidence_wire(evidence)["journal"]["durable"] is True
+    assert (session.evidence_wire(evidence)["ground_context_digest"]
+            == context.context_digest)
+    assert (session.evidence_wire(evidence)["ground_digest"]
+            == session.registration.ground_digest)
+    assert (session.evidence_wire(evidence)[
+        "ground_selector_resolution_replayed"] is False)
+    assert (session.evidence_wire(evidence)[
+        "ground_derived_artifacts_verified"] is True)
+
+
+@pytest.mark.asyncio
+async def test_acceptance_refuses_context_from_another_snapshot(
+    tmp_path: Path,
+):
+    context = GroundingContext.from_snapshot(
+        GROUND_SNAPSHOT, source="trusted_bridge", trusted_source=True)
+    changed = dict(GROUND_SNAPSHOT)
+    changed["levels"] = [dict(GROUND_SNAPSHOT["levels"][0], name="Other")]
+    calls = []
+
+    async def reader(_code, phase, _timeout):
+        calls.append(phase)
+        raise AssertionError("mismatch must refuse before a bridge read")
+
+    with pytest.raises(AcceptanceRuntimeError) as caught:
+        grounded = ground_program(
+            _wall_plan(), GROUND_SNAPSHOT, context=context)
+        await _prepare_acceptance(
+            grounded, changed, _document(), reader,
+            revit_version="2026", timeout_ms=1000,
+            evidence_root=tmp_path)
+    assert caught.value.code == "KIR-A002"
+    assert calls == []
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -207,6 +304,7 @@ async def test_post_reader_exception_becomes_inconclusive_evidence(
             plan, GROUND_SNAPSHOT, _document(), reader,
             revit_version="2026", timeout_ms=1000,
             evidence_root=tmp_path)
+    _bind_execution(session)
     evidence = await session.assess_after(reader, timeout_ms=1000)
     assert evidence.state is AcceptanceState.INCONCLUSIVE
     assert evidence.reason is AcceptanceReason.POST_READ_UNAVAILABLE
@@ -228,6 +326,7 @@ async def test_post_read_failure_is_explicitly_inconclusive(tmp_path: Path):
             plan, GROUND_SNAPSHOT, _document(), reader,
             revit_version="2026",
             timeout_ms=1000, evidence_root=tmp_path)
+    _bind_execution(session)
     evidence = await session.assess_after(reader, timeout_ms=1000)
     assert evidence.state is AcceptanceState.INCONCLUSIVE
     assert evidence.reason is AcceptanceReason.POST_READ_UNAVAILABLE
@@ -263,6 +362,7 @@ async def test_exact_id_move_is_independently_measured(tmp_path: Path):
             plan, GROUND_SNAPSHOT, _document(), reader,
             revit_version="2026",
             timeout_ms=1000, evidence_root=tmp_path)
+    _bind_execution(session)
     evidence = await session.assess_after(reader, timeout_ms=1000)
     assert calls == ["acceptance_before", "acceptance_after"]
     assert evidence.state is AcceptanceState.ACCEPTED
@@ -303,6 +403,7 @@ async def test_place_family_reaches_independent_acceptance(tmp_path: Path):
     assert session.registration.categories == ("OST_Furniture",)
     assert session.registration.expectation.blind_ops == ()
 
+    _bind_execution(session)
     evidence = await session.assess_after(reader, timeout_ms=1000)
     assert calls == ["acceptance_before", "acceptance_after"]
     assert evidence.state is AcceptanceState.ACCEPTED
@@ -336,6 +437,7 @@ async def test_place_family_that_did_not_happen_is_rejected(tmp_path: Path):
         session = await prepare_acceptance(
             plan, GROUND_SNAPSHOT, _document(), reader,
             revit_version="2026", timeout_ms=1000, evidence_root=tmp_path)
+    _bind_execution(session)
     evidence = await session.assess_after(reader, timeout_ms=1000)
     assert evidence.state is AcceptanceState.REJECTED
     assert evidence.reason is AcceptanceReason.MEASURED
@@ -347,13 +449,10 @@ async def test_place_family_that_did_not_happen_is_rejected(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_place_family_without_a_symbol_pool_stays_ok_false(tmp_path: Path):
-    """ИМЕНОВАННЫЙ ОТКАЗ ОТ СУЖДЕНИЯ, а не тихий возврат к квитанции.
-
-    Снимок без пула `family_symbols` категорию не доказывает. Ветка обязана
-    остаться неизмеренной и НАЗВАННОЙ: ни одного чтения, INCONCLUSIVE с
-    причиной partial_blind_scope.
-    """
+async def test_acceptance_cannot_register_an_ungrounded_family(
+    tmp_path: Path,
+):
+    """No exact grounded payload means no write authority or bridge read."""
     snapshot = {key: value for key, value in GROUND_SNAPSHOT.items()
                 if key != "family_symbols"}
     plan = _family_plan()
@@ -363,21 +462,9 @@ async def test_place_family_without_a_symbol_pool_stays_ok_false(tmp_path: Path)
         calls.append(phase)
         raise AssertionError("непроверяемая программа не читает модель")
 
-    with mock.patch(
-            "kukai.ir.acceptance_runtime.new_acceptance_run_id",
-            return_value=RUN_ID):
-        session = await prepare_acceptance(
+    with pytest.raises(KirRefusal):
+        await prepare_acceptance(
             plan, snapshot, _document(), reader,
             revit_version="2026", timeout_ms=1000, evidence_root=tmp_path)
     assert calls == []
-    assert session.registration.before is None
-    blind = session.registration.expectation.blind_ops
-    assert [item.op_name for item in blind] == ["place_family"]
-    assert "family_symbols" in blind[0].reason
-
-    evidence = await session.assess_after(reader, timeout_ms=1000)
-    assert evidence.state is AcceptanceState.INCONCLUSIVE
-    assert evidence.reason is AcceptanceReason.PARTIAL_BLIND_SCOPE
-    assert evidence.verdict is None
-    assert session.outcome_state(
-        evidence, WitnessState.SATISFIED) is AcceptanceState.INCONCLUSIVE
+    assert list(tmp_path.iterdir()) == []

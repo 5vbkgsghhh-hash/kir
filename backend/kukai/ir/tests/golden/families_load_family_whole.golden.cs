@@ -12,7 +12,7 @@ Func<string, string, Dictionary<string, object>> __Refuse = (string __oid, strin
 var __results = new Dictionary<string, object>();
 var __post = new List<string>();
 Family __fam_F1 = null; FamilySymbol __el_F1 = null; bool __already_F1 = false;
-using (Transaction __t = new Transaction(doc, "KIR: загрузить семейство"))
+using (Transaction __t = new Transaction(doc, "KIR: загрузить семейство целиком (первый типоразмер)"))
 {
     try
     {
@@ -26,8 +26,8 @@ using (Transaction __t = new Transaction(doc, "KIR: загрузить семе�
         __fho.SetClearAfterRollback(true);
         __t.SetFailureHandlingOptions(__fho);
         // load_family F1
-        if (!System.IO.File.Exists("C:\\Lib\\Columns\\RC.rfa")) { __t.RollBack(); return __Refuse("F1", "файл не найден: C:\\Lib\\Columns\\RC.rfa"); }
-        string __family_name_F1 = System.IO.Path.GetFileNameWithoutExtension("C:\\Lib\\Columns\\RC.rfa");
+        if (!System.IO.File.Exists("C:\\ProgramData\\Autodesk\\RVT 2024\\Libraries\\Russian\\Конструкции\\Колонны\\Бетонные\\M_Бетонная-Прямоугольная-Колонна.rfa")) { __t.RollBack(); return __Refuse("F1", "файл не найден: C:\\ProgramData\\Autodesk\\RVT 2024\\Libraries\\Russian\\Конструкции\\Колонны\\Бетонные\\M_Бетонная-Прямоугольная-Колонна.rfa"); }
+        string __family_name_F1 = System.IO.Path.GetFileNameWithoutExtension("C:\\ProgramData\\Autodesk\\RVT 2024\\Libraries\\Russian\\Конструкции\\Колонны\\Бетонные\\M_Бетонная-Прямоугольная-Колонна.rfa");
         var __families_F1 = new FilteredElementCollector(doc).OfClass(typeof(Family)).Cast<Family>()
             .Where(__f => __f.Name.Equals(__family_name_F1, StringComparison.OrdinalIgnoreCase))
             .OrderBy(__f => __f.Id.ToString(), StringComparer.Ordinal).ToList();
@@ -36,7 +36,7 @@ using (Transaction __t = new Transaction(doc, "KIR: загрузить семе�
         else
         {
             bool __loaded_F1;
-            try { __loaded_F1 = doc.LoadFamily("C:\\Lib\\Columns\\RC.rfa", out __fam_F1); }
+            try { __loaded_F1 = doc.LoadFamily("C:\\ProgramData\\Autodesk\\RVT 2024\\Libraries\\Russian\\Конструкции\\Колонны\\Бетонные\\M_Бетонная-Прямоугольная-Колонна.rfa", out __fam_F1); }
             catch (Exception __ex_F1) { __t.RollBack(); return __Refuse("F1", "LoadFamily: " + __ex_F1.Message); }
             if (!__loaded_F1 || __fam_F1 == null) { __t.RollBack(); return __Refuse("F1", "LoadFamily не загрузил семейство"); }
         }
@@ -48,7 +48,7 @@ using (Transaction __t = new Transaction(doc, "KIR: загрузить семе�
             .ThenBy(__x => __x.Id.ToString(), StringComparer.Ordinal).FirstOrDefault();
         if (__el_F1 == null) { __t.RollBack(); return __Refuse("F1", "семейство не содержит ни одного типоразмера, который резолвится"); }
         if (!__el_F1.IsActive) { __el_F1.Activate(); doc.Regenerate(); }
-        try { Parameter __cmt = __el_F1.get_Parameter(BuiltInParameter.ALL_MODEL_TYPE_COMMENTS); if (__cmt != null && !__cmt.IsReadOnly) __cmt.Set("kir:e8d200f7:F1"); } catch { }
+        try { Parameter __cmt = __el_F1.get_Parameter(BuiltInParameter.ALL_MODEL_TYPE_COMMENTS); if (__cmt != null && !__cmt.IsReadOnly) __cmt.Set("kir:7357b5bc:F1"); } catch { }
 
         doc.Regenerate();
 

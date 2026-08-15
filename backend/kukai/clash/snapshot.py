@@ -19,7 +19,7 @@ import json
 import math
 import pathlib
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from kukai.clash import geom as G
 from kukai.clash import hulls as H
@@ -38,6 +38,190 @@ class SnapshotIntegrityError(RuntimeError):
     """
 
 
+FEDERATION_COVERAGE_SCHEMA = "clash-federation-coverage/1"
+
+
+def _sha256_json(value: Mapping[str, Any]) -> str:
+    try:
+        payload = json.dumps(
+            value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise SnapshotIntegrityError(
+            "federation coverage is not canonical JSON") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _typed_string_list(value: Any, name: str) -> list[str]:
+    if (not isinstance(value, list)
+            or any(not isinstance(item, str) or not item for item in value)
+            or value != sorted(value)
+            or len(value) != len(set(value))):
+        raise SnapshotIntegrityError(
+            f"federation coverage {name} must be sorted unique strings")
+    return value
+
+
+def _federation_coverage_axis(
+    coverage: Any,
+    *,
+    records: Iterable[H.HullRecord],
+    refusals: Iterable[H.Refusal],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the sealed graph/hull accounting before exposing green axes."""
+
+    if not isinstance(coverage, Mapping):
+        raise SnapshotIntegrityError(
+            "origin.federation_coverage must be an object")
+    wire = dict(coverage)
+    digest = wire.pop("content_digest", None)
+    if (not isinstance(digest, str) or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+            or _sha256_json(wire) != digest):
+        raise SnapshotIntegrityError(
+            "federation coverage content digest mismatch")
+    required = {
+        "schema_version", "federation_root", "graph_content_digest",
+        "hull_set_content_digest", "scope_id", "scope_occurrences",
+        "hulled_occurrences", "geometry_refusal_occurrences",
+        "scope_census", "graph_complete", "complete", "graph_gaps",
+        "node_refusals", "graph_refusals", "source_row_refusals",
+        "incomplete_link_resolutions", "geometry_transform_gaps",
+    }
+    if set(wire) != required:
+        raise SnapshotIntegrityError(
+            "federation coverage has an unsupported field set")
+    if wire["schema_version"] != FEDERATION_COVERAGE_SCHEMA:
+        raise SnapshotIntegrityError(
+            "unsupported federation coverage schema")
+    for name in ("federation_root", "scope_id"):
+        if not isinstance(wire[name], str) or not wire[name]:
+            raise SnapshotIntegrityError(
+                f"federation coverage {name} must be non-empty")
+    for name in ("graph_content_digest", "hull_set_content_digest"):
+        value = wire[name]
+        if (not isinstance(value, str) or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)):
+            raise SnapshotIntegrityError(
+                f"federation coverage {name} must be sha256")
+    scope = _typed_string_list(
+        wire["scope_occurrences"], "scope_occurrences")
+    hulled = _typed_string_list(
+        wire["hulled_occurrences"], "hulled_occurrences")
+    refused_occurrences = _typed_string_list(
+        wire["geometry_refusal_occurrences"],
+        "geometry_refusal_occurrences")
+    if set(hulled).intersection(refused_occurrences) \
+            or set(scope) != set(hulled).union(refused_occurrences):
+        raise SnapshotIntegrityError(
+            "federation scope is not exactly hull-or-refusal accounted")
+    census = wire["scope_census"]
+    if not isinstance(census, Mapping) or set(census) != {
+            "occurrences", "hulled", "refused"}:
+        raise SnapshotIntegrityError(
+            "federation coverage scope_census is malformed")
+    for name, expected in (
+        ("occurrences", len(scope)),
+        ("hulled", len(hulled)),
+        ("refused", len(refused_occurrences)),
+    ):
+        value = census[name]
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or value < 0 or value != expected):
+            raise SnapshotIntegrityError(
+                "federation coverage scope census does not balance")
+
+    list_fields = (
+        "graph_gaps", "node_refusals", "graph_refusals",
+        "source_row_refusals", "incomplete_link_resolutions",
+        "geometry_transform_gaps",
+    )
+    for name in list_fields:
+        if not isinstance(wire[name], list):
+            raise SnapshotIntegrityError(
+                f"federation coverage {name} must be an array")
+    graph_complete = not any(wire[name] for name in list_fields[:-1])
+    if (not isinstance(wire["graph_complete"], bool)
+            or wire["graph_complete"] != graph_complete):
+        raise SnapshotIntegrityError(
+            "federation graph completeness contradicts named gaps")
+    complete = graph_complete and not wire["geometry_transform_gaps"]
+    if not isinstance(wire["complete"], bool) or wire["complete"] != complete:
+        raise SnapshotIntegrityError(
+            "federation completeness contradicts named gaps")
+
+    actual_records = sorted(record.source_id for record in records)
+    if actual_records != hulled:
+        raise SnapshotIntegrityError(
+            "federation coverage hulled occurrences differ from snapshot")
+    expected_refusals: dict[str, tuple[str, str]] = {}
+    keyed_gap_occurrences: list[str] = []
+    for index, row in enumerate(wire["geometry_transform_gaps"]):
+        if not isinstance(row, Mapping) or set(row) != {
+                "snapshot_refusal_id", "gap"}:
+            raise SnapshotIntegrityError(
+                "federation geometry gap row is malformed")
+        refusal_id = row["snapshot_refusal_id"]
+        gap = row["gap"]
+        if (not isinstance(refusal_id, str) or not refusal_id
+                or refusal_id in expected_refusals
+                or not isinstance(gap, Mapping)):
+            raise SnapshotIntegrityError(
+                "federation geometry gap refusal identity is invalid")
+        category = gap.get("category")
+        reason = gap.get("reason")
+        occurrence = gap.get("occurrence_key")
+        if (not isinstance(category, str) or not category
+                or not isinstance(reason, str) or not reason):
+            raise SnapshotIntegrityError(
+                "federation geometry gap lost category or reason")
+        if occurrence is not None:
+            if not isinstance(occurrence, str) or not occurrence:
+                raise SnapshotIntegrityError(
+                    "federation geometry gap occurrence key is invalid")
+            keyed_gap_occurrences.append(occurrence)
+        expected_refusals[refusal_id] = (
+            category, f"federation:{reason}")
+    if sorted(keyed_gap_occurrences) != refused_occurrences:
+        raise SnapshotIntegrityError(
+            "federation coverage keyed geometry refusals disagree")
+    actual_refusals: dict[str, tuple[str, str]] = {}
+    for refusal in refusals:
+        if refusal.source_id in actual_refusals:
+            raise SnapshotIntegrityError(
+                "federation snapshot has duplicate refusal identities")
+        if refusal.bucket != "missing_geometry":
+            raise SnapshotIntegrityError(
+                "federation geometry gaps must stay missing_geometry refusals")
+        actual_refusals[refusal.source_id] = (
+            refusal.category, refusal.reason)
+    if actual_refusals != expected_refusals:
+        raise SnapshotIntegrityError(
+            "federation geometry gaps differ from snapshot refusals")
+
+    extraction_complete = not any(wire[name] for name in (
+        "node_refusals", "graph_refusals", "source_row_refusals"))
+    extraction_axis = {
+        "complete": extraction_complete,
+        "graph_refusals": wire["graph_refusals"],
+        "node_refusals": wire["node_refusals"],
+        "source_row_refusals": wire["source_row_refusals"],
+        "note": (
+            "complete only when every source graph and node entering the "
+            "federation has an authoritative occurrence address"),
+    }
+    federation_axis = {
+        **wire,
+        "content_digest": digest,
+        "note": (
+            "complete only when graph assembly, expected links, occurrence "
+            "scope accounting, and source-to-root geometry transforms have "
+            "no named gaps"),
+    }
+    return extraction_axis, federation_axis
+
+
 @dataclass
 class Census:
     """Счётчики по классам. Все четыре публикуются всегда, включая нули."""
@@ -51,8 +235,25 @@ class Census:
     #: element-строк в L0 — 3 153. Разница НЕ обязана быть пригодной к поиску,
     #: но обязана быть НАЗВАНА: иначе знаменатель любого процента не доказан.
     outside_extraction_scope: int = 0
-    #: Элементы связанных файлов: в потоке есть, оболочек им никто не строил.
+    #: ЭЛЕМЕНТЫ связанных файлов, оболочек не получившие. Сумма `element_count`
+    #: по строкам `link`, а НЕ число самих строк.
+    #:
+    #: ДО 11.08.2026 ЗДЕСЬ ЛЕЖАЛО ЧИСЛО СВЯЗЕЙ. Имя говорило «элементы», код
+    #: присваивал `origin["links_in_l0"]`, и модель с тремя связями по сорок
+    #: тысяч элементов отчитывалась тройкой — величина объявлена в одном месте,
+    #: прочитана в другом, совпасть их ничто не заставляло. Настоящее число при
+    #: этом было ЗАМЕРЕНО и выброшено строкой рядом: экстрактор кладёт в строку
+    #: связи `element_count` с `GetLinkDocument()`, а читатель строку не
+    #: открывал вовсе.
     linked_elements_unscored: int = 0
+    #: Связи, у которых числа элементов ПРОЧИТАТЬ НЕ УДАЛОСЬ (файл не
+    #: загружен — `GetLinkDocument()` пуст, `element_count` остаётся `null`).
+    #:
+    #: ОТДЕЛЬНОЕ ЧИСЛО, А НЕ НОЛЬ В СУММЕ. «В связи ноль элементов» и «число
+    #: элементов связи не прочитано» — разные утверждения; сложить их значит
+    #: заменить одну ложь другой, ровно тем же приёмом, каким счётчик выше
+    #: врал до сегодняшнего дня.
+    links_without_element_count: int = 0
     #: ── сечения (волна D2-A). Знаменатель — `eligible` тех категорий, которым
     #: источник `axis_section` РАЗРЕШЁН. Стены сюда не входят: у них число
     #: есть, а разрешения нет, и складывать одно с другим значит спрятать
@@ -108,7 +309,8 @@ class Census:
                 "missing_geometry": sum(self.missing_geometry.values()),
                 "not_eligible": sum(self.not_eligible.values()),
                 "outside_extraction_scope": self.outside_extraction_scope,
-                "linked_elements_unscored": self.linked_elements_unscored}
+                "linked_elements_unscored": self.linked_elements_unscored,
+                "links_without_element_count": self.links_without_element_count}
 
     def balanced(self) -> bool:
         t = self.totals()
@@ -256,6 +458,124 @@ class ClashGeometrySnapshot:
     def mvp_records(self) -> list[H.HullRecord]:
         return [r for r in self.records if r.mvp_side in H.MVP_PAIR]
 
+    def coverage_axes(self, *, geometry_scope: str) -> dict[str, dict]:
+        """Independent input-coverage facts for a clash query.
+
+        A balanced hull census proves only that every *extracted* eligible
+        row was accounted for.  It does not prove that the extractor saw the
+        whole host document, that linked-model geometry was federated, or
+        that every element relevant to the requested query received a usable
+        hull.  Keep those claims separate so that one green counter cannot
+        mask a red one.
+
+        ``geometry_scope`` is deliberately small and typed.  ``mvp`` means
+        the two sides of the production MEP-vs-structure query;
+        ``all_eligible`` means every physical row admitted by the category
+        table (the diagnostic all-pairs query).
+        """
+        if geometry_scope == "mvp":
+            eligible = sum(self.census.mvp_eligible.values())
+            hulled = sum(self.census.mvp_hulled.values())
+            without_hull = sum(self.census.no_hull_mvp_side.values())
+            by_side = {
+                side: {
+                    "eligible": self.census.mvp_eligible.get(side, 0),
+                    "hulled": self.census.mvp_hulled.get(side, 0),
+                    "without_hull": self.census.no_hull_mvp_side.get(side, 0),
+                }
+                for side in ("mep", "struct")
+            }
+            by_category_without_hull = dict(
+                sorted(self.census.no_hull_by_category.items()))
+            degenerate = sum(
+                count
+                for category, by_kind in self.census.degenerate_by_category.items()
+                if ((H.KIND_TABLE.get(category) is not None)
+                    and H.KIND_TABLE[category].mvp_side in H.MVP_PAIR)
+                for count in by_kind.values())
+        elif geometry_scope == "all_eligible":
+            totals = self.census.totals()
+            eligible = totals["eligible"]
+            hulled = totals["hulled"]
+            without_hull = totals["unsupported"] + totals["missing_geometry"]
+            by_side = {}
+            by_category_without_hull = {
+                category: (self.census.unsupported.get(category, 0)
+                           + self.census.missing_geometry.get(category, 0))
+                for category in sorted(
+                    set(self.census.unsupported)
+                    | set(self.census.missing_geometry))
+                if (self.census.unsupported.get(category, 0)
+                    + self.census.missing_geometry.get(category, 0))
+            }
+            degenerate = sum(
+                value for kind, value in self.census.degenerate_hulls.items()
+                if kind != "ok")
+        else:
+            raise ValueError(
+                f"unknown clash geometry scope {geometry_scope!r}; "
+                "expected 'mvp' or 'all_eligible'")
+
+        outside = self.census.outside_extraction_scope
+        linked = self.census.linked_elements_unscored
+        extraction_axis = {
+                "complete": outside == 0,
+                "outside_extraction_scope": outside,
+                "elements_in_l0": self.origin.get("elements_in_l0"),
+                "header_census_total": self.origin.get("header_census_total"),
+                "note": (
+                    "complete only when the document census has no rows "
+                    "outside the extracted L0 stream"),
+            }
+        # ПОЛНОТУ РЕШАЮТ СВЯЗИ, А НЕ СУММА ИХ ЭЛЕМЕНТОВ. Условие слияния волны
+        # федерации с исправленным счётчиком (11.08.2026), и без него слияние
+        # выпускало бы новый молчаливо-неверный исход.
+        #
+        # Ось написана, когда `linked_elements_unscored` держал ЧИСЛО СВЯЗЕЙ, и
+        # тогда `linked == 0` значило «связей нет» — случайно верно. Счётчик
+        # исправлен и держит теперь ЭЛЕМЕНТЫ, и то же выражение стало ложью
+        # ровно на худших моделях: у здания, все связи которого ВЫГРУЖЕНЫ,
+        # `element_count` не прочитан ни у одной, сумма равна нулю, и поиск
+        # объявил бы себя ПОЛНЫМ там, где не видел вообще ничего. По корпусу
+        # это не край: 316 связей из 386 (82 %) числа не имеют.
+        #
+        # Тот же класс, что и сам исправленный счётчик: величина объявлена в
+        # одном месте (полнота федерации), прочитана в другом (сумма элементов),
+        # и совпасть их ничто не заставляло.
+        links_in_l0 = self.origin.get("links_in_l0") or 0
+        federation_axis = {
+                "complete": links_in_l0 == 0,
+                "linked_elements_unscored": linked,
+                "links_without_element_count":
+                    self.census.links_without_element_count,
+                "links_in_l0": links_in_l0,
+                "note": (
+                    "complete only when the document declares no links at all; "
+                    "linked_elements_unscored is a LOWER BOUND — "
+                    "links_without_element_count links carry no readable count"),
+            }
+        coverage = self.origin.get("federation_coverage")
+        if coverage is not None:
+            extraction_axis, federation_axis = _federation_coverage_axis(
+                coverage, records=self.records, refusals=self.refusals)
+        return {
+            "extraction": extraction_axis,
+            "federation": federation_axis,
+            "geometry": {
+                "complete": without_hull == 0 and degenerate == 0,
+                "scope": geometry_scope,
+                "eligible": eligible,
+                "hulled": hulled,
+                "without_hull": without_hull,
+                "degenerate_hulls": degenerate,
+                "by_side": by_side,
+                "by_category_without_hull": by_category_without_hull,
+                "note": (
+                    "complete only when every element relevant to the query "
+                    "has a non-degenerate conservative hull"),
+            },
+        }
+
     def as_dict(self) -> dict:
         return {"schema_version": SCHEMA_VERSION, "origin": self.origin,
                 "census": self.census.as_dict(), "by_grade": self.by_grade(),
@@ -268,6 +588,48 @@ class ClashGeometrySnapshot:
         «не искали»: баланс КАЖДОЙ категории, уникальность и непустота адресов,
         конечность оболочек, наличие происхождения.
         """
+        counter_fields = (
+            "eligible", "hulled", "unsupported", "missing_geometry",
+            "not_eligible", "reasons", "section_present", "section_absent",
+            "section_hulled", "section_blocked", "section_nominal_only",
+            "no_hull_mvp_side", "mvp_eligible", "mvp_hulled",
+            "no_hull_by_category", "degenerate_hulls",
+        )
+        for field_name in counter_fields:
+            counter = getattr(self.census, field_name)
+            if not isinstance(counter, collections.Counter):
+                raise SnapshotIntegrityError(
+                    f"census.{field_name} не является Counter")
+            invalid = {
+                key: value for key, value in counter.items()
+                if (not isinstance(key, str) or not key
+                    or isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0)
+            }
+            if invalid:
+                raise SnapshotIntegrityError(
+                    f"census.{field_name} содержит неверные счётчики: "
+                    f"{invalid}")
+        for field_name in ("outside_extraction_scope",
+                           "linked_elements_unscored"):
+            value = getattr(self.census, field_name)
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0):
+                raise SnapshotIntegrityError(
+                    f"census.{field_name} должен быть неотрицательным int")
+        if not isinstance(self.census.degenerate_by_category, dict):
+            raise SnapshotIntegrityError(
+                "census.degenerate_by_category должен быть mapping")
+        for category, counts in self.census.degenerate_by_category.items():
+            if (not isinstance(category, str) or not category
+                    or not isinstance(counts, collections.Counter)
+                    or any(not isinstance(kind, str) or not kind
+                           or isinstance(value, bool)
+                           or not isinstance(value, int) or value < 0
+                           for kind, value in counts.items())):
+                raise SnapshotIntegrityError(
+                    "census.degenerate_by_category содержит неверные данные")
+
         bad = self.census.unbalanced_categories()
         if bad:
             raise SnapshotIntegrityError(
@@ -280,19 +642,118 @@ class ClashGeometrySnapshot:
             raise SnapshotIntegrityError(
                 f"перепись сечений не сходится: {sorted(bad_sec)} ({bad_sec})")
         seen: set[str] = set()
+        actual_hulled: collections.Counter = collections.Counter()
+        actual_mvp_hulled: collections.Counter = collections.Counter()
+        actual_degeneracy: collections.Counter = collections.Counter()
+        actual_degeneracy_by_category: dict[str, collections.Counter] = (
+            collections.defaultdict(collections.Counter))
         for r in self.records:
             if not r.source_id or r.source_id in ("None", "?"):
                 raise SnapshotIntegrityError(f"пустой адрес элемента: {r!r}")
             if r.source_id in seen:
                 raise SnapshotIntegrityError(f"дублирующийся source_id: {r.source_id}")
             seen.add(r.source_id)
+            actual_hulled[r.category] += 1
+            if r.mvp_side in H.MVP_PAIR:
+                actual_mvp_hulled[r.mvp_side] += 1
+            degeneracy = H.hull_degeneracy(r.hull)
+            actual_degeneracy[degeneracy] += 1
+            if degeneracy != "ok":
+                actual_degeneracy_by_category[r.category][degeneracy] += 1
             lo, hi = r.bounds()
             if not all(isinstance(c, (int, float)) and math.isfinite(c)
                        for c in (*lo, *hi)):
                 raise SnapshotIntegrityError(
                     f"неконечная оболочка у {r.source_id}: {lo} {hi}")
+        normalized = lambda counter: collections.Counter({
+            key: value for key, value in counter.items() if value})
+        if normalized(actual_hulled) != normalized(self.census.hulled):
+            raise SnapshotIntegrityError(
+                "перепись hulled не совпадает с записями: "
+                f"records={dict(actual_hulled)} "
+                f"census={dict(self.census.hulled)}")
+        if normalized(actual_mvp_hulled) != normalized(self.census.mvp_hulled):
+            raise SnapshotIntegrityError(
+                "перепись mvp_hulled не совпадает с записями")
+        if normalized(actual_degeneracy) != normalized(
+                self.census.degenerate_hulls):
+            raise SnapshotIntegrityError(
+                "перепись вырожденности не совпадает с записями")
+        declared_degeneracy_by_category = {
+            category: normalized(counts)
+            for category, counts in self.census.degenerate_by_category.items()
+            if normalized(counts)
+        }
+        if ({category: normalized(counts)
+             for category, counts in actual_degeneracy_by_category.items()
+             if normalized(counts)} != declared_degeneracy_by_category):
+            raise SnapshotIntegrityError(
+                "перепись вырожденности по категориям не совпадает")
+
+        refusal_by_bucket: dict[str, collections.Counter] = {
+            "unsupported": collections.Counter(),
+            "missing_geometry": collections.Counter(),
+            "not_eligible": collections.Counter(),
+        }
+        refusal_reasons: collections.Counter = collections.Counter()
+        actual_no_hull_mvp_side: collections.Counter = collections.Counter()
+        actual_no_hull_by_category: collections.Counter = collections.Counter()
+        for refusal in self.refusals:
+            if (not isinstance(refusal, H.Refusal)
+                    or not isinstance(refusal.source_id, str)
+                    or not refusal.source_id
+                    or refusal.source_id in seen
+                    or refusal.bucket not in refusal_by_bucket
+                    or not isinstance(refusal.category, str)
+                    or not refusal.category
+                    or not isinstance(refusal.reason, str)
+                    or not refusal.reason):
+                raise SnapshotIntegrityError(
+                    f"неверная или дублирующаяся строка refusal: {refusal!r}")
+            seen.add(refusal.source_id)
+            refusal_by_bucket[refusal.bucket][refusal.category] += 1
+            refusal_reasons[refusal.reason] += 1
+            rule = H.KIND_TABLE.get(refusal.category)
+            if (refusal.bucket != "not_eligible" and rule is not None
+                    and rule.mvp_side in H.MVP_PAIR):
+                actual_no_hull_mvp_side[rule.mvp_side] += 1
+                actual_no_hull_by_category[refusal.category] += 1
+        for bucket, actual in refusal_by_bucket.items():
+            declared = getattr(self.census, bucket)
+            if normalized(actual) != normalized(declared):
+                raise SnapshotIntegrityError(
+                    f"перепись {bucket} не совпадает с refusals")
+        if normalized(refusal_reasons) != normalized(self.census.reasons):
+            raise SnapshotIntegrityError(
+                "перепись причин отказа не совпадает с refusals")
+        if normalized(actual_no_hull_mvp_side) != normalized(
+                self.census.no_hull_mvp_side):
+            raise SnapshotIntegrityError(
+                "перепись no_hull_mvp_side не совпадает с refusals")
+        if normalized(actual_no_hull_by_category) != normalized(
+                self.census.no_hull_by_category):
+            raise SnapshotIntegrityError(
+                "перепись no_hull_by_category не совпадает с refusals")
+        expected_mvp_eligible = actual_mvp_hulled + actual_no_hull_mvp_side
+        if normalized(expected_mvp_eligible) != normalized(
+                self.census.mvp_eligible):
+            raise SnapshotIntegrityError(
+                "перепись mvp_eligible не совпадает с records + refusals")
+
+        elements_in_l0 = self.origin.get("elements_in_l0")
+        if (elements_in_l0 is not None
+                and (isinstance(elements_in_l0, bool)
+                     or not isinstance(elements_in_l0, int)
+                     or elements_in_l0 < 0
+                     or elements_in_l0 != len(self.records) + len(self.refusals))):
+            raise SnapshotIntegrityError(
+                "origin.elements_in_l0 не совпадает с records + refusals")
         if not self.origin:
             raise SnapshotIntegrityError("снапшот без происхождения")
+        coverage = self.origin.get("federation_coverage")
+        if coverage is not None:
+            _federation_coverage_axis(
+                coverage, records=self.records, refusals=self.refusals)
 
     def join_manifest(self) -> dict:
         """Ревью №15: что из модели вообще НЕ дошло до поиска.
@@ -311,6 +772,7 @@ class ClashGeometrySnapshot:
             "not_eligible": t["not_eligible"],
             "outside_extraction_scope": t["outside_extraction_scope"],
             "linked_elements_unscored": t["linked_elements_unscored"],
+            "links_without_element_count": t["links_without_element_count"],
             "l1_join": "absent",
             "l1_join_note": ("op_id/lift_status/ground-размеры в D1 не "
                              "присоединены: матрица op×category из §6 этим "
@@ -408,6 +870,8 @@ def read_decompile(run_dir: str | pathlib.Path) -> tuple[list[dict], dict, dict,
     footer: dict = {}
     statuses: list[dict] = []
     links = 0
+    linked_elements = 0
+    links_unread = 0
     seen_categories: collections.Counter = collections.Counter()
     l0 = d / "L0.jsonl"
     with l0.open(encoding="utf-8") as f:
@@ -433,7 +897,20 @@ def read_decompile(run_dir: str | pathlib.Path) -> tuple[list[dict], dict, dict,
                 # {"record":"category_status","status":{...}}.
                 statuses.append(r.get("status") or {})
             elif kind == "link":
+                # СТРОКА СВЯЗИ ОТКРЫВАЕТСЯ, А НЕ ТОЛЬКО СЧИТАЕТСЯ (11.08.2026).
+                # Здесь стояло одно `links += 1`, а `census.linked_elements_
+                # unscored` — поле, чьё ИМЯ обещает элементы — получало именно
+                # это число. Настоящее лежало в самой строке: экстрактор кладёт
+                # `element_count` с `GetLinkDocument()` (`extract.py`, цикл по
+                # `RevitLinkInstance`) и оставляет `null`, когда документ не
+                # загружен. Оба случая теперь РАЗЛИЧНЫ и оба названы.
                 links += 1
+                count = (r.get("link") or {}).get("element_count")
+                if isinstance(count, int) and not isinstance(count, bool) \
+                        and count >= 0:
+                    linked_elements += count
+                else:
+                    links_unread += 1
     if not footer:
         raise SnapshotIntegrityError(
             "L0 без footer: поток обрезан, а перепись на обрезанном потоке "
@@ -449,6 +926,16 @@ def read_decompile(run_dir: str | pathlib.Path) -> tuple[list[dict], dict, dict,
         raise SnapshotIntegrityError(
             f"footer обещал {declared_cats} строк category_status, "
             f"в потоке {len(statuses)}")
+    # ТРЕТЬЕ ЧИСЛО ТОГО ЖЕ ФУТЕРА, И ЕГО НЕ ЧИТАЛ НИКТО. `element_count` и
+    # `category_count` сверяются с потоком и роняют прогон; `link_count`
+    # объявлялся рядом и игнорировался, поэтому связь, потерянная при записи,
+    # оставляла перепись сходящейся САМА С СОБОЙ — ровно та дыра, ради которой
+    # сверка футера и заведена (ревью №10). Это не новая строгость, а
+    # доведение уже принятого закона до третьего его слагаемого.
+    declared_links = footer.get("link_count")
+    if isinstance(declared_links, int) and declared_links != links:
+        raise SnapshotIntegrityError(
+            f"footer обещал {declared_links} строк link, в потоке {links}")
     # header.document.census — СПИСОК {key, count, name}; замерено, а не
     # предположено: на фасаде это 30 489 элементов против 3 153 в потоке.
     census_rows = ((header.get("document") or {}).get("census") or []) if header else []
@@ -472,6 +959,12 @@ def read_decompile(run_dir: str | pathlib.Path) -> tuple[list[dict], dict, dict,
         if isinstance(row.get("count"), int))
     origin["category_status_rows"] = len(statuses)
     origin["links_in_l0"] = links
+    #: Три числа, а не одно, и порознь они не заменяют друг друга: связей
+    #: столько-то, элементов в них столько-то, а у стольких-то связей число
+    #: элементов ПРОЧИТАТЬ НЕ УДАЛОСЬ. Сумма 0 при `links_in_l0 > 0` значит
+    #: «все связи выгружены», а не «связей нет».
+    origin["linked_elements_in_l0"] = linked_elements
+    origin["links_without_element_count"] = links_unread
     origin["elements_in_l0"] = len(elements)
 
     inputs: dict[str, str] = {"L0.jsonl": _sha(l0.read_bytes())}
@@ -512,6 +1005,12 @@ def build_from_decompile(run_dir: str | pathlib.Path) -> ClashGeometrySnapshot:
     if header_total:
         snap.census.outside_extraction_scope = max(
             0, header_total - origin["elements_in_l0"])
-    snap.census.linked_elements_unscored = origin.get("links_in_l0", 0)
+    # СПРОШЕН АВТОРИТЕТ, А НЕ ОБЪЯВЛЕНА ВЕЛИЧИНА. Здесь стояло
+    # `= origin.get("links_in_l0", 0)`: поле, названное ЭЛЕМЕНТАМИ, получало
+    # число СТРОК-СВЯЗЕЙ, и три связи по сорок тысяч отчитывались тройкой.
+    snap.census.linked_elements_unscored = origin.get(
+        "linked_elements_in_l0", 0)
+    snap.census.links_without_element_count = origin.get(
+        "links_without_element_count", 0)
     snap.validate()
     return snap

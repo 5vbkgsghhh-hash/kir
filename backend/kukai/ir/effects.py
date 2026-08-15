@@ -123,7 +123,7 @@ def _external_reads(op: Mapping[str, Any], op_ids: frozenset[str]) -> frozenset[
             if node.get("by") == "element_id" and "value" in node:
                 found.add(f"external:{node['value']}")
             for key, value in node.items():
-                if key == "__host_wall__":
+                if key in spec.SYNTHETIC_FIELDS:  # власть — registry_base
                     continue
                 _walk(value)
         elif isinstance(node, (list, tuple)):

@@ -82,6 +82,10 @@ _S = ContentClass.SYSTEM
 
 # Строка на категорию. Порядок — по классам, внутри класса по алфавиту, чтобы
 # правка была видна в дифе как одна строка, а не как перетасовка таблицы.
+#: Сколько строк «не классифицировано» печатать. Не порог качества, а предел
+#: читаемости: остальное обязано быть НАЗВАНО числом, а не пропасть молча.
+_UNKNOWN_ROWS_SHOWN = 20
+
 CATEGORY_CLASS: dict[str, ContentClass] = {
     # --- ЗДАНИЕ -----------------------------------------------------------
     "OST_Areas": _M,
@@ -261,6 +265,90 @@ CATEGORY_CLASS: dict[str, ContentClass] = {
     # плоскости, служебное. Класс назван прямо, а не подставлен догадкой: это
     # верхняя граница неопределённости, и она печатается отдельной строкой.
     "no_category": ContentClass.UNKNOWN,
+
+    # --- ДОБАВЛЕНО 13.08.2026 -------------------------------------------
+    # 68 имён, встреченных в корпусе и не имевших строки. Классифицированы
+    # ГЛАЗАМИ, а не по суффиксу, и суффикс дал бы другой ответ минимум
+    # трижды: `OST_AnalyticSurfaces` (3041) выглядит поверхностями здания, а
+    # есть АНАЛИТИЧЕСКАЯ модель, порождаемая физической; `OST_RailingSupport`
+    # (2608) — не самостоятельное здание, а часть ограждения;
+    # `OST_MEPLoadAreaSeparationLines` просится в оформление по `Lines`, но
+    # прецедент уже стоит в этой же таблице — `OST_RoomSeparationLines`
+    # отнесён к ЗДАНИЮ, потому что рисуется руками и без него пространство не
+    # воспроизвести. Спорные строки правятся поштучно; на то они и строки.
+    # ЗДАНИЕ
+    "OST_Cornices": _M,
+    "OST_DataDevices": _M,
+    "OST_ElectricalCircuit": _M,
+    "OST_ElectricalLoadZoneInstance": _M,
+    "OST_Entourage": _M,
+    "OST_FoodServiceEquipment": _M,
+    "OST_Hardscape": _M,
+    "OST_MEPLoadAreaSeparationLines": _M,
+    "OST_MEPLoadAreas": _M,
+    "OST_MEPSpaceSeparationLines": _M,
+    "OST_MultistoryStairs": _M,
+    "OST_Parking": _M,
+    "OST_Planting": _M,
+    "OST_RoofOpening": _M,
+    "OST_SWallRectOpening": _M,
+    "OST_ShaftOpening": _M,
+    "OST_Site": _M,
+    "OST_SiteProperty": _M,
+    "OST_SitePropertyLineSegment": _M,
+    "OST_VerticalCirculation": _M,
+    "OST_Wire": _M,
+    # ОФОРМЛЕНИЕ
+    "OST_ConduitTags": _D,
+    "OST_ELECTRICAL_AreaBasedLoads_Tags": _D,
+    "OST_ElectricalEquipmentTags": _D,
+    "OST_ElectricalFixtureTags": _D,
+    "OST_GenericModelTags": _D,
+    "OST_InsulationLines": _D,
+    "OST_KeynoteTags": _D,
+    "OST_LightingFixtureTags": _D,
+    "OST_ParkingTags": _D,
+    "OST_PathOfTravelLines": _D,
+    "OST_PathOfTravelTags": _D,
+    "OST_PlantingTags": _D,
+    "OST_RoofTags": _D,
+    "OST_SitePropertyLineSegmentTags": _D,
+    "OST_SpecialityEquipmentTags": _D,
+    "OST_SpotElevSymbols": _D,
+    "OST_WireTags": _D,
+    # ОРГАНИЗАЦИЯ ДОКУМЕНТА
+    "OST_CalloutHeads": _V,
+    "OST_ColorFillLegends": _V,
+    "OST_ElevationMarks": _V,
+    "OST_GridHeads": _V,
+    "OST_LevelHeads": _V,
+    "OST_PanelScheduleGraphics": _V,
+    "OST_PanelSchedules": _V,
+    "OST_ReferenceViewerSymbol": _V,
+    "OST_SectionHeads": _V,
+    "OST_ViewportLabel": _V,
+    # ПРОИЗВОДНОЕ
+    "OST_AdaptivePoints": _G,
+    "OST_AnalyticSpaces": _G,
+    "OST_AnalyticSurfaces": _G,
+    "OST_CableTrayRun": _G,
+    "OST_ConduitFittingCenterLine": _G,
+    "OST_ConduitRun": _G,
+    "OST_EdgeSlab": _G,
+    "OST_ElectricalAnalyticalTransformer": _G,
+    "OST_MEPAnalyticalBus": _G,
+    "OST_Parts": _G,
+    "OST_RailingHandRail": _G,
+    "OST_RailingSupport": _G,
+    "OST_StairsSketchLandingCenterLines": _G,
+    "OST_StairsSketchRunLines": _G,
+    "OST_StairsStringerCarriage": _G,
+    # СЛУЖЕБНОЕ
+    "OST_DesignOptionSets": _S,
+    "OST_DesignOptions": _S,
+    "OST_Divisions": _S,
+    "OST_ElectricalCircuitNaming": _S,
+    "OST_ElectricalPowerSource": _S,
 }
 
 # Ключи таблицы ИЗВЛЕЧЕНИЯ, которых нет в переписи как отдельных категорий:
@@ -304,22 +392,226 @@ def _extracted_by_collector(directory: pathlib.Path) -> dict[str, int]:
     return dict(counts)
 
 
+def _side_index_names() -> tuple[tuple[str, str], ...]:
+    """Список боковых индексов — У ТОГО, КТО ИХ ГРУЗИТ, а не свой второй.
+
+    `relift_offline._SIDE_INDEX_FILES` — единственное место, где этот список
+    ведут, и лифт входит именно через него. Свой список здесь разошёлся бы с
+    ним при первой же новой стадии, и разошёлся бы МОЛЧА: недостающее имя
+    выглядело бы как «у прогона нет этого индекса».
+    """
+    from relift_offline import _SIDE_INDEX_FILES
+    return tuple(_SIDE_INDEX_FILES)
+
+
+#: Читается лениво, чтобы `content_coverage` оставался импортируемым без
+#: инструментов рядом; ошибка импорта — не пустой список, а исключение.
+_SIDE_INDEX_NAMES = _side_index_names()
+
+
+def _conditions(directory: pathlib.Path, census: list[dict[str, Any]],
+                extracted: dict[str, int]) -> dict[str, Any]:
+    """Условия, при которых процент этого прогона вообще сопоставим с другим.
+
+    Спрашиваем АВТОРИТЕТЫ, а не заводим поле: таблица извлечения знает, что мы
+    умеем читать; перепись §18.1 знает, что в документе есть; `L0` знает, что
+    прочитано на самом деле. Пересечение первых двух минус третье и есть
+    «умели прочесть, документ это имел, не прочли».
+
+    `category_outside_table` сюда НЕ попадает намеренно: это известный и
+    названный пробел, ради описания которого метрика и заведена. Опасен
+    другой случай — категория В ТАБЛИЦЕ, и он до 12.08 не был виден нигде.
+    """
+    try:
+        from kukai.ir.decompile.extract import _CATEGORY_SPECS
+        table = {spec.name for spec in _CATEGORY_SPECS}
+    except Exception:                                          # noqa: BLE001
+        # Таблицы нет — условия НЕИЗВЕСТНЫ, и это другой факт, чем «условий
+        # нет». Пустой словарь тут читался бы как «всё прочитано».
+        return {"table_available": False}
+    unread = {row["key"]: int(row.get("count", 0)) for row in census
+              if row.get("key") in table and int(row.get("count", 0)) > 0
+              and extracted.get(row.get("key"), 0) == 0}
+    status_path = directory / "status.json"
+    scanned = None
+    if status_path.is_file():
+        try:
+            scanned = int(json.loads(status_path.read_text(encoding="utf-8"))
+                          .get("categories_scanned"))
+        except Exception:                                      # noqa: BLE001
+            scanned = None
+    return {
+        "table_available": True,
+        "categories_scanned": scanned,
+        "in_table_unread": dict(sorted(unread.items())),
+        "in_table_unread_elements": sum(unread.values()),
+        # ═══ БОКОВЫЕ ИНДЕКСЫ — УСЛОВИЕ ТОГО ЖЕ РАНГА, ЧТО НЕПРОЧИТАННЫЕ
+        # КАТЕГОРИИ, и до 12.08 `comparable()` их не смотрел.
+        #
+        # Они решают, что лифтер ВООБЩЕ МОЖЕТ поднять: без
+        # `family_placement.index.json` каждый экземпляр семейства — атом, без
+        # `dimension.index.json` размеры не поднимутся никогда. Прогон,
+        # оборвавшийся на побочных стадиях, честно проходит проверку по
+        # непрочитанным категориям (перепись у него полна!) и при этом
+        # выражает МЕНЬШЕ — просто потому, что лифтеру нечем.
+        #
+        # ПОВОД НАЗВАН ЗАРАНЕЕ, А НЕ ПОСЛЕ УКУСА: `k2_ar_rd_v15`, с которого
+        # сняты все наши числа покрытия, завершился с `stage="error"` и БЕЗ
+        # `mep_system`, `tag`, `dimension`. Живой разбор идёт до конца, со
+        # всеми стадиями. Сравнение живого с `v15` прошло бы старый
+        # `comparable()` и показало разницу, которую прочли бы как выигрыш
+        # компилятора, — а это разница ПОЛНОТЫ ПРОГОНОВ. Ровно 27 пунктов
+        # фасада, второй раз, и в самом важном сравнении.
+        "side_indexes": sorted(
+            name for name, filename in _SIDE_INDEX_NAMES
+            if (directory / filename).is_file()),
+        # ЧЕГО СТОИТ ОТСУТСТВУЮЩИЙ ИНДЕКС — В ЭЛЕМЕНТАХ, А НЕ В ФАКТЕ
+        # (13.08.2026). `comparable()` сравнивал НАЛИЧИЕ файла и отвергал
+        # прогон за ненятую стадию, которой НЕЧЕГО было снимать: у
+        # `snowdon_plumb_v4` нет `dimension`, а в `OST_Dimensions` ноль
+        # элементов — «стадия не снята» и «стадии нечего было снимать» суть
+        # ОДИН факт, и различать их значит отказывать по признаку, не
+        # влияющему на предмет.
+        #
+        # `None` вместо нуля там, где стадии нет строки в `_STAGE_CATEGORIES`
+        # (`geometry` — она пишет bundle, а не индекс): пустое множество
+        # категорий даёт ноль, НЕОТЛИЧИМЫЙ от «нечего читать», и этот ноль
+        # означал бы «сравнивать можно» на голом незнании.
+        "side_index_pending": _pending_by_stage(directory, census),
+    }
+
+
+def _pending_by_stage(directory: pathlib.Path,
+                      census: list[dict[str, Any]]) -> dict[str, int | None]:
+    """{стадия без индекса: сколько элементов её категорий В ПЕРЕПИСИ}.
+
+    `None` = у стадии нет строки в `_STAGE_CATEGORIES`, то есть чего она
+    читает — неизвестно, и ноль тут был бы утверждением, а не замером.
+    """
+    from kukai.ir.decompile.pipeline import _STAGE_CATEGORIES
+
+    counts = {row["key"]: row["count"] for row in census
+              if isinstance(row.get("count"), int)}
+    pending: dict[str, int | None] = {}
+    for name, filename in _SIDE_INDEX_NAMES:
+        if (directory / filename).is_file():
+            continue
+        cats = _STAGE_CATEGORIES.get(name)
+        pending[name] = (None if not cats
+                         else sum(counts.get(c, 0) for c in cats))
+    return pending
+
+
+def comparable(left: dict[str, Any], right: dict[str, Any]) -> tuple[bool, str]:
+    """Сопоставимы ли два отчёта. ОТКАЗ НАЗЫВАЕТ ОБЕ ВЕЛИЧИНЫ.
+
+    Разброс по зданиям — то, что говорит о компиляторе; но он говорит о нём
+    ТОЛЬКО если прогоны прочитали одно и то же множество категорий. Иначе
+    сравниваются полноты чтения под именем компилятора, и это ровно тот
+    случай, что стоил 27 пунктов на двух ревизиях одного фасада.
+    """
+    a = (left.get("conditions") or {}).get("in_table_unread")
+    b = (right.get("conditions") or {}).get("in_table_unread")
+    if a is None or b is None:
+        return False, ("условия одного из отчётов неизвестны (нет таблицы "
+                       "извлечения) — сравнивать нечего с чем")
+    if set(a) != set(b):
+        only_left = sorted(set(a) - set(b))
+        only_right = sorted(set(b) - set(a))
+        return False, (
+            "прогоны прочитали РАЗНЫЕ множества категорий, поэтому их "
+            "проценты несопоставимы: "
+            f"не прочитано только у первого {only_left or '—'}, "
+            f"только у второго {only_right or '—'}. "
+            "Одна такая категория стоила 27 пунктов на двух ревизиях одного "
+            "здания (12.08.2026): её элементы позволяют лифтеру опознать "
+            "порождённых детей, которых честная цифра ИСКЛЮЧАЕТ, и падает "
+            "ЗНАМЕНАТЕЛЬ, а не растёт числитель")
+    # ВТОРОЕ УСЛОВИЕ, ТОГО ЖЕ РАНГА. Перепись может быть полна у обоих, а
+    # лифтеру у одного нечем поднимать: боковой индекс решает, ВОЗМОЖЕН ли
+    # подъём вообще. Прогон, оборвавшийся на побочных стадиях, честно проходит
+    # первую проверку и выражает меньше — не потому, что компилятор хуже.
+    sa = (left.get("conditions") or {}).get("side_indexes")
+    sb = (right.get("conditions") or {}).get("side_indexes")
+    if sa is None or sb is None:
+        return False, ("набор боковых индексов у одного из отчётов неизвестен "
+                       "(снят прибором до 12.08) — сравнивать нечего с чем")
+    # ОТСУТСТВИЕ ИНДЕКСА ЗНАЧИМО ТОЛЬКО ЕСЛИ БЫЛО ЧТО ЧИТАТЬ (13.08.2026).
+    # Стадия без индекса, в чьих категориях перепись даёт НОЛЬ, эквивалентна
+    # присутствующей-и-пустой — такой индекс у корпуса есть (`mep_system` с
+    # нулём строк) и сравнение его проходит. Отвергать за неё значит отказывать
+    # по признаку, не влияющему на предмет.
+    #
+    # ГРАНИЦА: `None` (стадии нет строки в `_STAGE_CATEGORIES`) НЕ считается
+    # пустой. Незнание того, что стадия читает, — не доказательство, что читать
+    # было нечего.
+    pa = (left.get("conditions") or {}).get("side_index_pending") or {}
+    pb = (right.get("conditions") or {}).get("side_index_pending") or {}
+    effective_a = set(sa) | {k for k, v in pa.items() if v == 0}
+    effective_b = set(sb) | {k for k, v in pb.items() if v == 0}
+    if effective_a != effective_b:
+        # Отказ обязан назвать ЦЕНУ, а не только имя: «нет dimension» не
+        # говорит, велика ли потеря — 13 905 элементов или ноль.
+        def _cost(names, pending):
+            return ", ".join(
+                f"{n} ({pending.get(n)} эл. в переписи)"
+                if pending.get(n) is not None
+                else f"{n} (сколько читает — НЕИЗВЕСТНО, строки в "
+                     f"_STAGE_CATEGORIES нет)"
+                for n in sorted(names)) or "—"
+
+        return False, (
+            "у прогонов РАЗНЫЙ набор боковых индексов, и у отсутствующих было "
+            "ЧТО читать, поэтому лифтер мог поднять разное: "
+            f"только у первого {_cost(effective_a - effective_b, pb)}, "
+            f"только у второго {_cost(effective_b - effective_a, pa)}. "
+            "Индекс решает ВОЗМОЖНОСТЬ подъёма: без `family_placement` каждый "
+            "экземпляр семейства — атом, без `dimension` размеры не "
+            "поднимутся никогда. Прогон с оборванными побочными стадиями "
+            "выражает меньше НЕ потому, что компилятор хуже")
+    return True, ""
+
+
 def build(directory: pathlib.Path, ops: int | None = None,
-          generator_children: int | None = None) -> dict[str, Any]:
+          generator_children: int | None = None,
+          ops_by_category: dict[str, int] | None = None) -> dict[str, Any]:
     header = _header(directory)
     census = _census(header, directory)
     extracted = _extracted_by_collector(directory)
 
-    if ops is None:
+    if ops is None and ops_by_category is None:
         from relift_offline import relift
         report = relift(directory)
         ops = int(report.get("op_total", 0))
         elements = int(report.get("elements", 0))
+        ops_by_category = dict(report.get("ops_by_category") or {})
         if generator_children is None:
             generator_children = int(report.get("generator_children", 0))
     else:
+        if ops_by_category is not None:
+            ops = sum(ops_by_category.values()) if ops is None else ops
         elements = sum(extracted.values())
         generator_children = generator_children or 0
+
+    # Числитель раскладывается по ТОМУ ЖЕ классу, что и знаменатель, и по той
+    # же закрытой таблице — по КАТЕГОРИИ элемента-источника, а не по имени
+    # опа. Список опов двигается каждую неделю, категория элемента — факт о
+    # модели. Пока разложения не было, `create_text`/`create_tag` попадали в
+    # числитель «здания», знаменатель которого оформление исключает: замер
+    # 10.08 на `snowdon_plumb_v4` дал 100.07%, а на РД-башне смесь стоила
+    # +9.38 п.п. (v7 85.23% без стадии оформления против v8 94.61% с ней, на
+    # одних и тех же 115 880 прочитанных элементах).
+    ops_by_class: dict[str, int] = {cls.value: 0 for cls in ContentClass}
+    if ops_by_category:
+        for key, count in ops_by_category.items():
+            ops_by_class[classify(key).value] += int(count)
+        ops_class_source = "по категории элемента-источника"
+    else:
+        # Молчание тут запрещено: «нет разбивки» и «оформительских опов нет» —
+        # разные факты, и второй нельзя подставлять вместо первого.
+        ops_by_class[ContentClass.MODEL.value] = ops or 0
+        ops_class_source = "разбивки нет: числитель отнесён к зданию"
+    ops_model = ops_by_class[ContentClass.MODEL.value]
 
     per_class: dict[str, dict[str, Any]] = {
         cls.value: {"census": 0, "read": 0, "categories": 0, "rows": []}
@@ -372,6 +664,10 @@ def build(directory: pathlib.Path, ops: int | None = None,
     authored_model = max(model - generator_children, 0)
     authored_model_read = max(model_read - generator_children, 0)
     authored_content = authored_model + documentation
+    # Второе допущение, названное рядом с первым по его же образцу: числитель
+    # не может превышать знаменатель. Пока оно держится, «сколько не выражено»
+    # исчислимо; нарушится — прибор ОТКАЗЫВАЕТСЯ считать, а не подгоняет.
+    numerator_exceeds_read = ops_model > authored_model_read
 
     # Коллекторы-псевдонимы читают элементы, уже посчитанные переписью под их
     # настоящими категориями. Их след виден только в «прочитано», и если он
@@ -383,10 +679,41 @@ def build(directory: pathlib.Path, ops: int | None = None,
         "directory": str(directory),
         "doc_name": header.get("document", {}).get("doc_name", ""),
         "ops": ops,
+        "ops_by_class": ops_by_class,
+        "ops_class_source": ops_class_source,
         "elements_read": elements,
         "generator_children": generator_children,
         "census_total": census_total,
         "categories_total": len(census),
+        # ═══ ЧЕМ ЭТОТ ПРОЦЕНТ ОБУСЛОВЛЕН, РЯДОМ С НИМ САМИМ ═══
+        #
+        # ЗАМЕР 12.08.2026, ДВЕ РЕВИЗИИ ОДНОГО ФАСАДА, КОМПИЛЯТОР МЕЖДУ НИМИ
+        # НЕ МЕНЯЛСЯ НИ НА СТРОКУ: `sob62_fas_r23_v12` даёт 63.80%,
+        # `sob62_fas_r23_v19` — 91.23%. Разница 27 пунктов, и делает её НЕ
+        # выразительность и даже не объём чтения в наивном смысле: прочитано
+        # 5 095 против 5 218, то есть +2.4%.
+        #
+        # МЕХАНИЗМ ОСТРЕЕ. Одна лишняя прочитанная категория — 122 сетки
+        # витража — позволила лифтеру ОПОЗНАТЬ 1 264 панели и импоста как
+        # порождённых детей витражной стены. `generator_child` из честной
+        # цифры исключается, поэтому знаменатель упал ровно на них
+        # (4 205 -> 2 942), а числитель почти не двинулся (2 683 -> 2 806).
+        # То есть **123 прочитанных элемента переклассифицировали 1 264
+        # других**, и процент вырос от ЧТЕНИЯ, а не от компилятора.
+        #
+        # НИ ОДИН ФЛАГ ЭТОГО НЕ ЛОВИЛ: у обоих прогонов `census_balanced:
+        # true`, `errors: []`, `done: 1`, `is_partial_read: false`, и даже
+        # `generator_children_assumption_broken: false`. Различал их только
+        # `categories_scanned` (14 против 15), который ни с чем не сравнивался.
+        #
+        # ПОЭТОМУ ПРОЦЕНТ ЕДЕТ СО СВОИМИ УСЛОВИЯМИ. Сигнал НЕ ЗАВОДИТСЯ
+        # заново — он ВЫЧИСЛЯЕТСЯ у существующих авторитетов: таблица
+        # извлечения (что мы вообще умеем читать) против переписи §18.1 (что
+        # в документе есть) против фактически прочитанного. Категория, которая
+        # В ТАБЛИЦЕ ЕСТЬ и в переписи ненулевая, а прочитана в ноль, — это не
+        # «вне таблицы» (известный и названный пробел метрики), а другая,
+        # опасная причина, и она обязана стоять рядом с числом.
+        "conditions": _conditions(directory, census, extracted),
         "denominators": {
             "model": model,
             "model_authored": authored_model,
@@ -396,8 +723,10 @@ def build(directory: pathlib.Path, ops: int | None = None,
             "document": census_total,
             "unknown": unknown,
         },
-        "model_pct": pct(ops, model),
-        "model_pct_authored": pct(ops, authored_model),
+        # ЗДАНИЕ меряется зданием: числитель — только модельные опы.
+        "model_pct": pct(ops_model, model),
+        "model_pct_authored": pct(ops_model, authored_model),
+        # СОДЕРЖАНИЕ = здание + оформление, поэтому здесь числитель полный.
         "content_pct": pct(ops, content),
         "content_pct_authored": pct(ops, authored_content),
         # Нижняя граница: если ВСЁ неклассифицированное окажется
@@ -411,8 +740,40 @@ def build(directory: pathlib.Path, ops: int | None = None,
             "model_unread": model - model_read,
             # Лифтер и оп: прочитано, авторское, но в опы не поднято.
             "model_read_authored": authored_model_read,
-            "model_read_unlifted": max(authored_model_read - ops, 0),
-            "expressed_of_read_pct": pct(ops, authored_model_read),
+            # ИНВЕРСИЯ ОТКАЗЫВАЕТ, А НЕ ГАСИТСЯ (13.08.2026).
+            #
+            # Здесь стоял `max(authored_model_read - ops_model, 0)`. Числитель
+            # (узлы-опы из `relift_offline`) и знаменатель (перепись §18.1)
+            # приходят от РАЗНЫХ производителей, и сверки между ними нет:
+            # ничто не мешает числителю превысить знаменатель. Зажим превращал
+            # это в аккуратный ноль — в колонке «сколько мы НЕ выразили», то
+            # есть печатал самый лестный из возможных ответов. **Гашение
+            # скрывало ошибку В ПОЛЬЗУ НАШЕГО ЖЕ ЧИСЛА.**
+            #
+            # И это не гипотеза: на `sob62_fas_r23_v19` настоящий `build` с
+            # удвоенным числителем (имитация лифтера, дающего два опа на
+            # элемент) печатал **182.46% и «невыраженных 0»** — молча. А
+            # `relift_offline.py:235` помнит замер 10.08, когда колонка уже
+            # печатала 100.07% на `snowdon_plumb_v4`; тогда починили
+            # КЛАССИФИКАЦИЮ, сверку не добавили.
+            #
+            # `None`, а не 0: «не знаем, сколько не выражено» и «не выражено
+            # ноль» — разные факты, и второй сегодня печатался вместо первого.
+            "model_read_unlifted": (
+                None if numerator_exceeds_read
+                else authored_model_read - ops_model),
+            "expressed_of_read_pct": (
+                None if numerator_exceeds_read
+                else pct(ops_model, authored_model_read)),
+            # СВОЙСТВО, НА КОТОРОМ ВСЁ ДЕРЖИТСЯ, — И ОНО НЕ ГАРАНТИРОВАНО.
+            # Колонка верна, пока лифтер даёт ОДИН оп на элемент. Замерено
+            # 13.08 по всему корпусу: 52 прогона с деревом, 247 347 узлов-опов,
+            # столько же различных `source_element_id`, дельта 0, немых
+            # прогонов 0. Но ничто в коде этого не требует, а библиотека
+            # компонентов уже однажды это свойство сломала — покрытие,
+            # посчитанное по РАЗВЁРНУТОМУ выводу, было завышено ровно на
+            # избыток 2 351.
+            "expressed_numerator_exceeds_read": numerator_exceeds_read,
             # Целый класс, которого мы не касались: оформление.
             "documentation_unread": documentation
             - per_class[ContentClass.DOCUMENTATION.value]["read"],
@@ -427,6 +788,24 @@ def build(directory: pathlib.Path, ops: int | None = None,
         "unknown_rows": sorted(unknown_rows, key=lambda r: -r["census"]),
         "alias_collectors_read": alias_read,
     }
+
+
+def _conditions_line(cond: dict[str, Any]) -> str:
+    if not cond.get("table_available"):
+        return ("УСЛОВИЯ НЕИЗВЕСТНЫ: таблицы извлечения нет — с чем этот "
+                "процент сопоставим, сказать нечем")
+    unread = cond.get("in_table_unread") or {}
+    scanned = cond.get("categories_scanned")
+    head = (f"условия: категорий отсканировано {scanned}; "
+            f"умели прочесть, но не прочли — {len(unread)} категорий "
+            f"({cond.get('in_table_unread_elements', 0)} элементов)")
+    if not unread:
+        return head + ". Сопоставим только с прогоном такого же множества."
+    names = ", ".join(f"{k}:{v}" for k, v in list(unread.items())[:6])
+    tail = "" if len(unread) <= 6 else f" и ещё {len(unread) - 6}"
+    return (head + f"\n  НЕ ПРОЧИТАНО ИЗ ТОГО, ЧТО УМЕЕМ: {names}{tail}"
+            "\n  Сравнивать этот процент можно ТОЛЬКО с прогоном, у которого "
+            "это множество ТО ЖЕ.")
 
 
 def render(report: dict[str, Any]) -> str:
@@ -444,6 +823,12 @@ def render(report: dict[str, Any]) -> str:
         f"опов поднято: {report['ops']}   элементов прочитано: "
         f"{report['elements_read']}   категорий в переписи: "
         f"{report['categories_total']}",
+        # Числитель обязан называть свой состав рядом с процентами: пока он
+        # был одним числом, оформительские опы молча считались зданием.
+        f"опы по классам: {report['ops_by_class']}   ({report['ops_class_source']})",
+        # УСЛОВИЯ СТОЯТ НАД ЧИСЛОМ, А НЕ ПОД НИМ: читатель, дошедший до
+        # процента, уже должен знать, с чем этот процент сопоставим.
+        _conditions_line(report.get("conditions") or {}),
         "",
         f"{'знаменатель':<30}{'элементов':>10}{'читаем':>9}{'покрытие':>10}",
         f"{'ЗДАНИЕ':<30}{den['model']:>10}{model_bucket['read']:>9}"
@@ -458,11 +843,15 @@ def render(report: dict[str, Any]) -> str:
         "",
         "разрыв разложен (чинится РАЗНЫМ трудом):",
         f"  выражаем из прочитанного здания: {gap['expressed_of_read_pct']}% "
-        f"({report['ops']} опов из {gap['model_read_authored']} авторских)",
+        f"({report['ops_by_class']['model']} модельных опов из "
+        f"{gap['model_read_authored']} авторских)",
         f"  не ЧИТАЕМ элементов здания:      {gap['model_unread']}"
         f"   ← строка в таблице категорий",
-        f"  читаем, но не поднимаем:         {gap['model_read_unlifted']}"
-        f"   ← лифтер и оп",
+        (f"  читаем, но не поднимаем:         {gap['model_read_unlifted']}"
+         f"   ← лифтер и оп"
+         if gap["model_read_unlifted"] is not None else
+         "  читаем, но не поднимаем:         НЕИСЧИСЛИМО"
+         "   ← числитель больше знаменателя, см. ВНИМАНИЕ ниже"),
         f"  оформление не читается вовсе:    {gap['documentation_unread']}"
         f"   ← целый класс",
         "",
@@ -478,9 +867,23 @@ def render(report: dict[str, Any]) -> str:
     if report["unknown_rows"]:
         lines.append("")
         lines.append("НЕ КЛАССИФИЦИРОВАНО (правь таблицу или объясни):")
-        for row in report["unknown_rows"][:20]:
+        # ОТСЕЧКА НАЗЫВАЕТ, СКОЛЬКО СКРЫЛА (13.08.2026). Список резался на
+        # двадцати молча: на `snowdon_plumb_v5` незнакомых 44, читатель видел
+        # 20 и не знал об остальных 24; на `snowdon_elec_v1` — 22 и 2. Это наше
+        # же правило «никаких молчаливых отсечек», нарушенное в приборе, по
+        # которому считаются доли. Показ по-прежнему ограничен — длинный хвост
+        # нечитаем, — но ограничение теперь ЗАЯВЛЕНО числом.
+        shown = report["unknown_rows"][:_UNKNOWN_ROWS_SHOWN]
+        for row in shown:
             lines.append(f"  {row['census']:>7}  {row['category']}"
                          f"  {row['category_ru']}")
+        hidden = report["unknown_rows"][len(shown):]
+        if hidden:
+            lines.append(
+                f"  … и ещё {len(hidden)} категорий на "
+                f"{sum(r['census'] for r in hidden)} элементов — НЕ ПОКАЗАНЫ "
+                f"(показ ограничен {_UNKNOWN_ROWS_SHOWN} строками; полный "
+                f"список в `--json`)")
         lower = report["content_pct_lower_bound"]
         lines.append(f"  ⇒ содержательное покрытие лежит между {lower}% "
                      f"и {report['content_pct_authored']}%")
@@ -488,6 +891,18 @@ def render(report: dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"коллекторы-псевдонимы (уже в переписи под своими "
                      f"категориями): {report['alias_collectors_read']}")
+    if report["gap"]["expressed_numerator_exceeds_read"]:
+        lines.append("")
+        lines.append(
+            "ВНИМАНИЕ: ВЫРАЖЕНО БОЛЬШЕ, ЧЕМ ПРОЧИТАНО "
+            f"({report['ops_by_class']['model']} опов из "
+            f"{report['gap']['model_read_authored']} авторских) — числитель и "
+            "знаменатель приходят от РАЗНЫХ производителей, и это значит, что "
+            "лифтер дал больше одного опа на элемент либо числитель посчитан "
+            "по развёрнутому выводу. Проценты выше НЕ ПЕЧАТАЮТСЯ: доля больше "
+            "ста — не результат, а отказ прибора. Следующий ход: сверить число "
+            "узлов-опов с числом различных source_element_id "
+            "(13.08: 52 прогона, 247 347 опов, дельта 0).")
     if report["generator_children_assumption_broken"]:
         lines.append("")
         lines.append(

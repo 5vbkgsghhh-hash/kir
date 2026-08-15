@@ -239,6 +239,56 @@ class RefusalsNameTheCause(unittest.TestCase):
         _d, create, _c, _r = _checks_of(_work_plane())
         self.assertIn("IsZeroLength()", create)
 
+    def test_work_plane_never_swallows_point_or_two_level_operands(self):
+        """`ref_dir` selects a different Revit overload.  Even an explicit
+        neutral value is author intent and must not disappear at that branch's
+        early return."""
+        cases = {
+            "rotation_deg": 0.0,
+            "mirrored": False,
+            "hand_flipped": False,
+            "facing_flipped": False,
+            "top_level": LVL,
+            "base_offset_mm": 0.0,
+            "top_offset_mm": 0.0,
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                out = compile_program(
+                    _prog(_work_plane(**{field: value})),
+                    revit_version="2024", snapshot=SNAPSHOT, bulk=True)
+                self.assertFalse(out.ok)
+                refusals = [d for d in out.diagnostics
+                            if d.code == "KIR-P007"
+                            and d.field_name == field]
+                self.assertEqual(len(refusals), 1, out.diagnostics)
+                self.assertIn("ref_dir", refusals[0].message_ru)
+                self.assertIn("не будет молча", refusals[0].message_ru)
+
+    def test_trusted_emitter_call_has_the_same_fail_closed_boundary(self):
+        """The validator is the public boundary, but a trusted pre-grounded
+        caller must not be able to reintroduce the old silent-ignore path."""
+        from kukai.ir.authoring import _emit_place_work_plane
+        from kukai.ir.diag import KirRefusal
+
+        fields = {
+            "rotation_deg": 15.0,
+            "mirrored": True,
+            "hand_flipped": True,
+            "facing_flipped": False,
+            "top_level": LVL,
+            "base_offset_mm": 100.0,
+            "top_offset_mm": -100.0,
+        }
+        op = _work_plane(**fields)[-1]
+        with self.assertRaises(KirRefusal) as caught:
+            _emit_place_work_plane(op, "2024", "kir:test")
+        self.assertEqual(
+            set(fields),
+            {d.field_name for d in caught.exception.diagnostics})
+        self.assertTrue(all(d.code == "KIR-P007"
+                            for d in caught.exception.diagnostics))
+
 
 # ── свидетели ───────────────────────────────────────────────────────────────
 

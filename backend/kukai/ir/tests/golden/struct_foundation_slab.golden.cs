@@ -36,7 +36,7 @@ Func<object, string> __ClassName = (__cnObj) =>
 var __results = new Dictionary<string, object>();
 var __post = new List<string>();
 Floor __el_F1 = null;
-using (Transaction __t = new Transaction(doc, "KIR: плитный фундамент с проёмом"))
+using (Transaction __t = new Transaction(doc, "KIR: плитный фундамент с двумя проёмами"))
 {
     try
     {
@@ -68,9 +68,16 @@ using (Transaction __t = new Transaction(doc, "KIR: плитный фундам�
         __hl_F1_0.Append(Line.CreateBound(P(7000, 5000, 0), P(5000, 5000, 0)));
         __hl_F1_0.Append(Line.CreateBound(P(5000, 5000, 0), P(5000, 3000, 0)));
         __loops_F1.Add(__hl_F1_0);
+        CurveLoop __hl_F1_1 = new CurveLoop();
+        __hl_F1_1.Append(Line.CreateBound(P(9000, 1000, 0), P(11000, 1000, 0)));
+        __hl_F1_1.Append(Line.CreateBound(P(11000, 1000, 0), P(11000, 2000, 0)));
+        __hl_F1_1.Append(Line.CreateBound(P(11000, 2000, 0), P(10000, 3000, 0)));
+        __hl_F1_1.Append(Line.CreateBound(P(10000, 3000, 0), P(9000, 2000, 0)));
+        __hl_F1_1.Append(Line.CreateBound(P(9000, 2000, 0), P(9000, 1000, 0)));
+        __loops_F1.Add(__hl_F1_1);
         __el_F1 = Floor.Create(doc, __loops_F1, __ft_F1.Id, __lv_F1.Id, true, null, 0.0);
         if (__el_F1 == null) { __t.RollBack(); return __Refuse("F1", "создание фундаментной плиты вернуло null"); }
-        try { Parameter __cm = __el_F1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:287af90c:F1"); } catch { }
+        try { Parameter __cm = __el_F1.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS); if (__cm != null && !__cm.IsReadOnly) __cm.Set("kir:cac0f234:F1"); } catch { }
 
         doc.Regenerate();
 

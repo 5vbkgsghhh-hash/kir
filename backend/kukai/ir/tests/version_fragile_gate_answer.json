@@ -1,0 +1,44 @@
+{
+  "schema": "version-fragile-gate-answer/1",
+  "run": "k2_ar_rd_v7",
+  "dated": "2026-08-13",
+  "tool": "tools/compile_gate_offline.py",
+  "programs": 150,
+  "checks": 889,
+  "refusals": [
+    {
+      "code": "KIR-E003",
+      "op_id": "e11862664",
+      "field": "holes",
+      "versions": [
+        "2021"
+      ],
+      "count": 6,
+      "message": "отверстия в перекрытии не поддержаны на Revit 2021 (NewFloor без holes; Floor.Create — с 2022)",
+      "op_name": "create_floor"
+    },
+    {
+      "code": "KIR-E003",
+      "op_id": "e15972657",
+      "field": null,
+      "versions": [
+        "2021"
+      ],
+      "count": 3,
+      "message": "потолок не создаётся на Revit 2021: Ceiling.Create появился только в 2022, а legacy-пути к потолку (doc.Create.NewCeiling) в API нет ни на одной версии 2021-202",
+      "op_name": "create_ceiling"
+    },
+    {
+      "code": "KIR-E003",
+      "op_id": "e11840421",
+      "field": "contour.holes",
+      "versions": [
+        "2021"
+      ],
+      "count": 2,
+      "message": "проёмы в перекрытии-по-контуру не поддержаны на Revit 2021",
+      "op_name": "create_floor_by_contour"
+    }
+  ],
+  "op_name_source": "Разрешено 13.08.2026 одним проходом по `k2_ar_rd_v7/tree.json`: op_id = 'e' + source_element_id листа. Гипотеза НЕ принята на слово — у двух из трёх строк оп известен независимо, по месту отказа в эмиттере (holes -> _emit_floor, contour.holes -> _emit_floor_contour, поле уникально среди мест отказа по версии); обе сошлись, третья дала create_ceiling в согласии с текстом самого отказа. Три свидетеля, из них два независимых от этого файла."
+}

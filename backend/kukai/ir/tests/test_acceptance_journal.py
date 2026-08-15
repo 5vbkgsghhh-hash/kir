@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import stat
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -10,7 +11,9 @@ import pytest
 
 from kukai.ir.acceptance import derive_expectation, expectation_categories
 from kukai.ir.acceptance_evidence import (
+    REGULAR_WRITE_EXECUTION_LANE,
     AcceptanceRegistration,
+    ExecutionArtifactBinding,
     assess_acceptance,
 )
 from kukai.ir.acceptance_journal import (
@@ -22,6 +25,7 @@ from kukai.ir.acceptance_journal import (
 from kukai.ir.acceptance_live import observation_from_census
 from kukai.ir.acceptance_mutation import derive_mutation_expectation
 from kukai.ir.compiler import plan_program
+from kukai.ir.ground import ground_program
 from kukai.ir.contracts import DocumentFingerprint
 from kukai.ir.outcome import (
     AcceptanceState,
@@ -52,9 +56,11 @@ def _parts(run_id: str = "a" * 32):
     before = observation_from_census(
         expectation, document, {("OST_Walls", L1): 10}, run_id=run_id,
         phase="before")
+    grounded = ground_program(plan, GROUND_SNAPSHOT)
     registration = AcceptanceRegistration(
         run_id=run_id,
         plan_digest=plan.plan_digest,
+        ground_digest=grounded.ground_digest,
         revit_version="2026",
         expectation=expectation,
         mutation_expectation=derive_mutation_expectation(plan),
@@ -62,6 +68,7 @@ def _parts(run_id: str = "a" * 32):
         categories=expectation_categories(expectation),
         before=before,
         mutation_before=None,
+        ground_context_digest=grounded.context.context_digest,
     )
     after = observation_from_census(
         expectation, document, {("OST_Walls", L1): 11}, run_id=run_id,
@@ -74,6 +81,25 @@ def _parts(run_id: str = "a" * 32):
     return registration, evidence, outcome
 
 
+def _bind(journal, registration, evidence):
+    binding = ExecutionArtifactBinding.from_source(
+        "wrapped final C#",
+        run_id=registration.run_id,
+        revit_version=registration.revit_version,
+        plan_digest=registration.plan_digest,
+        ground_digest=registration.ground_digest,
+        ground_context_digest=registration.ground_context_digest,
+        execution_lane=REGULAR_WRITE_EXECUTION_LANE,
+        tool="revit_ir",
+        op="write",
+    )
+    journal.bind_execution_artifact(binding)
+    return binding, replace(
+        evidence,
+        execution_artifact_binding_digest=binding.binding_digest,
+    )
+
+
 def test_registration_is_fsynced_before_terminal_evidence(tmp_path: Path):
     registration, evidence, outcome = _parts()
     with mock.patch("kukai.ir.acceptance_journal.os.fsync",
@@ -82,12 +108,14 @@ def test_registration_is_fsynced_before_terminal_evidence(tmp_path: Path):
         assert journal.path.read_text(encoding="utf-8").count("\n") == 1
         assert stat.S_IMODE(journal.path.stat().st_mode) == 0o600
         assert not journal.state.finalized
+        binding, evidence = _bind(journal, registration, evidence)
         journal.finalize(outcome, evidence=evidence)
-    # file + directory for prepare, file for terminal
-    assert fsync.call_count >= 3
+    # file + directory for prepare, file for binding, file for terminal
+    assert fsync.call_count >= 4
 
     reopened = AcceptanceJournal.open(journal.path)
     assert reopened.state.finalized
+    assert reopened.state.artifact_binding == binding
     assert reopened.state.registration_digest == (
         registration.registration_digest)
     assert reopened.state.final_payload is not None
@@ -98,6 +126,7 @@ def test_registration_is_fsynced_before_terminal_evidence(tmp_path: Path):
 def test_second_terminal_record_is_forbidden(tmp_path: Path):
     registration, evidence, outcome = _parts()
     journal = AcceptanceJournal.create(tmp_path, registration)
+    _binding, evidence = _bind(journal, registration, evidence)
     journal.finalize(outcome, evidence=evidence)
     with pytest.raises(AcceptanceJournalError, match="already finalized"):
         journal.finalize(outcome, evidence=evidence)
@@ -107,6 +136,11 @@ def test_evidence_from_another_registration_is_forbidden(tmp_path: Path):
     registration, _evidence, outcome = _parts()
     _other_registration, other_evidence, _other_outcome = _parts("b" * 32)
     journal = AcceptanceJournal.create(tmp_path, registration)
+    binding, _ = _bind(journal, registration, _evidence)
+    other_evidence = replace(
+        other_evidence,
+        execution_artifact_binding_digest=binding.binding_digest,
+    )
     with pytest.raises(AcceptanceJournalError, match="another registration"):
         journal.finalize(outcome, evidence=other_evidence)
 

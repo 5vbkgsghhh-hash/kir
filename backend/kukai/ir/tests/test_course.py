@@ -217,19 +217,87 @@ class EveryRecipeRuns(unittest.TestCase):
             self.assertIn("__grounded__", member["level"])
             self.assertEqual(member["level"]["__grounded__"]["via"], "name")
 
-    def test_a_ref_inside_a_group_member_is_refused_and_says_why(self) -> None:
-        """ОТРИЦАТЕЛЬНЫЙ КОНТРОЛЬ к уроку «единица». Показанная граница,
-        которая на деле проходит, учит модель бояться работающего приёма."""
+    def test_a_ref_to_a_sibling_above_inside_a_group_is_LEGAL(self) -> None:
+        """ЗАКОН ПЕРЕПИСАН 12.08.2026, и старая редакция была НЕ СЛОМАНА.
+
+        До этого дня тест пиннил обратное: любой `ref` внутри члена группы
+        отказывался. Он делал свою работу честно — просто предмет изменился,
+        и вот почему это было ОБЯЗАНО измениться:
+
+        дверь адресует свою стену ТОЛЬКО через `ref`, значит «ref внутри
+        члена запрещён» означало «этаж со стенами И дверьми не собирается в
+        группу ВООБЩЕ». А 41.1% элементов настоящей башни живут в группах
+        (стены 94.9%, двери 91.4%), и человек моделирует 59-этажный дом
+        ровно так: собрал этаж, сгруппировал, поставил 59 раз. Оставалось
+        перечисление, упиравшееся в потолок 300 опов.
+
+        Своя же докстрока старой редакции и назвала цену: «показанная
+        граница, которая на деле проходит, учит модель бояться работающего
+        приёма». Теперь она стоит с другой стороны: приём работает, и
+        показывать надо ЕГО.
+        """
         script = ('LVL = {"by": "name", "value": "Этаж 1"}\n'
-                  'with unit("Блок", placements=[(3000, 0)]):\n'
-                  '    w = create_wall(p0_mm=(0, 0), p1_mm=(3000, 0), '
+                  'with unit("Блок", placements=[(3000, 0), (6000, 0)]):\n'
+                  '    w = create_wall(p0_mm=(0, 0), p1_mm=(5000, 0), '
                   'level=LVL, height_mm=3000)\n'
-                  '    create_door(host=w, offset_mm=1500)\n')
+                  '    create_door(host=w, offset_mm=1500)\n'
+                  '    create_window(host=w, offset_mm=3500, sill_mm=900)\n')
+        result = sandbox.execute_author_script(script, policy=POLICY)
+        self.assertTrue(result.ok, result.refusal and result.refusal.render())
+        planned = compiler.plan_program(_program(result), bulk=True).to_ops()
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0]["op"], "create_group")
+        self.assertEqual(len(planned[0]["members"]), 3)
+        self.assertEqual(len(planned[0]["placements"]), 2)
+
+    def test_a_ref_OUTSIDE_the_group_is_refused_and_names_the_next_move(self):
+        """Первая из ДВУХ границ, оставшихся после переписи закона.
+
+        Группа — это маленькая программа в своём пространстве имён; ссылка
+        наружу из него не разрешается ничем, потому что группа ставится N
+        раз, а адресат вне её — один.
+        """
+        script = ('LVL = {"by": "name", "value": "Этаж 1"}\n'
+                  'outer = create_wall(p0_mm=(0, 0), p1_mm=(3000, 0), '
+                  'level=LVL, height_mm=3000)\n'
+                  'with unit("Блок", placements=[(3000, 0)]):\n'
+                  '    create_door(host=outer, offset_mm=1500)\n')
         result = sandbox.execute_author_script(script, policy=POLICY)
         self.assertTrue(result.ok, result.refusal and result.refusal.render())
         with self.assertRaises(Exception) as caught:
             compiler.plan_program(_program(result), bulk=True)
-        self.assertIn("ref", str(caught.exception).lower())
+        text = str(caught.exception)
+        self.assertIn("KIR-T001", text)
+        self.assertIn("НАРУЖУ", text)
+        self.assertIn("element_id", text, "отказ обязан назвать СЛЕДУЮЩИЙ ХОД")
+
+    def test_a_ref_FORWARD_inside_the_group_is_refused_and_says_why(self):
+        """Вторая граница — и она проверяется JSON-программой НАМЕРЕННО.
+
+        В питоне ссылка вперёд НЕВЫРАЗИМА: ручки не существует, пока оп не
+        вызван. То есть скриптом эту границу не нащупать в принципе, и тест
+        на скрипте молча проверял бы пустоту. Программу подают и напрямую
+        (`/admin/kir/run`), поэтому закон обязан держаться и там.
+        """
+        program = {
+            "ir_version": spec.IR_VERSION,
+            "intent": "дверь объявлена ВЫШЕ своей стены",
+            "ops": [{"op": "create_group", "id": "G", "name": "Блок",
+                     "placements": [[3000, 0]],
+                     "members": [
+                         {"op": "create_door", "id": "D",
+                          "host": {"by": "ref", "value": "W"},
+                          "offset_mm": 1500},
+                         {"op": "create_wall", "id": "W",
+                          "p0_mm": [0, 0], "p1_mm": [3000, 0],
+                          "height_mm": 3000,
+                          "level": {"by": "name", "value": "Этаж 1"}}]}]}
+        with self.assertRaises(Exception) as caught:
+            compiler.plan_program(program, bulk=True)
+        text = str(caught.exception)
+        self.assertIn("KIR-T001", text)
+        self.assertIn("НИЖЕ", text)
+        self.assertIn("выше", text, "отказ обязан назвать СЛЕДУЮЩИЙ ХОД")
 
     def test_a_group_member_cannot_stand_on_a_level_this_program_creates(self):
         """ОТРИЦАТЕЛЬНЫЙ КОНТРОЛЬ к «две программы».
@@ -417,13 +485,88 @@ class TheRegistryLookupHasOneSource(unittest.TestCase):
 
         Первая же рукописная строчка контракта — хоть один допуск, набранный
         числом, — ломает этот тест: докстрока опа обязана входить в вывод
-        ДОСЛОВНО и целиком.
+        ДОСЛОВНО.
+
+        ПОЧЕМУ «ДОСЛОВНО», НО БОЛЬШЕ НЕ «ЦЕЛИКОМ» (12.08.2026). Два контракта
+        реестра переросли канал печати: `route_duct_system` 3 967 символов и
+        `route_pipe_system` 3 904 при потолке 3 300. Прежняя редакция требовала
+        целостности и краснела на обоих — а под этим красным лежал живой
+        дефект: обрезался ХВОСТ, то есть уезжали ПАРАМЕТРЫ И ДОПУСКИ
+        СВИДЕТЕЛЯ, и модель авторствовала граф-оп, не видя их. Проверено той
+        же дверью, что у модели: `execute_author_script` политикой прода
+        отдавал 3 300 символов без слова «Допуски».
+
+        Теперь сокращается ПРОЗА ПОСТУСЛОВИЯ изнутри, а разделы доезжают все,
+        поэтому и проверка сменила форму: дословность каждого доехавшего куска
+        плюс отдельный тест на то, что вырезанное называется точным срезом.
+        Ослаблением это не является — прежняя проверка не отличала «влезло» от
+        «влезло без допусков».
         """
         for name in sorted(spec.OPS):
             with self.subTest(op=name):
                 printed = _printed(lambda: C.spec(name))
-                self.assertIn(dsl.OP_FUNCTIONS[name].__doc__, printed)
+                doc = dsl.OP_FUNCTIONS[name].__doc__
                 self.assertIn(dsl._call_head(spec.OPS[name]), printed)
+                if doc in printed:
+                    continue
+                # Сокращённый случай: обе половины докстроки — ДОСЛОВНО, а
+                # между ними названная вырезка. Ни одного слова «от себя».
+                self.assertIn("ПРОЗА ПОСТУСЛОВИЯ СОКРАЩЕНА", printed,
+                              "докстрока не доехала и вырезка не названа")
+                shown, _, tail = printed.partition("\n    […ПРОЗА")
+                self.assertIn(doc[:200], shown)
+                self.assertIn(doc[-200:], tail)
+
+    def test_the_excision_recipe_returns_exactly_what_was_cut(self) -> None:
+        """ПРАВДОПОДОБНЫЙ, НО СМЕЩЁННЫЙ СРЕЗ ХУЖЕ ОТСУТСТВИЯ СОВЕТА.
+
+        Совет считает индексы В ДОКСТРОКЕ, а печатается текст с НАШИМ
+        заголовком: ошибка ровно на его длину дала бы связный, населённый и
+        неверный кусок — тот самый правдоподобный сосед, который не выглядит
+        неполным. Поэтому склейка проверяется побайтно.
+        """
+        import re
+        cut = 0
+        for name in sorted(spec.OPS):
+            printed = _printed(lambda: C.spec(name))
+            match = re.search(rf"print\({name}\.__doc__\[(\d+):(\d+)\]\)",
+                              printed)
+            if match is None:
+                continue
+            cut += 1
+            start, stop = int(match.group(1)), int(match.group(2))
+            doc = dsl.OP_FUNCTIONS[name].__doc__
+            excised = doc[start:stop]
+            with self.subTest(op=name):
+                self.assertTrue(excised, "срез пуст — совет ведёт в никуда")
+                self.assertNotIn(excised, printed,
+                                 "вырезанное осталось в выводе: совет "
+                                 "предлагает достать то, что и так приехало")
+                self.assertIn(doc[:start][-120:], printed)
+                self.assertIn(doc[stop:][:120], printed)
+        self.assertEqual(
+            cut, 2,
+            "число сокращённых контрактов изменилось. Это не повод двигать "
+            "число: перемерить длины (course._spec_parts) и решить, вырос ли "
+            "контракт или сдвинулся потолок канала")
+
+    def test_every_section_of_the_contract_survives_the_channel(self) -> None:
+        """ГАРАНТИЯ, РАДИ КОТОРОЙ ВСЁ ЭТО: разделы доезжают ВСЕ.
+
+        Потолок — свойство канала, а гарантия — свойство контракта, и связь
+        между ними обязан держать прогон. Иначе «контракт напечатан» опять
+        станет значить «сколько влезло».
+        """
+        for name in sorted(spec.OPS):
+            ospec = spec.OPS[name]
+            with self.subTest(op=name):
+                printed = _printed(lambda: C.spec(name))
+                self.assertLessEqual(len(printed.rstrip("\n")), C.LESSON_CAP)
+                self.assertIn("Параметры — из реестра", printed)
+                self.assertIn("ПОСТУСЛОВИЕ", printed)
+                if ospec.tolerances:
+                    self.assertIn("Допуски свидетеля", printed,
+                                  "допуски объявлены реестром, но не доехали")
 
     def test_one_contract_carries_every_part_the_pointer_promises(self) -> None:
         """Указатель обещает шесть вещей — проверены все шесть на `create_wall`.

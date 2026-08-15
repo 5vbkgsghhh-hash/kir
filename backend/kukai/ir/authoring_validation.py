@@ -14,6 +14,7 @@ from kukai.ir import docspace, faceref, relate, spec
 from kukai.ir.diag import (
     Diagnostic,
     GROUND_BAD_SELECTOR,
+    PARSE_EXCLUSIVE_FIELDS,
     PARSE_MISSING_FIELD,
     TYPE_BAD_TYPE,
     TYPE_BOUNDS,
@@ -42,6 +43,22 @@ def _num(x) -> bool:
 # error that previously sailed to a late Revit runtime refusal.  Refused
 # statically here instead — same enforcement point as every numeric bound.
 _COORD_LIMIT_MM = 16_000_000.0
+
+# ``ref_dir`` selects Revit's WorkPlaneBased placement overload.  The
+# operands below belong to the point/TwoLevelsBased lowering: today there is
+# no measured Revit contract which composes them with that overload.  Keep
+# the list at the validation/emission boundary so an explicit neutral value
+# (``rotation_deg=0``/``mirrored=false``) cannot disappear merely because it
+# happens to match a default.
+PLACE_FAMILY_WORK_PLANE_UNSUPPORTED = (
+    "rotation_deg",
+    "mirrored",
+    "hand_flipped",
+    "facing_flipped",
+    "top_level",
+    "base_offset_mm",
+    "top_offset_mm",
+)
 
 #: Потолок длины `create_text.content`.
 #:
@@ -971,6 +988,62 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                         message_ru="строка значения <=1000"))
                 else:
                     norm[p.name] = {"type": "str", "v": v}
+            elif isinstance(v, dict) and set(v) == {"workset"}:
+                # РАБОЧИЙ НАБОР — НЕ ССЫЛКА, хотя выглядит как она. `Workset`
+                # не наследует `Element`, `Parameter.Set(WorksetId)` не
+                # существует (CS1503 на всех шести), и набор пишется ЦЕЛЫМ.
+                # Свой род значения заведён намеренно: сложить его к `ref`
+                # значило бы получить одну запись, живущую по другим правилам,
+                # чем остальные, — и способность, которая ВЫГЛЯДИТ доказанной.
+                name = v.get("workset")
+                if not isinstance(name, str) or not name.strip():
+                    diags.append(Diagnostic(
+                        code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                        field_name=p.name,
+                        expected={"workset": "имя рабочего набора"}, got=v,
+                        message_ru="значение набора — {workset: <имя>}"))
+                else:
+                    norm[p.name] = {"type": "int_ref", "pool": "worksets",
+                                    "by": "name", "v": name.strip()}
+            elif isinstance(v, dict) and set(v) == {"phase"}:
+                # ВТОРОЙ РОД ССЫЛКИ. Приём тот же, что у материала, и это
+                # НАМЕРЕННО один приём, а не второй способ делать то же:
+                # разошлись бы они на первом же роде, который придёт третьим.
+                name = v.get("phase")
+                if not isinstance(name, str) or not name.strip():
+                    diags.append(Diagnostic(
+                        code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                        field_name=p.name,
+                        expected={"phase": "имя фазы"}, got=v,
+                        message_ru="ссылочное значение — {phase: <имя>}"))
+                else:
+                    norm[p.name] = {"type": "ref", "pool": "phases",
+                                    "by": "name", "v": name.strip()}
+            elif isinstance(v, dict) and set(v) == {"material"}:
+                # ССЫЛОЧНОЕ ЗНАЧЕНИЕ. Множество значений `set_param` было
+                # закрыто на str|bool|число, и потому НЕДОСТИЖИМ был каждый
+                # параметр со значением-ссылкой: материал, фаза, помещение,
+                # уровень. Ветка открыта на материале — одном, а не на всех
+                # четырёх: четыре сразу дали бы четыре недоказанных вместо
+                # одного доказанного.
+                #
+                # ССЫЛКА АВТОРИТСЯ ЯВНО И НЕ ИМЕЕТ УМОЛЧАНИЯ. Опускаемое
+                # значение разрешалось бы правилом `sole_entry`, которое не
+                # ВЫБИРАЕТ, а констатирует безальтернативность: замерено
+                # 12.08.2026 — на фикстуре так разрешаются 46 пар из 47, а на
+                # настоящих зданиях 42 из 91 умолчания перестают работать.
+                # Здесь этот выбор не создаётся ПО ПОСТРОЕНИЮ, а не по памяти
+                # исполнителя.
+                name = v.get("material")
+                if not isinstance(name, str) or not name.strip():
+                    diags.append(Diagnostic(
+                        code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                        field_name=p.name,
+                        expected={"material": "имя материала"}, got=v,
+                        message_ru="ссылочное значение — {material: <имя>}"))
+                else:
+                    norm[p.name] = {"type": "ref", "pool": "materials",
+                                    "by": "name", "v": name.strip()}
             elif isinstance(v, dict) and set(v) <= {"value", "unit"}:
                 num, unit = v.get("value"), v.get("unit")
                 if not _num(num) or unit not in ("mm", "raw"):
@@ -1520,14 +1593,13 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
             if spiral_norm is not None:
                 norm[p.name] = spiral_norm
         elif p.kind == "member_ops":
-            # feat/native-groups: the group DEFINITION — 1..N PRE-GROUNDED
-            # member authoring ops authored at occurrence 0's absolute coords.
-            # Structural check only (each member is a dict with a real,
-            # non-group authoring op name and its own id); the members' own
-            # params were already validated + grounded when the op was built by
-            # the component-library bridge, and the GEOMETRIC fidelity of the
-            # whole group is proven offline (native_group.assert_group_matches_
-            # place_op) — never re-derived here.
+            # feat/native-groups: the group definition is 1..N create-authoring
+            # ops at occurrence 0's absolute coordinates.  This first pass owns
+            # container shape, identity and obvious capability exclusions.  The
+            # compiler immediately runs every accepted member through the SAME
+            # single-op planner as a top-level operation and binds its OpContract
+            # into the parent plan; no component bridge is a validation trust
+            # boundary.
             v = op.get(p.name)
             if not (isinstance(v, list) and 1 <= len(v) <= 200
                     and all(isinstance(m, dict) for m in v)):
@@ -1541,13 +1613,18 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                 for mi, m in enumerate(v):
                     mop = m.get("op")
                     mospec = spec.OPS.get(mop) if isinstance(mop, str) else None
-                    if mospec is None or mospec.family not in spec.WRITE_FAMILIES \
-                            or mop == "create_group":
+                    if (mospec is None
+                            or mospec.family != "authoring"
+                            or mospec.effect.value != "create"
+                            or mospec.result.identity_cardinality.value != "one"
+                            or mop == "create_group"
+                            or mop in spec.SOLO_OPS):
                         diags.append(Diagnostic(
                             code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
                             field_name=f"{p.name}[{mi}].op", got=mop,
-                            message_ru=("член группы — авторинг-оп (не query, не "
-                                        "вложенная create_group)")))
+                            message_ru=("член группы — одиночный create-authoring "
+                                        "op с одним Element-результатом (не "
+                                        "query/modify/delete/solo/create_group)")))
                         ok = False
                         continue
                     mid = m.get("id")
@@ -1566,28 +1643,78 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                         ok = False
                         continue
                     seen_ids.add(mid)
-                    # Лид-ревью №3: интра-программные ref-селекторы внутри
-                    # члена указывают на переменные ВНЕ неймспейса группы —
-                    # эмиссия дала бы несуществующий __el_* (падение на
-                    # компайл-гейте). Отказываем типизированно здесь.
-                    def _has_ref(node) -> bool:
+                    # Ссылка ВНУТРЬ группы законна; ссылка НАРУЖУ — нет.
+                    #
+                    # Лид-ревью №3 отказывало всякому `ref` внутри члена, и
+                    # причина была верной ровно наполовину: ref на переменную
+                    # ВНЕ неймспейса группы дал бы несуществующий `__el_*` и
+                    # падение на компайл-гейте. Но ref на СОСЕДА ПО ТОЙ ЖЕ
+                    # ГРУППЕ — не ссылка наружу: эмиттер именует членов
+                    # `{oid}__m__{id}`, и достаточно переписать значение ссылки
+                    # тем же именем (`authoring._emit_group`).
+                    #
+                    # **ЦЕНА СТАРОГО ОТКАЗА, ЗАМЕРЕНА 12.08.2026.** Дверь
+                    # адресует свою стену ТОЛЬКО через `ref`, поэтому этаж со
+                    # стенами И дверьми был негруппируем ПО ПОСТРОЕНИЮ — а
+                    # именно так человек и собирает 59-этажный дом: **41.1%
+                    # элементов настоящей башни живут внутри групп** (стены
+                    # 94.9%, несущие колонны 100%, панели витража 99.3%, двери
+                    # 91.4%; 2 941 экземпляр из 367 определений). Оставшейся
+                    # формой было перечисление, и оно упиралось в потолок 300
+                    # при медиане настоящего этажа 796 опов.
+                    #
+                    # Порядок членов проверяется здесь же и БЕСПЛАТНО:
+                    # `seen_ids` — это ровно «члены, объявленные ВЫШЕ», поэтому
+                    # ссылка назад проходит, ссылка вперёд отказывается с
+                    # названной причиной. Автор естественно пишет стену раньше
+                    # двери.
+                    def _refs(node) -> list:
+                        out: list = []
                         if isinstance(node, dict):
                             if node.get("by") == "ref":
-                                return True
+                                out.append(node.get("value"))
                             g = node.get("__grounded__")
                             if isinstance(g, dict) and g.get("via") == "ref":
-                                return True
-                            return any(_has_ref(x) for x in node.values())
-                        if isinstance(node, list):
-                            return any(_has_ref(x) for x in node)
-                        return False
-                    if _has_ref({k: v2 for k, v2 in m.items() if k != "id"}):
+                                out.append(g.get("value"))
+                            for x in node.values():
+                                out.extend(_refs(x))
+                        elif isinstance(node, list):
+                            for x in node:
+                                out.extend(_refs(x))
+                        return out
+                    body = {k: v2 for k, v2 in m.items() if k != "id"}
+                    member_ids = {
+                        str(other.get("id")) for other in v
+                        if isinstance(other, dict) and other.get("id") is not None}
+                    outside = [r for r in _refs(body)
+                               if str(r) not in member_ids]
+                    forward = [r for r in _refs(body)
+                               if str(r) in member_ids and str(r) not in seen_ids]
+                    if outside:
                         diags.append(Diagnostic(
                             code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
-                            field_name=f"{p.name}[{mi}]", got=mid,
-                            message_ru=("член группы не может содержать "
-                                        "ref-селекторы — только element_id/"
-                                        "абсолютные координаты")))
+                            field_name=f"{p.name}[{mi}]", got=sorted(outside),
+                            expected=sorted(member_ids),
+                            message_ru=(
+                                f"член группы ссылается НАРУЖУ группы: "
+                                f"{sorted(outside)!r}. Внутри группы ссылаться "
+                                f"можно только на её же членов "
+                                f"({sorted(member_ids)!r}); на элементы вне "
+                                f"группы — по element_id. СЛЕДУЮЩИЙ ХОД: либо "
+                                f"внеси адресуемый элемент в members, либо "
+                                f"замени ref на element_id")))
+                        ok = False
+                        continue
+                    if forward:
+                        diags.append(Diagnostic(
+                            code=TYPE_BAD_TYPE, op_index=i, op_id=oid,
+                            field_name=f"{p.name}[{mi}]", got=sorted(forward),
+                            message_ru=(
+                                f"член группы ссылается на члена, объявленного "
+                                f"НИЖЕ: {sorted(forward)!r}. Внутри группы "
+                                f"порядок членов — это порядок создания. "
+                                f"СЛЕДУЮЩИЙ ХОД: переставь адресуемого члена "
+                                f"выше ссылающегося (стену раньше двери)")))
                         ok = False
                         continue
                 if ok:
@@ -1655,6 +1782,28 @@ def validate(op: dict, name: str, i: int, oid: str, diags: list) -> dict:
                 expected={"by": "name|element_id"}, got=selector,
                 message_ru=("panel_type: у типа ячейки витража нет правила по "
                             "умолчанию — назовите тип или его element_id")))
+    if name == "place_family" and "ref_dir" in op:
+        # ``_emit_place`` routes to the WorkPlaneBased overload as soon as it
+        # sees ref_dir.  Before this guard every explicit operand below was
+        # accepted by the registry and then lost at that early return.  A
+        # typed refusal is deliberately stricter than interpreting a neutral
+        # explicit value as omission: source intent must never disappear.
+        for field in PLACE_FAMILY_WORK_PLANE_UNSUPPORTED:
+            if field not in op:
+                continue
+            diags.append(Diagnostic(
+                code=PARSE_EXCLUSIVE_FIELDS,
+                op_index=i,
+                op_id=oid,
+                field_name=field,
+                expected=(f"{field} без ref_dir или ref_dir без "
+                          f"{field}"),
+                got=op[field],
+                message_ru=(
+                    f"place_family на рабочей плоскости: {field} "
+                    "не имеет доказанного совместного lowering с "
+                    "ref_dir; уберите один из операндов — компилятор не "
+                    "будет молча игнорировать авторское поле")))
     if name in ("create_door", "create_window", "place_family"):
         raw_states = {
             key: op.get(key, False)

@@ -34,6 +34,7 @@ from kukai.ir.acceptance_mutation import (
     derive_mutation_expectation,
 )
 from kukai.ir.compiler import plan_program
+from kukai.ir.ground import ground_program
 from kukai.ir.contracts import DocumentFingerprint
 from kukai.ir.outcome import (
     AcceptanceState,
@@ -82,6 +83,8 @@ def _registration(before=None, *, expectation=None):
     return AcceptanceRegistration(
         run_id=RUN_ID,
         plan_digest=_wall_plan().plan_digest,
+        ground_digest=ground_program(
+            _wall_plan(), GROUND_SNAPSHOT).ground_digest,
         revit_version="2026",
         expectation=selected,
         mutation_expectation=derive_mutation_expectation(_wall_plan()),
@@ -309,6 +312,8 @@ class TestAcceptanceEvidence:
         registration = AcceptanceRegistration(
             run_id=RUN_ID,
             plan_digest=_wall_plan().plan_digest,
+            ground_digest=ground_program(
+                _wall_plan(), GROUND_SNAPSHOT).ground_digest,
             revit_version="2026",
             expectation=vacuous,
             mutation_expectation=MutationExpectation((), ()),

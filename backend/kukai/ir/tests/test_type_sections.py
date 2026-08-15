@@ -165,13 +165,19 @@ class TheBundleReadsInsteadOfInventing(unittest.TestCase):
         self.assertEqual((element["z0_mm"], element["z1_mm"]), (2700.0, 3300.0))
         self.assertEqual(list(geometry.profiles), [element["element_id"]])
 
-    def test_a_wall_is_refused_by_the_containment_gate_by_name(self):
-        """Толщина у стены ЕСТЬ, а тела нет — и причина не «нет данных».
+    def test_a_declared_wall_now_gets_a_body_and_the_blame_follows(self):
+        """14.08: стена, объявленная целиком, получает ТЕЛО, а не отказ.
 
-        Замер 09.08 на 800 настоящих стенах: полоса вокруг оси нарушает закон
-        консервативности 97 раз, до 2854 мм наружу. Пока замок не открыт,
-        отказ обязан называться СВОИМ именем, иначе он неотличим от «толщину
-        никто не знает».
+        Раньше здесь стоял обратный храповик — «толщина есть, тела нет,
+        `wall_prism_refused_by_containment_gate`». Замок содержания (97
+        нарушений из 800) НЕ переснят и остаётся закрытым там, где он мерил:
+        у стены с настоящим габаритом. У объявленной габарита нет вовсе, и
+        полоса допущена ровно туда (`hulls.WALL_BAND_SCOPE`).
+
+        Важнее самой полосы то, что ВИНА ПОЕХАЛА ЗА НЕЙ: перепись «без
+        геометрии» пуста, потому что причина спрашивается у `build_hull`, а не
+        у половины его условия. Разъехавшись, они дали бы квитанцию «НЕ
+        ВИДЕЛИ» про элемент, который видели.
         """
         pack = self._pack([{
             "op": "create_wall", "id": "w1",
@@ -179,11 +185,23 @@ class TheBundleReadsInsteadOfInventing(unittest.TestCase):
             "level": {"by": "name", "value": "L1"},
             "type": {"by": "name", "value": "Стена 200"}}])
         geometry = CB.bundle_elements(pack, snapshot=_rich_snapshot())
-        self.assertEqual(
-            geometry.no_geometry,
-            {"wall_prism_refused_by_containment_gate": 1})
-        # числа собраны и лежат в элементе — билдер ждёт только замка
+        self.assertEqual(geometry.no_geometry, {})
         self.assertEqual(geometry.elements[0]["prism"]["width_mm"], 200.0)
+
+    def test_a_wall_whose_type_is_unknown_is_still_refused_by_name(self):
+        """КОНТРОЛЬ-FAIL к предыдущему: отказ обязан остаться возможным.
+
+        Тест выше зелен и без правки блеймa — достаточно, чтобы тело
+        строилось. Этот отличает «причина умеет говорить» от «причина
+        замолчала навсегда»: тип не назван, числа взять неоткуда, и перепись
+        обязана назвать это своим именем.
+        """
+        pack = self._pack([{
+            "op": "create_wall", "id": "w1",
+            "p0_mm": [0.0, 0.0], "p1_mm": [5000.0, 0.0], "height_mm": 3000.0,
+            "level": {"by": "name", "value": "L1"}}])
+        geometry = CB.bundle_elements(pack, snapshot=_rich_snapshot())
+        self.assertEqual(geometry.no_geometry, {"wall_type_not_declared": 1})
 
     def test_a_nominal_pipe_stays_nominal_without_a_type_table(self):
         pack = self._pack([{
@@ -268,8 +286,13 @@ class NoOperationLeavesWithoutAVerdict(unittest.TestCase):
     """
 
     def test_every_body_making_op_answers_with_geometry_or_a_reason(self):
+        # СПРАШИВАЕМ ТОТ ЖЕ АВТОРИТЕТ, ЧТО И КОД (11.08.2026). Здесь стояло
+        # `sorted(CB.OP_CATEGORY)` — теневая таблица, снятая вместе с долгом
+        # (`test_clash_coverage.OneTableForOneRelation`). Сторож не «ослаб»,
+        # он был МЁРТВ: `AttributeError` падал раньше первой проверки, то
+        # есть закон полноты не исполнялся ни разу с момента снятия таблицы.
         silent: list[str] = []
-        for name in sorted(CB.OP_CATEGORY):
+        for name in CB.body_making_ops():
             op = {"op": name, "id": "x1"}
             geometry = CB.bundle_elements([{"ops": [op]}],
                                           snapshot=_rich_snapshot())
