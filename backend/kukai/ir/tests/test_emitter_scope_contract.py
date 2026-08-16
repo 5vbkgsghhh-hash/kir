@@ -1075,9 +1075,18 @@ def _tail_declarators(code: str, start: int) -> set[str]:
 # ровно тот случай, где эта проверка ловит CS0103 (первый прогон свидетеля
 # упал на 2021-2026 на столкновении имени `__st_` с SubTransaction обёртки
 # per_op, и упал он ЗДЕСЬ-и-в-воротах, а не на машине пользователя).
+#
+# `__KirSortTri`/`__KirSurfaceToleranceMatch` добавлены 14.08.2026 — ВТОРАЯ
+# ступень того же свидетеля поверхности (допуск по расстоянию, а не по
+# равенству на решётке). Тот же якорь `_with_mesh_canon_helper` вставляет их
+# в ТУ ЖЕ преамбулу, что и `__KirCanonPayload` — они живут в одном блоке
+# `_MESH_CANON_HELPER_CS`, поэтому и видимость у них одна и та же. Забыть
+# добавить их сюда значило бы, что ЭТА проверка ловит собственный CS0103
+# эмиттера первой — что она живьём и сделала при первом прогоне патча.
 GLOBALS = frozenset({"__t", "__post", "__results", "__Refuse", "__OpRefuse",
                      "__ClassName",
-                     "__KirCanonUnit", "__KirCanonCmp", "__KirCanonPayload"})
+                     "__KirCanonUnit", "__KirCanonCmp", "__KirCanonPayload",
+                     "__KirSortTri", "__KirSurfaceToleranceMatch"})
 
 
 def _code(text: str) -> str:

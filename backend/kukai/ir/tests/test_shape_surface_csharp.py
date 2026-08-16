@@ -242,5 +242,126 @@ class TheEmittedWitnessRunsAndAgreesWithPython(unittest.TestCase):
         self.assertEqual(1, len(violations))
 
 
+#: Тот же тетраэдр, но вершина 1 стоит НЕ в центре ячейки, а в 0.01 мм от её
+#: границы (граница — при x=1000.25, см. `_KirCanonUnit`: floor(x/0.5+0.5)
+#: меняется ровно там). Ради этого сценария и ЗАВЕДЕНА ВТОРАЯ СТУПЕНЬ:
+#: реальный семейственный импост 14.08.2026 стоял в точности здесь.
+_EDGE_VERTS = [[0.0, 0.0, 0.0], [1000.24, 0.0, 0.0],
+              [0.0, 1000.0, 0.0], [0.0, 0.0, 1000.0]]
+_EDGE_TRIS = [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]
+
+
+def _edge_fragment() -> str:
+    op = {"id": "D1", "mesh": {"vertices_mm": _EDGE_VERTS, "triangles": _EDGE_TRIS},
+          "category": "mass", "name": "меш"}
+    _decl, _create, checks, _rb = emit_directshape(op, "2026", "kir:test")
+    for check in checks:
+        if check.obligation_key == "surface":
+            return check.render()
+    raise AssertionError("в эмиссии нет свидетеля поверхности")
+
+
+@unittest.skipIf(shutil.which("dotnet") is None,
+                 "нет dotnet — исполнить эмитированный C# нечем")
+class TheToleranceFallbackSavesAGenuineMatchAndStillRefusesADefect(
+        unittest.TestCase):
+    """ВТОРАЯ СТУПЕНЬ свидетеля поверхности (14.08.2026), ИСПОЛНЕННАЯ .NET.
+
+    `TheEmittedWitnessRunsAndAgreesWithPython` выше доказывает, что строгая
+    ступень (равенство на решётке) верна и симметрична. Этот класс доказывает
+    ДОПОЛНЕНИЕ к ней: когда строгая ступень ложно отвергает геометрию,
+    совпадающую с точностью до сотых долей миллиметра (замер 14.08.2026 на
+    живом Revit 2023: 13 из 24 реальных семейств), допусковый фолбэк её
+    принимает — а геометрию, действительно отличающуюся на миллиметр,
+    по-прежнему отвергает. Оба факта обязаны быть доказаны ОДНИМ прогоном
+    одного и того же скомпилированного фрагмента, иначе «чинит» и «не
+    ослепла» — два разных утверждения с разной ценой лжи.
+    """
+
+    work: pathlib.Path
+    _tmp: tempfile.TemporaryDirectory
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="kir-surface-tol-cs-")
+        cls.work = pathlib.Path(cls._tmp.name)
+        (cls.work / "kirsurface.csproj").write_text(_CSPROJ, encoding="utf-8")
+        source = (_STUBS
+                  .replace("__HELPER__",
+                           _indent(_MESH_CANON_HELPER_CS, "        "))
+                  .replace("__FRAGMENT__", _indent(_edge_fragment(), "    ")))
+        (cls.work / "Program.cs").write_text(source, encoding="utf-8")
+        env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT="1",
+                   DOTNET_NOLOGO="1")
+        res = subprocess.run(
+            ["dotnet", "build", "-c", "Release", "--nologo"],
+            cwd=cls.work, capture_output=True, text=True, env=env, timeout=900)
+        if res.returncode != 0:
+            raise unittest.SkipTest(
+                "dotnet build недоступен в этой среде:\n"
+                + res.stdout[-2000:] + res.stderr[-1000:])
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def _run(self, observed) -> tuple[str, list[str]]:
+        payload = "\n".join(
+            " ".join(repr(float(c)) for pt in tri for c in pt)
+            for tri in observed) + "\n"
+        env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT="1",
+                   DOTNET_NOLOGO="1")
+        res = subprocess.run(
+            ["dotnet", "run", "-c", "Release", "--no-build", "--nologo"],
+            cwd=self.work, input=payload, capture_output=True, text=True,
+            env=env, timeout=900)
+        self.assertEqual(0, res.returncode, res.stdout + res.stderr)
+        lines = res.stdout.splitlines()
+        return lines[0], lines[2:2 + int(lines[1])]
+
+    @staticmethod
+    def _expected() -> str:
+        verts = _emitted_vertices(_EDGE_VERTS)
+        return mesh_surface_payload(GmMesh(
+            vertices_mm=tuple(tuple(v) for v in verts),
+            triangles=tuple(tuple(t) for t in _EDGE_TRIS)))
+
+    @staticmethod
+    def _observed(delta: float):
+        verts = [list(v) for v in _emitted_vertices(_EDGE_VERTS)]
+        verts[1][0] += delta
+        return [[verts[a], verts[b], verts[c]] for a, b, c in _EDGE_TRIS]
+
+    # ── контроль-PASS: тот самый реальный дефект, теперь спасённый ────────
+
+    def test_a_boundary_crossing_jitter_of_0_02mm_is_accepted(self):
+        """Вершина сдвинута на 0.02 мм — она ПЕРЕСЕКАЕТ границу решётки
+        (1000.24 -> 1000.26), строгий прообраз меняется, но реальное
+        расстояние (0.02 мм) внутри допуска 0.1 мм. Ровно класс дефекта,
+        замеренный 14.08.2026 на живом импосте витража."""
+        observed, violations = self._run(self._observed(delta=0.02))
+        self.assertNotEqual(
+            self._expected(), observed,
+            "строгий прообраз ОБЯЗАН разойтись — иначе сценарий не "
+            "воспроизводит границу решётки, которую чинит вторая ступень")
+        self.assertEqual(
+            [], violations,
+            "вторая ступень обязана была принять геометрию, совпадающую "
+            "с точностью 0.02мм — иначе починка не работает")
+
+    # ── контроль-FAIL: настоящий дефект в 1мм всё ещё ловится ──────────────
+
+    def test_a_real_1mm_defect_still_refuses(self):
+        """Вершина сдвинута на 1.0 мм — заведомо выше допуска 0.1 мм и на
+        порядок больше замеренного зазора (0.01-0.02 мм). Если починка
+        наивно расширила бы саму решётку, а не спрашивала расстояние, этот
+        тест провалился бы: ОБЯЗАН остаться красным для настоящего дефекта."""
+        observed, violations = self._run(self._observed(delta=1.0))
+        self.assertNotEqual(self._expected(), observed)
+        self.assertEqual(1, len(violations))
+        self.assertIn("surface differs", violations[0])
+        self.assertIn("(geometry)", violations[0])
+
+
 if __name__ == "__main__":
     unittest.main()

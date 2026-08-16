@@ -40,7 +40,8 @@ from .recompile import (
     Matrix4,
     validate_transform,
 )
-from .schema import EXTRACT_BATCH, GEOM_CANON_MM, GEOM_DETAIL
+from .schema import (
+    EXTRACT_BATCH, GEOM_CANON_MM, GEOM_DETAIL, GEOM_WEIGHT_CEILING)
 from .side_contract import source_binding_cs
 
 
@@ -234,10 +235,18 @@ class GeometryDetailLevel(str, Enum):
 
 
 class GeometryFailureReason(str, Enum):
-    """Typed fail-safe reasons emitted in addition to legacy error strings."""
+    """Typed fail-safe reasons emitted in addition to legacy error strings.
+
+    ``WEIGHT_CEILING_EXCEEDED`` is deliberately its own reason and not another
+    budget code.  A budget code says *we ran out of time here*; this one says
+    *this shape is too heavy to take at all*, which is a property of the shape
+    and stays true on the next run.  Collapsing the two would make a permanent
+    refusal look like a transient one and invite a pointless retry.
+    """
 
     TIME_BUDGET_EXCEEDED = "time_budget_exceeded"
     CALL_BUDGET_EXHAUSTED = "call_budget_exhausted"
+    WEIGHT_CEILING_EXCEEDED = "weight_ceiling_exceeded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1589,12 +1598,30 @@ Func<IList<double>, int, int, bool> __gxClampedKnots =
     return true;
 };
 
+// ПОТОЛОК ВЕСА — НАКОПИТЕЛЬНЫЙ И НА ВЕСЬ ЭЛЕМЕНТ, а не на часть.
+//
+// Счётчик живёт здесь, потому что лямбды-помощники объявлены раньше тела и
+// захватить переменную тела не могут. Тело обнуляет его перед каждым
+// элементом. Считать по частям было бы слабее: у элемента из десяти тел
+// десять раз по потолку — это снова путь к зависанию.
+int __gxWeightCeiling = __GX_WEIGHT_CEILING__;
+int[] __gxWeight = new int[2];   // [0] треугольники, [1] вершины
+string __gxWeightSentinel = "weight_ceiling_exceeded";
+
 Action<Mesh, List<object>, List<object>> __gxAppendMesh =
     (__mesh, __vertices, __triangles) =>
 {
     if (__mesh == null || __mesh.NumTriangles <= 0 ||
         __mesh.Vertices == null || __mesh.Vertices.Count < 3)
         throw new InvalidOperationException("mesh contains no triangles");
+    // Проверка ПЕРЕД накоплением: считаем то, что уже стоило нам времени, и
+    // отказываемся прежде, чем взяться за следующую грань.
+    __gxWeight[0] += __mesh.NumTriangles;
+    __gxWeight[1] += __mesh.Vertices.Count;
+    if (__gxWeight[0] > __gxWeightCeiling || __gxWeight[1] > __gxWeightCeiling)
+        throw new InvalidOperationException(
+            __gxWeightSentinel + ": triangles=" + __gxWeight[0] +
+            " vertices=" + __gxWeight[1] + " ceiling=" + __gxWeightCeiling);
     int __offset = __vertices.Count;
     foreach (XYZ __vertex in __mesh.Vertices)
         __vertices.Add(__gxPoint(__vertex));
@@ -1645,6 +1672,14 @@ Func<Solid, Dictionary<string, object>> __gxSolidMesh = (__solid) =>
     var __triangles = new List<object>();
     foreach (Face __face in __solid.Faces)
     {
+        // Вторая застава, ДО тесселяции следующей грани: `__gxAppendMesh`
+        // ловит превышение уже оплаченной работой, а эта проверка не даёт
+        // оплатить следующую. Вместе они и делают работу ограниченной.
+        if (__gxWeight[0] > __gxWeightCeiling ||
+            __gxWeight[1] > __gxWeightCeiling)
+            throw new InvalidOperationException(
+                __gxWeightSentinel + ": triangles=" + __gxWeight[0] +
+                " vertices=" + __gxWeight[1] + " ceiling=" + __gxWeightCeiling);
         Mesh __faceMesh = __face.Triangulate(1.0);
         __gxAppendMesh(__faceMesh, __vertices, __triangles);
     }
@@ -2100,6 +2135,10 @@ foreach (string __requestedId in __gxRequestedIds)
     __row["category"] = "";
     __row["parts"] = __parts;
     __row["errors"] = __errors;
+    // Вес считается НА ЭЛЕМЕНТ: обнуляем на входе в каждую строку, иначе
+    // потолок сработал бы на втором элементе за грехи первого.
+    __gxWeight[0] = 0;
+    __gxWeight[1] = 0;
     if (__gxDetailLevel != ViewDetailLevel.Fine)
         __row["detail_level"] = "__GX_DETAIL_NAME__";
     string __gxBudgetReason = null;
@@ -2178,6 +2217,17 @@ foreach (string __requestedId in __gxRequestedIds)
             __gxBudgetElapsed = ((DateTime.UtcNow.Ticks - __gxCallWatchT0) / TimeSpan.TicksPerMillisecond);
         }
     }
+    bool __gxWeightHit = false;
+    foreach (object __gxErrObj in __errors)
+    {
+        string __gxErrText = __gxErrObj as string;
+        if (__gxErrText != null && __gxErrText.IndexOf(
+                __gxWeightSentinel, StringComparison.Ordinal) >= 0)
+        {
+            __gxWeightHit = true;
+            break;
+        }
+    }
     if (__gxBudgetReason != null)
     {
         // Never mislabel a timed-out partial traversal as usable geometry.
@@ -2186,6 +2236,19 @@ foreach (string __requestedId in __gxRequestedIds)
         __errors.Add(__gxBudgetReason);
         __row["reason"] = __gxBudgetReason;
         __row["elapsed_ms"] = __gxBudgetElapsed;
+        __row["status"] = "failed";
+    }
+    else if (__gxWeightHit)
+    {
+        // Частичная геометрия тяжёлой формы — не геометрия: у неё нет тех
+        // граней, на которых обход остановился. Отдаём типизированный отказ,
+        // чтобы элемент остался ЧЕСТНЫМ АТОМОМ с названной причиной, а не
+        // тихо потерял часть формы.
+        __parts.Clear();
+        __errors.Clear();
+        __errors.Add(__gxWeightSentinel);
+        __row["reason"] = __gxWeightSentinel;
+        __row["elapsed_ms"] = ((DateTime.UtcNow.Ticks - __gxElementWatchT0) / TimeSpan.TicksPerMillisecond);
         __row["status"] = "failed";
     }
     else if (__errors.Count > 0)
@@ -2284,8 +2347,13 @@ def build_geometry_extract_cs(
     body = body.replace("__GX_CALL_BUDGET_MS__", str(call_budget_ms))
     body = body.replace("__GX_DETAIL_ENUM__", detail_names[detail])
     body = body.replace("__GX_DETAIL_NAME__", detail)
-    if "__GX_" in body:
+    # Помощники тоже несут подстановку (потолок веса), поэтому и они проходят
+    # проверку на неразрешённый placeholder: guard, глядящий только в тело,
+    # молча пропустил бы `__GX_WEIGHT_CEILING__` в живой Revit.
+    helper = GEOMETRY_EXTRACT_HELPER_CS.replace(
+        "__GX_WEIGHT_CEILING__", str(GEOM_WEIGHT_CEILING))
+    if "__GX_" in body or "__GX_" in helper:
         raise GeometryExtractionError(
             "internal geometry emitter placeholder was not resolved")
     return (source_binding_cs(link_title) + "\n"
-            + GEOMETRY_EXTRACT_HELPER_CS + "\n" + body)
+            + helper + "\n" + body)

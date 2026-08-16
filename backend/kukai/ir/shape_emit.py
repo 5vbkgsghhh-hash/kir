@@ -164,6 +164,34 @@ def _xyz_literals(verts: list) -> str:
         for v in verts)
 
 
+def _surface_raw_triangles(verts: list, tris: list) -> list:
+    """Плоские девятки координат — одна на треугольник, для допуска второй
+    ступени (см. шапку `authoring._MESH_CANON_HELPER_CS` про 14.08.2026).
+
+    Вершины ВНУТРИ треугольника сортируются лексикографически — тот же
+    порядок, что строит `__KirSortTri` в эмитированном C#. Список
+    треугольников намеренно НЕ сортируется здесь: сортирует уже
+    `__KirSurfaceToleranceMatch` на обеих сторонах одним и тем же ключом
+    (`__KirRawTriCmp`), поэтому сортировать дважды значило бы либо повторять
+    код, либо рисковать разными ключами по обе стороны канала.
+    """
+
+    out = []
+    for a, b, c in tris:
+        pts = sorted((tuple(verts[a]), tuple(verts[b]), tuple(verts[c])))
+        out.append([coord for pt in pts for coord in pt])
+    return out
+
+
+def _cs_double_array_literal(rows: list) -> str:
+    """``List<double[]> { new double[]{...}, ... }`` — вход второй ступени."""
+
+    items = ", ".join(
+        "new double[] { " + ", ".join(repr(float(v)) for v in row) + " }"
+        for row in rows)
+    return f"new List<double[]> {{ {items} }}"
+
+
 def _surface_expectation(oid: str, verts: list, tris: list) -> tuple[str, str, str]:
     """(ожидаемый прообраз, голова оболочки, хвост оболочки) для свидетеля.
 
@@ -271,6 +299,7 @@ def emit_directshape(op: dict, ver: str, stamp: str,
     from kukai.ir.emit_model import tolerance
     tol = tolerance("create_directshape", "bbox_mm")
     surf_tol = tolerance("create_directshape", "surface_canon_mm")
+    surf_pt_tol = tolerance("create_directshape", "surface_point_mm")
     xmin, ymin, zmin, xmax, ymax, zmax = mesh_bbox(verts)
     # ОЖИДАНИЕ ПРЕД-РЕГИСТРИРУЕТСЯ ДО ЛЮБОГО ЭФФЕКТА и считается ИМЕННО от
     # вершин, которые уедут в C# (см. _emitted_vertices). Именно это делает
@@ -279,6 +308,10 @@ def emit_directshape(op: dict, ver: str, stamp: str,
     # построено то, что послано.
     surf_expected, surf_head, surf_tail = _surface_expectation(
         oid, _emitted_vertices(verts), tris)
+    # Ожидание ВТОРОЙ ступени — той же формы и от тех же округлённых вершин,
+    # но БЕЗ квантования на решётку: тут сравнивается расстояние, а не номер
+    # ячейки, поэтому и ожидание обязано быть в исходных миллиметрах.
+    surf_raw_expected = _surface_raw_triangles(_emitted_vertices(verts), tris)
 
     checks: list[WitnessCheck] = [
         # ГАБАРИТ ПО ТРЁМ ОСЯМ. Общий bbox_extents_witness проверяет только XY
@@ -339,6 +372,14 @@ def emit_directshape(op: dict, ver: str, stamp: str,
             obligation_key="surface",
             reader_cs=(
                 f"    string __csf_{s} = null;\n"
+                # ВТОРАЯ СТУПЕНЬ ЧИТАЕТ ТУ ЖЕ ГЕОМЕТРИЮ В ТОМ ЖЕ ПРОХОДЕ, а не
+                # заново: два прочтения одного элемента могли бы увидеть два
+                # разных снимка, и «строгая ступень не совпала» с «допусковая
+                # не совпала» относились бы не к одному и тому же наблюдению.
+                # Объявлена ВНЕ `if (__ge_{s} != null)`, как и __csf_{s} — по
+                # тому же Scope-контракту: verdict_cs читает её из другой
+                # области видимости.
+                f"    var __csRaw_{s} = new List<double[]>();\n"
                 f"    if (__ge_{s} != null)\n    {{\n"
                 f"        var __csr_{s} = new List<long[]>();\n"
                 f"        foreach (GeometryObject __csg_{s} in __ge_{s})\n        {{\n"
@@ -348,14 +389,22 @@ def emit_directshape(op: dict, ver: str, stamp: str,
                 f"            {{\n"
                 f"                MeshTriangle __cst_{s} = __csm_{s}.get_Triangle(__csi_{s});\n"
                 f"                var __csp_{s} = new List<long[]>();\n"
+                f"                var __csw_{s} = new double[3][];\n"
                 f"                for (int __csv_{s} = 0; __csv_{s} < 3; __csv_{s}++)\n"
                 f"                {{\n"
                 f"                    XYZ __csx_{s} = __cst_{s}.get_Vertex(__csv_{s});\n"
+                f"                    double __csmx_{s} = MM(__csx_{s}.X);\n"
+                f"                    double __csmy_{s} = MM(__csx_{s}.Y);\n"
+                f"                    double __csmz_{s} = MM(__csx_{s}.Z);\n"
                 f"                    __csp_{s}.Add(new long[] {{ "
-                f"__KirCanonUnit(MM(__csx_{s}.X), {surf_tol}), "
-                f"__KirCanonUnit(MM(__csx_{s}.Y), {surf_tol}), "
-                f"__KirCanonUnit(MM(__csx_{s}.Z), {surf_tol}) }});\n"
+                f"__KirCanonUnit(__csmx_{s}, {surf_tol}), "
+                f"__KirCanonUnit(__csmy_{s}, {surf_tol}), "
+                f"__KirCanonUnit(__csmz_{s}, {surf_tol}) }});\n"
+                f"                    __csw_{s}[__csv_{s}] = new double[] "
+                f"{{ __csmx_{s}, __csmy_{s}, __csmz_{s} }};\n"
                 f"                }}\n"
+                f"                __csRaw_{s}.Add(__KirSortTri("
+                f"__csw_{s}[0], __csw_{s}[1], __csw_{s}[2]));\n"
                 f"                __csp_{s}.Sort(__KirCanonCmp);\n"
                 f"                long[] __csq_{s} = new long[9];\n"
                 f"                for (int __csa_{s} = 0; __csa_{s} < 3; __csa_{s}++)\n"
@@ -370,7 +419,15 @@ def emit_directshape(op: dict, ver: str, stamp: str,
                 f"    if (__csf_{s} == null)\n"
                 f"        __post.Add({_cs(oid + ': поверхность построенного меша не читается (geometry)')});\n"
                 f"    else if (__csf_{s} != {_cs(surf_expected)})\n"
-                f"        __post.Add({_cs(oid + ': built mesh surface differs from the authored surface on the canon grid (geometry)')});\n"),
+                f"    {{\n"
+                # ВТОРАЯ СТУПЕНЬ — ТОЛЬКО ЗДЕСЬ, только когда строгая уже
+                # сказала «нет». Дешёвый путь для подавляющего большинства
+                # форм не платит за неё ничего; платит только тот случай,
+                # который иначе отвергался бы ложно.
+                f"        if (!__KirSurfaceToleranceMatch(__csRaw_{s}, "
+                f"{_cs_double_array_literal(surf_raw_expected)}, {surf_pt_tol}))\n"
+                f"            __post.Add({_cs(oid + ': built mesh surface differs from the authored surface on the canon grid (geometry)')});\n"
+                f"    }}\n"),
             message="built mesh surface mismatch on the canon grid (geometry)",
             tol=surf_tol, style="guard"),
     ]

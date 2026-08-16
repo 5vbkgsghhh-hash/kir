@@ -309,6 +309,88 @@ Func<List<long[]>, string, string, string> __KirCanonPayload =
     __cpSb.Append(__cpTail);
     return __cpSb.ToString();
 };
+
+// ── ДОПУСК ВТОРОЙ СТУПЕНИ (14.08.2026) ──────────────────────────────────
+//
+// ПОЧЕМУ ВООБЩЕ НУЖНА ВТОРАЯ СТУПЕНЬ. `__KirCanonPayload` строго равенство
+// на решётке `GEOM_CANON_MM`: вершина в 0.01 мм от границы ячейки и её
+// пересобранный Revit'ом двойник могут разойтись НА ОДНУ ЯЧЕЙКУ при
+// микроскопической сварке в TessellatedShapeBuilder, хотя РЕАЛЬНОЕ
+// расстояние между ними — сотые доли миллиметра. Один переброшенный индекс
+// меняет ключ КАЖДОГО треугольника, куда входит эта вершина, и строгое
+// сравнение отвергает геометрию, совпадающую по объёму/площади/габариту
+// нацело. Замерено живьём 14.08.2026 на Revit 2023: 13 из 24 реальных
+// семейств получали именно такой ложный отказ.
+//
+// РЕШЁТКА НЕ ОГРУБЛЯЕТСЯ. Огрубление `GEOM_CANON_MM` сделало бы строгую
+// ступень слепее для ВСЕХ форм, а не только для пограничного случая.
+// Вместо этого — вторая ступень, вызываемая ТОЛЬКО когда первая уже
+// сказала «нет»: сравнение по ФАКТИЧЕСКОМУ евклидову расстоянию между
+// соответствующими вершинами, а не по номеру ячейки, в которую они попали.
+//
+// СОРТИРОВКА — ТА ЖЕ ИДЕЯ, ЧТО У КАНОНА ВЫШЕ, НО НА СЫРЫХ ЧИСЛАХ. Внутри
+// треугольника три вершины сортируются лексикографически (`__KirSortTri`),
+// список треугольников — по этой же сортированной девятке
+// (`__KirRawTriCmp`). Питон строит ожидание ТЕМ ЖЕ порядком
+// (`shape_emit._surface_raw_triangles`), поэтому после сортировки обеих
+// сторон i-й треугольник наблюдения обязан отвечать i-му треугольнику
+// ожидания — если форма настоящая, а не просто численно похожая.
+Comparison<double[]> __KirRawVertCmp = (__rvA, __rvB) =>
+{
+    for (int __rvI = 0; __rvI < 3; __rvI++)
+    {
+        int __rvC = __rvA[__rvI].CompareTo(__rvB[__rvI]);
+        if (__rvC != 0) return __rvC;
+    }
+    return 0;
+};
+Func<double[], double[], double[], double[]> __KirSortTri = (__stA, __stB, __stC) =>
+{
+    double[][] __stP = new double[][] { __stA, __stB, __stC };
+    Array.Sort(__stP, __KirRawVertCmp);
+    return new double[] {
+        __stP[0][0], __stP[0][1], __stP[0][2],
+        __stP[1][0], __stP[1][1], __stP[1][2],
+        __stP[2][0], __stP[2][1], __stP[2][2] };
+};
+Comparison<double[]> __KirRawTriCmp = (__rtA, __rtB) =>
+{
+    for (int __rtI = 0; __rtI < 9; __rtI++)
+    {
+        int __rtC = __rtA[__rtI].CompareTo(__rtB[__rtI]);
+        if (__rtC != 0) return __rtC;
+    }
+    return 0;
+};
+// Возвращает true, только если СЧЁТ треугольников совпал И после сортировки
+// обеих сторон одним и тем же ключом каждая пара вершин сошлась в пределах
+// допуска. Несовпадение счёта — типизированный "нет" без попытки сравнения:
+// сравнивать i-й с i-м при разном числе треугольников бессмысленно, и это
+// уже отдельно ловит свидетель числа граней.
+Func<List<double[]>, List<double[]>, double, bool> __KirSurfaceToleranceMatch =
+    (__stmA, __stmB, __stmTol) =>
+{
+    if (__stmA.Count != __stmB.Count) return false;
+    List<double[]> __stmSa = new List<double[]>(__stmA);
+    List<double[]> __stmSb = new List<double[]>(__stmB);
+    __stmSa.Sort(__KirRawTriCmp);
+    __stmSb.Sort(__KirRawTriCmp);
+    for (int __stmI = 0; __stmI < __stmSa.Count; __stmI++)
+    {
+        double[] __stmTa = __stmSa[__stmI];
+        double[] __stmTb = __stmSb[__stmI];
+        for (int __stmJ = 0; __stmJ < 9; __stmJ += 3)
+        {
+            double __stmDx = __stmTa[__stmJ] - __stmTb[__stmJ];
+            double __stmDy = __stmTa[__stmJ + 1] - __stmTb[__stmJ + 1];
+            double __stmDz = __stmTa[__stmJ + 2] - __stmTb[__stmJ + 2];
+            double __stmD = Math.Sqrt(
+                __stmDx * __stmDx + __stmDy * __stmDy + __stmDz * __stmDz);
+            if (__stmD > __stmTol) return false;
+        }
+    }
+    return true;
+};
 """
 
 
