@@ -168,9 +168,23 @@ jobs:
     name: generated C# × Revit 2021–2026
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    env:
-      NUGET_PACKAGES: ${{ runner.temp }}/kir-nuget-packages
     steps:
+      # 🔴 КОНТЕКСТ `runner` НЕ СУЩЕСТВУЕТ НА УРОВНЕ ДЖОБА. Пока эта величина
+      # стояла в `env:` джоба, GitHub отказывался разбирать ВЕСЬ файл целиком —
+      # не джоб и не шаг, — и прогон умирал до запуска единого задания. Замер
+      # 16.08.2026: 171 прогон из 175 с `jobs.total_count == 0`, `/logs` → 404,
+      # `created_at == updated_at`, а поле `name` у прогона было ПУТЁМ ФАЙЛА
+      # вместо объявленного `CI — KIR compiler evidence`. Ошибку назвал сам
+      # GitHub через `POST /actions/workflows/<wf>/dispatches` с валидным
+      # реф'ом: «Unrecognized named-value: 'runner'».
+      #
+      # Переменная окружения раннера доступна там, где контекста ещё нет.
+      # `$GITHUB_ENV` пробрасывает её и в шелл последующих шагов, и в контекст
+      # `env`, которым ниже пользуется шаг кэша.
+      - name: Point NuGet at the runner temp
+        shell: bash
+        run: echo "NUGET_PACKAGES=$RUNNER_TEMP/kir-nuget-packages" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-dotnet@v4
@@ -292,7 +306,13 @@ jobs:
           print(json.dumps(payload, indent=2))
           PY
 
-          PYTHONPATH=backend python -m kukai.ir.gate_runner
+          # Оба вывода уходят в файл РЯДОМ с логом: шаг сводки ниже собирает из
+          # них строки «ОТКАЗ ПРИБОРА». `pipefail` включён в шапке шага, поэтому
+          # `| tee` не съедает ненулевой код возврата — проверено формой:
+          # инструмент, спрятавший свой отказ за успехом конвейера, и есть тот
+          # дефект, ради которого вся эта машинерия.
+          PYTHONPATH=backend python -m kukai.ir.gate_runner \
+            | tee "$RUNNER_TEMP/gate-runner.txt"
 
           # ── The four matrices that were built and never automated ──────────
           # Measured 2026-08-04 against this same service, all green, all fast:
@@ -308,7 +328,8 @@ jobs:
           python scripts/graph_compile_matrix.py
           python scripts/audit_rules_compile_matrix.py
           python scripts/emitted_csharp_compile_matrix.py
-          python scripts/kir_gap_compile_matrix.py
+          python scripts/kir_gap_compile_matrix.py \
+            | tee "$RUNNER_TEMP/kir-gap-matrix.txt"
 
           # ── create_element templates: 82/84, and that is CORRECT ───────────
           # `Floor.Create` is 2022+ and the floor template deliberately carries no
@@ -353,6 +374,56 @@ jobs:
                 f"cell(s), no undeclared failure")
           PY
           cd ..
+
+      # 🔴 «МЫ ЭТОГО НЕ ПРОВЕРЯЛИ» ОБЯЗАНО БЫТЬ ВИДНО БЕЗ ЧТЕНИЯ ЛОГА.
+      # Решение владельца 16.08.2026. У ворот три исхода — зелено · красно ·
+      # ОТКАЗ ПРИБОРА, — и третий бесполезен, если живёт на 1100-й строке
+      # лога: сводку читают, лог нет. `if: always()` несущий — отказ прибора
+      # чаще всего сопровождает красный, и именно тогда он и нужен.
+      - name: Отказы прибора — в сводку прогона
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "## Что этот прогон проверил и чего НЕ проверял"
+            echo
+            # 🔴 ОБЕ ПОЛОВИНЫ, А НЕ ОДНА. Первая редакция печатала только
+            # отказы — и это провалило собственную цель: читающий видел, ЧЕГО
+            # не проверяли, и не видел, МНОГО ЛИ проверили, а значит не мог
+            # отличить «проверено и чисто, с одним названным пробелом» от
+            # «не судили почти ничего». Прочитано глазами 16.08.2026 на
+            # настоящем выводе прогона, а не задумано.
+            echo "### Проверено"
+            echo '```'
+            grep -ahE "^PASS:|^FAIL:|собрано Roslyn|^ЗЕЛЕНО|^КРАСНО|^ЯЧЕЕК" \
+              "$RUNNER_TEMP/gate-runner.txt" "$RUNNER_TEMP/kir-gap-matrix.txt" \
+              2>/dev/null || echo "(строк итога нет — приборы не дошли до итога)"
+            echo '```'
+            echo
+            echo "### Проверить было НЕЧЕМ"
+            found=0
+            for f in "$RUNNER_TEMP/gate-runner.txt" "$RUNNER_TEMP/kir-gap-matrix.txt"; do
+              [ -s "$f" ] || continue
+              if grep -a "ОТКАЗ ПРИБОРА" "$f" > "$RUNNER_TEMP/refusals.txt" 2>/dev/null; then
+                found=1
+                echo "\`$(basename "$f")\`:"
+                echo '```'
+                cat "$RUNNER_TEMP/refusals.txt"
+                echo '```'
+                echo
+              fi
+            done
+            # Отсутствие файла и отсутствие отказов — РАЗНЫЕ факты, и второй
+            # читается как «проверили всё». Молчать нельзя ни в одном случае.
+            if [ ! -s "$RUNNER_TEMP/gate-runner.txt" ] \
+               && [ ! -s "$RUNNER_TEMP/kir-gap-matrix.txt" ]; then
+              echo "🔴 ВЫВОДА НЕТ ВООБЩЕ — шаг доказательств не дошёл до этих"
+              echo "приборов. Это НЕ «отказов нет»."
+            elif [ "$found" = "0" ]; then
+              echo "Отказов прибора нет: оба прибора отработали на своих входах."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload compile-service diagnostics
         if: failure()

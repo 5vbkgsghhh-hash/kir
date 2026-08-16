@@ -288,6 +288,52 @@ def _fail(diags: list, **kw) -> None:
     diags.append(Diagnostic(**kw))
 
 
+def _unknown_field_ru(op_name: str, field_name: str, known: set) -> str:
+    """KIR-P003 на JSON-двери начинает называть СЛЕДУЮЩИЙ ХОД, а не только повод.
+
+    ЗАМЕР, КОТОРЫЙ ЭТО КУПИЛ (живой ход владельца 16.08.2026, флеш-модель). В
+    ОДНОМ ходу рядом легли два отказа, и они повели себя ПРОТИВОПОЛОЖНО:
+
+      * `KIR-T002` на `create_roof.slopes` — «slopes без единого угла — это
+        плоская крыша, просто не задавай поле». Модель прислала исправленную
+        программу через ЧЕТЫРЕ СЕКУНДЫ (10:45:45 -> 10:45:49);
+      * `KIR-P003` на `create_door` — «неизвестное поле». Ход УМЕР.
+
+    Разница ровно одна: первый текст несёт следующий ход, второй — повод.
+
+    ПОЧЕМУ НЕ РУКОПИСНЫЙ СПРАВОЧНИК, О КОТОРОМ ПРОСИЛИ. Рукописный список
+    полей разъедется с реестром на первой же новой операции, и разъедется
+    МОЛЧА — в этом дереве разъехались ВСЕ рукописные списки и НИ ОДИН
+    порождаемый. Поэтому следующий ход ВЫВОДИТСЯ: имена слотов, их виды,
+    границы и умолчания печатает `dsl._call_form` ПРЯМО ИЗ РЕЕСТРА.
+
+    ПОЧЕМУ ЗОВЁТСЯ ЧУЖОЙ ПОРОЖДАТЕЛЬ, А НЕ ПИШЕТСЯ СВОЙ. `_call_form` уже
+    куплен замером на СЛАБОЙ модели (04.08: 13 отказов из 27 — голый
+    `TypeError`, и модель узнавала сигнатуру ПО ОДНОМУ БИТУ ЗА ХОД, одиннадцать
+    ходов подряд). Второй такой же текст здесь был бы вторым мнением о форме
+    опа и разошёлся бы с первым ровно тогда, когда оба читают подряд.
+
+    ИМПОРТ ЛОКАЛЬНЫЙ НАМЕРЕННО: `dsl` импортирует `compiler` (`dsl.py:67`),
+    верхнеуровневый импорт замкнул бы цикл. Путь холодный — это ветка отказа.
+    """
+    from kukai.ir.dsl import _call_form  # локальный: цикл, см. докстроку
+
+    near = difflib.get_close_matches(field_name, sorted(known), n=2, cutoff=0.6)
+    head = f"неизвестное поле {field_name!r} у {op_name}"
+    if near:
+        head += f". Похоже на {', '.join(repr(n) for n in near)}"
+    try:
+        form = _call_form(spec.OPS[op_name])
+    except Exception:  # noqa: BLE001 — справка не имеет права стоить отказа
+        return head + ". СЛЕДУЮЩИЙ ХОД: убери поле — у этого опа его нет."
+    return (
+        f"{head}.\nВСЕ слоты этого опа — из реестра, других нет:\n{form}\n"
+        f"СЛЕДУЮЩИЙ ХОД: убери лишнее поле либо возьми имя из списка выше "
+        f"(размеры почти везде идут с суффиксом `_mm`), и СРАЗУ сверь "
+        f"остальные слоты — они все перечислены здесь, один ход вместо "
+        f"одного слота за ход.")
+
+
 def _check_filters(where: Any, i: int, oid: str, diags: list,
                    op_kind: Optional[str] = None) -> dict:
     if where is None:
@@ -479,7 +525,8 @@ def _validate_op(op: Any, i: int, diags: list) -> Optional[dict]:
     for k in op:
         if k not in known:
             _fail(diags, code=PARSE_UNKNOWN_FIELD, op_index=i, op_id=oid, field_name=k,
-                  candidates=sorted(known), message_ru=f"неизвестное поле '{k}' у {name}")
+                  candidates=sorted(known),
+                  message_ru=_unknown_field_ru(name, k, known))
     if spec.OPS[name].family in spec.WRITE_FAMILIES:
         from kukai.ir import authoring
         return authoring.validate(op, name, i, oid, diags)

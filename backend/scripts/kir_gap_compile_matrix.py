@@ -20,17 +20,41 @@
 тот же, которым пользуются `kukai/ir/gate_runner.py` и
 `scripts/emitted_csharp_compile_matrix.py`.
 
-ТРИ ИСХОДА ЯЧЕЙКИ, И ИХ НЕЛЬЗЯ СЧИТАТЬ ВМЕСТЕ
----------------------------------------------
-    OK      C# собрался этой версией API
-    отказ   компилятор ОТКАЗАЛ типизированно ДО эмиссии — это исправность, а
-            не провал. Единственный ожидаемый случай на сегодня:
-            `create_ceiling` на Revit 2021 (KIR-E003 — `Ceiling.Create`
-            появился в 2022, а legacy-пути к потолку нет ни на одной версии).
-            Ожидаемые отказы перечислены в EXPECTED_REFUSALS; отказ, которого
-            там нет, — красный.
-    FAIL    Roslyn не собрал. Симметричный красный (все шесть) почти всегда
-            означает наш аргумент, асимметричный — версионную дыру.
+ЧЕТЫРЕ ИСХОДА ЯЧЕЙКИ, И ИХ НЕЛЬЗЯ СЧИТАТЬ ВМЕСТЕ
+------------------------------------------------
+    OK          C# собрался этой версией API
+    отказ       компилятор ОТКАЗАЛ типизированно ДО эмиссии — это исправность,
+                а не провал. Единственный ожидаемый случай на сегодня:
+                `create_ceiling` на Revit 2021 (KIR-E003 — `Ceiling.Create`
+                появился в 2022, а legacy-пути к потолку нет ни на одной
+                версии). Ожидаемые отказы перечислены в EXPECTED_REFUSALS;
+                отказ, которого там нет, — красный.
+    FAIL        Roslyn не собрал. Симметричный красный (все шесть) почти
+                всегда означает наш аргумент, асимметричный — версионную дыру.
+    ОТКАЗ ПРИБОРА  строку НЕ ИЗ ЧЕГО было собрать: `M.Unresolved` — каталог
+                пула не несёт нужного поля, разведка не снята, корпуса нет.
+                Это НЕ дефект компилятора и НЕ «находок нет»; это «мы не
+                проверяли», и оно обязано выглядеть иначе, чем и зелёное, и
+                красное.
+
+🔴 ЗАЧЕМ ЧЕТВЁРТЫЙ ИСХОД ПОЯВИЛСЯ (16.08.2026, решение владельца). До этого
+`M.Unresolved` считался в `fail_cells`, и прогон падал. В первом же ожившем
+прогоне ворот `place_family` дал `НЕ СОБРАНА: family_symbol: в каталоге пула
+family_symbols нет поля 'placement'` — каталогу нужен ЖИВОЙ этап разведки,
+которого на разовой машине CI нет и быть не может. Шесть ячеек из 156 роняли
+прогон по причине, которую CI не может устранить НИКОГДА.
+
+Ворота, красные ВСЕГДА, — не ворота: их красный перестают читать, и следующий
+настоящий дефект уезжает в прод под тем же красным. Мы это уже покупали
+(«красный по известной причине прячет следующий»). Поэтому постоянный красный
+из-за отказа ПРИБОРА недопустим ровно так же, как зелёный из-за
+необследованности.
+
+ЧТОБЫ ЭТО НЕ СТАЛО ГЛУШИЛКОЙ, отказ прибора невозможно спутать с зелёным:
+число отказавших строк печатается ВСЕГДА, даже когда оно ноль. Помимо числа,
+`EXPECTED_INSTRUMENT_REFUSALS` связывает имя строки и несущие части причины:
+один новый отказ не может незаметно заменить один исчезнувший. Превышение
+бюджета либо неизвестное имя/причина роняют прогон отдельным текстом.
 
 ГРАНИЦА ОХВАТА, СЛОВАМИ
 -----------------------
@@ -85,6 +109,35 @@ EXPECTED_REFUSALS: dict[tuple[str, str], tuple[str, str]] = {
         "версии 2021-2026 (замерено компиляцией) — обходного пути НЕТ"),
 }
 
+#: ЗАКРЫТЫЙ СПИСОК ИМЕНОВАННЫХ ОТКАЗОВ ПРИБОРА.
+#:
+#: Одного числа недостаточно: если `place_family` исправился, а другая
+#: строка сломалась, счётчик останется равен одному и скроет подмену.
+#: Поэтому храповик фиксирует и имя строки, и несущие части причины.
+EXPECTED_INSTRUMENT_REFUSALS: dict[str, tuple[str, ...]] = {
+    "place_family": ("family_symbol", "placement"),
+}
+
+#: СКОЛЬКО ИМЕНОВАННЫХ СТРОК ИМЕЮТ ПРАВО ОТКАЗАТЬ ПРИБОРОМ.
+#:
+#: Это ХРАПОВИК, а не послабление. Значение равно ЗАМЕРУ 16.08.2026 в CI —
+#: ровно одна строка (`place_family`), которой нужен живой этап разведки пула
+#: `family_symbols`. Пока отказов не больше — прогон судит то, что может
+#: судить, и печатает, чего не судил. Появится ВТОРАЯ такая строка — прогон
+#: упадёт, и упадёт с текстом про отказ прибора, а не про дефект компилятора.
+#:
+#: Ноль отказов тоже законен и НЕ является ошибкой: на машине с разведанным
+#: каталогом строка соберётся. Поэтому сравнение — «больше бюджета», а не
+#: «равно бюджету».
+REFUSAL_BUDGET_ROWS = len(EXPECTED_INSTRUMENT_REFUSALS)
+
+
+def expected_instrument_refusal(name: str, why: object) -> bool:
+    """Имя и причина обязаны совпасть с замером, а не только число."""
+    required = EXPECTED_INSTRUMENT_REFUSALS.get(name)
+    text = str(why)
+    return required is not None and all(token in text for token in required)
+
 
 def offline_catalogue() -> dict:
     """Каталог из фикстуры: тот же формат, что даёт фаза 0 (`{id, name}`)."""
@@ -133,7 +186,11 @@ def resolved_rows(which: str, only: set[str] | None) -> list[tuple]:
             program = M.resolve_picks(row.program, cat, {}, chosen)
             program = M.resolve_deps(program, produced)
         except M.Unresolved as exc:
-            out.append((row.name, None, f"НЕ СОБРАНА: {exc}"))
+            # Строку НЕ ИЗ ЧЕГО собрать: каталог пула не несёт нужного поля.
+            # Причина возвращается ГОЛОЙ — ярлык исхода ставит `main`, потому
+            # что решение «это отказ прибора, а не FAIL» принимается там же,
+            # где ведётся счёт. Две подписи на одном факте разъезжаются.
+            out.append((row.name, None, str(exc)))
             continue
         out.append((row.name, program, chosen))
     return out
@@ -159,19 +216,39 @@ def main(argv: list[str]) -> int:
                     choices=("gap", "base", "all"))
     ap.add_argument("--only", action="append")
     ap.add_argument("--json", help="куда положить машинный отчёт")
+    ap.add_argument("--max-refused-rows", type=int,
+                    default=REFUSAL_BUDGET_ROWS,
+                    help="сколько строк имеют право отказать ПРИБОРОМ, не "
+                         "роняя прогон (храповик; по умолчанию замер в CI)")
     args = ap.parse_args(argv)
 
     rows = resolved_rows(args.which, set(args.only) if args.only else None)
-    ok_cells = fail_cells = expected_cells = 0
+    ok_cells = fail_cells = expected_cells = refused_cells = 0
+    refused: list[tuple[str, str]] = []
+    unexpected_refused: list[tuple[str, str]] = []
     report: list[dict] = []
 
     print(f"{'строка':28s} " + "  ".join(VERSIONS))
     print("-" * 78)
     for name, program, chosen in rows:
         if program is None:
-            print(f"{name:28s} {chosen}")
-            report.append({"row": name, "unbuildable": chosen})
-            fail_cells += len(VERSIONS)
+            # ОТКАЗ ПРИБОРА, НЕ FAIL. `M.Unresolved` поднимается только когда
+            # плейсхолдер строки нечем заполнить из каталога — то есть у нас
+            # не было ВХОДА. Компилятор при этом не спрашивали вовсе, и
+            # записать это в `fail_cells` значило бы обвинить его в том, чего
+            # он не делал, и держать прогон красным вечно.
+            is_expected = expected_instrument_refusal(name, chosen)
+            label = (
+                "ОТКАЗ ПРИБОРА" if is_expected
+                else "НЕОЖИДАННЫЙ ОТКАЗ ПРИБОРА")
+            print(f"{name:28s} {label}: {chosen}")
+            report.append({"row": name,
+                           "instrument_refusal": str(chosen),
+                           "expected": is_expected})
+            refused_cells += len(VERSIONS)
+            refused.append((name, str(chosen)))
+            if not is_expected:
+                unexpected_refused.append((name, str(chosen)))
             continue
         cells, notes = [], []
         for ver in VERSIONS:
@@ -206,19 +283,67 @@ def main(argv: list[str]) -> int:
         report.append({"row": name, "cells": dict(zip(VERSIONS, cells)),
                        "notes": notes, "chosen": chosen})
 
-    total = ok_cells + fail_cells + expected_cells
+    total = ok_cells + fail_cells + expected_cells + refused_cells
     print("\n" + "=" * 78)
     print(f"ЯЧЕЕК {total} = строк {len(rows)} × версий {len(VERSIONS)}")
     print(f"  собрано Roslyn            {ok_cells}")
     print(f"  ожидаемый отказ (годно)   {expected_cells}")
-    print(f"  НЕ СОБРАНО                {fail_cells}")
+    print(f"  НЕ СОБРАНО (дефект)       {fail_cells}")
+    # 🔴 ПЕЧАТАЕТСЯ ВСЕГДА, ВКЛЮЧАЯ НОЛЬ. Строка, появляющаяся только при
+    # отказах, превращает «мы не проверяли» в невидимое: читающий сводку
+    # видит те же цифры, что и при полной проверке, и делает вывод о
+    # компиляторе там, где вывода нет. Ноль здесь — тоже сообщение.
+    print(f"  ОТКАЗ ПРИБОРА             {refused_cells} "
+          f"(строк {len(refused)} из {len(rows)}, бюджет "
+          f"{args.max_refused_rows})")
+    for rname, why in refused:
+        print(f"     · {rname:26.26s} {why}")
     if args.json:
         pathlib.Path(args.json).write_text(
             json.dumps({"ok": ok_cells, "expected_refusal": expected_cells,
-                        "fail": fail_cells, "rows": report},
+                        "fail": fail_cells,
+                        "instrument_refusal_cells": refused_cells,
+                        "instrument_refusal_rows": [r for r, _ in refused],
+                        "unexpected_instrument_refusal_rows":
+                            [r for r, _ in unexpected_refused],
+                        "refusal_budget_rows": args.max_refused_rows,
+                        "rows": report},
                        ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"  отчёт -> {args.json}")
-    return 0 if fail_cells == 0 else 1
+
+    # ТРИ ИСХОДА ПРОГОНА, И ОНИ РАЗЛИЧИМЫ ПО ТЕКСТУ, А НЕ ТОЛЬКО ПО КОДУ.
+    # Образец — `tools/build_client.py`: отказ печатается ДО любого «итого»,
+    # потому что показанный итог уже прочитан.
+    if fail_cells:
+        print(f"КРАСНО: {fail_cells} ячеек не собрались — это дефект, "
+              f"а не нехватка входа")
+        return 1
+    if unexpected_refused:
+        names = ", ".join(name for name, _ in unexpected_refused)
+        print(f"КРАСНО ПО ПОДМЕНЕ ОТКАЗА: {names}. Такого имени "
+              f"или такой причины нет в закрытом списке")
+        return 1
+    if len(refused) > args.max_refused_rows:
+        print(f"КРАСНО ПО ОТКАЗАМ: строк с отказом прибора {len(refused)}, "
+              f"бюджет {args.max_refused_rows}. Компилятор здесь ни при чём — "
+              f"выросло то, чего мы НЕ ПРОВЕРЯЕМ, и молчать об этом нельзя")
+        return 1
+    if refused and ok_cells == 0:
+        # 🔴 ВЫРОЖДЕННЫЙ ИСХОД, И ОН НЕ ЗЕЛЁНЫЙ. Ни одна ячейка не собрана, а
+        # значит прогон не судил НИЧЕГО — «зелено с пробелом» здесь было бы
+        # зелёным по построению, ровно тот дефект, который канон этого проекта
+        # называет вырожденным контролем. Третий код возврата взят у
+        # `tools/build_client.py`: 0 собрано · 1 дефект · 2 ПРИБОР НЕ ОТРАБОТАЛ.
+        print(f"ОТКАЗ ПРИБОРА ЦЕЛИКОМ: собрано 0, отказало {len(refused)} "
+              f"строк из {len(rows)}. Прогон не судил ничего — это НЕ зелёный")
+        return 2
+    if refused:
+        print(f"ЗЕЛЕНО С НАЗВАННЫМ ПРОБЕЛОМ: собрано {ok_cells}, "
+              f"не проверено {refused_cells} ячеек в {len(refused)} строках "
+              f"(отказ прибора, причины выше)")
+        return 0
+    print(f"ЗЕЛЕНО: собрано {ok_cells}, отказов прибора нет")
+    return 0
 
 
 if __name__ == "__main__":

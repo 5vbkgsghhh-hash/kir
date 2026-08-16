@@ -144,7 +144,14 @@ class OpenModelProfileContractTests(unittest.TestCase):
         self.assertIn('__snap["__document_fingerprint"]', GROUND_SNAPSHOT_CS)
         self.assertIn(
             '__snap[__pool + "__total"] = __total', GROUND_SNAPSHOT_CS)
-        self.assertNotIn("IntegerValue", GROUND_SNAPSHOT_CS)
+        # Правило прежнее — «версионно-хрупкое имя не упоминать», — но
+        # держится оно теперь ЗАКРЫТЫМ СПИСКОМ С ЗАМЕРАМИ, а не голой
+        # подстрокой: та краснела на законном `WorksetId.IntegerValue`
+        # (собирается на всех шести) вместе с опасным `ElementId.IntegerValue`
+        # (отказ на 2026, CS1061). Подробности и оба замера — в
+        # `open_model_guard.INTEGER_VALUE_EXCEPTIONS`.
+        from kukai.ir.tests.open_model_guard import integer_value_offenders
+        self.assertEqual(integer_value_offenders(GROUND_SNAPSHOT_CS), [])
 
     def test_truss_pool_uses_native_family_symbols_in_both_collectors(
             self) -> None:

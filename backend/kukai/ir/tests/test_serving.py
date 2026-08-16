@@ -72,7 +72,11 @@ class StructuralFilterLiveCase(unittest.TestCase):
         self.assertIn('__r["category"]', cs)
         self.assertIn('__r["family_name"]', cs)
         self.assertIn('__r["type_name"]', cs)
-        self.assertNotIn("IntegerValue", cs)
+        # Тот же сторож, что и в `test_open_model`, и ОДИН на оба: держать
+        # правило двумя копиями подстроки — именной дефект этого проекта, и он
+        # здесь уже дал ложный красный на `WorksetId.IntegerValue`.
+        from kukai.ir.tests.open_model_guard import integer_value_offenders
+        self.assertEqual(integer_value_offenders(cs), [])
 
     def test_snapshot_parameter_projection_is_bounded_and_program_specific(self):
         program = {"ops": [{

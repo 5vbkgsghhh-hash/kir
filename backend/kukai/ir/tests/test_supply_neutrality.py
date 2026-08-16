@@ -78,21 +78,33 @@ class AdminDeviceAllowList(_EnvGuard):
             self.assertFalse(serving.revit_ir_enabled())
             self.assertFalse(serving.revit_decompile_enabled())
 
-    def test_unset_env_keeps_this_installation_working(self) -> None:
-        # Миграционный фолбэк: прод-.env трогать нельзя, поэтому «переменная не
-        # задана» обязана сохранить ровно прежнее поведение этой установки.
-        #
-        # Предмет — ФОЛБЭК СПИСКА УСТРОЙСТВ, а не гейт целиком; режим ставится
-        # явно, чтобы последнее утверждение проверяло устройство, а не молчание
-        # третьего условия.
+    def test_unset_env_is_the_same_as_empty_and_never_guesses_a_device(self):
+        """НЕЗАДАННАЯ ПЕРЕМЕННАЯ И ЗАДАННАЯ ПУСТОЙ — ОДНО И ТО ЖЕ.
+
+        Прежняя редакция называлась «unset keeps this installation working» и
+        требовала, чтобы `admin_devices()` вернул `_MIGRATION_ADMIN_DEVICE` —
+        id ЭТОЙ машины, зашитый литералом в файл, который публикуется
+        отдельным репозиторием. 15.08.2026 волна границы опенсорса литерал
+        сняла, и фолбэка не стало: `admin_devices` документирует это дословно
+        («угадывать чужое устройство мы не вправе»).
+
+        🔴 ТЕСТ ПЕРЕПИСАН ПОД ДОСТИГНУТОЕ, А НЕ ПОДОГНАН ПОД КРАСНЫЙ. Разница
+        проверяемая: прежнее ожидание требовало ПРИСУТСТВИЯ литерала, новое
+        требует его ОТСУТСТВИЯ, и соседний тест ниже это принуждает. Замысел
+        сохранён и усилен — «в компиляторе нет ничьего устройства», — тогда
+        как подгонка ослабила бы его до «как получилось».
+
+        Режим ставится явно по тому же доводу, что и в тесте выше: без него
+        `revit_ir_enabled()` ложен по двум причинам сразу, и зелёный пришёл бы
+        без акта различения.
+        """
         enter_kir_mode(self)
         os.environ.pop("KUKAI_ADMIN_DEVICES", None)
-        self.assertEqual(
-            serving.admin_devices(), (serving._MIGRATION_ADMIN_DEVICE,))
         os.environ["KUKAI_KIR_TOOL"] = "stage2"
+        self.assertEqual(serving.admin_devices(), ())
         with mock.patch.object(serving, "_turn_device_id",
-                               return_value=serving._MIGRATION_ADMIN_DEVICE):
-            self.assertTrue(serving.revit_ir_enabled())
+                               return_value="any-device"):
+            self.assertFalse(serving.revit_ir_enabled())
 
     def test_gate_refusal_names_the_env_variable(self) -> None:
         os.environ["KUKAI_ADMIN_DEVICES"] = ""
@@ -111,14 +123,38 @@ class AdminDeviceAllowList(_EnvGuard):
             self.assertIn("KUKAI_ADMIN_DEVICES", result.get("message_ru", ""),
                           msg=result)
 
-    def test_only_the_migration_default_carries_a_device_literal(self) -> None:
-        # §18.5, принуждение: hex-32 литерал в исполняемом коде — ровно один,
-        # и он помечен как миграционный дефолт. Появление второго означает, что
-        # чьё-то устройство снова зашили в компилятор.
+    def test_no_device_literal_survives_in_the_compiler(self) -> None:
+        """ХРАПОВИК РАЗВЁРНУТ В СТОРОНУ ДОСТИГНУТОГО: литералов НОЛЬ.
+
+        Прежняя редакция требовала РОВНО ОДИН hex-32 литерал и присутствия
+        имени `_MIGRATION_ADMIN_DEVICE` — она сторожила «второго не появилось»,
+        пока первый считался неизбежным. 15.08.2026 первый сняли: список
+        устройств задаётся только `KUKAI_ADMIN_DEVICES`, фолбэка нет.
+
+        Оставить тест как был значило бы требовать ВОЗВРАТА литерала в файл,
+        который публикуется отдельным репозиторием, — то есть охранять
+        отменённое состояние. Ноль — это то же правило §18.5 на достигнутой
+        отметке: чьё-то устройство в компиляторе не зашито, и обратно оно уже
+        не проедет.
+        """
         source = Path(serving.__file__).read_text(encoding="utf-8")
+        self.assertTrue(source.strip(), "исходник не прочитан — это отказ")
         hits = re.findall(r"[\"'][0-9a-f]{32}[\"']", source)
-        self.assertEqual(len(hits), 1, msg=hits)
-        self.assertIn("_MIGRATION_ADMIN_DEVICE", source)
+        self.assertEqual(
+            hits, [],
+            msg=f"в компилятор вернулся литерал устройства: {hits}")
+        # 🔴 ЗАПРЕЩЕНО СВЯЗЫВАНИЕ, А НЕ УПОМИНАНИЕ. Первая редакция этой
+        # строки искала само имя и покраснела на КОММЕНТАРИИ, объясняющем,
+        # почему фолбэк снят (`serving.py:102`). Запрет упоминания запретил бы
+        # документировать собственную историю — а зонд, ловящий ЯРЛЫК вместо
+        # ветки, здесь уже покупали не раз. Предмет — присвоение и атрибут
+        # модуля; второе проверяется исполнением, а не чтением.
+        self.assertIsNone(
+            re.search(r"^_MIGRATION_ADMIN_DEVICE\s*=", source, re.M),
+            msg="миграционный фолбэк снова ПРИСВАИВАЕТСЯ в компиляторе")
+        self.assertFalse(
+            hasattr(serving, "_MIGRATION_ADMIN_DEVICE"),
+            msg="фолбэк вернулся атрибутом модуля")
 
 
 class RejectionFeedPath(_EnvGuard):
