@@ -14,7 +14,7 @@
   <img alt="License Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Revit 2021-2026" src="https://img.shields.io/badge/Revit-2021%E2%80%932026-005386">
   <img alt="Historical compile gate 1056 checks" src="https://img.shields.io/badge/historical%20compile%20gate-1056%20checks-brightgreen">
-  <img alt="35 writing ops registered" src="https://img.shields.io/badge/registry-35%20writing%20ops-success">
+  <img alt="66 writing ops registered" src="https://img.shields.io/badge/registry-66%20writing%20ops-success">
   <img alt="KIR backend source published" src="https://img.shields.io/badge/source-backend%20published-orange">
 </p>
 
@@ -72,11 +72,11 @@ flowchart TB
         direction LR
         SDK["Python SDK<br/>numpy · shapely · the model"]
         PROG["Typed program<br/>KIR JSON, ops + refs"]
-        REG["Registry<br/>one source of truth:<br/>schema · grammar · docs · emitters"]
+        REG["Registry<br/>70 typed ops:<br/>66 write · 4 query"]
         GRND["ground<br/>symbolic selectors to ElementIds"]
         PLAN["typecheck + plan<br/>mm only · DAG · txn partitions"]
         EMIT["emit<br/>per-version C#"]
-        GATE["Roslyn gate<br/>2021–2026 · 1056 checks PASS"]
+        GATE["Roslyn gate<br/>Revit 2021–2026"]
         RUN["live Revit<br/>one TransactionGroup"]
         SDK --> PROG --> REG --> GRND --> PLAN --> EMIT --> GATE --> RUN
     end
@@ -112,23 +112,32 @@ its own test.
 reason code*, never a silent drop. That reverse direction is what turns "we can build" into "we can
 edit what already exists".
 
-A stage-by-stage account of both pipelines — the registry as one source of truth, isolation modes,
-the census, fold, rebuild verification — lives in **docs/ARCHITECTURE.md**.
+The binding architecture is kept close to the executable contracts: the registry in
+[`registry_base.py`](backend/kukai/ir/registry_base.py), the compiler in
+[`compiler.py`](backend/kukai/ir/compiler.py), reverse construction in
+[`decompile/`](backend/kukai/ir/decompile/), and the checked honesty laws in
+[`docs/laws/`](docs/laws/).
 
 ## Repository layout
 
-The current repository contains the runnable source snapshot, not only the public open-core slice:
+The repository is an audit-oriented snapshot of the independently reviewable KIR backend surfaces:
 
-- `backend/kukai/ir/` — the forward compiler, typed diagnostics, serving, witness/acceptance
-  machinery and the reverse/decompile pipeline;
-- `backend/kukai/modeling/bridge/` — bridge clients and adapters used to talk to a Revit session;
+- `backend/kukai/ir/` — Python SDK, registry, forward compiler, typed diagnostics,
+  witness/acceptance machinery, Building Graph and reverse/decompile pipeline;
+- `backend/kukai/clash/` — snapshot geometry, broad/narrow phase clash detection and
+  evidence-bearing clash results;
+- `backend/kukai/viewer/` — graph/scene deltas and the browser-facing model representation;
+- `backend/kukai/modeling/checker/` — deterministic model checks over the compiled state;
+- `backend/kukai/modeling/bridge/` — backend bridge clients, adapters, recordings and mocks;
 - `backend/compile-service/` — the .NET 8 Roslyn service used for versioned C# compilation;
-- `backend/kukai/ir/tests/` and `backend/tests/` — unit, contract and bridge tests;
+- `backend/kukai/ir/tests/`, `backend/kukai/ir/decompile/tests/` and `backend/tests/` —
+  executable contracts, fixtures and evidence gates;
 - `examples/` — small SDK programs that can be compiled offline before connecting Revit.
 
 Runtime data, credentials, virtual environments, build outputs and logs are intentionally not part
-of the repository. A live run still requires a separately installed Revit bridge and the matching
-Revit API reference packages.
+of the repository. The KUKI application and the in-process Revit plugin are not published here.
+A live run requires a separately installed compatible bridge and the matching Revit API reference
+packages; the compiler, registry, graph and clash code can be audited independently.
 
 ## Show me code
 
@@ -155,9 +164,10 @@ Note what is *not* expressible. A door has no `xyz`: it is `host` + `offset_mm` 
 `sill_mm`. "A window floating in the air" is not a case we validate — it is a sentence the language
 cannot form. Every length is millimetres; feet do not exist in the IR.
 
-The Python surface is generated, not written: **35 builders are born from the registry at import
-time, one per registry op** (2026-07-28), so a signature cannot drift from the spec. The SDK adds no semantics of its own — it cannot
-express anything the registry lacks, and it cannot hide a refusal.
+The Python surface is generated, not handwritten: **70 callables are born from the registry at
+import time — 66 writing operations and 4 queries** (current `main`, 2026-08-16), so a signature
+cannot drift from the spec. The SDK adds no semantics of its own — it cannot express anything the
+registry lacks, and it cannot hide a refusal.
 
 ```python
 import numpy as np
@@ -233,10 +243,10 @@ Everything below is derived from an instrument on the date shown, not from memor
 
 | Fact | Value | Date / source |
 |---|---|---|
-| Writing ops in the registry | **35** (+4 query) | current `backend/kukai/ir/spec.py` |
-| Published backend snapshot | **801 code/config files** | current `main`, 2026-08-03 |
-| Python syntax check at publication | **768 files parsed** | Python 3.12, 2026-08-03 |
-| Offline KIR smoke compile | **PASS** — level program emitted Revit 2023 C# | Python 3.12, 2026-08-03 |
+| Registry surface | **70 ops: 66 write + 4 query** | imported from current `backend/kukai/ir/spec.py`, 2026-08-16 |
+| Generated Python SDK surface | **70 generated callables** | imported from current `backend/kukai/ir/sdk.py`, 2026-08-16 |
+| Published audit snapshot | **818 tracked files; 807 code/config artifacts** | current `main`, 2026-08-16 |
+| Building intelligence surfaces | **Building Graph + clash + viewer + checker are published** | current source tree, 2026-08-16 |
 | Historical live baseline | **31 of 31 writing ops** had a witnessed run | 2026-07-28 local telemetry; telemetry is not shipped here |
 | Historical six-version compile gate | **1 056 Roslyn compilations, PASS** | 2026-07-28 local gate run |
 | Historical reverse-direction coverage | **48 categories; 92.83% on the 90 758-element R2026 model** | 2026-07-27/28 local runs |
@@ -280,34 +290,36 @@ Full account: **Five Conservation Laws of Honesty for an AI Agent in CAD**.
 
 ## Read more
 
-- **A Building Is a Program** — the long-form
-  technical case: what the IR expresses, why it runs in both directions, and the measured number
-  behind each claim.
-- **Five Conservation Laws of Honesty for an AI Agent in CAD**
-  — the five laws, the catch behind each, and how each one is mechanically enforced.
-- **A Day of Measured Revit API Traps** — fourteen Revit
-  API behaviours as symptom, wrong hypothesis, measurement, rule. Useful even if you never touch KIR.
-- **One Day Inside an AI-led Compiler Team** — a
-  first-person account of one working day on this project.
+- [KIR master design](docs/laws/KIR_MASTER_DESIGN.md) — the executable architecture and its
+  non-negotiable boundaries;
+- [Typed honesty specification](docs/laws/TYPED_HONESTY_SPEC.md) — what may be claimed and what
+  must remain an explicit refusal;
+- [Merkle specification](docs/laws/MERKLE_SPEC.md) — stable identity for graph and reverse
+  artifacts;
+- [Translation validation](docs/laws/TRANSLATION_VALIDATION_SPEC.md) — how derived output is
+  checked against its source;
+- [SDK examples](examples/README.md) — compact Python programs that emit typed KIR.
 
 <a id="repository-state"></a>
 ## Current repository state
 
-The KIR backend source is published in `main` now. To prepare a clean local environment:
+The KIR compiler-core source is published in `main`. To inspect the registry in a clean local
+environment:
 
 ```bash
 cd backend
 python3.12 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-PYTHONPATH=. python -c "from kukai.ir import spec; print(len(spec.OPS))"
+PYTHONPATH=. python -c "from kukai.ir import spec; print(len(spec.OPS))"  # 70
 dotnet restore compile-service/CompileService.csproj
 dotnet run --project compile-service
 ```
 
 The last two commands provision and start the Roslyn compile service. Live execution additionally
 needs a Revit 2021–2026 installation, its API reference assemblies and a separately running bridge.
-The source snapshot is deliberately free of machine-specific paths, credentials and runtime data.
+The public snapshot deliberately excludes machine-specific paths, credentials, runtime data, the
+KUKI application and the in-process Revit plugin.
 
 ---
 
@@ -317,10 +329,18 @@ The source snapshot is deliberately free of machine-specific paths, credentials 
 
 ## For auditors
 
-Beyond the compiler core (`backend/kukai/ir/`, `compile-service/`):
+Binding audit entry points beyond the compiler core:
 
-- **Language contracts:** `backend/kukai/ir/specs/` (`SPEC_V1.md`, decompile spec)
-- **Laws of honesty / cert / merkle:** `docs/laws/`
-- **NN authoring skill + sandbox course:** `backend/kukai/ir/skill.py`, `backend/kukai/ir/course/`
-- **CI evidence & secret boundary:** `.github/workflows/kir-evidence.yml`, `kir-security.yml`
-- **Audit / matrix tools:** `backend/tools/{bounds_audit,api_trap_audit}.py`, `backend/scripts/*matrix*`
+- **Language and operation contracts:** `backend/kukai/ir/registry_base.py`, `spec.py`,
+  `contracts.py`, `ops_*.py`;
+- **Building Graph and reverse path:** `backend/kukai/ir/decompile/building_graph.py`,
+  `graph_clash_query.py`, `federation.py` and their tests;
+- **Clash / viewer / checker:** `backend/kukai/clash/`, `backend/kukai/viewer/`,
+  `backend/kukai/modeling/checker/`;
+- **Honesty / translation / Merkle laws:** `docs/laws/`;
+- **NN authoring skill + sandbox course:** `backend/kukai/ir/skill.py`,
+  `backend/kukai/ir/course/`;
+- **CI evidence and secret boundary:** `.github/workflows/kir-evidence.yml`,
+  `.github/workflows/kir-security.yml`;
+- **Audit and matrix tools:** `backend/tools/{bounds_audit,api_trap_audit}.py`,
+  `backend/scripts/*matrix*.py`.
