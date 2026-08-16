@@ -653,3 +653,80 @@ class CoincidentWallsAreFoundOnTheProgramPathToo(unittest.TestCase):
         двух проверках и не измерял бы ничего."""
         assert self._flagged([self._wall("u1", (0, 0), (6000, 0)),
                               self._wall("u2", (0, 2000), (6000, 2000))]) == set()
+
+
+class TheLevelIsPartOfAWallIdentity(unittest.TestCase):
+    """🔴 ТИПОВОЙ ЭТАЖ — НЕ ДУБЛЬ САМОГО СЕБЯ (замер 15.08.2026).
+
+    На пути ПРОГРАММЫ точка двумерна: `p0_mm`/`p1_mm` несут план, отметку несёт
+    отдельное поле `level`. Пока ключ личности не включал уровень, обычная
+    башня помечалась дублями ЦЕЛИКОМ — замер на 5 этажах по 8 стен дал
+    **40 из 40**. Это единственное наблюдение о сборке, доезжающее до модели,
+    и оно было ложным на 100 % на любом многоэтажном здании.
+
+    Путь МОДЕЛИ так болеть не мог: там концы трёхмерные. Один предикат отвечал
+    на два разных вопроса, потому что у входов разная размерность.
+    """
+
+    _LEVELS = [{"op": "create_level", "id": "L%d" % n, "elev_mm": (n - 1) * 3000.0,
+                "name": "Этаж %d" % n} for n in (1, 2, 3, 4, 5)]
+
+    def _wall(self, oid, level_id, p0, p1):
+        return {"op": "create_wall", "id": oid,
+                "level": {"by": "ref", "value": level_id},
+                "height_mm": 3000.0, "p0_mm": list(p0), "p1_mm": list(p1)}
+
+    def _flagged(self, walls):
+        preview = P.build_program_preview(
+            {"ir_version": "1.0", "intent": "проба", "ops": self._LEVELS + walls})
+        return {element.element_id
+                for plan in preview.plans for element in plan.elements
+                if P.AnomalyReason.COINCIDENT_WALLS in element.anomalies}
+
+    _PLAN = [((0, 0), (6000, 0)), ((6000, 0), (6000, 6000)),
+             ((6000, 6000), (0, 6000)), ((0, 6000), (0, 0)),
+             ((0, 3000), (6000, 3000)), ((3000, 0), (3000, 6000)),
+             ((0, 0), (3000, 3000)), ((6000, 0), (3000, 3000))]
+
+    def test_a_repeated_storey_is_not_a_pile_of_duplicates(self):
+        """ГЛАВНОЕ ЧИСЛО. Пять одинаковых этажей по восемь стен — ноль находок."""
+        walls = [self._wall("w%d_%d" % (lvl, k), "L%d" % lvl, a, b)
+                 for lvl in (1, 2, 3, 4, 5)
+                 for k, (a, b) in enumerate(self._PLAN)]
+        assert len(walls) == 40
+        assert self._flagged(walls) == set()
+
+    def test_a_real_duplicate_on_one_level_is_still_caught(self):
+        """КОНТРОЛЬ-FAIL. Уровень в ключе не имеет права ОСЛАБИТЬ находку:
+        сегментация, отменяющая сам предикат, зелена по построению."""
+        assert self._flagged([self._wall("d1", "L2", (0, 0), (6000, 0)),
+                              self._wall("d2", "L2", (0, 0), (6000, 0))]) == {"d1", "d2"}
+
+    def test_the_same_ends_on_different_levels_are_two_walls(self):
+        assert self._flagged([self._wall("s1", "L1", (0, 0), (6000, 0)),
+                              self._wall("s2", "L2", (0, 0), (6000, 0))]) == set()
+
+    def test_a_wall_without_a_level_is_not_drawn_at_all(self):
+        """ГРАНИЦА, ЗАМЕРЕННАЯ, А НЕ ПРЕДПОЛОЖЕННАЯ (15.08.2026).
+
+        Первая редакция этого теста требовала, чтобы две безуровневые стены
+        помечались дублями друг друга. Замер опроверг: стена без уровня НЕ
+        ПОПАДАЕТ НИ НА ОДИН ПЛАН — предпросмотр строится по уровням, и таких
+        стен он не рисует вовсе (планов 0, элементов 0). Значит она не может
+        нести аномалию ни при каком ключе.
+
+        Сегмент `None` в ключе личности при этом остаётся и остаётся верным:
+        он не даёт безуровневой стене слиться с «Этаж 1», если она когда-нибудь
+        до предиката доедет. Но СЕГОДНЯ это свойство через публичный вход не
+        наблюдаемо, и тест говорит ровно то, что можно проверить, — иначе он
+        сторожил бы выдумку.
+        """
+        homeless = {"op": "create_wall", "id": "n1", "height_mm": 3000.0,
+                    "p0_mm": [0, 0], "p1_mm": [6000, 0]}
+        preview = P.build_program_preview(
+            {"ir_version": "1.0", "intent": "проба",
+             "ops": self._LEVELS + [homeless, dict(homeless, id="n2")]})
+        assert preview.plans == [] or all(
+            not plan.elements for plan in preview.plans), (
+            "безуровневая стена стала рисоваться — перечитай `level_key_of` "
+            "и решай, каким сегментом её сравнивать")

@@ -30,7 +30,7 @@
 import re
 import unittest
 
-from kukai.ir import dsl, spec
+from kukai.ir import dsl, sandbox, spec
 from kukai.ir.course import SANDBOX_NAMES
 from kukai.ir.skill import build_skill_text, build_walkthrough_programs_text
 from kukai.ir.tool_doc import build_tool_description
@@ -73,7 +73,13 @@ def _documentation() -> str:
 class EverySandboxNameIsDocumentedOrDeclaredDark(unittest.TestCase):
 
     def _names(self) -> set[str]:
-        return set(dsl.__all__) | set(SANDBOX_NAMES)
+        # 🔴 ОБЛАСТЬ СТОРОЖА БЫЛА УЖЕ ЕГО СОБСТВЕННОГО ОБЕЩАНИЯ (правка 15.08).
+        # Шапка говорит «каждое имя пространства скрипта», а область была
+        # `dsl.__all__ | SANDBOX_NAMES` — то есть без имён, которые песочница
+        # кладёт САМА. `model` жил непроверенным с появления каталога. Теперь
+        # третье слагаемое берётся у авторитета (`sandbox.HOST_NAMES`), который
+        # сверяется с фактическим впрыском и отказывает на расхождении.
+        return set(dsl.__all__) | set(SANDBOX_NAMES) | set(sandbox.HOST_NAMES)
 
     def test_the_op_layer_cannot_fall_behind(self):
         """69 = 69, и это по построению, а не по счастью."""

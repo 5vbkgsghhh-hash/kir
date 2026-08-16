@@ -40,7 +40,7 @@ from kukai.ir.a5_recovery import (
     A5Phase,
     stamp_scope as _a5_stamp_scope,
 )
-from kukai.llm.envelope import ErrCode, attach_err
+from kukai.ir.envelope import ErrCode, attach_err
 from kukai.ir.contracts import (CommitReceipt, DocumentFingerprint,
                                 RevisionProof, RunId)
 from kukai.ir.bridge_result import extract_error as _extract_error
@@ -98,15 +98,19 @@ logger = logging.getLogger(__name__)
 # путь выключен целиком (это законный способ поставить компилятор без живого
 # Revit вообще).
 _ADMIN_DEVICES_ENV = "KUKAI_ADMIN_DEVICES"
-# ПРИГОВОР: фолбэк умирает при опенсорс-срезе; §18.5: пусто = живой путь
-# выключен. Он существует ровно потому, что прод-.env этой установки трогать
-# нельзя, а поведение прода обязано сохраниться байт-в-байт: переменная не
-# задана ⇒ работает историческое устройство этой машины и ничьё больше.
-_MIGRATION_ADMIN_DEVICE = "a6d7d14340bc599817ae7e6896182ca0"
-# Совместимость: kukai/llm/client.py логирует ожидаемое устройство при закрытом
-# гейте. Имя оставлено, чтобы его импорт не сломал панель инструментов; новый
-# код обязан спрашивать admin_devices()/is_admin_device().
-ADMIN_DEVICE = _MIGRATION_ADMIN_DEVICE
+# ПРИГОВОР ИСПОЛНЕН 15.08.2026. Здесь стоял СЫРОЙ ИДЕНТИФИКАТОР МАШИНЫ
+# (`_MIGRATION_ADMIN_DEVICE`) — фолбэк на случай, если переменная не задана.
+# Канон называл его утечкой ещё 09.08: этот файл уезжает отдельным
+# опенсорс-репозиторием под Apache-2.0, и id чужой машины в нём — не TODO.
+#
+# Условие снятия — не решимость, а ЗАМЕР: 15.08 переменная задана в прод-`.env`
+# явно, служба мягко перезапущена, живой путь проверен ИСПОЛНЕНИЕМ (`ok:true`,
+# 9657 стен). Носитель ограничения — конфигурация установки, и только она.
+#
+# Переменная НЕ задана ⇒ пустой список ⇒ живой путь выключен, и отказ НАЗЫВАЕТ
+# `KUKAI_ADMIN_DEVICES` (`admin_gate_message_ru`). Это законная поставка
+# компилятора без живого Revit, а не поломка: молчаливым отказ быть не должен,
+# но и угадывать чужое устройство мы больше не имеем права.
 _FLAG = "KUKAI_KIR_TOOL"
 _QUERY_TIMEOUT_MS = 30_000
 _WRITE_TIMEOUT_MS = 120_000
@@ -153,16 +157,38 @@ def _turn_device_id() -> Optional[str]:
 def admin_devices() -> tuple[str, ...]:
     """Список допущенных устройств этой УСТАНОВКИ (§18.5).
 
-    Источник — env ``KUKAI_ADMIN_DEVICES`` (через запятую). Переменная НЕ
-    задана ⇒ миграционный дефолт (историческое устройство этой машины: см.
-    приговор у ``_MIGRATION_ADMIN_DEVICE``). Переменная задана и пуста ⇒
-    пустой список, то есть живой путь выключен.
+    Источник — env ``KUKAI_ADMIN_DEVICES`` (через запятую) и БОЛЬШЕ НИЧЕГО.
+
+    🔴 ФОЛБЭКА НЕТ С 15.08.2026. Раньше незаданная переменная означала
+    «работает историческое устройство этой машины», и id этой машины стоял
+    здесь литералом — в файле, который публикуется отдельным репозиторием.
+    Теперь незаданная переменная и заданная пустой значат ОДНО И ТО ЖЕ:
+    пустой список, живой путь выключен, отказ называет переменную
+    (``admin_gate_message_ru``). Угадывать чужое устройство мы не вправе.
     """
     raw = os.environ.get(_ADMIN_DEVICES_ENV)
     if raw is None:
-        return (_MIGRATION_ADMIN_DEVICE,)
+        return ()
     return tuple(
         item.strip() for item in raw.split(",") if item.strip())
+
+
+def __getattr__(name: str):
+    """``serving.ADMIN_DEVICE`` — ПЕРВОЕ допущенное устройство установки.
+
+    Имя оставлено ради совместимости (``kukai/llm/client.py`` логирует
+    ожидаемое устройство при закрытом гейте; его же берут наборы). Но это
+    больше НЕ КОНСТАНТА С ЧУЖИМ id: значение выводится из конфигурации в
+    момент обращения, и когда список пуст, ответ — ``None``, а не выдуманное
+    устройство. Новый код обязан спрашивать ``admin_devices()`` /
+    ``is_admin_device()``; это ответ на вопрос «кого бы гейт пустил», а не
+    источник истины.
+    """
+    if name == "ADMIN_DEVICE":
+        devices = admin_devices()
+        return devices[0] if devices else None
+    raise AttributeError(
+        "module %r has no attribute %r" % (__name__, name))
 
 
 def is_admin_device(device_id: Optional[str]) -> bool:
@@ -690,6 +716,56 @@ def _result_contract_diagnostic(exec_res: Any, family: str,
                     "detail": "result keys without typed identity: " +
                               ", ".join(unidentified[:10])}
     return None
+
+
+def green_is_earned(
+    *,
+    violations,
+    family: str,
+    has_acceptance_session: bool,
+    acceptance: AcceptanceState,
+    journal_error: Optional[str],
+) -> bool:
+    """КАРДИНАЛЬНЫЙ ИНВАРИАНТ ОДНОЙ ФУНКЦИЕЙ: когда ``ok`` имеет право быть True.
+
+    🔴 ПОЧЕМУ ЭТО ОТДЕЛЬНАЯ ФУНКЦИЯ, А НЕ ВЫРАЖЕНИЕ В ТЕЛЕ (15.08.2026).
+    До этого дня условие жило конъюнкцией внутри ``_handle_revit_ir_inner`` —
+    1125 строк, — и держалось СВЯЗКОЙ ЛОКАЛЬНЫХ ПЕРЕМЕННЫХ. Замер того дня:
+    ``acceptance_session`` встречается в модуле 37 раз и **НИ РАЗУ во всём
+    дереве тестов**. То есть главное обещание продукта — «ноль
+    молчаливо-неверных исходов» — не проверялось ничем, и всякий разрез этой
+    функции был неверифицируем В ПРИНЦИПЕ.
+
+    **Условие, у которого нет имени, невозможно пришпилить.** Поэтому имя
+    заведено раньше разреза: поведение не изменилось ни на бит (чистое
+    вынесение), но у инварианта появился адрес, к которому можно приложить
+    контроль-FAIL.
+
+    Что здесь утверждается, по осям ``ProgramOutcome``:
+
+    * **любое нарушение постусловия закрывает зелёный** — и для чтения тоже;
+    * **чтение** зелено само по себе: у него есть свой контракт, приёмки нет;
+    * **запись** зелена ТОЛЬКО когда все три условия сошлись — сессия приёмки
+      существовала, независимая приёмка сказала ACCEPTED, и терминальная
+      запись легла на диск (``journal_error is None``).
+
+    Третье условие не декоративно: измеренная в памяти приёмка — не
+    несбрасываемая улика. Зелёное, чья терминальная запись не зафсинкана,
+    наружу не выходит.
+
+    **FAIL-CLOSED ПО ПОСТРОЕНИЮ.** Будущий путь записи, забывший подготовить
+    сессию, не станет успешным оттого, что ``has_acceptance_session`` осталось
+    ложью: ложь здесь закрывает зелёный, а не пропускает его.
+    """
+    if violations:
+        return False
+    if family == "query":
+        return True
+    return (
+        has_acceptance_session
+        and acceptance is AcceptanceState.ACCEPTED
+        and journal_error is None
+    )
 
 
 def _with_outcome(result: dict, outcome: ProgramOutcome) -> dict:
@@ -1515,6 +1591,11 @@ class _AuthoredInput:
     #: Едет рядом с `author_digest` всюду, где тот едет: подпись исходника без
     #: подписи среды удостоверяет ровно половину.
     env_digest: str = ""
+    #: Подпись КАТАЛОГА документа, поданного скрипту. Третья подпись рядом с
+    #: двумя первыми и по той же причине: один исходник над разными зданиями
+    #: даёт разные программы, и без неё правка скрипта неотличима от дрейфа
+    #: модели.
+    model_digest: str = ""
     receipt: Optional[dict] = None
 
 
@@ -1568,6 +1649,13 @@ def _authorship_receipt(result: Any, *, source_bytes: int) -> dict:
         # большой исходник): подписывать нечего, и пустой блок сказал бы
         # «среда неизвестна» вместо «скрипт не исполнялся».
         receipt["environment"] = environment
+    model_digest = getattr(result, "model_digest", "") or ""
+    if model_digest:
+        # ТРЕТИЙ ПОДПИСАНТ. Пусто — каталог этому ходу не подавали (офлайн,
+        # мост молчал, или программа задана обычным JSON); отсутствие ключа и
+        # пустая строка тут читались бы одинаково неверно, поэтому ключа
+        # просто нет.
+        receipt["model_digest"] = model_digest
     digest = getattr(result, "program_digest", "") or ""
     if digest:
         receipt["program_digest"] = digest
@@ -1648,6 +1736,115 @@ def _building_watch() -> tuple[Any, int]:
     return key, _building.programs_seen(key)
 
 
+#: Потолок плоской строки карты адресов. Тот же довод, что у `DIGEST_LIMIT`:
+#: скаляр верхнего уровня переживает сворачивание целиком лишь до 120 символов
+#: (`chat_helpers._summarize_tool_result` режет длиннее по ЖЁСТКОМУ литералу,
+#: независимому от настраиваемого cap). Строка обязана уместиться САМА, а не
+#: надеяться на снисхождение сворачивателя.
+ELEMENT_MAP_NOTE_LIMIT = 120
+
+
+def element_map_note(mapping: Mapping[str, Any],
+                     limit: int = ELEMENT_MAP_NOTE_LIMIT) -> str:
+    """Карта «операция → элемент» ПЛОСКОЙ СТРОКОЙ, переживающей историю.
+
+    🔴 ЗАМЕР 15.08.2026 настоящим сворачивателем на ПРОД-форме квитанции:
+
+        {"element_map": {"w1": ["9001"], "d1": ["5"]}}
+                                    ->  "<объект, 2 полей — свёрнуто>"
+        {"assembly_note": "сборка: …"}          ->  строка целиком
+
+    Словарь схлопывается НА ЛЮБОМ УРОВНЕ — верхний его не спасает, потому что
+    сворачиватель заменяет всякий словарь и список, а сохраняет только скаляры.
+    Значит мост `op_id → element_id`, ради которого шли две волны, испарялся
+    через тридцать сообщений: модель пользуется им в пределах хода и не может
+    сослаться на построенное потом. Ровно тот же дефект, что чинил
+    `lift_assembly_note`, в соседнем поле.
+
+    ДВЕ ФОРМЫ ОДНОГО ФАКТА, И ОБЕ ЗАКОННЫ. Словарь остаётся: он машинный, его
+    читают в пределах хода, у него нет потолка. Строка — для памяти, и она
+    сознательно беднее: адрес операции и адреса её элементов, без структуры.
+
+    НИКОГДА НЕ ВЫГЛЯДИТ ПОЛНОЙ, БУДУЧИ УСЕЧЁННОЙ — хвост `+N` считается
+    ЗАРАНЕЕ и входит в потолок вместе со строкой (тот же приём, что в
+    `assembly_view.digest`). Строка, молча оборвавшаяся, хуже отсутствующей:
+    по ней принимают решение как по полной.
+
+    Пустая карта и НЕСОБРАВШАЯСЯ карта — разные факты, и второй сюда не
+    попадает вовсе: его несёт `element_map_error`, который сам является
+    скаляром верхнего уровня и переживает историю без нашей помощи.
+    """
+    if not mapping:
+        return "элементы: не названы"
+
+    head = "элементы: "
+    parts: list[str] = []
+    shown = 0
+    for op_id, value in mapping.items():
+        ids = [str(v) for v in value] if isinstance(value, (list, tuple)) \
+            else [str(value)]
+        piece = "%s=%s" % (op_id, ",".join(ids))
+        candidate = head + "; ".join(parts + [piece])
+        reserve = len(" +%d" % (len(mapping) - shown - 1))
+        if len(candidate) + reserve > limit:
+            break
+        parts.append(piece)
+        shown += 1
+
+    out = head + "; ".join(parts) if parts else head.strip()
+    hidden = len(mapping) - shown
+    if hidden > 0:
+        out += " +%d" % hidden
+    return out
+
+
+def lift_element_map(result: dict) -> dict:
+    """Положить плоскую форму карты рядом со словарём. Один владелец формы.
+
+    Зовётся ТАМ ЖЕ, где кладётся сама карта, чтобы тест мог позвать ровно то,
+    что зовёт прод. Пока подъём стоял бы строкой внутри тела, единственным
+    способом его проверить было бы переписать форму квитанции руками — то есть
+    сторожить фикстуру, а не путь (форма 27).
+    """
+    mapping = result.get("element_map")
+    if isinstance(mapping, Mapping) and mapping:
+        result.setdefault("element_map_note", element_map_note(mapping))
+    return result
+
+
+def lift_assembly_note(result: dict, block: Mapping[str, Any]) -> dict:
+    """ДАЙДЖЕСТ СБОРКИ — НА ВЕРХНИЙ УРОВЕНЬ КВИТАНЦИИ, ИНАЧЕ ОН НЕ ДОЖИВАЕТ.
+
+    `chat_helpers._summarize_tool_result` сохраняет ТОЛЬКО СКАЛЯРЫ ВЕРХНЕГО
+    УРОВНЯ, заменяя каждый словарь и список на «свёрнуто». Дайджест лежал
+    внутри `building`, то есть на уровень глубже — и исчезал ровно на том
+    сворачивании, ради выживания в котором написан (`assembly_view.digest`
+    отдаёт ПЛОСКУЮ строку именно поэтому, а не структуру).
+
+    Замер 15.08.2026 настоящим сворачивателем на двух настоящих формах:
+
+        {"building": {"assembly_note": …}}   ->  "<объект, 7 полей — свёрнуто>"
+        {"assembly_note": …}                 ->  строка целиком
+
+    Тест Ш2 держал ВТОРУЮ форму, которой прод не производит: он сторожил
+    фикстуру, а не путь, и был зелен при разомкнутой петле. Наш именной
+    дефект — величина заявлена в одном месте и прочитана в другом.
+
+    ПОЧЕМУ ОТДЕЛЬНОЙ ФУНКЦИЕЙ. Чтобы у формы квитанции был ОДИН владелец и
+    тест мог позвать ровно то, что зовёт прод. Пока подъём стоял строкой
+    внутри тела, единственным способом его проверить было переписать форму
+    руками — то есть снова сторожить фикстуру.
+
+    `assembly` (структура) НАМЕРЕННО остаётся только в `building`: её читает
+    модель в пределах хода, и копия наверху платилась бы каждым ходом. Наверх
+    едет ровно то, что обязано пережить историю.
+    """
+    note = block.get("assembly_note")
+    if isinstance(note, str) and note:
+        result.setdefault("assembly_note", note)
+    return result
+
+
 async def _stamp_building_verdict(result: Any, watch: tuple[Any, int]) -> Any:
     """ВЕРДИКТ О ЗДАНИИ — на КВИТАНЦИЮ, одним местом на все исходы.
 
@@ -1684,6 +1881,7 @@ async def _stamp_building_verdict(result: Any, watch: tuple[Any, int]) -> Any:
             functools.partial(_building.judge, key, since_seq=before))
         if block:
             result.setdefault("building", block)
+            lift_assembly_note(result, block)
     except Exception:  # noqa: BLE001 — вердикт не может ломать ход, где Revit
         logger.debug("KIR building verdict stamping failed", exc_info=True)
     return result
@@ -1746,7 +1944,203 @@ async def _stamp_building_clash(result: Any, watch: tuple[Any, int]) -> Any:
     return result
 
 
-async def _authored_input(args: Any) -> _AuthoredInput:
+async def _document_catalogue(llm_client: Any, bridge_callback: Any) -> Any:
+    """Каталог открытого документа ДЛЯ СКРИПТА — отдельным чтением, до эмиссии.
+
+    ПОЧЕМУ ОТДЕЛЬНЫМ, А НЕ ТЕМ ЖЕ. Снимок заземления берётся ПОСЛЕ того, как
+    программа собрана (`_snapshot_cs(program)` подставляет в тело имена
+    параметров, которые назвала программа), а скрипту каталог нужен ДО: он его
+    и пишет. Поэтому здесь читается ОБЩЕЕ тело `_SNAPSHOT_CS` — то же самое,
+    что уже проходит ворота, без сужения по программе.
+
+    ЦЕНА НАЗВАНА: один лишний круговой рейс к мосту, и только на ходах с
+    `program_py`. Обычный путь JSON не платит ничего — сюда он не заходит.
+
+    ОТКАЗ МОСТА НЕ СРЫВАЕТ ХОД. Каталог — удобство, а не условие: без него
+    скрипт получит имя `model`, которое НАЗОВЁТ причину, и сможет назвать типы
+    руками, как делал всегда. Отменять ход из-за неудачи вспомогательного
+    чтения значило бы сделать новую способность обязательной задним числом.
+
+    ВЛАСТЬ ОСТАЁТСЯ У ЗАЗЕМЛЕНИЯ. Этот каталог ни на что не влияет, кроме того,
+    что скрипт СМОГ прочитать: программу всё равно заземляет `ground` по
+    СВОЕМУ, свежему снимку, и он же отказывает, если допущение сломалось.
+    """
+    if llm_client is None or bridge_callback is None:
+        return None
+    try:
+        result = await _run_declarative(
+            llm_client, bridge_callback, _SNAPSHOT_CS,
+            "script_catalogue", _SNAPSHOT_TIMEOUT_MS)
+    except Exception:                       # noqa: BLE001 — см. «отказ не срывает»
+        return None
+    if _extract_error(result) is not None:
+        return None
+    payload = result.get("result", result) if isinstance(result, dict) else None
+    # «levels» — тот же признак настоящего снимка, по которому его узнаёт
+    # заземляющая ветка ниже; второго определения снимка здесь не заводится.
+    return payload if isinstance(payload, dict) and "levels" in payload else None
+
+
+#: Имя, ради которого платится рейс за каталогом. Одно; его тождество с
+#: пространством скрипта держит `test_catalogue_roundtrip_is_asked_for`, а не
+#: соглашение: переименуют в песочнице — ратчет покраснеет, и рейс не начнёт
+#: пропускаться молча.
+_CATALOGUE_NAME = "model"
+
+#: Имя, ради которого собирается индекс здания. Тот же приём и тот же ратчет,
+#: что у каталога, — и то же тождество с `sandbox.HOST_NAMES`.
+_BUILDING_NAME = "building"
+
+
+def _script_may_read_catalogue(source: str) -> bool:
+    """Может ли ЭТОТ скрипт вообще прочитать каталог документа.
+
+    ЗАЧЕМ. Рейс за каталогом стоит **3262 и 3675 мс** (замер 16.08.2026 по двум
+    записям `EXEC_PIPELINE_RECORD op=script_catalogue` в журнале прода) и
+    платился на КАЖДОМ ходе `program_py` — даже когда скрипт каталога не
+    касается. Разложение хода того же дня: модель 84.6 %, мост и Ревит 13.1 %,
+    наш питон 0.44 %. Значит лишний рейс к мосту — второй по величине кусок
+    хода после ожидания модели, и это чистая потеря, а не цена способности.
+
+    ПОЧЕМУ ПРОВЕРКА НАДЁЖНА, А НЕ УДОБНА. Каталог доезжает до скрипта РОВНО
+    одним способом — именем в пространстве имён (`sandbox.HOST_NAMES`). Достать
+    его иначе нечем: `globals` и `locals` скрипту ЗАПРЕЩЕНЫ как билтины, модули
+    не инжектируются, а `getattr` не за что зацепить. Скрипт, не назвавший
+    имени, каталог прочитать НЕ МОЖЕТ — значит рейс за ним не меняет ни одной
+    наблюдаемой величины, включая подпись каталога в квитанции.
+
+    ПОЧЕМУ ПОДСТРОКА, А НЕ РАЗБОР `ast`. Ошибка здесь допустима ровно в одну
+    сторону: лишний рейс — это сегодняшняя цена, пропущенный — потеря
+    способности у автора, который её попросил. Подстрока ошибается ТОЛЬКО в
+    сторону лишнего рейса: она совпадёт на комментарии, на строковом литерале и
+    на чужом имени вроде `my_model`. Разбор точнее, но падает на синтаксически
+    неверном исходнике — а такой сюда доходит (песочница разбирает его САМА и
+    отвечает `KIR-B001`), и решение пришлось бы принимать в обработчике
+    исключения, то есть там, где ошибиться легче всего.
+
+    ЧЕГО ЭТО НЕ МЕНЯЕТ. Власть остаётся у заземления: программу всё равно
+    заземляет `ground` по своему, свежему снимку, и он же отказывает
+    `KIR-G101`, если допущение сломалось. Пропущенный рейс не может сделать
+    постройку тихой — он может только не дать скрипту данных, которых тот не
+    спрашивал.
+    """
+    return _CATALOGUE_NAME in source
+
+
+def _script_may_read_building(source: str) -> bool:
+    """Может ли ЭТОТ скрипт вообще прочитать индекс здания.
+
+    Тот же приём и тот же довод, что у каталога (`_script_may_read_catalogue`):
+    индекс доезжает до скрипта РОВНО именем в пространстве имён, `globals` и
+    `locals` скрипту запрещены как билтины, — значит скрипт, не назвавший
+    имени, прочитать его НЕ МОЖЕТ, и сборка индекса не меняет ни одной
+    наблюдаемой величины. Подстрока, а не `ast`, по той же причине: ошибаться
+    можно только в сторону лишней работы, а разбор падал бы на синтаксически
+    неверном исходнике, который сюда доходит.
+
+    ЦЕНА ЗДЕСЬ ДРУГАЯ, И ЭТО НАДО ЗНАТЬ. Каталог стоил РЕЙС К МОСТУ (3262 и
+    3675 мс), индекс не стоит НИ ОДНОГО: имя документа берётся из контекста
+    хода, который плагин уже прислал сам, а элементы читаются с диска из
+    сохранённого разбора. Проверка всё равно нужна — чтение корпуса и разбор
+    L0 не бесплатны, — но экономится не рейс, а работа.
+    """
+    return _BUILDING_NAME in source
+
+
+def _building_index_for_turn(source: str) -> Optional[dict]:
+    """Индекс СУЩЕСТВУЮЩЕГО здания для скрипта — или названная причина отказа.
+
+    🔴 НИ ОДНОГО РЕЙСА К МОСТУ. Заголовок открытого документа приходит с
+    контекстным пушем плагина и лежит в реестре сокетов; разбор берётся с
+    диска. Живое перечитывание документа под индекс — отдельная работа с
+    отдельной ценой, и она здесь НЕ делается (см. `building_index.
+    index_from_run`, где эта граница названа).
+
+    ТРИ ИСХОДА, И НИ ОДИН НЕ МОЛЧИТ:
+
+    * индекс есть — приезжает вместе со свежестью источника;
+    * разбора нет — `refused` с причиной словами. Пустой индекс читался бы как
+      «в здании ничего нет», а это факт о НАШЕМ чтении, не о здании;
+    * разбор есть, но другого документа — отбрасывается внутри `resolve_run`
+      по РАСХОЖДЕНИЮ личности, и причина это называет.
+
+    СВЕЖЕСТЬ НЕ ДОКАЗЫВАЕТСЯ, И ЭТО ЗАМЕР, А НЕ ОСТОРОЖНОСТЬ. Общий ключ у
+    живого документа и разбора ровно один — заголовок; совпадение не доказывает
+    «тот же файл», расхождение доказывает «другой файл». Асимметрия и разрешение
+    источника взяты у `clash.existing.resolve_run` целиком: второй резолвер был
+    бы вторым местом, обязанным совпадать.
+
+    🔴 ВЛАСТЬ ОСТАЁТСЯ У ЗАЗЕМЛЕНИЯ. Индекс — данные для чтения, а не источник
+    истины для селекторов: программу всё равно заземляет `ground` по своему,
+    свежему снимку, и он же отказывает `KIR-G101`, если допущение сломалось.
+    Скрипт, ветвящийся на данных индекса, породит другую программу — и она
+    пройдёт тот же заземляющий контроль, что и любая другая.
+    """
+    if not _script_may_read_building(source):
+        return None
+    try:
+        from kukai.clash.existing import resolve_run
+        from kukai.ir.building_index import index_from_run
+
+        title = _turn_document_title()
+        if not title:
+            return {"refused": (
+                "заголовок открытого документа этому ходу неизвестен — плагин "
+                "ещё не прислал контекст. Это факт о НАШЕМ чтении, а не о "
+                "здании")}
+        run, why, freshness = resolve_run(title)
+        if run is None:
+            # ЧУЖОЙ ТЕКСТ НАЗЫВАЕТСЯ ЧУЖИМ, А НЕ ПОДРЕЗАЕТСЯ. Причина
+            # `resolve_run` написана для клеша и кончается словами «сравнивать
+            # со стоящим не с чем» — здесь это читалось бы не про то. Резать
+            # её по подстроке значило бы матчить ЯРЛЫК вместо предмета (та
+            # самая форма, на которой этот проект уже ловился), поэтому
+            # заимствование объявлено, а своё следствие сказано отдельно.
+            return {"refused": (
+                "индекс здания собрать не из чего. Резолвер источника (общий "
+                "с клешем) говорит: «%s». Для скрипта это значит одно: разбор "
+                "ЭТОГО документа не снимался, и поэлементно ответить нечем — "
+                "факт о НАШЕМ чтении, а не о здании"
+                % (why or ("разбор документа «%s» не разрешился" % title)))}
+        payload = index_from_run(str(run))
+        payload["source_run"] = run.name
+        payload["doc_title"] = title
+        if freshness is not None:
+            payload["freshness"] = freshness.to_dict()
+        return payload
+    except Exception as exc:  # noqa: BLE001 — сбор индекса НЕ ломает ход
+        # Отказ приезжает НАЗВАННЫМ и в те же три исхода: скрипт узнает, что
+        # смотреть было нечем, вместо пустого индекса, читаемого как «пусто».
+        return {"refused": "индекс здания не собрался (%s: %s)"
+                           % (type(exc).__name__, str(exc)[:200])}
+
+
+def _turn_document_title() -> str:
+    """Заголовок документа этого хода — БЕЗ рейса к мосту.
+
+    Плагин присылает контекст сам (`ws_registry._handle_context`), и заголовок
+    уже лежит в реестре. Спрашивать его у моста значило бы платить 3.5 с за
+    то, что нам уже сказали.
+    """
+    try:
+        from kukai.api.chat_ws import _session_contexts
+        from kukai.api.ws_registry import ws_ids_for_device
+
+        device = _turn_device_id()
+        if not device:
+            return ""
+        for ws_id in ws_ids_for_device(device):
+            name = str((_session_contexts.get(ws_id) or {}).get(
+                "document_name") or "")
+            if name:
+                return name
+        return ""
+    except Exception:  # noqa: BLE001 — отсутствие имени не ломает ход
+        return ""
+
+
+async def _authored_input(args: Any, llm_client: Any = None,
+                          bridge_callback: Any = None) -> _AuthoredInput:
     """ЕДИНСТВЕННОЕ место, где питон становится операциями.
 
     Возвращает либо готовый `{"program": {...}}` для тела инструмента, либо
@@ -1786,15 +2180,27 @@ async def _authored_input(args: Any) -> _AuthoredInput:
 
     # Отдельный поток: песочница синхронна (subprocess + стена), и держать на
     # ней цикл событий значило бы подвесить чужие ходы на чужом цикле.
+    #
+    # РЕЙС ТОЛЬКО ЗА ТЕМ, ЧТО СКРИПТ СПРОСИЛ — см. `_script_may_read_catalogue`.
+    catalogue = (await _document_catalogue(llm_client, bridge_callback)
+                 if _script_may_read_catalogue(source) else None)
+    # ИНДЕКС ЗДАНИЯ — тем же правилом «только за тем, что спросили», но без
+    # рейса вовсе: имя документа уже прислал плагин, элементы лежат на диске.
+    # До 16.08.2026 этот аргумент не передавался НИКЕМ, и `building.*` на
+    # живом ходе всегда отвечал «индекс не подан» — способность была построена
+    # и не соединена в тот же день, что и написана.
+    building = await asyncio.to_thread(_building_index_for_turn, source)
     result = await asyncio.to_thread(
-        execute_author_script, source, policy=_sandbox_policy())
+        execute_author_script, source, policy=_sandbox_policy(),
+        model=catalogue, building=building)
     receipt = _authorship_receipt(
         result, source_bytes=len(source.encode("utf-8", "surrogatepass")))
 
     if not result.ok:
         return _AuthoredInput(
             args=args, from_script=True, author_digest=result.author_digest,
-            env_digest=result.env_digest, receipt=receipt,
+            env_digest=result.env_digest, model_digest=result.model_digest,
+            receipt=receipt,
             refusal=_script_refusal_result(result.refusal, receipt))
 
     # Конверт, выставленный скриптом (`intent`/`defaults`/`allow_destructive`/
@@ -1804,7 +2210,7 @@ async def _authored_input(args: Any) -> _AuthoredInput:
     return _AuthoredInput(
         args={"program": program}, from_script=True,
         author_digest=result.author_digest, env_digest=result.env_digest,
-        receipt=receipt)
+        model_digest=result.model_digest, receipt=receipt)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2107,7 +2513,7 @@ async def handle_revit_ir(args: Any, llm_client, bridge_callback,
     в теле, там же обоснование. Абзац выше остаётся правдой дословно: ни одно
     поле не поднимает бюджет ПЕРЕЧИСЛЕНИЯ, потому что перечисление и есть то,
     что этот бюджет меряет."""
-    authored = await _authored_input(args)
+    authored = await _authored_input(args, llm_client, bridge_callback)
     if authored.refusal is not None:
         return _stamp_refusal(_stamp_authorship(authored.refusal, authored))
     # Отметка снимается ДО тела: врезка журнала стоит внутри него, и «вырос ли
@@ -2179,7 +2585,7 @@ async def handle_revit_ir_bulk(args: Any, llm_client, bridge_callback,
         # инструмента, а «внутренний вход только с админского устройства» —
         # утверждение, которое не должно зависеть от значения флага.
         return _typed_error("gate", admin_gate_message_ru("revit_ir (bulk)"))
-    authored = await _authored_input(args)
+    authored = await _authored_input(args, llm_client, bridge_callback)
     if authored.refusal is not None:
         return _stamp_refusal(_stamp_authorship(authored.refusal, authored))
     # Отметка снимается ДО тела — ровно тем же дозором, что у чат-двери:
@@ -2334,6 +2740,17 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                     try:
                         document_fingerprint = (
                             _snapshot_document_fingerprint(cand))
+                        # ДВЕРЬ К СТОЯЩЕМУ ЗДАНИЮ. Личность документа знаема
+                        # ровно здесь; проверка коллизий по ней находит разбор
+                        # ЭТОГО документа и сравнивает пачку с тем, что уже
+                        # стоит. Без этой строки способность есть, а двери к
+                        # ней нет — ровно так `sdk.py` пролежал пять недель.
+                        # `title` — то же `Document.Title`, что разбор пишет в
+                        # `passport.json::doc_name` (`extract.py:1014`).
+                        from kukai.ir import clash_bundle as _clash_bundle
+
+                        _clash_bundle.remember_turn_document(
+                            document_fingerprint.title)
                     except (TypeError, ValueError):
                         logger.debug(
                             "KIR ground snapshot has no bound document identity",
@@ -2445,11 +2862,22 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                 "stage": "planned",
                 "held_in_kir": True,
                 "ops": len(_held_ops or []),
+                # 🔴 СЛЕДУЮЩИЙ ХОД ОБЯЗАН НАЗЫВАТЬ ТО, ЧТО СУЩЕСТВУЕТ.
+                # Здесь стояло «кнопка «Отправить в Revit»», а на кнопке
+                # написано «⇣ перенести в Revit (N опов)»
+                # (`kukai_chat_v5.html`). Замер 16.08: владелец построил через
+                # чат-дверь, получил эту квитанцию и не смог понять, что делать
+                # — «я как человек вообще понять не могу почему и что не так».
+                # Отказ, называющий несуществующую кнопку, хуже отказа без
+                # совета: он посылает искать. Это наш именной класс в канале
+                # диагностики — величина, называющая следующий ход, не та, что
+                # существует, — и она сторожится
+                # `test_held_receipt_names_a_real_button`.
                 "message_ru": (
                     "Программа принята и показана в окне КИР. "
                     "В Revit НИЧЕГО НЕ ЗАПИСАНО и свидетеля нет — "
                     "исполнения не было. Перенос в Revit — отдельное действие: "
-                    "кнопка «Отправить в Revit» в окне КИР."),
+                    "кнопка «перенести в Revit» в окне КИР."),
                 "handoff": None,
             }
             return _with_outcome(held, program_not_started())
@@ -3106,17 +3534,12 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
         # durable terminal evidence record.  Keep the condition fail-closed:
         # a future write route that forgets to prepare a session cannot become
         # successful merely because ``acceptance_session`` stayed ``None``.
-        _accepted = (
-            not _violations
-            and (
-                family == "query"
-                or (
-                    acceptance_session is not None
-                    and
-                    _outcome.acceptance is AcceptanceState.ACCEPTED
-                    and _acceptance_journal_error is None
-                )
-            )
+        _accepted = green_is_earned(
+            violations=_violations,
+            family=family,
+            has_acceptance_session=acceptance_session is not None,
+            acceptance=_outcome.acceptance,
+            journal_error=_acceptance_journal_error,
         )
         _wf.record_witness(
             program=out.planned, family=family,
@@ -3177,6 +3600,38 @@ async def _handle_revit_ir_inner(args: Any, llm_client, bridge_callback,
                       "witness": _witness,
                       "result": exec_res,
                       "outcome": _outcome.to_dict()}
+        # МОСТ ДВУХ ПРОСТРАНСТВ АДРЕСА, ОТДАННЫЙ МОДЕЛИ ЯВНО.
+        #
+        # `_result_contract_diagnostic` выше уже НЕ ВЫПУСКАЕТ успешную пишущую
+        # программу, у которой хоть у одной операции нет типизированной
+        # идентичности (KIR-X008). То есть карта «id операции → элемент Ревита»
+        # существует на каждой такой квитанции ГАРАНТИРОВАННО — и до этой
+        # строки её не читал НИКТО из тех, кому она нужна: компаратор
+        # «заявленное против построенного» (`design_check.compare_geometry`)
+        # объявлял в своей докстроке, что для авторской программы соответствия
+        # нет, `assembly_view` вынужден возить `address_space`, а
+        # `materializer` не мог связать синтетический id с элементом.
+        #
+        # Форма — СПИСОК на любой арности, довод у `address.receipt_map`.
+        # Защитно: карта — удобство чтения, и сорваться на ней значило бы
+        # обрушить УЖЕ СОСТОЯВШУЮСЯ запись ради удобства.
+        # ОТСУТСТВИЕ КАРТЫ НАЗЫВАЕТСЯ, А НЕ МОЛЧИТ: пустая карта и несобранная
+        # карта — разные факты, и второй нельзя прочесть как «элементов нет».
+        if isinstance(_payload, Mapping) and out.planned is not None:
+            try:
+                from kukai.ir import address as _address
+                out_result["element_map"] = _address.receipt_map(
+                    out.planned.to_ops(), _payload, strict=False)
+                # ПЛОСКАЯ ФОРМА РЯДОМ СО СЛОВАРЁМ: словарь схлопывается при
+                # сворачивании истории на ЛЮБОМ уровне, строка выживает.
+                lift_element_map(out_result)
+            except Exception as _map_exc:  # noqa: BLE001 — карта не ломает запись
+                logger.debug("element_map failed", exc_info=True)
+                out_result["element_map_error"] = (
+                    "карта «операция → элемент» не собралась (%s): адреса "
+                    "построенных элементов в этой квитанции НЕ НАЗВАНЫ — это "
+                    "не значит, что элементов нет"
+                    % type(_map_exc).__name__)
         if out.grounded is not None:
             context = out.grounded.context
             out_result["ground_context"] = {

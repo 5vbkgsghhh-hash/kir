@@ -27,7 +27,7 @@ import pathlib
 import tempfile
 import unittest
 
-from kukai.ir import created_ledger
+from kukai.ir import created_ledger, witness_feed
 
 
 class TheLedgerReadsThePayloadAndNotTheProgram(unittest.TestCase):
@@ -156,20 +156,79 @@ class TheTwoPlacesThatDecideCreatedAgree(unittest.TestCase):
 
     Разойдись они — два места начнут отвечать на один вопрос по-разному, а
     это ровно наш класс: величина названа в одном месте, читается в другом,
-    и ничто не заставляет их совпасть. `CREATED_KEYS` объявлен НЕПОЛНЫМ по
-    признанию, поэтому пинится не полнота, а СОГЛАСИЕ.
+    и ничто не заставляет их совпасть. Оба места теперь спрашивают ОДИН
+    авторитет — реестр опов, — поэтому пинится и полнота, и согласие.
     """
 
     def test_witness_and_ledger_use_the_same_created_keys(self) -> None:
-        import inspect
+        """Оба места решают «создано ли» ОДНИМ авторитетом — реестром.
 
-        from kukai.ir import witness_feed
-        src = inspect.getsource(witness_feed)
-        self.assertIn('"id"', src)
-        for key in ("id",):
-            self.assertIn(
-                key, created_ledger.CREATED_KEYS,
-                f"свидетель считает {key!r} признаком созданного, реестр — нет")
+        🔴 ПРЕЖНЯЯ РЕДАКЦИЯ ЭТОГО ТЕСТА НЕ УМЕЛА ПОКРАСНЕТЬ (снято 15.08.2026).
+        Она проверяла `'"id"' in inspect.getsource(witness_feed)` — строка
+        `"id"` встречается в семисотстрочном модуле заведомо — и затем
+        перебирала кортеж из ОДНОГО элемента, проверяя `"id" in CREATED_KEYS`,
+        то есть константу. Тест стоял зелёным ровно тогда, когда два места
+        разошлись на `segment_ids`: четыре созидающих опа реестр терял, а
+        свидетель метил `other`. Сторож, который не умеет сказать «нет», хуже
+        отсутствующего: он создаёт уверенность и не даёт защиты.
+
+        Здесь сверяется ПОВЕДЕНИЕ на строке результата, а не наличие подстроки
+        в исходнике.
+
+        🔴 И ВТОРАЯ РЕДАКЦИЯ ТОЖЕ БЫЛА ВАКУУМНОЙ — поймано мутацией, а не
+        рассуждением. Она перебирала `created_identity_fields()`, то есть
+        СПРАШИВАЛА ТУ САМУЮ ВЕЛИЧИНУ, КОТОРУЮ ПРОВЕРЯЕТ: подмени эту функцию
+        старым рукописным кортежем — и тест зелен, потому что честно сверяет
+        подменённое с подменённым. Авторитет теста обязан быть НЕЗАВИСИМ от
+        предмета, поэтому ожидание берётся у `spec.OPS` напрямую.
+        """
+
+        from kukai.ir.registry_base import EffectKind
+        from kukai.ir import spec
+
+        expected = {op.result.identity_field for op in spec.OPS.values()
+                    if op.effect is EffectKind.CREATE and op.result.identity_field}
+        self.assertTrue(expected, "реестр не дал ни одного созидающего поля")
+        self.assertEqual(
+            set(created_ledger.created_keys()), expected,
+            "ключи реестра следов разошлись с реестром ОПЕРАЦИЙ")
+
+        for field in sorted(expected):
+            value = 4242 if field == "id" else [4242]
+            self.assertTrue(
+                created_ledger.extract_created({"o1": {field: value}}),
+                f"реестр следов не считает {field!r} созданным, а реестр опов — да")
+            self.assertEqual(
+                witness_feed.outcome_label({field: value}), "created",
+                f"свидетель не считает {field!r} созданным, а реестр опов — да")
+
+    def test_the_agreement_check_can_actually_fail(self) -> None:
+        """КОНТРОЛЬ-FAIL сверки, и он проверен МУТАЦИЕЙ, а не надеждой.
+
+        Поле, которого реестр не знает, не «создано» — раз. И два: вернув
+        рукописный кортёж, каким он был до 15.08, сверка обязана ПОКРАСНЕТЬ.
+        Без второй половины первая доказывает только, что мусор не проходит.
+        """
+
+        self.assertFalse(created_ledger.extract_created({"o1": {"нет_такого": 7}}))
+        self.assertEqual(witness_feed.outcome_label({"нет_такого": 7}), "other")
+
+        from kukai.ir import address
+        real = address.created_identity_fields
+        address.created_identity_fields = lambda: ("id", "ids", "created_ids")
+        try:
+            with self.assertRaises(AssertionError):
+                self.test_witness_and_ledger_use_the_same_created_keys()
+        finally:
+            address.created_identity_fields = real
+
+    def test_moved_is_not_created_and_that_is_a_decision(self) -> None:
+        """`moved_ids` исключён НАЗВАННО, а не молча выпал из кортежа."""
+
+        self.assertIn("moved_ids", created_ledger.not_created_keys())
+        self.assertNotIn("moved_ids", created_ledger.created_keys())
+        self.assertFalse(created_ledger.extract_created({"m1": {"moved_ids": [1]}}))
+        self.assertEqual(witness_feed.outcome_label({"moved_ids": [1]}), "other")
 
     def test_the_ledger_is_wired_into_the_write_path(self) -> None:
         """Модуль, приехавший неподключённым, — наш преобладающий дефект.

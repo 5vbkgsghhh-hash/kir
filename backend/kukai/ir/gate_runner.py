@@ -34,8 +34,32 @@ os.environ.setdefault("KIR_REJECTIONS_PATH",
                       os.path.join(tempfile.gettempdir(), "kir_gate_queue.jsonl"))
 
 from kukai.compile_client import CompileClient                     # noqa: E402
-from kukai.llm.revit_execution_pipeline import wrap_user_code      # noqa: E402
+# 🔴 ПОЛУМЕРА, И ОНА НАЗВАНА (15.08.2026). Здесь стоял ВЕРХНЕУРОВНЕВЫЙ импорт
+# продукта, из-за которого `kukai/ir/` — пакет, публикуемый отдельным
+# репозиторием, — не импортировался без `kukai/llm`. Импорт стал отложенным:
+# пакет теперь импортируется чисто, а продукт нужен только чтобы ворота
+# ЗАПУСТИТЬ.
+#
+# ПОЧЕМУ НЕ ПЕРЕЕЗД, КОТОРЫЙ БЫЛ БЫ ЧЕСТНЕЕ. По предмету `wrap_user_code`
+# компиляторная: она про эмитированный C#. Но её литералы
+# (`WRAPPER_HEADER`/`WRAPPER_FOOTER`) пришпилены AST-СТОРОЖЕМ ДРИФТА, который
+# держит ТРИ копии обёртки попарно синхронными (`chat_ws` legacy,
+# `kukai/modeling/tests/bridge/test_exec_wrapper_sync.py`,
+# `tests/test_revit_execution_pipeline.py`) и разбирает ИСХОДНИК того модуля.
+# Переезд владельца без перенаправления этой схемы либо ломает сторожа, либо
+# МОЛЧА его ослабляет — а три копии одной величины и есть именной дефект
+# дерева. Это волна, а не строка, и до неё импорт остаётся отложенным.
+def _wrap_user_code(code: str) -> str:
+    from kukai.llm.revit_execution_pipeline import wrap_user_code
+    return wrap_user_code(code)
+
+
+wrap_user_code = _wrap_user_code
 from kukai.ir import spec                                          # noqa: E402
+# ВЕРСИЯ РЕВИТА ИМЕЕТ ОДИН ИСТОЧНИК. Литерал `"2023"` в умолчании параметра
+# был СЕДЬМЫМ местом, выводящим версию, и его поймал закрытый реестр
+# `tests/test_revit_version_has_one_source.py` — ровно за тем он и заведён.
+from kukai.ir import revit_version as _rv                          # noqa: E402
 from kukai.ir.compiler import compile_program                      # noqa: E402
 from kukai.ir.op_contract import audit_contract_kernel             # noqa: E402
 from kukai.ir.tests.test_golden import PROGRAMS                    # noqa: E402
@@ -52,8 +76,174 @@ SEED = 62026
 #: блок `main()`. Круговая сверка разворота фикстурой заземляться НЕ ВПРАВЕ:
 #: там вопрос «воспроизводит ли разворот ЭТО здание», и бедность модели дала
 #: бы расхождения от себя самой (решение директора 12.08 — снимок того
-#: прогона, `open_model.profile.json`, есть в 70 прогонах из 77).
+#: прогона, `open_model.profile.json`, есть в 73 прогонах из 80 — перемерено
+#: 15.08.2026; прежняя запись «70 из 77» устарела вместе с корпусом).
 GROUND_SNAPSHOT_ORIGIN = "kukai.ir.tests.fixtures.GROUND_SNAPSHOT"
+
+# ═════════════════════════════════════════════════════════════════════════
+# ВТОРАЯ ПОЛОСА: ЗАЗЕМЛЕНИЕ НАСТОЯЩИМ ДОКУМЕНТОМ
+#
+# Первая полоса отвечает «собирается ли C# на шести версиях» и заземляется
+# ФИКСТУРОЙ. Вторая отвечает на ДРУГОЙ вопрос: «а заземляется ли эта программа
+# документом, который кто-то действительно спроектировал». Ответы независимы, и
+# складывать их нельзя: программа может собираться на всех шести и не иметь ни
+# одного настоящего документа, которым её можно заземлить.
+#
+# МОСТА И ЖИВОГО РЕВИТА НЕ ТРЕБУЕТСЯ: каждый сохранённый разбор несёт
+# `open_model.profile.json`, а `OpenModelProfile.to_ground_snapshot()` (модуль
+# `open_model`) уже умеет превратить его в снимок той же формы, что фикстура.
+# Здесь не пишется ни одного нового конвертера — спрашивается существующий.
+#
+# 🔴 ЧИСЛО, КОТОРОЕ ЛЕГКО ПРОЧЕСТЬ НЕВЕРНО. `required_pools` в профиле — это
+# КОНСТАНТНЫЙ список из 36 имён, который штампуется в каждый профиль. «Объединение
+# по корпусу = 36 = required» поэтому истинно и ПУСТО: оно говорит о списке, а не
+# о содержимом. Замер 15.08.2026 по 73 профилям прода: пулов с НЕПУСТЫМИ
+# записями — 28 из 36, а восемь не наполняются НИ В ОДНОМ разборе
+# (`area_load_types`, `area_reinforcement_types`, `foundation_symbols`,
+# `line_load_types`, `point_load_types`, `rebar_bar_types`, `rebar_hook_types`,
+# `truss_types`). Отбор ниже спрашивает ЗАПИСИ, а не имена.
+
+#: Корень сохранённых разборов. Тот же адрес, что читают `serving` и
+#: `course.corpus` — одно имя переменной на весь проект.
+REAL_PROFILE_ROOT = os.environ.get(
+    "KUKAI_DECOMPILE_DATA",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "backend", "data", "decompile"))
+
+#: Как достать корпус, если его нет в этом дереве. Стоит РЯДОМ с отказом, а не
+#: в чьей-то памяти: «сторож без прибора обязан отказывать в категории, которую
+#: нельзя спутать с „находок нет“».
+#:
+#: 🔴 АДРЕС УСТАНОВКИ СЮДА НЕ ПИШЕТСЯ. Этот файл уезжает в опенсорс, и
+#: абсолютный путь развёртывания в исполняемом коде — утечка, а не подсказка
+#: (`tests/test_authority_boundaries.py` держит это запретом, и он поймал
+#: первую редакцию строки). Подсказка называет ПЕРЕМЕННУЮ и форму адреса;
+#: конкретный адрес принадлежит установке и живёт в её окружении.
+REAL_PROFILE_FETCH_HINT = (
+    "профилей не найдено. Корпус машинно-локален и в чекаут не входит; "
+    "укажите его адрес переменной KUKAI_DECOMPILE_DATA — она ждёт каталог, в "
+    "котором лежат подкаталоги разборов с файлом open_model.profile.json")
+
+
+def pools_required_by(program: dict) -> frozenset[str]:
+    """Пулы, которых программа требует ПОСЛЕ раскрытия макросов.
+
+    Спрашивается РЕЕСТР (`OpSpec.grounded`), а не имена операций: пул с
+    подстановкой `{category}` разрешается значением самой операции, потому что
+    у колонны архитектурный и конструктивный пулы РАЗНЫЕ, и выбрать один
+    значило бы заземлить половину программ не тем каталогом.
+
+    Раскрытие макросов обязательно по той же причине, по которой оно
+    обязательно у `_needs_snapshot`: стек прячет трубы, а требование пула
+    несёт именно спрятанная операция.
+    """
+    from kukai.ir import macros as _macros
+
+    ops = program.get("ops", [])
+    try:
+        ops = _macros.expand(ops)
+    except Exception:          # noqa: BLE001 — компилятор откажет и назовёт причину
+        pass
+    need: set[str] = set()
+    for op in ops if isinstance(ops, list) else []:
+        if not isinstance(op, dict):
+            continue
+        ospec = spec.OPS.get(op.get("op"))
+        if ospec is None:
+            continue
+        for _param, pool, _required in ospec.grounded:
+            if "{category}" in pool:
+                pool = pool.format(
+                    category=op.get("category") or "structural")
+            need.add(pool)
+    return frozenset(need)
+
+
+def load_real_profiles(root: str = "") -> list[tuple[str, dict, frozenset[str]]]:
+    """`(имя прогона, снимок, множество НЕПУСТЫХ пулов)`, по имени прогона.
+
+    Порядок детерминирован именем: ворота обязаны отвечать одинаково на двух
+    прогонах подряд, а порядок каталога таковым не является.
+
+    Пул с пустыми `entries` в множество НЕ ВХОДИТ: он объявлен и ничего не
+    предлагает, а заземление по имени в пустом каталоге — отказ. Считать такой
+    пул «имеющимся» значило бы получить зелёное там, где выбирать не из чего.
+    """
+    import glob as _glob
+    import json as _json
+
+    from kukai.ir.open_model import OpenModelProfile
+
+    root = root or REAL_PROFILE_ROOT
+    found: list[tuple[str, dict, frozenset[str]]] = []
+    pattern = os.path.join(root, "*", "open_model.profile.json")
+    for path in sorted(_glob.glob(pattern)):
+        run = os.path.basename(os.path.dirname(path))
+        try:
+            with open(path, encoding="utf-8") as fh:
+                profile = OpenModelProfile.from_dict(_json.load(fh))
+            snapshot = profile.to_ground_snapshot()
+        except Exception:      # noqa: BLE001 — битый профиль не роняет ворота
+            continue
+        filled = frozenset(
+            name for name, rows in snapshot.items()
+            if isinstance(rows, list) and rows)
+        found.append((run, snapshot, filled))
+    return found
+
+
+def ground_on_real_document(
+        program: dict,
+        profiles: list[tuple[str, dict, frozenset[str]]],
+        *, revit_version: str = _rv.DEFAULT_VERSION
+        ) -> tuple[str, dict] | str:
+    """Первый настоящий документ, которым программа ЗАЗЕМЛЯЕТСЯ, или причина.
+
+    Возвращает `(имя прогона, снимок)` либо строку-причину — три исхода, а не
+    два, и это ровно то различие, ради которого функция существует:
+
+    * `нет профиля с пулами …` — ни один разбор корпуса не несёт нужных
+      каталогов. Это факт о КОРПУСЕ;
+    * `KIR-G101 …` / любой код отказа — каталоги есть, но программа названа
+      словарём, которого в этих зданиях нет. Это факт о ПРОГРАММЕ;
+    * успех — программа заземлена настоящим зданием.
+
+    ПОЧЕМУ ПЕРЕБОР, А НЕ «ПЕРВЫЙ ПОДХОДЯЩИЙ». Первая редакция брала первый
+    профиль, чьи пулы непусты, и получила 10 заземлённых из 69 при 29 отказах
+    `KIR-G101` — все на одном и том же здании, оказавшемся первым по алфавиту.
+    Пулы у него были, а ИМЕНА ТИПОВ — свои. «Заземляется ли программа настоящим
+    документом» есть вопрос про СУЩЕСТВОВАНИЕ такого документа, поэтому
+    перебираются все кандидаты. Выбор без перебора — выбор без акта
+    различения.
+    """
+    need = pools_required_by(program)
+    if not need:
+        # 🔴 ФОРМА 18, ПОЙМАННАЯ ОБРАТНЫМ КОНТРОЛЕМ НА СЕБЕ САМОМ. Программа,
+        # которой не нужен НИ ОДИН пул, «заземляется» любым профилем, включая
+        # заведомо пустой: `need <= filled` истинно для пустого множества
+        # всегда. Первая редакция считала такие успехом и раздувала число —
+        # зелёное, полученное без акта различения. Заземлять здесь нечего, и
+        # это ТРЕТИЙ исход, а не разновидность успеха.
+        return "заземлять нечего: программа не требует ни одного пула"
+    candidates = [(run, snap) for run, snap, filled in profiles
+                  if need <= filled]
+    if not candidates:
+        missing = sorted(need - frozenset().union(
+            *[filled for _r, _s, filled in profiles]) if profiles else need)
+        return ("нет профиля с пулами: "
+                + ", ".join(missing or sorted(need)))
+    last = "?"
+    for run, snapshot in candidates:
+        try:
+            out = compile_program(program, revit_version=revit_version,
+                                  snapshot=snapshot, bulk=True)
+        except Exception as exc:            # noqa: BLE001
+            last = type(exc).__name__
+            continue
+        if out.ok:
+            return run, snapshot
+        last = out.diagnostics[0].code if out.diagnostics else "?"
+    return f"{last}, перебрано профилей: {len(candidates)}"
 
 SIZED_CABLE_TRAY_GATE_NAME = "auth_cable_tray_sized"
 SIZED_CABLE_TRAY_GATE_MARKERS = (
@@ -484,6 +674,23 @@ async def main() -> int:
                                        "origin": [5000.0, 0.0],
                                        "size_mm": [2400.0, 1200.0]}},
                  "elevation_mm": 1500.0}]}
+    # ВТОРОЙ МАРШ (15.08.2026). ДВЕ программы, и вторая не для симметрии:
+    # привязка марша — ЗАКРЫТОЕ перечисление Revit, а ветка, которой ворота не
+    # строят, ими не проверена вовсе. `center` — умолчание, `left` — доказывает,
+    # что имя члена доезжает до C# не литералом умолчания.
+    programs["auth_stairs_run"] = {"ir_version": "1.0",
+        "intent": "второй марш существующей лестницы",
+        "ops": [{"op": "create_stairs_run", "id": "RN1",
+                 "stairs": {"by": "element_id", "value": 4242},
+                 "p0_mm": [0.0, 0.0], "p1_mm": [3000.0, 0.0],
+                 "base_elevation_mm": 1500.0}]}
+    programs["auth_stairs_run_left"] = {"ir_version": "1.0",
+        "intent": "марш с левой привязкой",
+        "ops": [{"op": "create_stairs_run", "id": "RN1",
+                 "stairs": {"by": "element_id", "value": 4242},
+                 "p0_mm": [0.0, 0.0], "p1_mm": [3000.0, 0.0],
+                 "base_elevation_mm": 1500.0,
+                 "justification": "left"}]}
     programs["auth_stairs_landing_arc"] = {"ir_version": "1.0",
         "intent": "площадка со скруглённой гранью",
         "ops": [{"op": "create_stairs_landing", "id": "LG1",
@@ -1154,6 +1361,16 @@ async def main() -> int:
     # не оставить в чьей-то памяти.
     program_compilations = 0
     fixture_grounded = 0
+    # ВТОРАЯ ПОЛОСА. Корпус читается ОДИН раз: 73 профиля стоят ~1 с, а внутри
+    # цикла это стало бы стоимостью, растущей с числом программ, — форма 10.
+    real_profiles = load_real_profiles()
+    real_grounded = 0
+    real_remainder: list[tuple[str, str]] = []
+    # ЕДИНИЦА ЗНАМЕНАТЕЛЯ. `fixture_grounded` считает КОМПИЛЯЦИИ (пишущая
+    # программа входит дважды: atomic и per_op), а вторая полоса считает
+    # ПРОГРАММЫ. Делить одно на другое значит сложить разные единицы — именной
+    # дефект этого дерева. Поэтому у второй полосы свой счётчик программ.
+    snapshot_programs = 0
     for name, prog in programs.items():
         needs_snapshot = _needs_snapshot(prog)
         snapshot = GROUND_SNAPSHOT if needs_snapshot else None
@@ -1162,6 +1379,20 @@ async def main() -> int:
             fixture_grounded += 1
         atomic_row = await _gate_row(name, prog, snapshot, "atomic")
         print(f"{name:24s} {' '.join(atomic_row)}")
+        # Настоящий документ — ОТДЕЛЬНЫЙ вопрос, и его «OK» не заменяет
+        # фикстурное: программа может собираться на всех шести и не иметь ни
+        # одного здания, которым её можно заземлить. Считаем и то и другое.
+        if needs_snapshot and real_profiles:
+            snapshot_programs += 1
+            real = ground_on_real_document(prog, real_profiles)
+            if isinstance(real, tuple):
+                real_run, real_snapshot = real
+                real_grounded += 1
+                real_row = await _gate_row(
+                    name, prog, real_snapshot, "atomic")
+                print(f"{name + '@' + real_run:24.24s} {' '.join(real_row)}")
+            else:
+                real_remainder.append((name, real))
         # per_op is only a DIFFERENT emission for write-family programs (the
         # query/read path ignores isolation entirely — compiling it twice
         # would be redundant, not honest new coverage). `_needs_snapshot`
@@ -1574,6 +1805,26 @@ async def main() -> int:
           f"компиляций программ идут против ФИКСТУРЫ "
           f"{GROUND_SNAPSHOT_ORIGIN} — не против настоящего документа. "
           f"Их «OK» есть утверждение о фикстуре")
+    # ВТОРАЯ ПОЛОСА — РЯДОМ со строкой выше, а не вместо неё: это ответы на
+    # РАЗНЫЕ вопросы, и замена одного другим потеряла бы оба.
+    if not real_profiles:
+        # Отказ, а не ноль. Ноль здесь читался бы как «настоящих документов
+        # программы не выдерживают», тогда как правда — «мы не смотрели».
+        print(f"      настоящий документ: ОТКАЗ ПРИБОРА — "
+              f"{REAL_PROFILE_FETCH_HINT}")
+    else:
+        print(f"      настоящий документ: {real_grounded} из "
+              f"{snapshot_programs} ПРОГРАММ, требующих снимка, заземлены "
+              f"РАЗБОРОМ настоящего здания ({len(real_profiles)} профилей "
+              f"корпуса) и собраны на шести версиях с ним. Знаменатель здесь "
+              f"— программы, а не компиляции: строкой выше их "
+              f"{fixture_grounded}, потому что пишущая входит дважды "
+              f"(atomic и per_op)")
+        # ЗАКРЫТЫЙ, НО НЕ ПОЛНЫЙ: пусто здесь значило бы «мы не знаем», а не
+        # «остатка нет». Полнота недостижима — список ограничен корпусом,
+        # который на этой машине может быть любым.
+        for pname, why in real_remainder:
+            print(f"        · {pname:32.32s} {why}")
     print(f"{'PASS' if failures == 0 else 'FAIL'}: "
           f"{len(programs)} programs (atomic) "
           f"+ {write_program_count} write programs (per_op), "

@@ -28,7 +28,7 @@ os.environ.setdefault(
     "KIR_REJECTIONS_PATH",
     os.path.join(tempfile.gettempdir(), "kir_relate_queue.jsonl"))
 
-from kukai.ir import contour, relate                       # noqa: E402
+from kukai.ir import contour, macros, relate               # noqa: E402
 from kukai.ir.compiler import compile_program              # noqa: E402
 from kukai.ir.tests.fixtures import GROUND_SNAPSHOT        # noqa: E402
 
@@ -1151,22 +1151,65 @@ class ElementAddressRefusesLoudly(unittest.TestCase):
         self.assertIn("['start', 'end', 'center']",
                       " ".join(d.message_ru for d in out.diagnostics))
 
-    def test_inside_a_stack_the_reference_is_refused_not_silently_wrong(self):
-        """`stack` переименовывает опы по этажам и НЕ переписывает ссылки —
-        как и у любого `by=ref` сегодня. Проверяется, что это ГРОМКО."""
-        program = {"ir_version": "1.0", "ops": [{
-            "op": "stack", "id": "s", "levels": 2, "h_mm": 3000,
-            "floor": [
-                {"op": "create_column", "id": "c", "xy": [0, 0],
-                 "symbol": {"by": "name", "value": "К 300x300"}},
-                {"op": "create_beam", "id": "b",
-                 "p0_mm": {"at_element": {"by": "ref", "value": "c"},
-                           "point": "center", "z_mm": 3000},
-                 "p1_mm": [4000, 0, 3000],
-                 "symbol": {"by": "name", "value": "Балка 200x400"}}]}]}
-        out = compile_program(program, "2026", snapshot=_SNAPSHOT)
-        self.assertFalse(out.ok)
-        self.assertIn("KIR-L003", self._codes(out))
+    def test_inside_a_stack_the_reference_resolves_PER_STOREY(self):
+        """🔴 ИСКОПАЕМОЕ ПЕРЕПИСАНО 15.08.2026 — СМЕНИЛСЯ ПРЕДМЕТ, НЕ ПОРОГ.
+
+        Тест утверждал: «`stack` переименовывает опы по этажам и НЕ переписывает
+        ссылки — проверяется, что это ГРОМКО», и ждал `KIR-L003`. Волна типового
+        этажа (`0efcb2b0`) научила экспансию ПЕРЕПИСЫВАТЬ ссылки, и утверждение
+        перестало быть правдой о коде: программа ниже теперь законна.
+
+        Форма 9 канона в чистом виде — прозу никто не мутирует, поэтому тест
+        пережил смену поведения и покраснел лишь на полном прогоне. Удалять его
+        было нельзя: у него есть ВЫЖИВШИЙ предмет, и он проверяется здесь —
+        ссылка внутри набора обязана резолвиться ПОЭТАЖНО, а не на первый этаж.
+
+        Проверяется РАЗРЕШЕНИЕ ССЫЛКИ, а не то, что программа собралась: «оно
+        скомпилировалось» не отличает верный этаж от первого.
+        """
+        floor = [
+            {"op": "create_column", "id": "c", "xy": [0, 0],
+             "symbol": {"by": "name", "value": "К 300x300"}},
+            {"op": "create_beam", "id": "b",
+             "p0_mm": {"at_element": {"by": "ref", "value": "c"},
+                       "point": "center", "z_mm": 3000},
+             "p1_mm": [4000, 0, 3000],
+             "symbol": {"by": "name", "value": "Балка 200x400"}},
+        ]
+        ops = macros._expand_stack(
+            {"op": "stack", "id": "s", "levels": 2, "h_mm": 3000,
+             "floor": floor})
+
+        beams = [o for o in ops if o["op"] == "create_beam"]
+        self.assertEqual(len(beams), 2, "экспансия не дала по балке на этаж — "
+                                        "контроль вырожден, сравнивать нечего")
+        for beam in beams:
+            with self.subTest(beam=beam["id"]):
+                ref = beam["p0_mm"]["at_element"]["value"]
+                storey = beam["id"].rsplit("_", 1)[0]      # 's_L2_b' -> 's_L2'
+                self.assertEqual(
+                    ref, f"{storey}_c",
+                    "балка адресует колонну ЧУЖОГО этажа — ровно тот молчаливо "
+                    "неверный исход, ради запрета которого ссылки переписываются")
+
+    def test_a_reference_OUT_of_the_stack_is_still_refused_loudly(self):
+        """Вторая половина, без которой первая ничего не стоит.
+
+        Переписать можно только ссылку на ЧЛЕНА набора. Ссылка наружу
+        переписываться не может по построению, и она обязана оставаться
+        ГРОМКИМ отказом — иначе хостящийся оп на каждом этаже повис бы на одном
+        и том же чужом элементе, и это была бы тихая неправда.
+        """
+        with self.assertRaises(Exception) as caught:
+            macros._expand_stack(
+                {"op": "stack", "id": "s", "levels": 2, "h_mm": 3000,
+                 "floor": [{"op": "create_door", "id": "d",
+                            "host": {"by": "ref", "value": "outsider"},
+                            "offset_mm": 1000}]})
+        text = str(caught.exception)
+        self.assertIn("KIR-M001", text)
+        self.assertIn("outsider", text,
+                      "отказ обязан НАЗВАТЬ хозяина, которого не нашёл")
 
 
     def test_a_contour_corner_says_why_the_element_address_is_not_taken(self):

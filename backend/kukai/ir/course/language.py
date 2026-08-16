@@ -75,6 +75,15 @@ _WARM_BY_NAME: dict[str, tuple[str, ...]] = {
     # KIR-B004 «импорт kukai.ir.decompile запрещён» — то есть исправная
     # справка выглядела бы виной скрипта модели.
     "spec": ("kukai.ir.acceptance", "kukai.ir.decompile.extract"),
+    # ЕДИНИЦА ЗАМЫСЛА С ПРЕДИКАТОМ (15.08). `unit(reads_as=…)` спрашивает
+    # реестр прочтений у `assembly_view` ленивым импортом — и БЕЗ этой строки
+    # он отказывал KIR-B004 «импорт kukai.ir.assembly_view запрещён» на живом
+    # прогоне, с `blame: author`, то есть предикат обвинял автора за импорт,
+    # которого автор не писал. ТРЕТЬЕ вхождение того же дефекта в этой самой
+    # таблице: строка выше записывает его же со `spec()`. Ратчет заведён
+    # затем, чтобы четвёртого не было
+    # (`tests/test_sandbox_warm_covers_lazy_imports.py`).
+    "reads_as": ("kukai.ir.assembly_view",),
 }
 
 

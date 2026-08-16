@@ -15,12 +15,13 @@ SPEC 12.9), kind escape value -> typed Diagnostic list, never an exception.
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import logging
 import re
 import uuid
 from dataclasses import dataclass, field, replace
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from kukai.ir import faceref, relate, spec
 from kukai.ir.contracts import ElementIdentityProof
@@ -51,18 +52,32 @@ from kukai.ir.op_contract import OpContractError, contract_for
 
 logger = logging.getLogger(__name__)
 
-MAX_OPS_PER_PROGRAM = 20    # user-authored (pre-macro-expansion) op budget
+MAX_OPS_PER_PROGRAM = 100   # user-authored (pre-macro-expansion) op budget
 MAX_BULK_OPS = 300          # internal bulk (decompile/rebuild) pre-macro budget
 MAX_VALIDATED_OPS = 320     # post-expansion ceiling (macros.MAX_EXPANDED_OPS + margin)
 
 # ДВА БЮДЖЕТА — И ОТКАЗ ОБЯЗАН НАЗЫВАТЬ, КАКОЙ ИЗ НИХ ИСЧЕРПАН.
 #
 # Их два не по недосмотру, а по разной природе входа:
-#   * АВТОРСКИЙ (MAX_OPS_PER_PROGRAM=20) меряет программу, НАПИСАННУЮ моделью.
-#     Он мал намеренно: 210 из 586 живых отказов 30.07 — именно он, и это
-#     работающий сигнал «выбрана не та форма» (повтор — в макрос, этапы — в
-#     разные программы). Модель, которой разрешили писать по 300 операций, —
-#     другой продукт с другими рисками.
+#   * АВТОРСКИЙ (MAX_OPS_PER_PROGRAM=100) меряет программу, НАПИСАННУЮ
+#     моделью.
+#
+#     🔴 ПОДНЯТ С 20 ДО 100 РЕШЕНИЕМ ВЛАДЕЛЬЦА 15.08.2026. Прежнее значение
+#     стояло не по недосмотру, и довод против подъёма записан здесь же: 210 из
+#     586 живых отказов 30.07 — именно этот бюджет, и он работал сигналом
+#     «выбрана не та форма» (повтор — в макрос, этапы — в разные программы).
+#     Довод НЕ отозван и остаётся верным; владелец принял его и решил иначе,
+#     потому что цель продукта — авторство здания, а не защита от многословия.
+#
+#     ЧТО ПОДЪЁМ НЕ МЕНЯЕТ, и это важнее самого числа:
+#       * послемакросный потолок `MAX_VALIDATED_OPS` (320) не тронут — это
+#         предел эмиттера, а не политика, и 100 < 320 с запасом;
+#       * ФОРМА `program_py` бюджета перечисления не поднимала и не поднимает:
+#         скрипт, породивший больше `MAX_OPS_PER_PROGRAM` операций, отказывает
+#         тем же типизированным отказом (`test_program_py_door`);
+#       * «попросить bulk» из чата по-прежнему нельзя ПО ПОСТРОЕНИЮ:
+#         у `handle_revit_ir` нет параметра бюджета (`test_op_budget_seam`).
+#     То есть поднят ровно один порог, и ровно на публичной двери.
 #   * ВНУТРЕННИЙ (MAX_BULK_OPS=300) меряет ЧАНК МАТЕРИАЛИЗАТОРА, который никто
 #     не писал руками: он собран из разбора живой модели, где 6 343 элемента
 #     это норма, а не замысел автора.
@@ -171,6 +186,12 @@ class CompileOutput:
     # только для `atomic`-строк, а какие из них `atomic` — неизвестно.
     txn_isolation: str = "atomic"
 
+    #: ТАБЛИЦА ЕДИНИЦ ЗАМЫСЛА из конверта программы, как её написал автор
+    #: (`course.unit()`). Компилятор её НЕ ИНТЕРПРЕТИРУЕТ: она не меняет ни
+    #: эмиссии, ни плана, ни заземления — она только доезжает до квитанции,
+    #: чтобы наблюдение об арности N могло назвать замысел, а не список опов.
+    units: list = field(default_factory=list)
+
     def as_dict(self) -> dict:
         d = {"ok": self.ok, "csharp": self.csharp,
              "diagnostics": [x.as_dict() for x in self.diagnostics]}
@@ -188,6 +209,15 @@ class CompileOutput:
             d["handoff"] = self.handoff
         if self.grounding_report:
             d["grounding_report"] = self.grounding_report
+        if self.units:
+            # 🔴 ЗДЕСЬ ОБРЫВАЛСЯ ЗАМЫСЕЛ. Провенанс операции доезжает до
+            # `PlannedOp.to_evidence_dict` и подписывается `plan_digest`, но
+            # `to_dict`/`to_ops` его СРЕЗАЮТ, и наружу, в квитанцию, не
+            # выходило ничего: модель писала композитом, а получала обратно
+            # список опов. Таблица единиц едет в ответе целиком — она мала
+            # (строка на единицу), и без неё наблюдение об арности N
+            # адресуется числом `u0`, которое читателю не значит ничего.
+            d["units"] = self.units
         return d
 
 
@@ -291,6 +321,88 @@ def _check_filters(where: Any, i: int, oid: str, diags: list,
     return out
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# ИМЯ ВИДА: ЛЕСТНИЦА РАЗРЕШЕНИЯ И ОТКАЗ, КОТОРЫЙ НАЗЫВАЕТ СОСЕДА
+#
+# ЗАМЕР, ИЗ КОТОРОГО ЭТО ВЫРОСЛО (14.08.2026, `data/telemetry/
+# kir_rejections.jsonl`, 1558 строк / 314 попыток авторства). Отказ
+# «неизвестный kind» — 28.3% ПОПЫТОК, второй по величине класс. Но
+# разбор того, ЧТО именно просили, показал, что это в основном НЕ
+# отсутствие способности:
+#
+#   вид существует в другом НАПИСАНИИ   42 строки  railings/railing,
+#                                                  structural framing/
+#                                                  structural_framing,
+#                                                  levels/level, cable trays
+#   вид существует ТОЧНО                 8 строк   (ископаемые: спрашивали
+#                                                  до того, как вид завели)
+#   вида нет вовсе                      59 строк   в т.ч. русские имена
+#
+# ДВЕ ПОЛОВИНЫ ПОЧИНКИ, И ОБЕ ОБЯЗАТЕЛЬНЫ.
+#
+# 1. ЛЕСТНИЦА. Точное имя -> ЕДИНСТВЕННОЕ совпадение канонической формы
+#    (регистр, пробелы/точки/дефисы -> подчёркивание, множественное число)
+#    -> отказ. Это НЕ догадка и не второй словарь: множество то же самое,
+#    закрытое, и приём дословно тот же, которым `ground.py` уже разрешает
+#    `by=name` («точное совпадение после trim; если нет — ОДНО совпадение
+#    без учёта регистра»). Разрешение ВИДНО автору без отдельной квитанции:
+#    эмиссия кладёт `__r["kind"] = "<разрешённый вид>"` в ответ запроса,
+#    то есть выбор предъявлен там же, где результат.
+#
+# 2. ОТКАЗ НАЗЫВАЕТ СОСЕДА, А НЕ СПИСОК. `candidates` по-прежнему везёт
+#    ВЕСЬ закрытый набор — сужать его значило бы отнять у модели то, чем
+#    она чинится, — но текст отказа теперь указывает на конкретное:
+#      * `column` -> «уточни: column_architectural | column_structural»
+#        (живой отказ, последний 14.08: род колонны в Revit решает КАТЕГОРИЯ,
+#        и угадать за автора нельзя — см. KINDS, где они намеренно врозь);
+#      * `wall_type` -> «это ПУЛ ТИПОВ; типы спрашивают query_types(pool=…)»
+#        (живой отказ 14.08: перепутана лестница, а не имя);
+#      * иначе — ближайшие по написанию, а не 51 имя подряд.
+# ═════════════════════════════════════════════════════════════════════════
+
+
+def _canon_kind(raw: str) -> str:
+    """Каноническая форма имени вида — ТОЛЬКО для сверки, никогда для хранения.
+
+    Множественное число снимается ПОСЛЕДНИМ шагом, потому что `levels` и
+    `level` — это одно имя, набранное двумя способами, а не два вида.
+    """
+    text = re.sub(r"[\s.\-]+", "_", raw.strip().lower())
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text[:-1] if text.endswith("s") else text
+
+
+def _kind_canon_index() -> dict[str, list[str]]:
+    """Каноническая форма -> виды, которые к ней сводятся.
+
+    Список, а не одно имя: столкновение обязано быть ВИДНЫМ и обязано
+    отказывать, а не выбирать первый. Пустых списков здесь не бывает по
+    построению — индекс строится из самой таблицы.
+    """
+    index: dict[str, list[str]] = {}
+    for name in spec.KINDS:
+        index.setdefault(_canon_kind(name), []).append(name)
+    return {key: sorted(value) for key, value in index.items()}
+
+
+def _kind_hint(raw: str) -> str:
+    """Чем закончить отказ: указанием на конкретное, а не перечнем."""
+    canon = _canon_kind(raw)
+    family = sorted(n for n in spec.KINDS if _canon_kind(n).startswith(canon + "_"))
+    if family:
+        return (f" — вид уточняется: {' | '.join(family)}. "
+                f"Общего вида «{raw}» нет намеренно: выбрать за автора нельзя")
+    pools = set(spec.OPS["query_types"].params[0].choices)
+    if raw.strip() in pools or raw.strip() + "s" in pools:
+        return (f" — «{raw}» это ПУЛ ТИПОВ, а не вид элемента. Каталог типов "
+                f"спрашивают `query_types(pool=…)`; `kind` перечисляет "
+                f"построенные элементы")
+    near = difflib.get_close_matches(canon, sorted(spec.KINDS), n=3, cutoff=0.6)
+    if near:
+        return f" — ближайшие: {', '.join(near)}"
+    return ""
+
+
 def _check_kind(op: dict, i: int, oid: str, diags: list) -> Optional[str]:
     kind = op.get("kind")
     if kind == spec.KIND_ESCAPE:
@@ -299,12 +411,37 @@ def _check_kind(op: dict, i: int, oid: str, diags: list) -> Optional[str]:
               got=spec.KIND_ESCAPE, candidates=sorted(spec.KINDS),
               message_ru="kind='other' — вне закрытой таблицы; маршрут: recipe/вики-путь")
         return None
-    if not isinstance(kind, str) or kind not in spec.KINDS:
-        _fail(diags, code=GROUND_UNSUPPORTED_KIND, op_index=i, op_id=oid, field_name="kind",
-              got=kind, candidates=sorted(spec.KINDS),
-              message_ru=f"неизвестный kind {kind!r}")
-        return None
-    return kind
+    if isinstance(kind, str):
+        if kind in spec.KINDS:
+            return kind
+        matches = _kind_canon_index().get(_canon_kind(kind), ())
+        if len(matches) == 1:
+            # Та же лестница, что у `ground.by=name`: одно совпадение в ЗАКРЫТОМ
+            # множестве — это то же имя, набранное иначе, а не выбор из двух.
+            #
+            # 🔴 ДОЛГ, НАЗВАННЫЙ 15.08.2026, А НЕ ОБНАРУЖЕННЫЙ ПОЗЖЕ. Эта
+            # ветка ИСПРАВЛЯЕТ написание автора и НИЧЕГО об этом не говорит:
+            # ни диагностики, ни строки в квитанции. По закону этого дерева
+            # «выбор, которого вызывающий не видит, — это `.FirstOrDefault()`
+            # с хорошей репутацией», и ровно поэтому `ground` обязан печатать
+            # `grounding_report`, а именованное умолчание — `runner_up`.
+            #
+            # Почему не починено здесь: у разбора нет НЕ-ОТКАЗНОГО канала
+            # диагностики — `_fail` заводит отказ, а исправление написания
+            # отказом не является. Канал заводится отдельной волной; до тех
+            # пор факт исправления виден только по расхождению `kind` во входе
+            # и в нормализованной программе.
+            #
+            # Замер, на котором долг записан: `'Wall '` и `'WALL'` собираются
+            # молча (`tests/test_any_query.py`), `'wall​'` — нет, потому
+            # что `\s` не снимает нулевую ширину. То есть лестница НЕ всеядна,
+            # и это её сильная сторона; молчаливость — слабая.
+            return matches[0]
+    _fail(diags, code=GROUND_UNSUPPORTED_KIND, op_index=i, op_id=oid, field_name="kind",
+          got=kind, candidates=sorted(spec.KINDS),
+          message_ru=(f"неизвестный kind {kind!r}"
+                      + (_kind_hint(kind) if isinstance(kind, str) else "")))
+    return None
 
 
 def _validate_op(op: Any, i: int, diags: list) -> Optional[dict]:
@@ -763,7 +900,21 @@ def _parse_and_check_internal(
         diags.append(Diagnostic(code=PARSE_BAD_VERSION, field_name="ir_version",
                                 expected=spec.IR_VERSION, got=program.get("ir_version"),
                                 message_ru="ir_version обязателен и должен быть '1.0'"))
-    known_top = {"ir_version", "intent", "allow_destructive", "ops", "defaults"}
+    # `units` — ЗАКОННАЯ ЧАСТЬ КОНВЕРТА, И РЕШЕНИЕ ЗДЕСЬ ПРИНЯТО ЯВНО.
+    #
+    # Таблица единиц замысла (`course.unit()`) описывает, КАК ЧИТАТЬ набор
+    # опов; на исполнение она не влияет ничем — ни одного байта эмиссии, ни
+    # одной транзакции, ни одного чекпойнта. Этим она принципиально отличается
+    # от `phases`, который отказывает ниже: фаза ОБЕЩАЕТ чекпойнт, и склеить
+    # фазы в одну программу значило бы объявить чекпойнт, которого нет.
+    # Единица не обещает исполнению ничего, поэтому программа с единицами —
+    # обычная программа, и отказывать ей не за что.
+    #
+    # ПОЧЕМУ НЕ ПРОСТО «ИГНОРИРУЕМ». Молча пропущенный ключ неотличим от
+    # неизвестного, а неизвестный здесь — типизированный отказ. Имя внесено в
+    # список ЗНАЯ, что оно значит, и это решение записано рядом с ним.
+    known_top = {"ir_version", "intent", "allow_destructive", "ops", "defaults",
+                 "units"}
     # Internal A5 materialization binds each deterministic chunk to its durable
     # journal receipt.  This metadata is accepted only on the trusted ``bulk``
     # path; it is deliberately absent from the user/LLM schema and has no
@@ -1918,6 +2069,19 @@ def emit_for_version(normed_ops: list[dict], revit_version: str) -> str:
     return emit(normed_ops, revit_version)
 
 
+def _units_of(program: Any) -> list:
+    """Таблица единиц замысла из конверта — БЕЗ интерпретации.
+
+    Отдельной функцией, а не выражением в двух местах: две копии одного
+    чтения — именной дефект этого дерева, и он стоил бы ровно того, что здесь
+    чинится (одна дверь несёт замысел, другая теряет).
+    """
+    if isinstance(program, Mapping):
+        rows = program.get("units")
+        return list(rows) if isinstance(rows, (list, tuple)) else []
+    return []
+
+
 def compile_program(program: Any, revit_version: str = "2026",
                     query_id: str = "", snapshot: Any = None,
                     *, bulk: bool = False,
@@ -2146,10 +2310,12 @@ def compile_program(program: Any, revit_version: str = "2026",
                 grounded=grounded_program,
                 grounding_report=ground_mod.compiler_choices(grounded),
                 grounded_ops=grounded,
+                units=_units_of(program),
                 txn_isolation=isolation)
         stage = "emit_query"
         cs = emit_for_version(normed, revit_version)
         return CompileOutput(ok=True, csharp=cs, planned=planned,
+                             units=_units_of(program),
                              txn_isolation=isolation)
     except KirRefusal as r:
         out = CompileOutput(ok=False, diagnostics=r.diagnostics)

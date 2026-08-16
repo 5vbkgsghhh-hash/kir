@@ -392,6 +392,15 @@ PROGRAMS = {
              "name": "Кухня-ниша"},
         ],
     },
+    "authoring_stairs_run": {
+        "ir_version": "1.0",
+        "intent": "второй марш на существующей лестнице",
+        "ops": [{"op": "create_stairs_run", "id": "RN1",
+                 "stairs": {"by": "element_id", "value": 8888},
+                 "p0_mm": [0, 0], "p1_mm": [3200, 0],
+                 "base_elevation_mm": 1800,
+                 "justification": "left"}],
+    },
     "authoring_stairs_landing": {
         "ir_version": "1.0",
         "intent": "промежуточная площадка на существующей лестнице",
@@ -2378,6 +2387,7 @@ PREDATES_CONVENTION: frozenset[str] = frozenset({
     "arch_railing_hosted",
     "arch_railing_path",
     "authoring_stairs_landing",
+    "authoring_stairs_run",
     "authoring_stairs_spiral",
     "authoring_stairs_straight",
     "authoring_wall_arc",

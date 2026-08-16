@@ -294,3 +294,103 @@ class TheClientSideMergeIsCheckedByNode(unittest.TestCase):
         # КОНТРОЛЬ-PASS: вырезание не съело весь файл, иначе проверка была бы
         # зелёной по построению.
         self.assertIn("mergeScenes", code)
+
+
+class TheCompletenessFlagSurvivesTheMerge(DeltaBase):
+    """🔴 «ХВОСТ» — СВОЙСТВО НАКОПЛЕННОГО, А НЕ ПОСЛЕДНЕГО ОТВЕТА.
+
+    НАЙДЕНО 16.08.2026 НА ЖИВОМ ХОДЕ ВЛАДЕЛЬЦА, и цена была — весь продукт.
+    Он попросил коробку 4×4, увидел её в окне КИР, нажал «Отправить в Revit» и
+    получил: «на экране ХВОСТ журнала, а не здание: часть программ в эту сцену
+    не попала». Дословная его реакция: «я как человек вообще понять не могу
+    почему и что не так».
+
+    Обе половины были по отдельности правы. Сервер ставит `partial = since > 0`
+    (`live_scene.py:243`) и говорит правду О СВОИХ БАЙТАХ. Кнопка читает
+    `data.header.partial` и спрашивает про СЦЕНУ. Между ними стоял
+    `mergeScenes`, бравший заголовок целиком от дельты, — и правда об ответе
+    становилась ложью о сцене. Именной дефект этого проекта дословно: величина
+    УТВЕРЖДАЕТСЯ в одном месте, ЧИТАЕТСЯ в другом, и совпасть их не заставляет
+    ничто.
+
+    ЦЕНА — ПО ПОСТРОЕНИЮ, А НЕ ПО НЕВЕЗЕНИЮ. Живая сессия начинает кадром
+    `since=0`, дальше идут дельты; ПЕРВАЯ ЖЕ дельта — даже пустая, даже
+    «ничего нового» — ставила признак навсегда. Перенос в Revit был мёртв у
+    всякого, кто держит окно открытым дольше одного опроса.
+
+    ПОЧЕМУ ПРОВЕРЯЕТСЯ NODE, А НЕ ПИТОНОМ. Склейка живёт у клиента, и питон её
+    не исполняет. Прибор рядом (`verify_merge.mjs`) сверяет ГЕОМЕТРИЮ склейки и
+    к этому вопросу не относится; здесь ровно одна величина — честность о
+    полноте. Блобы кладёт этот тест: инструмент, чьи входы никто не готовит,
+    не запускается никогда — `verify_merge.mjs` ровно в таком состоянии и
+    живёт, его питоновский спутник обещан докстрокой и в дереве отсутствует.
+    """
+
+    def _blobs(self, into):
+        """База (`since=0`) и хвост (`since>0`) — ПРОД-КОДОМ, не руками.
+
+        Форма 27: тест, строящий вход своими руками, зелен на форме, которой
+        прод не производит.
+        """
+        base, _, header = self._full()
+        _journal.append(self.key, {"ops": [_pipe("хвост", 777.0)]})
+        delta, _ = L.scene_from_session(
+            self.DEVICE, self.DOC, header["journal"]["next_seq"],
+            header["base_digest"])
+        (into / "d_base.bin").write_bytes(base)
+        (into / "d_delta.bin").write_bytes(delta)
+
+    def _run_node(self, module_path):
+        import pathlib
+        import subprocess
+        import tempfile
+        tool = pathlib.Path(__file__).with_name("verify_partial.mjs")
+        self.assertTrue(tool.exists(), "прибор не приехал вместе с тестом")
+        with tempfile.TemporaryDirectory() as tmp:
+            into = pathlib.Path(tmp)
+            self._blobs(into)
+            return subprocess.run(
+                ["node", str(tool), str(into), str(module_path)],
+                capture_output=True, text=True, timeout=120)
+
+    def _module(self):
+        import pathlib
+        import shutil
+        if shutil.which("node") is None:
+            self.skipTest("node не установлен — прибор не запускался")
+        own = pathlib.Path(__file__).resolve().parents[4] / \
+            "assets" / "viewer" / "scene-data.js"
+        if not own.exists():
+            self.skipTest(f"нет {own}")
+        return own
+
+    def test_a_whole_scene_plus_a_tail_is_still_whole(self):
+        proc = self._run_node(self._module())
+        self.assertEqual(proc.returncode, 0,
+                         f"\n{proc.stdout}\n{proc.stderr}")
+        self.assertIn("склейка целого с хвостом — не хвост", proc.stdout)
+
+    def test_the_instrument_reddens_on_the_broken_merge(self):
+        """КОНТРОЛЬ-FAIL, И ОН ПОВЕДЕНЧЕСКИЙ, А НЕ «СИМВОЛА НЕТ».
+
+        Берётся НАСТОЯЩИЙ модуль, и в нём восстанавливается ровно прежнее
+        поведение — заголовок целиком от дельты. Зелёный прибор, не умеющий
+        покраснеть, — не прибор; на этом дереве таких нашли шесть за вечер.
+        """
+        import pathlib
+        import re
+        import tempfile
+        module = self._module()
+        text = module.read_text(encoding="utf-8")
+        broken = re.sub(
+            r"\n\s*partial: partial,\n\s*partial_ru: \(partial.*?\),\n",
+            "\n", text, flags=re.S)
+        self.assertNotEqual(broken, text, "мутация не нашла своё место")
+        with tempfile.TemporaryDirectory() as tmp:
+            hurt = pathlib.Path(tmp) / "scene-data.js"
+            hurt.write_text(broken, encoding="utf-8")
+            proc = self._run_node(hurt)
+        self.assertEqual(proc.returncode, 1,
+                         f"прибор не покраснел на сломанной склейке:"
+                         f"\n{proc.stdout}\n{proc.stderr}")
+        self.assertIn("Кнопка переноса мертва по построению", proc.stdout)

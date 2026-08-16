@@ -153,16 +153,67 @@ def test_a_broken_judge_is_named_not_swallowed(monkeypatch):
 # --------------------------------- дайджест переживает историю (Ш2)
 
 def _receipt_with(view) -> str:
-    """Квитанция такой формы, какой она уезжает в историю."""
+    """Квитанция такой формы, какой её строит ПРОД — не такой, какой удобно.
+
+    🔴 ПРЕЖНЯЯ РЕДАКЦИЯ КЛАЛА `assembly_note` НА ВЕРХНИЙ УРОВЕНЬ РУКАМИ, а прод
+    клал его внутрь `building` (`live/verdict._with_assembly`). Форма теста
+    выживала при сворачивании, форма прода — нет, и тест был зелен ровно
+    столько, сколько петля была разомкнута: он сторожил фикстуру.
+
+    Теперь блок собирается как в проде (`building` со всеми полями, дайджест
+    ВНУТРИ), а наверх его поднимает та самая функция, которую зовёт прод, —
+    `serving.lift_assembly_note`. Ошибиться формой больше негде: форма одна.
+    """
     import json
     from kukai.ir.assembly_view import digest
-    return json.dumps({
+    from kukai.ir.serving import lift_assembly_note
+
+    block = {                                # ← как строит `live/verdict.judge`
+        "programs": 2, "ops": 4, "programs_evicted": 0,
+        "verdict": "PASS", "message_ru": "…",
+        "assembly": view.to_dict(),          # СТРУКТУРА — будет свёрнута
+        "assembly_note": digest(view),       # ПЛОСКАЯ строка — обязана выжить
+    }
+    receipt = {
         "ok": True, "kir": True,
         "witness": {"geometry_ok": True, "semantic_ok": True},
         "result": {"w1": {"id": "9001"}, "w2": {"id": "9002"}},
-        "assembly": view.to_dict(),          # СТРУКТУРА — будет свёрнута
-        "assembly_note": digest(view),       # ПЛОСКАЯ строка — обязана выжить
+        "building": block,
+    }
+    return json.dumps(lift_assembly_note(receipt, block), ensure_ascii=False)
+
+
+def test_the_receipt_shape_is_the_one_prod_builds():
+    """КОНТРОЛЬ ФОРМЫ. Дайджест обязан лежать И внутри `building` (как его
+    кладёт вердикт), И наверху (как его поднимает прод). Если однажды подъём
+    исчезнет, этот тест краснеет ДО того, как краснеет выживание."""
+    import json
+    view = observe_program(_program(_GAP))
+    receipt = json.loads(_receipt_with(view))
+    assert "assembly_note" in receipt["building"], "вердикт перестал класть дайджест"
+    assert receipt["assembly_note"] == receipt["building"]["assembly_note"]
+
+
+def test_without_the_lift_the_digest_is_lost():
+    """КОНТРОЛЬ-FAIL ПОДЪЁМА: без него дайджест НЕ выживает.
+
+    Без этого контроля предыдущий тест зелен по построению — он не отличает
+    «подъём работает» от «сворачиватель и так всё сохраняет»."""
+    import json
+    from kukai.api.chat_helpers import _summarize_tool_result
+    from kukai.ir.assembly_view import digest
+
+    view = observe_program(_program(_GAP))
+    nested = json.dumps({                    # форма БЕЗ подъёма — прод до 15.08
+        "ok": True, "kir": True,
+        "result": {"w1": {"id": "9001"}},
+        "building": {"programs": 2, "verdict": "PASS",
+                     "assembly": view.to_dict(), "assembly_note": digest(view)},
     }, ensure_ascii=False)
+    collapsed = _summarize_tool_result(nested, cap=600)
+    assert "enclosure_none" not in collapsed, (
+        "дайджест выжил БЕЗ подъёма — значит подъём ничего не доказывает, "
+        "и сворачиватель изменился: перечитай `_summarize_tool_result`")
 
 
 def test_the_digest_survives_history_collapse_while_the_structure_does_not():
@@ -365,8 +416,18 @@ class TheSummaryDiscriminatesWhatOneSourceCannot(unittest.TestCase):
 class EverySourceIsNamedAndItsSilenceToo(unittest.TestCase):
 
     def test_who_was_asked_names_EVERY_source(self):
+        """🔴 ЧЕТВЁРТЫЙ ИСТОЧНИК — `units` (15.08.2026), и этот пин сработал
+        ровно как задуман: добавить источник и не прийти сюда нельзя.
+
+        Три первых судят ЭЛЕМЕНТ (замкнутость по стенам, аномалия плана,
+        опора конструктива). Четвёртый читает НАБОР: единицы замысла
+        (`course.unit(reads_as=...)`) — единственный источник, работающий на
+        арности N. Он молчит, когда единиц нет: «не спрашивали» и «спросили,
+        ответа нет» здесь по-прежнему разные факты, и `sources_asked` называет
+        именно первый.
+        """
         assert observe_program(_program(_BOX)).sources_asked == (
-            "design_check", "preview", "coherence")
+            "design_check", "preview", "coherence", "units")
 
     def test_no_walls_still_asks_the_plan(self):
         """«Стен нет» не значит «смотреть не на что»: проём без хозяина живёт

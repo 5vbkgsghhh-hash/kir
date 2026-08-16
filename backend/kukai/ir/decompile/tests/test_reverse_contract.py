@@ -127,7 +127,14 @@ class ReverseContractTests(unittest.TestCase):
         # 64 -> 65 (10.08.2026): create_space is a named LIFTER_GAP.  The
         # writer exists, while reverse capture is not yet strong enough to
         # recreate it; omitting the op from this denominator hid that gap.
-        self.assertEqual(len(REVERSE_CONTRACTS), 65)
+        # 65 -> 66 (15.08.2026): волна второго марша — create_stairs_run,
+        # CAPTURE_GAP. Режим НЕ выбран по симметрии с площадкой: решение уже
+        # принято в самом модуле и стоит там с замером — «L0 reads no
+        # StairsRun at all: Stairs.GetStairsRuns() is called nowhere in
+        # decompile/ and the run class is named nowhere either». То есть
+        # чинить надо ЗАХВАТ, а не лифтер, ровно как у площадки, но по
+        # СВОЕЙ проверке, а не потому, что сосед такой же.
+        self.assertEqual(len(REVERSE_CONTRACTS), 66)
         # 23 -> 24 (03.08.2026): create_railing переведён из capture_gap в
         # direct. Захват путей ограждений едет с 29.07, и k2_ar_rd_v9 несёт
         # 31 строку захвата — прежняя формулировка «L0 has neither a railing
@@ -324,7 +331,10 @@ class ReverseContractTests(unittest.TestCase):
         # компонентах-площадках не знает вовсе, поэтому каждая площадка
         # разобранного здания теряется молча. Переснято прогоном на ЭТОМ
         # дереве, а не сложено с числом чужой ветки.
-        self.assertEqual(report["write_ops"], 65)
+        # 65 -> 66 (15.08.2026): create_stairs_run, CAPTURE_GAP — та же волна
+        # второго марша. `direct_same_op_lifts` НЕ двигается: подъёма у марша
+        # нет, и это ровно то, что говорит его причина в модуле.
+        self.assertEqual(report["write_ops"], 66)
         self.assertEqual(report["direct_same_op_lifts"], 27)
         self.assertEqual(
             report["modes"],
@@ -395,7 +405,11 @@ class ReverseContractTests(unittest.TestCase):
                 # ПОЛНЫМ, потеряв каждую промежуточную площадку.
                 # create_dimension moved from capture_gap to bounded direct;
                 # create_space entered separately as a named lifter gap.
-                "capture_gap": 25,
+                # 25 -> 26 (15.08.2026): create_stairs_run. Разбивка по
+                # режимам обязана двигаться вместе с итогом (66 выше) — иначе
+                # сумма сойдётся при разъехавшемся составе, а это ровно
+                # форма 12: «счёт совпал, имена разошлись».
+                "capture_gap": 26,
                 "lifter_gap": 2,
                 "decomposed": 4,
                 "composed": 1,

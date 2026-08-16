@@ -119,11 +119,24 @@ class ThePhaseCountHasACeiling(unittest.TestCase):
                 os.environ["KUKAI_KIR_JOURNAL_PROGRAMS"] = prev
 
     def test_the_op_budget_still_measures_one_phase(self):
-        """Потолок числа фаз НЕ заменяет авторский бюджет и не ослабляет его:
-        двадцать опов на фазу остаются, и это разные величины."""
+        """Потолок числа ФАЗ и авторский бюджет ОПОВ — РАЗНЫЕ величины, и одна
+        не подменяет другую.
+
+        🔴 ЧИСЛО ОТСЮДА УБРАНО. Прежняя редакция писала
+        `assertEqual(C.MAX_OPS_PER_PROGRAM, 20)`, и когда владелец поднял
+        бюджет до 100 (15.08), тест покраснел — при том, что предмет его
+        проверки не изменился ни на байт: фазы по-прежнему меряются не опами.
+        Пин величины в тесте о РАЗЛИЧИИ величин — это тот самый именной дефект
+        дерева: число объявлено в `compiler`, прочитано здесь, и ничто не
+        заставляло их совпасть.
+
+        Что осталось: обе величины существуют, положительны и НЕ РАВНЫ. Это и
+        есть утверждение «их две, и они про разное», и оно переживает любую
+        смену любой из них."""
         from kukai.ir import compiler as C
 
-        self.assertEqual(C.MAX_OPS_PER_PROGRAM, 20)
+        self.assertGreater(C.MAX_OPS_PER_PROGRAM, 0)
+        self.assertGreater(S.max_plan_phases(), 0)
         self.assertNotEqual(S.max_plan_phases(), C.MAX_OPS_PER_PROGRAM)
 
 

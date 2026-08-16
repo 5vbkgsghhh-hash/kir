@@ -7,7 +7,7 @@ import unittest
 os.environ.setdefault("KIR_REJECTIONS_PATH",
                       os.path.join(tempfile.gettempdir(), "kir_test_queue.jsonl"))
 
-from kukai.ir.compiler import compile_program  # noqa: E402
+from kukai.ir.compiler import MAX_OPS_PER_PROGRAM, compile_program  # noqa: E402
 
 
 def _p(ops, **envelope):
@@ -52,7 +52,12 @@ class NegativeCorpus(unittest.TestCase):
         (_p([{"op": "query_count", "kind": "wall"}], intent=42), "KIR-T001"),
         (_p([{"op": "query_count", "kind": "wall"}], intent="x" * 2001), "KIR-T002"),
         (_p([{"op": "query_count", "kind": "wall"}], allow_destructive="yes"), "KIR-T001"),
-        (_p([{"op": "query_count", "kind": "wall"}] * 21), "KIR-L001"),
+        # ГРАНИЦА БЕРЁТСЯ У АВТОРИТЕТА. Здесь стоял литерал 21 — «на один
+        # больше бюджета», верный, пока бюджет был 20. Владелец поднял его до
+        # 100 (15.08), и негативный случай перестал быть негативным: программа
+        # компилируется, а корпус, который обязан ловить отказ, ловил тишину.
+        (_p([{"op": "query_count", "kind": "wall"}] * (MAX_OPS_PER_PROGRAM + 1)),
+         "KIR-L001"),
         (_p([{"op": "create_level", "id": "L1"}]), "KIR-P005"),
         # unicode / injection attempts must be refused or safely escaped, never crash
         (_p([{"op": "query_count", "kind": 'wall"); doc.Delete(', }]), "KIR-G001"),

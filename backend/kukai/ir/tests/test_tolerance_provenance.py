@@ -98,8 +98,28 @@ _LANDING_OP = {
                    "size_mm": [2400.0, 1200.0]}}, [], "LG1", "contour", []),
 }
 
+_RUN_OP = {
+    "op": "create_stairs_run", "id": "RN1",
+    "stairs": {"by": "element_id", "value": 4242},
+    "p0_mm": [0.0, 0.0], "p1_mm": [3000.0, 0.0],
+    "base_elevation_mm": 1800.0, "justification": "center",
+}
+
 _SOLO_INSTANCES = {"create_stairs": _STAIRS_OP,
-                   "create_stairs_landing": _LANDING_OP}
+                   "create_stairs_landing": _LANDING_OP,
+                   "create_stairs_run": _RUN_OP}
+
+# 15.08.2026 — ТРЕТИЙ жилец, и на нём же закрыт способ терять их молча.
+# Прежде таблица велась рукой: соло-оп, забытый здесь, выпадал СРАЗУ из
+# вакуумного обхода и из провенанса допусков, и оба отчитывались «чисто».
+# Теперь состав сверяется с РЕЕСТРОМ на импорте: четвёртый соло-оп либо
+# получит образец, либо уронит корпус — но не исчезнет из него бесшумно.
+if set(_SOLO_INSTANCES) != set(spec.SOLO_OPS):
+    raise AssertionError(
+        "корпус соло-опов разошёлся с реестром: нет образца у "
+        + ", ".join(sorted(set(spec.SOLO_OPS) - set(_SOLO_INSTANCES)))
+        + "; лишние: "
+        + ", ".join(sorted(set(_SOLO_INSTANCES) - set(spec.SOLO_OPS))))
 
 # Условные поля, открывающие ветку с допуском.
 _FORCE = {"base_offset_mm": 150, "top_offset_mm": -250,

@@ -104,6 +104,10 @@ from kukai.ir.diag import PARSE_UNKNOWN_OP                     # noqa: E402
 from kukai.ir.compiler import MAX_OPS_PER_PROGRAM              # noqa: E402
 from kukai.ir.diag import (                                    # noqa: E402
     Diagnostic, PLAN_LIMIT, PLAN_PHASE_SHAPE, PLAN_SOLO_OP,
+    # `TYPE_BAD_ENUM` / `TYPE_BAD_TYPE` — отказы единицы замысла (`unit()`):
+    # неизвестное имя прочтения и вхождения без группы. Оба поднимаются ИЗ
+    # ТЕЛА скрипта, чтобы отказ нёс номер строки автора.
+    TYPE_BAD_ENUM, TYPE_BAD_TYPE,
 )
 
 #: Потолок канала — у песочницы, а не литералом здесь: число, набранное
@@ -485,6 +489,58 @@ def _op_spec_of(name: Any) -> Any:
             f"или ручка вызова (spec(w))."))])
 
 
+def _macro_names() -> tuple[str, ...]:
+    """Имена макросов — СПРОШЕНЫ У `macros`, а не перечислены здесь."""
+    from kukai.ir.macros import MACRO_OPS
+    return tuple(MACRO_OPS)
+
+
+def _macro_contract(name: str) -> str:
+    """Контракт МАКРОСА, собранный из его же реестров.
+
+    Макрос не оп: у него нет `OpSpec`, нет постусловия и нет пула заземления —
+    он РАСКРЫВАЕТСЯ в обычные опы до всякой проверки. Поэтому контракт у него
+    другой по составу, и главное в нём одно: ЧТО МОЖНО КЛАСТЬ ВНУТРЬ.
+    """
+    from kukai.ir import macros
+
+    lines = ["МАКРОС %s — раскрывается в обычные опы ДО проверки; форма поля "
+             "`program`, в скрипте (`program_py`) макросов нет: там повтор "
+             "пишет сам питон циклом." % name]
+    if name == "stack":
+        lines += [
+            "  stack(levels, h_mm, base_elev_mm, name_prefix, floor[, transform])",
+            "  Создаёт уровни и повторяет `floor` на каждом. `level` членам "
+            "проставляет САМА экспансия — задавать его внутри нельзя.",
+            "  ЧЛЕНЫ, БЕРУЩИЕ level: " + ", ".join(macros._STACKABLE) + ".",
+            "  ЧЛЕНЫ ХОСТЯЩИЕСЯ (уровень берут у ХОЗЯИНА, а не своим полем):",
+        ]
+        for op_name, why in sorted(macros._STACKABLE_HOSTED.items()):
+            lines.append("    %s — %s" % (op_name, why))
+        lines += [
+            "  Хозяин обязан быть ЧЛЕНОМ того же этажа: ссылка переезжает по "
+            "этажам вместе с ним. Хозяин вне набора — типизированный отказ "
+            "(иначе дверь каждого этажа повисла бы на стене первого).",
+            "  Хозяин по `element_id` — законно: это настоящий элемент "
+            "документа, один для всех этажей.",
+        ]
+    elif name == "series":
+        lines += [
+            "  series(count, track, items) — повтор вдоль ТРЕКА; уровней не "
+            "создаёт и `level` не переписывает.",
+            "  ЧЛЕНЫ: " + ", ".join(macros._SERIES_ABLE) + ".",
+            "  Хостящиеся члены переезжают со своим хозяином так же, как в "
+            "stack.",
+        ]
+    elif name == "grid_array":
+        lines += [
+            "  grid_array(nx, ny, dx_mm, dy_mm[, origin_mm, margin_mm, "
+            "prefix_x, prefix_y]) — сетка ОСЕЙ. Членов не принимает: "
+            "порождает только `create_grid`.",
+        ]
+    return "\n".join(lines)
+
+
 def spec(op_name: Any = None) -> None:
     """КОНТРАКТ операции из реестра — либо оглавление реестра целиком.
 
@@ -522,6 +578,19 @@ def spec(op_name: Any = None) -> None:
         _emit(_within_channel(_spec_index(),
                               lambda _keep: "имена целиком — op_names()"))
         return
+    # 🔴 У МАКРОСА ТОЖЕ ЕСТЬ КОНТРАКТ, И ДО 15.08.2026 ЕГО НЕ ОТДАВАЛА НИ ОДНА
+    # ДВЕРЬ. `spec("stack")` отвечал «операции нет в реестре» — формально
+    # верно (макрос не оп) и практически неверно: автор спрашивал про
+    # существующую способность и слышал, что её не существует. Ровно тот
+    # исход, ради запрета которого написан весь пакет, только в валюте текста.
+    #
+    # Собирается ИЗ РЕЕСТРОВ МАКРОСА, ни строки рукой: список членов —
+    # `_STACKABLE`, хостящиеся — `_STACKABLE_HOSTED` вместе с их
+    # обоснованиями. Второй экземпляр разошёлся бы на первом же новом жильце.
+    if isinstance(op_name, str) and op_name in _macro_names():
+        _emit(_within_channel(_macro_contract(op_name),
+                              lambda _keep: "остальные макросы — spec()"))
+        return
     ospec = _op_spec_of(op_name)
     head, doc = _spec_parts(ospec)
     # Смещение хвоста — ИНДЕКС В ДОКСТРОКЕ, а не в напечатанном: срез берут у
@@ -540,19 +609,71 @@ _UNIT_DEPTH = 0
 
 
 class Unit:
-    """Что осталось от `with unit(...)`: члены и ручка получившейся группы."""
+    """Что осталось от `with unit(...)`: члены, прочтение и ручка группы."""
 
-    __slots__ = ("name", "placements", "members", "handle")
+    __slots__ = ("name", "placements", "members", "handle",
+                 "index", "unit_id", "reads_as", "as_group", "op_ids", "line")
 
-    def __init__(self, name: str | None, placements: list) -> None:
+    def __init__(self, name: str | None, placements: list, *,
+                 index: int = 0, reads_as: str | None = None,
+                 as_group: bool = True, line: int | None = None) -> None:
         self.name = name
         self.placements = placements
         self.members: list[dict] = []
         self.handle: Any = None
+        self.index = index
+        #: Адрес единицы. Детерминирован и не зависит от имени: имя автора
+        #: может повторяться и может отсутствовать, а адресовать наблюдение
+        #: надо всегда и однозначно.
+        self.unit_id = "u%d" % index
+        self.reads_as = reads_as
+        self.as_group = as_group
+        #: id опов ВО ВНЕШНЕЙ программе, которыми единица там представлена:
+        #: один оп группы (`as_group=True`) либо все члены (`False`).
+        self.op_ids: list[str] = []
+        self.line = line
 
     def __repr__(self) -> str:
         return (f"Unit({self.name!r}, членов {len(self.members)}, "
                 f"вхождений {len(self.placements) + 1})")
+
+    def member_ids(self) -> list[str]:
+        return [str(m.get("id")) for m in self.members if m.get("id") is not None]
+
+    def as_dict(self) -> dict:
+        """Строка таблицы `units` конверта — ровно то, что уедет в JSON.
+
+        `reads_as` едет ВСЕГДА, в том числе `None`: отсутствие прочтения — это
+        решение автора «читать не проверяем», и оно обязано быть видно, а не
+        выглядеть как потерянное поле.
+        """
+        return {"index": self.index, "unit_id": self.unit_id,
+                "name": self.name, "reads_as": self.reads_as,
+                "as_group": self.as_group,
+                "op_ids": list(self.op_ids),
+                "member_ids": self.member_ids()}
+
+    def at(self) -> str:
+        """Адрес единицы для ОТКАЗА."""
+        label = f"«{self.name}»" if self.name else "без имени"
+        return f"{label} ({self.unit_id}" + (
+            f", строка {self.line})" if self.line else ")")
+
+
+class _UnitLedger:
+    """Единицы ОДНОЙ программы. Живёт при программе, как книга фаз."""
+
+    __slots__ = ("units",)
+
+    def __init__(self) -> None:
+        self.units: list[Unit] = []
+
+
+#: Книга единиц ЖИВЁТ ПРИ ПРОГРАММЕ — ровно по тем же слабым ключам и ровно по
+#: той же причине, что книга фаз: модульная книга пережила бы `dsl.reset()` и
+#: приписала бы единицы прошлого скрипта следующему.
+_UNIT_LEDGERS: "weakref.WeakKeyDictionary[Any, _UnitLedger]" = \
+    weakref.WeakKeyDictionary()
 
 
 class _UnitContext:
@@ -565,22 +686,68 @@ class _UnitContext:
     отдельным диагнозом. Второй набор правил здесь разошёлся бы с первым на
     первой же правке реестра.
 
-    ЧТО ЭТО ДЕЛАЕТ. Открывает временную программу (`dsl.program()` —
-    публичный контекст языка), забирает накопленное и кладёт ОДИН оп
-    `create_group` во внешнюю программу. Ни одного своего поля:
-    `members`/`placements`/`name` — имена реестра.
+    ЧТО ЭТО ДЕЛАЕТ. Записывает единицу ВСЕГДА — срезом и строкой в таблице
+    `units` конверта, по образцу `phase()`. Дополнительно, при `as_group=True`
+    (умолчание), открывает временную программу (`dsl.program()`), забирает
+    накопленное и кладёт ОДИН оп `create_group` во внешнюю программу. Ни одного
+    своего поля у группы: `members`/`placements`/`name` — имена реестра.
+
+    ССЫЛКИ ВНУТРИ ГРУППЫ — поправлено 15.08.2026, прежний текст здесь ЛГАЛ.
+    Сплошного запрета `{"by": "ref"}` внутри члена НЕТ с 12.08.2026. Живой
+    закон стоит в `authoring_validation` и состоит из двух отказов и одного
+    разрешения: НАРУЖУ множества членов — отказ, ВПЕРЁД (на члена ниже) —
+    отказ, на соседа ВЫШЕ — законно, порядок членов есть порядок создания.
     """
 
-    __slots__ = ("_unit", "_inner")
+    __slots__ = ("_unit", "_inner", "_outer", "_start", "_reads_as", "_as_group")
 
-    def __init__(self, name: str | None, placements: Iterable) -> None:
-        self._unit = Unit(name, [list(p) for p in (placements or ())])
+    def __init__(self, name: str | None, placements: Iterable, *,
+                 reads_as: str | None = None, as_group: bool = True) -> None:
+        self._reads_as = reads_as
+        self._as_group = as_group
+        self._unit = Unit(name, [list(p) for p in (placements or ())],
+                          reads_as=reads_as, as_group=as_group)
         self._inner = None
+        self._outer = None
+        self._start = 0
 
     def __enter__(self) -> Unit:
         from kukai.ir import dsl
         global _UNIT_DEPTH
-        self._inner = dsl.program()
+        # ПРОЧТЕНИЕ ПРОВЕРЯЕТСЯ НА ВХОДЕ, А НЕ НА ВЫХОДЕ: отказ, поднятый
+        # внутри блока, несёт НОМЕР СТРОКИ автора (песочница видит кадр
+        # `<kir-script>`), а поднятый на сливе — уже нет. Тот же довод, по
+        # которому так устроена фаза.
+        if self._reads_as is not None:
+            from kukai.ir.assembly_view import UNIT_READS, UNIT_READS_RU
+            if self._reads_as not in UNIT_READS:
+                known = ", ".join(
+                    "%s — %s" % (n, UNIT_READS_RU.get(n, "")) for n in
+                    sorted(UNIT_READS))
+                raise _refuse_phase(
+                    TYPE_BAD_ENUM, field_name="reads_as", got=self._reads_as,
+                    expected=sorted(UNIT_READS),
+                    message=(
+                        f"прочтение {self._reads_as!r} не объявлено. Реестр "
+                        f"прочтений ОТКРЫТ на дополнение, но имя обязано в нём "
+                        f"быть: непроверяемое прочтение — это обещание "
+                        f"проверки, которой нет. Известны: {known}. "
+                        f"СЛЕДУЮЩИЙ ХОД: возьми одно из них либо не указывай "
+                        f"`reads_as` вовсе — единица запишется и без него"))
+        if self._as_group is False and self._unit.placements:
+            raise _refuse_phase(
+                TYPE_BAD_TYPE, field_name="placements",
+                got=len(self._unit.placements),
+                message=(
+                    "placements заданы при as_group=False. Вхождения — "
+                    "свойство ГРУППЫ Ревита: без группы повторять нечего, и "
+                    "тихо их проглотить значило бы потерять написанное "
+                    "автором. СЛЕДУЮЩИЙ ХОД: либо as_group=True, либо убери "
+                    "placements и напиши повторения сам"))
+        self._unit.line = _author_line()
+        self._outer = dsl.current()
+        self._start = len(self._outer.ops) if self._outer is not None else 0
+        self._inner = dsl.program() if self._as_group else None
         # СЧЁТЧИК, А НЕ ФЛАГ: единицы вкладываются друг в друга законно, и
         # `phase()` обязан отличать «внутри единицы» от «снаружи» на любой
         # глубине. Что это стережёт — в `_PhaseContext.__enter__`.
@@ -592,8 +759,13 @@ class _UnitContext:
         global _UNIT_DEPTH
         _UNIT_DEPTH = max(0, _UNIT_DEPTH - 1)
         inner, self._inner = self._inner, None
-        collected = [dict(op) for op in inner.ops]
-        inner.__exit__(exc_type, exc, tb)     # текущая программа на место
+        if inner is not None:
+            collected = [dict(op) for op in inner.ops]
+            inner.__exit__(exc_type, exc, tb)  # текущая программа на место
+        else:
+            outer = self._outer
+            collected = ([dict(op) for op in outer.ops[self._start:]]
+                         if outer is not None else [])
         if exc_type is not None:
             return False                      # исключение автора идёт наружу
         self._unit.members = collected
@@ -601,33 +773,94 @@ class _UnitContext:
             raise dsl.DslRefusal([dsl.Diagnostic(
                 code=dsl.TYPE_BAD_TYPE, field_name="members",
                 expected="1..200 опов", got=0,
-                message_ru=("unit() не собрал ни одной операции: группа без "
-                            "членов ничего не повторяет. Пиши опы ВНУТРИ "
+                message_ru=("unit() не собрал ни одной операции: единица без "
+                            "членов не описывает ничего. Пиши опы ВНУТРИ "
                             "блока with"))])
-        kwargs: dict[str, Any] = {"members": collected,
-                                  "placements": self._unit.placements}
-        if self._unit.name is not None:
-            kwargs["name"] = self._unit.name
-        self._unit.handle = dsl.OP_FUNCTIONS["create_group"](**kwargs)
+        if self._as_group:
+            kwargs: dict[str, Any] = {"members": collected,
+                                      "placements": self._unit.placements}
+            if self._unit.name is not None:
+                kwargs["name"] = self._unit.name
+            self._unit.handle = dsl.OP_FUNCTIONS["create_group"](**kwargs)
+            handle_id = getattr(self._unit.handle, "id", None)
+            self._unit.op_ids = [str(handle_id)] if handle_id is not None else []
+        else:
+            # СРЕЗ, КАК У ФАЗЫ: опы остаются в программе побайтово теми же.
+            self._unit.op_ids = self._unit.member_ids()
+
+        # ═══ ЕДИНИЦА ЗАПИСЫВАЕТСЯ ВСЕГДА — И ЭТО ГЛАВНОЕ В ЭТОМ БЛОКЕ ═══
+        #
+        # До 15.08.2026 `unit()` означал РОВНО «сделай группу Ревита»: члены
+        # схлопывались в один `create_group`, и всё, что автор сказал о своём
+        # замысле — имя, границы набора, — переставало существовать сразу
+        # после раскрытия. Наблюдение потом адресовалось элементами, то есть
+        # модель писала композитом, а читала поэлементно.
+        #
+        # Теперь запись единицы ОРТОГОНАЛЬНА тому, делается ли группа: таблица
+        # `units` уезжает в конверте по образцу `phases`, а `as_group` решает
+        # только форму записи в Ревите. Опы при этом не меняются ни в одном
+        # байте — их дайджест подписывает программу, и метка, вписанная в оп,
+        # сдвинула бы подпись у здания, которое не менялось.
+        outer = self._outer if self._outer is not None else dsl.current()
+        if outer is not None:
+            ledger = _UNIT_LEDGERS.get(outer)
+            if ledger is None:
+                ledger = _UnitLedger()
+                _UNIT_LEDGERS[outer] = ledger
+            self._unit.index = len(ledger.units)
+            self._unit.unit_id = "u%d" % self._unit.index
+            ledger.units.append(self._unit)
         return False
 
 
-def unit(name: str | None = None, *, placements: Iterable = ()) -> _UnitContext:
-    """Повторяющаяся единица одной группой Revit.
+def unit(name: str | None = None, *, reads_as: str | None = None,
+         as_group: bool = True, placements: Iterable = ()) -> _UnitContext:
+    """ЕДИНИЦА ЗАМЫСЛА: набор элементов, о котором можно говорить как об одном.
 
-        with unit("Кабинка су", placements=[(1600, 0), (3200, 0)]):
-            create_wall(...)
-            create_wall(...)
+        with unit("фасадная лента, оси 1–5, этажи 2–3", reads_as="continuous"):
+            for lvl in levels[1:3]:
+                for a, b in spans:
+                    create_wall(p0_mm=a, p1_mm=b, level=lvl, type="Витраж 200")
 
-    Вхождение 0 — это САМИ члены, написанные в абсолютных координатах;
-    `placements` — смещения [dx, dy(, dz)] остальных вхождений. Пустой список
-    законен: группа, поставленная один раз, всё равно правится как одно целое.
+    ЗАЧЕМ. Проверяемость этого компилятора работает на арности 1: оп ->
+    элемент -> постусловие. Замысел живёт на арности N — «эти стены суть одна
+    лента», — и постусловие сказать этого не может: оно стоит на одном опе и
+    про соседа не знает. Полосатая стена (три стены встык, объявленные одной
+    лентой, но разного типа) проходит все три оси свидетеля, потому что каждая
+    стена в отдельности безупречна. Единица — то место, где набор становится
+    предметом суждения.
 
-    ВНУТРИ БЛОКА НЕЛЬЗЯ ССЫЛАТЬСЯ НА СОСЕДА: член группы не видит соседних
-    опов, и `{"by": "ref"}` там — типизированный отказ (`members[<id>]`).
-    Уровень, тип и символ адресуются именем или element_id.
+    `reads_as` — КАК ЧИТАТЬ этот набор. Реестр прочтений ОТКРЫТ на дополнение
+    (`assembly_view.UNIT_READS`), и это не словарь композитов: зданий
+    неограниченно много, а способов прочтения — единицы (непрерывная,
+    соосная, компланарная, этажированная, замыкающая). Композит остаётся
+    функцией, которую пишет сам автор; сюда он приносит только прочтение.
+    Без `reads_as` единица всё равно записывается — она остаётся АДРЕСОМ, по
+    которому наблюдение сможет назвать замысел, — но не судится.
+
+    `as_group` — ФОРМА ЗАПИСИ В РЕВИТЕ, и она ортогональна замыслу.
+    `True` (умолчание, сегодняшнее поведение байт в байт): члены схлопываются
+    в один `create_group`, и группа правится в Ревите как одно целое.
+    `False`: опы остаются в программе как есть, единица живёт только таблицей
+    конверта. Умолчание не меняется в этой волне намеренно: `create_group`
+    опознают пять потребителей (`course.measure`, `sdk`, `acceptance`,
+    `design.coherence`, `clash_bundle`), и смена умолчания — отдельное
+    решение с отдельной ценой.
+
+    `placements` — смещения [dx, dy(, dz)] дополнительных вхождений группы;
+    вхождение 0 это сами члены в абсолютных координатах. Только при
+    `as_group=True`: без группы повторять нечего, и это типизированный отказ,
+    а не молчаливое игнорирование.
+
+    ССЫЛКИ ВНУТРИ ГРУППЫ (исправлено 15.08.2026 — прежний текст здесь ЛГАЛ).
+    Сплошного запрета `{"by": "ref"}` внутри члена НЕТ с 12.08.2026. Живой
+    закон один и стоит в `authoring_validation` (`:1671-1716`): ссылка НАРУЖУ
+    множества членов — отказ; ссылка ВПЕРЁД, на члена объявленного ниже, —
+    отказ; ссылка на соседа ВЫШЕ по списку — ЗАКОННА, порядок членов есть
+    порядок создания.
     """
-    return _UnitContext(name, placements)
+    return _UnitContext(name, placements, reads_as=reads_as,
+                        as_group=as_group)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1125,9 +1358,17 @@ def take_ops() -> dict | None:
     if ledger is not None and ledger.phases:
         _refuse_tail(program, ledger)
         table = [p.as_dict() for p in ledger.phases]
+    # ТАБЛИЦА ЕДИНИЦ — ТОЧНО ТАК ЖЕ И РОВНО ПО ТОЙ ЖЕ ПРИЧИНЕ, что таблица
+    # фаз: опы остаются побайтово теми же, а принадлежность едет один раз
+    # рядом. Единиц нет — ключа нет: отсутствие остаётся отсутствием.
+    units = _UNIT_LEDGERS.get(program)
+    unit_table = ([u.as_dict() for u in units.units]
+                  if units is not None and units.units else None)
     out = dsl.take_ops()
     if out is not None and table is not None:
         out["phases"] = table
+    if out is not None and unit_table is not None:
+        out["units"] = unit_table
     return out
 
 

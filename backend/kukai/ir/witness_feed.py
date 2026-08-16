@@ -106,6 +106,41 @@ _MAX_FACT_TEXT = 80
 #: двумя маршрутами.
 _LABEL_KEYS = frozenset({"id", "deleted_id", "refused"})
 
+
+def outcome_label(row: Mapping[str, Any]) -> str:
+    """Метка исхода одной строки результата: `refused` / `created` / `other`.
+
+    ЕДИНСТВЕННОЕ место, где этот вопрос решается. Раньше решение стояло
+    выражением внутри цикла, а сверяющий тест воспроизводил его подстрокой в
+    исходнике — то есть ответ жил в двух местах, и они разъехались.
+
+    🔴 ПАРА `id`/`deleted_id` БЫЛА РУКОПИСНОЙ И ТЕРЯЛА ЧЕТЫРЕ СОЗИДАЮЩИХ ОПА
+    (замер 15.08.2026). Поле идентичности у `create_pipe_system`,
+    `create_room_separator`, `route_duct_system`, `route_pipe_system` —
+    `segment_ids`, и все четыре получали `other`. Метку читает
+    `tools/live_op_rates.py`, то есть прибор публиковал ставки по корпусу, где
+    созидающий оп не считался создавшим. В живом корпусе таких ходов **28 из
+    1913**.
+
+    Теперь созидающие поля берутся У РЕЕСТРА (`address.created_identity_fields`
+    — сегодня `id` и `segment_ids`). Два соседних решения объявлены, а не
+    подразумеваются:
+
+    * `deleted_id` остаётся отдельным слагаемым: у удаления идентичность есть,
+      созданного нет, и метка `created` значит здесь «оп принёс идентичность».
+      Менять этот смысл задним числом нельзя — корпус читается по всей истории;
+    * `moved_ids` НАМЕРЕННО не добавлен: правка не оставляет нового следа, и
+      `move_elements` остаётся `other`, как и был. Это решение, а не пропуск.
+    """
+
+    from kukai.ir.address import created_identity_fields
+
+    if "refused" in row:
+        return "refused"
+    if any(field in row for field in created_identity_fields()):
+        return "created"
+    return "created" if "deleted_id" in row else "other"
+
 _WRITE_LOCK = threading.Lock()
 _ZERO_CHECKSUM = "0" * 64
 
@@ -643,10 +678,7 @@ def record_witness(*, program: Any, family: str, revit_version: str,
             for oid, row in list(result_payload.items())[:_MAX_OPS_PER_RECORD]:
                 if isinstance(row, dict):
                     key = str(oid)[:64]
-                    per_op[key] = (
-                        "refused" if "refused" in row
-                        else "created" if ("id" in row or "deleted_id" in row)
-                        else "other")
+                    per_op[key] = outcome_label(row)
                     # Метка НЕ ограничивается списком опов: она пишется с
                     # 2026-07 и её непрерывность — свойство корпуса, которое
                     # `live_op_rates` читает по всей истории. Ограничен ФАКТ,

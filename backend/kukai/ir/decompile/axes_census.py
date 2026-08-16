@@ -73,11 +73,41 @@ BLIND_SPOTS = """\
     слепках `no_value` = 0, то есть «параметр есть, значения нет» на этих
     моделях не встретилось ни разу. На модели, где встретится, симуляция
     «сначала тип» будет ЗАНИЖАТЬ число нужных зондов.
- 3. МАСКА ТИПА — ОРАКУЛ. В симуляции маска существования выводится по типу из
-    наблюдённых значений, то есть задним числом. Живой протокол узнавал бы её,
-    опросив первый экземпляр каждого типа целиком; эта цена в симуляцию
-    ВКЛЮЧЕНА (2*T*B зондов), но равенство «маска первого экземпляра = маска
-    типа» здесь не доказано, а принято.
+ 3. 🔴 МАСКА ТИПА — ОРАКУЛ, И ПРЕМИССА ПОД НИМ ОПРОВЕРГНУТА ЗАМЕРОМ 15.08.2026.
+    В симуляции маска выводится по типу из наблюдённых значений, то есть
+    задним числом. Живой протокол узнавал бы её, опросив первый экземпляр
+    типа целиком; эта цена в симуляцию включена (2*T*B зондов). Равенство
+    «маска первого экземпляра = маска типа» РАНЬШЕ СТОЯЛО ЗДЕСЬ КАК ПРИНЯТОЕ.
+    Проверено на четырёх зданиях — НЕ ДЕРЖИТСЯ, и отказ идёт в ОПАСНУЮ
+    сторону: у экземпляра бывает ключ, которого не было у первого, и живой
+    протокол его НЕ СПРОСИТ — значение уедет из L0 молча.
+
+        sob62_r23_v5      1 тип из 71,    7 ключей,  0.46 % элементов
+        k2_ar_rd_v8       6 типов из 486, 2908 ключей, 1.27 % элементов
+        snowdon_plumb_v3  0                                    —
+        len_ar_me_r24_v1  0                                    —
+
+    МЕХАНИЗМ, а не случайность: `WALL_HEIGHT_TYPE` (привязка верха) есть у 7
+    экземпляров одного типа стены и отсутствует у 5 — потому что верх привязан
+    к уровню не у всех. Существование параметра — свойство СОСТОЯНИЯ
+    ЭКЗЕМПЛЯРА, а не типа, и никакой опрос первого экземпляра этого не даст.
+
+    ПОЭТОМУ `probes_typefirst` и `probes_constfold` ниже — ВЕРХНЯЯ ГРАНИЦА
+    выигрыша при ложной премиссе, а не достижимое число. Цитировать их как
+    план работ нельзя. Расхождение печатается рядом (`mask_diverged_types`,
+    `mask_lost_keys`), чтобы множитель нельзя было прочесть в отрыве от его
+    цены.
+
+ 3b. МЁРТВАЯ ПАРА (категория, параметр) — ФАКТ О ПРОЕКТЕ, НЕ О СХЕМЕ РЕВИТА.
+    Безопасная половина идеи — не спрашивать пару, которая у категории не
+    отвечает никогда: корпусом 28 слепков это 94.3 % зондов и ×17.5. Но
+    СТАТИЧЕСКИЙ список таких пар тоже неверен, и это замерено: по четырём
+    зданиям живых пар в объединении 19, а общих всем — 4; шестнадцать раз
+    пара мертва в одном доме и жива в другом (`OST_CurtainWallPanels`
+    отсутствует у ЛЕНа, `STRUCTURAL_SECTION_*` не носят колонны башни).
+    Список, снятый с одного проекта, на другом молча выбросит живые пары.
+    Годен только набор, выученный ВНУТРИ прогона и записавший, на каком
+    основании перестал спрашивать.
  4. СВЯЗАННЫЕ ФАЙЛЫ. Видна только сводка связи (имя, загружена ли):
     содержимое связанных документов извлечение не читает вовсе. «Сколько
     элементов в связях» — вопрос не к слепку.
@@ -198,6 +228,11 @@ def census(directory: Path, budget: int) -> dict[str, Any] | None:
     cat_elems: collections.Counter[str] = collections.Counter()
     cat_types: dict[str, set[str]] = collections.defaultdict(set)
     mask: dict[str, set[str]] = collections.defaultdict(set)
+    # Маска ПЕРВОГО экземпляра каждого типа — ровно то, что узнал бы живой
+    # протокол «сначала тип». Держится отдельно от объединения, потому что
+    # разница между ними и есть цена премиссы (см. BLIND_SPOTS п.3).
+    first_mask: dict[str, frozenset[str]] = {}
+    lost_keys = lost_instances = diverged_types = 0
     values: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
     level_sig: dict[str, collections.Counter] = collections.defaultdict(
         collections.Counter)
@@ -236,6 +271,18 @@ def census(directory: Path, budget: int) -> dict[str, Any] | None:
                 reference = element.get(field)
                 if reference:
                     sink[reference.get("name") or ""] += 1
+            element_keys = frozenset((element.get("params") or {}).keys())
+            known = first_mask.get(type_id)
+            if known is None:
+                first_mask[type_id] = element_keys
+            else:
+                missed = element_keys - known
+                if missed:
+                    # Ключ есть у ЭТОГО экземпляра и не было у первого.
+                    # Протокол, узнавший маску по первому, его не спросит —
+                    # значение уедет из L0 молча. Это ПОТЕРЯ, а не перерасход.
+                    lost_keys += len(missed)
+                    lost_instances += 1
             for key, value in (element.get("params") or {}).items():
                 n_params += 1
                 mask[type_id].add(key)
@@ -269,6 +316,8 @@ def census(directory: Path, budget: int) -> dict[str, Any] | None:
         varying = sum(1 for key in keys if len(values[(type_id, key)]) > 1)
         probes_typefirst += max(0, count - 1) * len(keys)
         probes_constfold += max(0, count - 1) * varying
+        if count >= 2 and first_mask.get(type_id, frozenset()) != keys:
+            diverged_types += 1
 
     outcomes: collections.Counter[str] = collections.Counter()
     probes_measured = probes_dead = dead_pairs = live_pairs = reached_type = 0
@@ -329,6 +378,12 @@ def census(directory: Path, budget: int) -> dict[str, Any] | None:
         "probes_now": probes_now,
         "probes_typefirst": probes_typefirst,
         "probes_constfold": probes_constfold,
+        # Цена премиссы, под которой стоят два числа выше. Держится РЯДОМ с
+        # ними намеренно: множитель, прочитанный без неё, — план работ,
+        # стоящий на опровергнутом равенстве.
+        "mask_diverged_types": diverged_types,
+        "mask_lost_keys": lost_keys,
+        "mask_lost_instances": lost_instances,
         "probes_measured": probes_measured,
         "probes_dead": probes_dead,
         "dead_pairs": dead_pairs,
@@ -430,6 +485,20 @@ def render(row: dict[str, Any], breakdown: dict[str, int]) -> None:
               f"   ({row['probes_now'] / max(1, row['probes_typefirst']):.1f}x меньше)")
         print(f"   + снятие тип-констант ....... {row['probes_constfold']}"
               f"   ({row['probes_now'] / max(1, row['probes_constfold']):.1f}x меньше)")
+        # Цена премиссы печатается ВПЛОТНУЮ к множителю и в его же блоке:
+        # два числа выше достижимы только при равенстве, которое замер 15.08
+        # опроверг. Строка молчит лишь когда терять нечего.
+        if row.get("mask_lost_keys"):
+            print(f"   🔴 НО ПРЕМИССА ЛОЖНА ЗДЕСЬ: маска первого экземпляра != маска типа")
+            print(f"      у {row['mask_diverged_types']} типов;"
+                  f" молча потерялось бы {row['mask_lost_keys']} значений"
+                  f" у {row['mask_lost_instances']} элементов"
+                  f" ({_pct(row['mask_lost_instances'], row['elements'])})")
+            print(f"      два числа выше — ВЕРХНЯЯ ГРАНИЦА, не план работ (BLIND_SPOTS п.3)")
+        else:
+            print(f"   премисса маски на ЭТОМ слепке не опровергнута"
+                  f" ({row['mask_diverged_types']} расходящихся типов);"
+                  f" на других опровергнута — см. BLIND_SPOTS п.3")
     if row["probes_measured"]:
         print(f"   ИЗМЕРЕНО КВИТАНЦИЯМИ (16 зондов из {row['probe_budget']}):")
         print(f"     опрошено .................. {row['probes_measured']}")

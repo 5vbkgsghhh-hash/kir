@@ -198,6 +198,27 @@ KINDS: dict[str, KindSpec] = {k.name: k for k in (
     KindSpec("flex_duct",
              ".OfCategory(BuiltInCategory.OST_FlexDuctCurves).WhereElementIsNotElementType()",
              discipline="mechanical"),
+    # ПОСТРОИТЬ МОЖНО, ПОСЧИТАТЬ БЫЛО НЕЛЬЗЯ (14.08.2026). У заготовок есть
+    # свои пишущие опы (`create_duct_placeholder`, `create_pipe_placeholder`),
+    # а вида для запроса не было — живой отказ 13.08 просил ровно эти два
+    # имени. Асимметрия «оп есть, вида нет» хуже отсутствия обоих: модель
+    # строит и не может проверить, что построила.
+    #
+    # ОТДЕЛЬНЫЙ ВИД, А НЕ ФИЛЬТР У `duct`/`pipe`, и это ЗАМЕР, а не вкус:
+    # Revit не заводит заготовке своей категории — она остаётся в
+    # OST_DuctCurves/OST_PipeCurves и отличается ТОЛЬКО битом
+    # `IsPlaceholder`. Значит `query_count(kind="duct")` считает заготовки
+    # вместе с настоящими воздуховодами, и отличить их запросом было нечем.
+    #
+    # `IsPlaceholder` ЖИВЁТ НА КОНКРЕТНОМ КЛАССЕ, НЕ НА `MEPCurve`: замер
+    # компиляцией 14.08 — `MEPCurve.IsPlaceholder` это CS1061 на всех шести
+    # версиях, а `Duct`/`Pipe` его несут 6/6. Поэтому сбор идёт по КЛАССУ, а
+    # предикат приводит к нему же.
+    KindSpec("duct_placeholder",
+             ".OfClass(typeof(Autodesk.Revit.DB.Mechanical.Duct))",
+             where_cs="((Autodesk.Revit.DB.Mechanical.Duct)e).IsPlaceholder",
+             comment="заготовки воздуховодов — та же категория, что у настоящих",
+             discipline="mechanical"),
     KindSpec("space",
              ".OfCategory(BuiltInCategory.OST_MEPSpaces).WhereElementIsNotElementType()",
              comment="пространства ОВК — не то же, что помещения АР",
@@ -215,6 +236,12 @@ KINDS: dict[str, KindSpec] = {k.name: k for k in (
              comment="арматура: задвижки, клапаны", discipline="plumbing"),
     KindSpec("flex_pipe",
              ".OfCategory(BuiltInCategory.OST_FlexPipeCurves).WhereElementIsNotElementType()",
+             discipline="plumbing"),
+    # Пара к `duct_placeholder` — довод целиком стоит там, у воздуховода.
+    KindSpec("pipe_placeholder",
+             ".OfClass(typeof(Autodesk.Revit.DB.Plumbing.Pipe))",
+             where_cs="((Autodesk.Revit.DB.Plumbing.Pipe)e).IsPlaceholder",
+             comment="заготовки труб — та же категория, что у настоящих",
              discipline="plumbing"),
     KindSpec("sprinkler",
              ".OfCategory(BuiltInCategory.OST_Sprinklers).WhereElementIsNotElementType()",

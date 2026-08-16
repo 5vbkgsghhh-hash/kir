@@ -7253,6 +7253,22 @@ def _emit_stairs_landing_program(op: dict, ver: str, intent: str = "", *,
         expected_identities=expected_identities)
 
 
+def _emit_stairs_run_program(op: dict, ver: str, intent: str = "", *,
+                             stamp_scope: str = "",
+                             expected_document=None,
+                             expected_identities=None) -> str:
+    """Тонкая регистрация без логики — тело в `stairs_run_emit.py`.
+
+    Импорт ленивый по той же причине, что у площадки: тот модуль берёт
+    приватные помощники ОТСЮДА, и модульный импорт замкнул бы граф.
+    """
+    from kukai.ir import stairs_run_emit
+    return stairs_run_emit.emit_stairs_run_program(
+        op, ver, intent, stamp_scope=stamp_scope,
+        expected_document=expected_document,
+        expected_identities=expected_identities)
+
+
 #: ОП-ВЛАДЕЛЕЦ ТРАНЗАКЦИЙ -> ЕГО СОБСТВЕННЫЙ ШАБЛОН ЦЕЛОЙ ПРОГРАММЫ.
 #:
 #: Таблица заведена вместе со вторым таким опом (10.08.2026) и ровно затем,
@@ -7264,6 +7280,7 @@ def _emit_stairs_landing_program(op: dict, ver: str, intent: str = "", *,
 _SOLO_PROGRAMS = {
     "create_stairs": emit_stairs_program,
     "create_stairs_landing": _emit_stairs_landing_program,
+    "create_stairs_run": _emit_stairs_run_program,
 }
 
 

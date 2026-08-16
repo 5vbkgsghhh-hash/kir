@@ -989,6 +989,36 @@ def assemble_passport(
         "doc_name": document.doc_name,
         "revit_version": document.revit_version,
         "change_stamp": document.change_stamp,
+        # ЛИЧНОСТЬ ДОКУМЕНТА, А НЕ ЕГО ИМЯ (15.08.2026, forward-only).
+        #
+        # До этой строки паспорт нёс из тройки `(title, path_name, project_uid)`
+        # РОВНО ОДНО поле — имя. Потребитель, сравнивающий пачку с уже стоящим
+        # зданием (`clash/existing.py`), мог опереться только на `doc_name`, а
+        # два документа с одним заголовком неразличимы: находка помечалась
+        # `proven=False`, и квитанция честно предупреждала, что сравнение идёт
+        # с ПРОШЛЫМ состоянием.
+        #
+        # Факт УЖЕ ЧИТАЕТСЯ экстрактором и УЖЕ лежит в L0
+        # (`L0Document.identity`, `extract.py:1074-1085`), причём живой отпечаток
+        # берёт то же самое поле Revit — `doc.ProjectInformation.UniqueId`
+        # (`open_model.py:1908`). Стороны сравнимы; сюда оно просто не доезжало.
+        #
+        # 🔴 ЧТО ЭТО ЗНАЧИТ, А ЧТО НЕТ. `project_information_unique_id` —
+        # РОДОСЛОВНАЯ, а не авторитет: Autodesk контрактует `Element.UniqueId`
+        # уникальным ВНУТРИ документа, поэтому Save As несёт то же значение
+        # (`decompile/identity.py`, `AUTHORITATIVE_DOCUMENT_IDENTITY_SOURCES`).
+        # Отсюда асимметрия, на которой стоит потребитель: совпадение НЕ
+        # доказывает «тот же файл», а РАСХОЖДЕНИЕ доказывает «другой файл».
+        # Опровержение здесь сильнее подтверждения, и это законный выигрыш.
+        #
+        # forward-only и сказано прямо: 4 из 71 сохранённых L0 несут `identity`,
+        # остальные сняты до неё и нести не могут. `None` здесь означает «этот
+        # разбор снят раньше», а не «у документа нет личности».
+        "document_identity": (
+            None if (document.identity is None
+                     or document.identity.document_identity is None)
+            else {"source": document.identity.document_identity.source,
+                  "value": document.identity.document_identity.value}),
         "gestalt": gestalt.strip(),
         # NAME carries richer honest facts than §2.4's class/dims pair.  Keep
         # that losslessly while retaining the exact §2.4 summary fields above.

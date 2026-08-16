@@ -452,13 +452,24 @@ def test_the_same_law_covers_width_height_daylight_and_door_sides():
 
 
 def test_apartment_oracle_rules_are_suspended_with_the_measurement_named():
-    """Замер точности оракула — часть причины, а не сноска к ней."""
+    """Замер точности оракула — часть причины, а не сноска к ней.
+
+    🔴 HAB002 ВЫШЕЛ ИЗ ЭТОГО СПИСКА 15.08.2026, и это не смягчение, а второй замер.
+    На эталоне генератора, где истина известна по построению, `derive_apartments`
+    даёт 20 квартир из 20 с ТОЧНЫМ составом: «0%» есть свойство ВХОДА, а не
+    алгоритма. HAB002 переехал на предусловия (`_DESIGN_PRECONDITIONS`), которые
+    отделяют вход, на котором оракулу верить можно, от входа, на котором нельзя;
+    основание и оба контроля — `test_apartment_oracle_precondition.py`.
+    Остальные три стоят каждое на СВОЁМ входе, и этим замером они НЕ покрыты.
+    """
     _, witness = spatial_model_from_program(_two_room_program(), building_id="t")
     profile = design_stage_profile(witness)
-    for rule_id in ("HAB002", "HAB003", "HAB004", "HAB042"):
+    for rule_id in ("HAB003", "HAB004", "HAB042"):
         reason = profile.suspension_reason(rule_id)
         assert reason, rule_id
         assert "0%" in reason and "469" in reason, "причина обязана нести замер"
+    assert not profile.suspension_reason("HAB002"), (
+        "HAB002 больше не снимается безусловно — он обязан стоять на предусловиях")
 
 
 def test_curtain_wall_facade_suspends_the_daylight_rule_with_both_numbers():

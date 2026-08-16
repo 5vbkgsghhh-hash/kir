@@ -694,6 +694,83 @@ OPS = [
             tolerances={},
         ),
     OpSpec(
+            name="create_stairs_run",
+            effect=EffectKind.CREATE,
+            result=RESULT_UNREFERENCED_ELEMENT,
+            family="authoring",
+            params=(
+                # ЛЕСТНИЦА-ХОЗЯИН — дословно тот же род и тот же довод, что у
+                # площадки: `ref_kinds` ПУСТ, потому что оп лежит в
+                # `spec.SOLO_OPS` и предшественника у него нет ни одного.
+                # Единственная законная форма — `element_id` уже стоящей
+                # лестницы.
+                ParamSpec("stairs", "target_w", required=True, ref_kinds=()),
+                # ОСЬ МАРША В ПЛАНЕ.  `CreateStraightRun` принимает
+                # `locationPath` типа `Line` и требует «bound line»; XY даёт
+                # автор, Z считает эмиссия из отметки самой лестницы (см.
+                # `base_elevation_mm`).  Форма та же, что у первого марша в
+                # `create_stairs`, и это не симметрия, а один и тот же
+                # аргумент одного и того же вызова.
+                ParamSpec("p0_mm", "pt_xy", required=True),
+                ParamSpec("p1_mm", "pt_xy", required=True),
+                # ОТМЕТКА НИЗА МАРША ОТНОСИТЕЛЬНО БАЗЫ ЛЕСТНИЦЫ.
+                #
+                # ПОЧЕМУ ОТНОСИТЕЛЬНАЯ, А НЕ АБСОЛЮТНАЯ — та же причина, по
+                # которой относительна отметка площадки, и здесь она даже
+                # жёстче: `CreateStraightRun` не имеет аргумента отметки
+                # ВООБЩЕ, её несёт Z точек `locationPath`.  Абсолютный Z
+                # потребовал бы знать `Stairs.BaseElevation` ДО эмиссии, то
+                # есть живой Revit на компиляции.  Поэтому автор говорит
+                # «на сколько выше базы», а `BaseElevation` (6/6, замер
+                # компиляцией) читает C# в рантайме.
+                #
+                # ГРАНИЦЫ — те же и по тому же основанию, что у площадки:
+                # верх 9 144 000 мм есть «30000 feet» из текста Autodesk
+                # (`ArgumentOutOfRangeException` у `CreateSketchedRun`
+                # дословно), низ 0 — СЛАБАЯ граница, потому что точная
+                # («bottom of run should not be lower than bottom of stairs»)
+                # есть величина живой модели.  Придумать её взамен значило бы
+                # повторить `create_door.sill_mm min_val=0`.
+                ParamSpec("base_elevation_mm", "mm", required=True,
+                          min_val=0.0, max_val=9_144_000.0),
+                # ПРИВЯЗКА МАРША — ЗАКРЫТОЕ ПЕРЕЧИСЛЕНИЕ REVIT.
+                # `StairsRunJustification` несёт ровно три члена, и все три
+                # проверены КОМПИЛЯЦИЕЙ против настоящих сборок на 2021-2026
+                # (6/6 каждый), а не прочитаны в XML.  В C# уезжает ИМЯ
+                # ЧЛЕНА, поэтому авторитетом остаются сборки Revit: опечатка
+                # не собирается, а не строит молча не то.  Умолчание
+                # `center` — то же, что жёстко зашито у первого марша в
+                # `create_stairs` (`StairsRunJustification.Center`), то есть
+                # оп не меняет поведения, к которому автор уже привык.
+                ParamSpec("justification", "enum", required=False,
+                          choices=("center", "left", "right"),
+                          default="center"),
+            ),
+            capability=(("create", "element"),),
+            post=("a StairsRun exists on the given stairs; GetStairs() == the "
+                  "requested stairs (topology); the run id appears in "
+                  "Stairs.GetStairsRuns() (topology); the run's re-read "
+                  "location path reproduces the authored axis endpoints in "
+                  "PLAN within the derived tolerance (geometry) — Z is NOT "
+                  "compared, it is Revit's own number derived from the stairs "
+                  "base; the run's base elevation re-read after "
+                  "StairsEditScope.Commit equals BaseElevation + the authored "
+                  "base_elevation_mm within the same tolerance (geometry); "
+                  "base_elevation_mm must already be an integer multiple of "
+                  "the live ActualRiserHeight, otherwise the op refuses and "
+                  "names the adjacent multiples — a run starting mid-riser is "
+                  "not a stair; MUST be the sole op of its program "
+                  "(StairsEditScope owns its transactions — KIR-L002 "
+                  "otherwise)"),
+            writes_model=True,
+            grounded=(),
+            # ПУСТО ПО ТОЙ ЖЕ ПРИЧИНЕ, ЧТО У ПЛОЩАДКИ: оба допуска этого опа —
+            # величины ЖИВОЙ модели (`VertexTolerance` документа и высота
+            # подступенка этой лестницы), реестровой константой они быть не
+            # могут по построению.
+            tolerances={},
+        ),
+    OpSpec(
             name="create_multistory_stairs",
             effect=EffectKind.CREATE,
             result=RESULT_UNREFERENCED_ELEMENT,
@@ -1240,7 +1317,12 @@ OPS = [
             # further occurrence's offset. The rebuild edits like a live
             # modeller's (edit one instance, all update) instead of N loose
             # elements. members are PRE-GROUNDED authoring ops (element_id /
-            # absolute coords — no name/ref resolution inside the group);
+            # absolute coords). CORRECTED 2026-08-15 — the old parenthetical
+            # "no name/ref resolution inside the group" is FALSE since
+            # 2026-08-12: `authoring_validation` refuses a ref pointing OUTSIDE
+            # the member set and a ref pointing FORWARD (to a member declared
+            # below), and allows a ref to an EARLIER member, because the member
+            # order is the creation order;
             # placements are per-additional-occurrence [dx,dy,dz] deltas
             # (occ_origin_k - occ_origin_0, ABSOLUTE origins subtracted — the
             # only origin-independent form; occurrence 0 IS the members). Emit

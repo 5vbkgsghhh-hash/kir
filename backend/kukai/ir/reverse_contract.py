@@ -432,7 +432,7 @@ _CONTRACTS = {
     # не входят в таблицу извлечения L0 вовсе, то есть чтение до этих
     # элементов не доходит. Разница между «стадия отказала на элементе» и
     # «стадия о нём не говорила» уже стоила этому пакету одного неверного
-    # диагноза (см. инженерные правила: «Absent index and empty index are different
+    # диагноза («Absent index and empty index are different
     # facts»), и повторять его умолчанием нельзя.
     #
     # ЧЕГО ИМЕННО НЕ ХВАТАЕТ, названо поимённо, чтобы следующая волна не
@@ -506,6 +506,27 @@ _CONTRACTS = {
                     "decompiled building is lost silently, and the stairs "
                     "lifts as its run alone"),
         decided_on="2026-08-10", due="2026-09-09"),
+    # ВТОРОЙ МАРШ — ТА ЖЕ ДЫРА ЗАХВАТА, ЧТО И У ПЛОЩАДКИ, И ПО ТОЙ ЖЕ ПРИЧИНЕ.
+    # Разбор читает лестницу как ОДИН элемент `OST_Stairs`: ни
+    # `Stairs.GetStairsRuns()`, ни класс `StairsRun` в `decompile/` не
+    # упоминаются ни разу. Значит настоящая лестница из четырёх маршей — а
+    # это МОДА настоящего дома (10 лестниц из 19 в `LEN_AR_ME_R24`) —
+    # поднимается как один марш, и три остальных теряются МОЛЧА. Пробел
+    # ровно тот же, что у площадки, и закрывается он одной работой захвата,
+    # а не двумя.
+    "create_stairs_run": ReverseContract(
+        "create_stairs_run", ReverseMode.CAPTURE_GAP,
+        ReverseGuarantee.NONE,
+        "L0 reads no StairsRun at all — Stairs.GetStairsRuns() is called "
+        "nowhere in decompile/ and the run class is named nowhere either",
+        sources=("L0:OST_Stairs",),
+        limitation=("capture must start reading StairsRun, its location path "
+                    "and its base elevation before a lifter is legal; until "
+                    "then a stair of N runs decompiles as its first run "
+                    "alone, and the remaining N-1 are lost silently — "
+                    "measured on LEN_AR_ME_R24: 61 runs across 19 stairs, "
+                    "mode FOUR runs per stair"),
+        decided_on="2026-08-15", due="2026-09-14"),
     # 09.08.2026: у потолка ДВЕ ветки подъёма, и обе названы здесь поимённо.
     # `_lift_ceiling_by_contour` появился в тот же день, что и второй вход
     # формы прямого опа (`contour` рода `region`), и берёт ровно то, что

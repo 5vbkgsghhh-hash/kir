@@ -891,12 +891,37 @@ class BulkFlag(unittest.TestCase):
             for i in range(n)
         ]
 
-    def test_twentyone_ops_without_bulk_refused(self):
-        program = {"ir_version": "1.0", "ops": self._wall_ops(21)}
+    def test_one_over_the_authored_budget_is_refused_without_bulk(self):
+        """ПОТОЛОК БЕРЁТСЯ У АВТОРИТЕТА, А НЕ ПИШЕТСЯ ЧИСЛОМ.
+
+        Прежняя редакция звалась `test_twentyone_ops_without_bulk_refused` и
+        подавала 21 оп, потому что бюджет был 20. Владелец поднял его до 100
+        (15.08), и тест позеленел молча в другую сторону: 21 оп больше не
+        отказывает, а проверка «потолок работает» перестала что-либо проверять,
+        оставшись зелёной. Числовой пин потолка — тот же именной дефект дерева:
+        величина объявлена в `compiler`, прочитана здесь, и ничто не заставляло
+        их совпасть.
+
+        Теперь граница выводится из `MAX_OPS_PER_PROGRAM`, и тест переживёт
+        следующий подъём бюджета, каким бы он ни был.
+        """
+        over = MAX_OPS_PER_PROGRAM + 1
+        program = {"ir_version": "1.0", "ops": self._wall_ops(over)}
         with self.assertRaises(KirRefusal) as ctx:
             _parse_and_check(program)          # bulk defaults to False
         codes = {d.code for d in ctx.exception.diagnostics}
         self.assertIn("KIR-L001", codes)
+
+    def test_exactly_the_authored_budget_is_accepted(self):
+        """КОНТРОЛЬ С ДРУГОЙ СТОРОНЫ ГРАНИЦЫ.
+
+        Без него отказ выше доказывает лишь, что что-то отказало, — а «отказ
+        всегда» выглядит точно так же. Пара «ровно потолок проходит, потолок+1
+        отказывает» и есть акт различения."""
+        program = {"ir_version": "1.0",
+                   "ops": self._wall_ops(MAX_OPS_PER_PROGRAM)}
+        normed = _parse_and_check(program)
+        self.assertEqual(len(normed), MAX_OPS_PER_PROGRAM)
 
     def test_threehundred_ops_with_bulk_ok(self):
         program = {"ir_version": "1.0", "ops": self._wall_ops(300)}
@@ -916,8 +941,14 @@ class BulkFlag(unittest.TestCase):
 
     def test_bulk_flag_not_in_llm_schema(self):
         # `bulk` is internal-only: it must not appear as an envelope field the
-        # user-facing parser accepts, and MAX_OPS_PER_PROGRAM stays 20.
-        self.assertEqual(MAX_OPS_PER_PROGRAM, 20)
+        # user-facing parser accepts.
+        #
+        # ЗДЕСЬ БОЛЬШЕ НЕТ `assertEqual(MAX_OPS_PER_PROGRAM, 20)`, и это не
+        # ослабление. Предмет этого теста — ФОРМА КОНВЕРТА: нельзя попросить
+        # bulk полем программы. Величина бюджета — предмет соседних тестов, и
+        # приписанная сюда, она делала ровно одно: роняла проверку конверта
+        # при каждой смене бюджета, то есть красила чужой предмет.
+        self.assertGreater(MAX_OPS_PER_PROGRAM, 0)
         program = {"ir_version": "1.0", "bulk": True, "ops": self._wall_ops(1)}
         with self.assertRaises(KirRefusal) as ctx:
             _parse_and_check(program)

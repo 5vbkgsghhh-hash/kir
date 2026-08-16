@@ -114,7 +114,7 @@ class EveryWritingOpIsNamed(unittest.TestCase):
         }
         self.assertEqual(
             measured,
-            {"writing": 65, "table": 44, "resolver": 6, "blind": 10,
+            {"writing": 66, "table": 44, "resolver": 6, "blind": 11,
              "no_elements": 4, "derived_only": 1},
             "арифметика категорий сдвинулась — обнови абзац над "
             "OP_RESULT_CATEGORIES в spec.py и это число здесь")

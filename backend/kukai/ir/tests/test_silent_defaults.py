@@ -56,6 +56,10 @@ MINIMAL = {
                     "p1_mm": [6000, 0], "level": {"by": "name", "value": "L"}},
     "create_window": {"op": "create_window", "id": "N",
                       "host": {"by": "ref", "value": "W"}, "offset_mm": 1000},
+    "create_stairs_run": {"op": "create_stairs_run", "id": "RN",
+                          "stairs": {"by": "element_id", "value": 4242},
+                          "p0_mm": [0.0, 0.0], "p1_mm": [3000.0, 0.0],
+                          "base_elevation_mm": 1800.0},
     "place_family": {"op": "place_family", "id": "P", "xyz": [0, 0, 0],
                      "level": {"by": "name", "value": "L"},
                      "symbol": {"by": "name", "value": "S"}},
@@ -74,6 +78,15 @@ SILENTLY_INJECTED = {
     ("create_type", "category"),       # то же
     ("query_list", "fields"),          # чтение, элементов не строит
     ("query_list", "limit"),           # чтение
+    ("create_stairs_run", "justification"),
+    # 15.08.2026. Правило файла требует ответить, КТО присваивает значение в
+    # построенном элементе. Здесь — ЭМИТТЕР: слово уезжает в C# именем члена
+    # (`StairsRunJustification.Center`) прямо аргументом CreateStraightRun,
+    # значит обещание наше и свидетельствовать его законно. Ревит тут ничего
+    # не решает. И всё же вердикта по нему НЕТ: привязка едет в квитанцию
+    # полем `justification`, а не строкой `__post.Add`, потому что обратно из
+    # StairsRun она не читается ничем — постусловие подтверждало бы ФАКТ
+    # ВЫЗОВА, то есть именной дефект этого дерева.
 }
 
 

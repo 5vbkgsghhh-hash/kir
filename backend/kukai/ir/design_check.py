@@ -207,7 +207,13 @@ _DESIGN_NOMINAL_OPENING_M2 = 1.0
 
 #: Правила, стоящие на ВЫВОДЕ КВАРТИРЫ (`graph.derive_apartments`). Снимаются ВСЕГДА,
 #: и это не осторожность, а следствие замера.
-_APARTMENT_ORACLE_RULES = ("HAB002", "HAB003", "HAB004", "HAB042")
+#: HAB002 ВЫШЕЛ ОТСЮДА 15.08.2026 и ушёл под ПРЕДУСЛОВИЕ — см. `_DESIGN_PRECONDITIONS`.
+#: Основание — замер, а не смягчение: на эталоне генератора, где истина известна по
+#: построению, `derive_apartments` даёт 20 квартир из 20 с ТОЧНЫМ составом (100%).
+#: Значит записанные «0%» есть свойство ВХОДА, и предусловие `apartments_are_dwellings`
+#: отделяет вход, на котором оракулу верить можно, от входа, на котором нельзя.
+#: Остальные три остаются снятыми БЕЗУСЛОВНО, и каждое по своей причине — ниже.
+_APARTMENT_ORACLE_RULES = ("HAB003", "HAB004", "HAB042")
 _APARTMENT_ORACLE_REASON = (
     "правило стоит на выводе КВАРТИРЫ, а тот — на классификации имён помещений. "
     "Точность этого оракула ИЗМЕРЕНА 03.08 и разгромна: по составу жилища 0% "
@@ -223,6 +229,21 @@ _DESIGN_PRECONDITIONS: dict[str, list[str]] = {
     "HAB001": ["building_entrance_known", "stair_landings_complete"],
     "HAB010": ["ground_level_known", "stair_landings_complete"],
     "HAB003": ["ground_level_known", "stair_landings_complete", "apartments_derived"],
+    # HAB002 судит ТОПОЛОГИЮ квартиры (не квартира-в-квартиру, ровно один вход в
+    # общую зону). Предмет у него ровно тот, который предусловие делает доверяемым:
+    # пока компоненты — жилища, топология про жилища; как только среди них есть
+    # компонента без кухни и санузла, то же правило рассуждает об артефакте вывода.
+    # Поэтому здесь ДВА предусловия, и второе — не осторожность, а различитель.
+    # ТРЕТЬЕ ПРЕДУСЛОВИЕ ДОБАВЛЕНО ПО КРАСНОМУ, А НЕ ПО ЗАМЫСЛУ, и это стоит записать.
+    # С двумя первыми HAB002 обвинил фикстуру `test_missing_ground_level_...`, у
+    # которой наружная дверь УБРАНА НАМЕРЕННО: квартира получила НОЛЬ входов, и
+    # «ровно один вход» обвинило здание в том, что есть свойство ЧТЕНИЯ. Это тот же
+    # класс, ради которого предусловия и заведены (замер 03.08: HAB010 обвинял
+    # 4 уровня детсада и 8 уровней snowdon в том, что они не спускаются к земле,
+    # которой проверка не нашла). Правило о ВХОДАХ не вправе говорить, пока ни одна
+    # дверь не подтверждена как вход с улицы.
+    "HAB002": ["apartments_derived", "apartments_are_dwellings",
+               "building_entrance_known"],
 }
 
 #: Фильтры субъектов: правило говорит только о тех, у кого есть его вход.
@@ -2791,13 +2812,60 @@ def _median(values: list[float]) -> float:
     return ordered[len(ordered) // 2] if ordered else 0.0
 
 
+def _translated(model_ids: Iterable[str],
+                translate: Mapping[str, str] | None) -> dict[str, str]:
+    """Ключи модели программы, переведённые в пространство `element_id`.
+
+    Пустой перевод оставляет ключи как есть — это путь ПЕРЕСБОРКИ, где обе
+    стороны уже несут `element_id`.
+    """
+
+    if not translate:
+        return {mid: mid for mid in model_ids}
+    return {mid: translate.get(mid, mid) for mid in model_ids}
+
+
 def compare_geometry(parse: SpatialModel, program: SpatialModel,
-                     *, tol_mm: float = 1.0) -> list[Divergence]:
+                     *, tol_mm: float = 1.0,
+                     translate: Mapping[str, str] | None = None,
+                     ) -> list[Divergence]:
     """ПОЭЛЕМЕНТНОЕ сравнение геометрии двух путей — не счётчиков, а чисел.
 
-    Возможно потому, что обе модели держат ОДНИ И ТЕ ЖЕ идентификаторы: путь
-    программы наследует `source_element_id` того же разбора. Для программы, написанной
-    человеком, такого соответствия нет, и тогда работают только агрегаты `compare()`.
+    Сравнение идёт по идентификаторам, и потому имеет смысл ровно тогда, когда
+    обе стороны адресуют В ОДНОМ ПРОСТРАНСТВЕ.
+
+    * **пересборка** — обе стороны несут `element_id` того же разбора,
+      `translate` не нужен;
+    * **АВТОРСКАЯ программа** — сторона программы несёт `id` ОПЕРАЦИИ
+      (`_program_nodes`: «`source_element_id` — это `id` самой операции»), а
+      сторона разбора — `element_id` Ревита. Пересечение таких множеств ПУСТО
+      по построению. Передай `translate` — карту `op_id → element_id`, которую
+      собирают из `kukai.ir.address.receipt_map(ops, payload)` — единственного
+      производителя карты в дереве.
+
+      🔴 РАСПАКОВКА ОБЯЗАНА БЫТЬ ЯВНОЙ, И ЭТО НЕ ПЕДАНТИЗМ. `receipt_map`
+      отдаёт СПИСОК на любой арности, а `translate` здесь плоский, потому что
+      сравниваются стены, проёмы и помещения — все арности ОДИН. Собирать его
+      так:
+
+          translate = {oid: only for oid, (only,) in receipt_map(...).items()}
+
+      Распаковка `(only,)` ОТКАЗЫВАЕТ, если элементов оказалось два, и это
+      ровно то поведение, которого здесь надо. До 15.08.2026 ту же карту строила
+      функция `address.op_to_element_ids`, которая вместо отказа МОЛЧА
+      выбрасывала операции множественной арности — замерено на реестре: пять
+      пишущих опов из 66 (`create_pipe_system`, `create_room_separator`,
+      `move_elements`, `route_duct_system`, `route_pipe_system`). Она удалена;
+      решение об арности принимается ЗДЕСЬ, где вопрос и задаётся.
+
+    🔴 ЧТО ЗДЕСЬ БЫЛО ДО 15.08.2026 И ПОЧЕМУ ЭТО БЫЛО ХУЖЕ ОТСУТСТВИЯ ФУНКЦИИ.
+    Докстрока честно говорила, что для не-пересборки соответствия нет. Но код
+    в этом случае не отказывал: каждая ветка стоит под `if common:` /
+    `if not shared: continue`, поэтому на авторской программе функция
+    возвращала **пустой список расхождений**, а пустой список расхождений
+    читается как «всё совпало». Ноль величины, которую здесь никто не считал,
+    выдавался за согласие. Теперь пустое пересечение — НАЗВАННАЯ находка, и
+    она стоит первой строкой.
 
     Смещение проёма раскладывается ВДОЛЬ и ПОПЕРЁК оси стены-хозяина отдельно — и это
     не украшение: язык выражает ровно одну из двух степеней свободы (`offset_mm` вдоль
@@ -2808,7 +2876,27 @@ def compare_geometry(parse: SpatialModel, program: SpatialModel,
     out: list[Divergence] = []
 
     walls_a = {wall.id: wall for wall in parse.walls}
-    walls_b = {wall.id: wall for wall in program.walls}
+    keys_b = _translated((wall.id for wall in program.walls), translate)
+    walls_b = {keys_b[wall.id]: wall for wall in program.walls}
+
+    # ОТКАЗ ВМЕСТО ТИШИНЫ. Обе стороны непусты, общего нет ни одного — значит
+    # сравнивали адреса разных пространств, и любой дальнейший вывод был бы о
+    # пустом множестве. Это единственное место, где функция обязана заговорить
+    # ДО того, как посчитает хоть одно число.
+    if walls_a and walls_b and not (set(walls_a) & set(walls_b)):
+        out.append(Divergence(
+            "адрес", "пространства не сведены",
+            f"{len(walls_a)} стен, пример `{sorted(walls_a)[0]}`",
+            f"{len(walls_b)} стен, пример `{sorted(walls_b)[0]}`",
+            "пересечение идентификаторов ПУСТО: стороны адресуют в разных "
+            "пространствах. Для авторской программы передай `translate` — "
+            "карту `op_id → element_id` из `address.receipt_map` с ЯВНОЙ "
+            "распаковкой `(only,)`, чтобы множественная арность отказала, а "
+            "не потерялась. "
+            "Без неё любое «совпало» ниже было бы утверждением о пустом "
+            "множестве"))
+        return out
+
     common = sorted(set(walls_a) & set(walls_b))
     if common:
         deltas = [max(math.dist(walls_a[i].curve[0], walls_b[i].curve[0]),
@@ -2825,7 +2913,8 @@ def compare_geometry(parse: SpatialModel, program: SpatialModel,
     for label, a_items, b_items in (("положение двери", parse.doors, program.doors),
                                     ("положение окна", parse.windows, program.windows)):
         a_by_id = {item.id: item for item in a_items}
-        b_by_id = {item.id: item for item in b_items}
+        keys_items = _translated((item.id for item in b_items), translate)
+        b_by_id = {keys_items[item.id]: item for item in b_items}
         shared = sorted(set(a_by_id) & set(b_by_id))
         if not shared:
             continue
@@ -2866,7 +2955,10 @@ def compare_geometry(parse: SpatialModel, program: SpatialModel,
                 "экземпляра как её хранит Revit — это граница языка, не ошибка"))
 
     rooms_a = {room.id: room for room in parse.rooms if room.boundary}
-    rooms_b = {room.id: room for room in program.rooms if room.boundary}
+    keys_rooms = _translated(
+        (room.id for room in program.rooms if room.boundary), translate)
+    rooms_b = {keys_rooms[room.id]: room
+               for room in program.rooms if room.boundary}
     shared_rooms = sorted(set(rooms_a) & set(rooms_b))
     if shared_rooms:
         ious: list[float] = []

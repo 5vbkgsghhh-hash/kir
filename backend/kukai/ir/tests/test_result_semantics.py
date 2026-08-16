@@ -148,7 +148,16 @@ class RegistryResultSemantics(unittest.TestCase):
         # независимых учётных пробела, и один из сторожей в тот момент был
         # мёртв: закрытый список стоит ровно столько, сколько стоит
         # проверка, что он ещё закрыт.
-        self.assertEqual(len(spec.OPS), 69)
+        # 69 -> 70 (15.08.2026): `create_stairs_run` — второй марш уже стоящей
+        # лестницы, соло-оп (своя `StairsEditScope`, как у площадки).
+        # Укомплектован волной, а не задним числом: обратный контракт есть
+        # (CAPTURE_GAP), строки клеша есть (`OP_NO_BODY` + `_BLIND_OPS`,
+        # причина — `OST_StairsRuns` вне `hulls.KIND_TABLE`), арифметика
+        # категорий сошлась (пишущих 66, слепых 11). Живого прогона у него
+        # НЕТ НИ ОДНОГО, и это записано в `UNPROVEN` с причиной — инцидент
+        # 15.08, когда `create_stairs` заблокировала поток Ревита модальным
+        # окном; ворота 6/6 и голден это НЕ заменяют.
+        self.assertEqual(len(spec.OPS), 70)
         for name, op in spec.OPS.items():
             with self.subTest(op=name):
                 self.assertIsInstance(op.effect, EffectKind)

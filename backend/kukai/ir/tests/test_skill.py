@@ -358,10 +358,39 @@ class NumbersMatchTheCode(unittest.TestCase):
         self.assertNotIn("Пустой список кандидатов", text)
 
     def test_every_quoted_limit_equals_its_constant(self):
-        text = skill.build_skill_text()
+        """🔴 КУРС ТЕПЕРЬ ЖИВЁТ В ДВУХ ДВЕРЯХ, И СТОРОЖ ОБЯЗАН ЗНАТЬ ОБЕ
+        (15.08.2026).
+
+        Шесть ситуационных приёмов §4 уехали в `course("приёмы")`, когда
+        описание пробило потолок 30 000. Вместе с приёмом «пределы макросов»
+        уехал и предел `MAX_TRACK_NODES`, и этот тест покраснел — верно по
+        механике и неверно по смыслу: он сторожит СТАЛОСТЬ числа («названный
+        предел равен своей константе»), а число не протухло, оно сменило
+        канал. Проверять надо КУРС ЦЕЛИКОМ, а курс теперь шире одной функции.
+
+        Тот же урок, что двумя часами раньше поймал ратчет способностей:
+        когда текст переезжает, сторожи, знавшие один адрес, начинают мерить
+        не предмет, а свою карту.
+        """
+        text = skill.build_skill_text() + "\n" + skill.build_techniques_text()
         for value in (macros.MAX_SERIES_OPS, macros.MAX_TRACK_PARAMS,
                       macros.MAX_TRACK_NODES, MAX_OPS_PER_PROGRAM):
             self.assertIn(str(value), text, f"предел {value} пропал из текста")
+
+    def test_the_moved_techniques_are_reachable_and_not_duplicated(self):
+        """КОНТРОЛЬ К ПЕРЕЕЗДУ, обе половины. Переехавшее обязано ЧИТАТЬСЯ по
+        новому адресу и НЕ оставаться по старому: «вытеснил» без первой
+        половины — это «удалил», без второй — «платим дважды»."""
+        permanent = skill.build_skill_text()
+        moved = skill.build_techniques_text()
+        for situation, _advice in skill.TECHNIQUES:
+            with self.subTest(technique=situation):
+                if situation in skill._TECHNIQUES_IN_PERMANENT_TEXT:
+                    self.assertIn(situation, permanent)
+                    self.assertNotIn(situation, moved)
+                else:
+                    self.assertIn(situation, moved)
+                    self.assertNotIn(situation, permanent)
 
     def test_no_stale_literal_for_the_op_budget(self):
         self.assertIn(str(MAX_OPS_PER_PROGRAM), skill.build_skill_text())

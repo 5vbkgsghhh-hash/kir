@@ -116,6 +116,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+# Род индекса и потолки живут ОДНИМ авторитетом. Импорт верхнего уровня, а не
+# ленивый: модуль тянет только `json` и `typing`, цикла нет, а вторая копия
+# слова "full" в этом файле была бы ровно тем дефектом, против которого весь
+# пакет — величина объявлена в одном месте и прочитана в другом.
+from kukai.ir import building_index as _building_index
+
 from kukai.ir.diag import (
     Diagnostic,
     SANDBOX_BAD_RESULT,
@@ -162,7 +168,17 @@ AUTHOR_GEOMETRY_LIBS_FLAG = "KUKAI_IR_AUTHOR_GEOMETRY_LIBS"
 #: выключил» — молчаливое несогласие со службой, которое никак не наблюдаемо.
 #: Скрипту они не видны: `os` ему недоступен ни импортом, ни инжекцией.
 #: Детерминизм не страдает — это положение тумблера, а не время и не случайность.
-ENV_PASSTHROUGH: tuple[str, ...] = ("KUKAI_CHECKER_V2",)
+#:
+#: ДВА АДРЕСА ТЕЛЕМЕТРИИ ЗДЕСЬ ПО ЗАМЕРУ 14.08.2026, а не для полноты. Ребёнок
+#: тоже компилирует (курс исполняет рецепты настоящей песочницей), а отказ
+#: компиляции пишет строку в фид отказов. Окружение ребёнка собрано с нуля,
+#: поэтому НЕ ПЕРЕНЕСЁННЫЙ адрес читается им как «адрес установки» — то есть
+#: ЖИВОЙ корпус, даже когда родитель уведён в /tmp. Родительскую половину
+#: закрыл корневой `conftest.py`; без этих двух строк вторая половина осталась
+#: бы открытой, а прибор, закрывающий половину диапазона, опаснее отсутствующего.
+#: В проде обе переменные не выставлены — значит перенос не меняет ничего.
+ENV_PASSTHROUGH: tuple[str, ...] = (
+    "KUKAI_CHECKER_V2", "KIR_REJECTIONS_PATH", "KIR_WITNESS_PATH")
 _ENV_PASSTHROUGH = ENV_PASSTHROUGH
 
 #: Транспортный потолок песочницы. НЕ путать с бюджетами компилятора
@@ -182,6 +198,19 @@ DEFAULT_WALL_SECONDS = 8.0
 DEFAULT_MEMORY_MB = 256
 DEFAULT_RECURSION_LIMIT = 500
 DEFAULT_NOFILE = 64
+
+#: ИМЕНА, КОТОРЫЕ ПЕСОЧНИЦА КЛАДЁТ В ПРОСТРАНСТВО СКРИПТА САМА — не через
+#: `course.SANDBOX_NAMES` и не через `dsl`. Список ЗАКРЫТ И ПОЛОН ПО
+#: ПОСТРОЕНИЮ: впрыск ниже сверяется с ним и ОТКАЗЫВАЕТ на расхождении, так что
+#: третье имя нельзя завести молча.
+#:
+#: 🔴 ЗАЧЕМ КОНСТАНТА, А НЕ ДВА ПРИСВАИВАНИЯ (замер 15.08.2026). Сторож
+#: `tests/test_sandbox_names_are_declared.py` объявляет, что проверяет КАЖДОЕ
+#: имя пространства скрипта, а его область — `dsl.__all__ | SANDBOX_NAMES`.
+#: Имена отсюда в обход не входили ВООБЩЕ: `model` жил непроверенным с самого
+#: появления каталога, и `building` уехал бы тем же путём. Прибор, накрывающий
+#: часть своего диапазона, — именной дефект этого дерева, и здесь он был.
+HOST_NAMES: tuple[str, ...] = ("model", "building")
 
 #: Порядок опроса языка: первая сработавшая функция забирает накопленные опы.
 _DRAIN_CANDIDATES = ("take_ops", "drain_ops", "drain", "collect_ops",
@@ -204,6 +233,31 @@ _BUILD_CANDIDATES = ("build", "build_program", "main")
 #: чекпойнта между фазами ещё нет, и молча делать вид, что он есть, нельзя.
 _ENVELOPE_KEYS = ("ir_version", "intent", "defaults", "allow_destructive",
                   "phases")
+
+#: 🔴 КОНВЕРТ — НАША ЗАБОТА, А НЕ АВТОРСКАЯ (замер 16.08.2026, живой ход
+#: владельца). `SANDBOX_NO_OPS` выше объявляет список в переменной `ops`
+#: ЗАКОННОЙ альтернативой вызовам языка — и она работала до компилятора, а
+#: там умирала: путь ручек штампует `ir_version` в `Program.build()`
+#: (`dsl.py`), путь переменной конверта не имеет вовсе, и автор получал
+#: `KIR-P004 ir_version обязателен` — про поле, которого он не писал и о
+#: котором из описания инструмента не знает.
+#:
+#: Замерено на живом ходе: модель дважды получила этот отказ, дважды ушла
+#: чинить НЕ ТО, и ход кончился, не построив ничего.
+#:
+#: Мы РЕКЛАМИРУЕМ путь и не достраиваем его — это наш дефект, а не ошибка
+#: автора, поэтому лечится достройкой, а не отказом получше. Штампуем ТОЛЬКО
+#: отсутствующее: конверт с ЯВНО НЕВЕРНОЙ версией по-прежнему обязан получить
+#: `KIR-P004`, потому что там автор сказал неправду о версии, а не промолчал.
+#: Два разных факта — два разных исхода (`tests/test_envelope_is_ours.py`).
+#:
+#: Версию НЕ пишем литералом: второе место, обязанное совпадать с реестром, и
+#: есть именной дефект этого дерева. Спрашиваем авторитет, и лениво — импорт
+#: живёт в РОДИТЕЛЕ (`_result_from_payload`), ребёнку реестр для этого не нужен.
+def _ir_version() -> str:
+    """Версия IR у ЕДИНСТВЕННОГО владельца — реестра."""
+    from kukai.ir.spec import IR_VERSION
+    return IR_VERSION
 
 #: След дефолтного repr — адрес объекта. Единственный вид недетерминизма,
 #: который ВИДЕН в выходе, поэтому он и ловится экраном, а не проповедью.
@@ -386,6 +440,17 @@ class SandboxResult:
     refusal: Optional[SandboxRefusal] = None
     #: подпись ТОЧНЫХ байт исходника — то, что уходит в квитанцию
     author_digest: str = ""
+    #: ПОДПИСЬ КАТАЛОГА, поданного этому запуску (пусто — каталог не подавали).
+    #: Третий подписант рядом с `author_digest` и `environment`, и по той же
+    #: причине: один и тот же исходник над РАЗНЫМ документом даёт разную
+    #: программу, и без этого поля читатель не отличит правку скрипта от
+    #: дрейфа модели.
+    model_digest: str = ""
+    #: подпись ИНДЕКСА ЗДАНИЯ — четвёртый подписант того же рода, что каталог
+    #: и среда. Без неё один `author_digest` удостоверял бы разные программы
+    #: после правки ЗДАНИЯ, и читатель не отличил бы правку скрипта от дрейфа
+    #: модели — ровно тот довод, что записан у `model_digest` выше.
+    building_digest: str = ""
     #: дайджест выданной программы: сверяется при replay_check
     program_digest: str = ""
     #: конверт, если скрипт его выставил (intent/defaults/allow_destructive)
@@ -630,16 +695,430 @@ def _refuse(code: str, message: str, *, kind: str, blame: str = "author",
                           detail=detail)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# КАТАЛОГ ОТКРЫТОГО ДОКУМЕНТА — ЕДИНСТВЕННОЕ, ЧТО СКРИПТ МОЖЕТ ПРОЧИТАТЬ
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ЗАЧЕМ. До 14.08.2026 в пространстве скрипта было 98 имён, и НИ ОДНО не читало
+# документ, в который скрипт пишет. Замер по корпусу отказов (314 попыток
+# авторства, 16.07–14.08): «слепота к каталогу» — 29.9% попыток, крупнейший
+# класс. Автор обязан назвать тип, уровень или ось ПО ИМЕНИ, а имена ему взять
+# было неоткуда: он их угадывал.
+#
+# ЧТО ЭТО ДАЁТ СВЕРХ «МЕНЬШЕ ОТКАЗОВ», и ради чего оно на самом деле сделано:
+# перечисление становится ПРАВИЛОМ. `for lvl in model.levels()` вместо двадцати
+# выписанных этажей; `model.grids()` — типовой этаж по сетке осей, а не по
+# литеральным координатам. Это и есть «направить внимание с API на геометрию».
+#
+# ЧЕГО ЗДЕСЬ НЕТ И ПОЧЕМУ.
+#
+# * НЕТ ГЕОМЕТРИИ ЗДАНИЯ. Снапшот заземления несёт КАТАЛОГИ (уровни, оси,
+#   пулы типов) и не несёт ни одной стены и ни одной комнаты — замерено:
+#   `grep -c 'OfClass(typeof(Wall))|OST_Rooms'` по `open_model.py` даёт 0.
+#   Поэтому «найди комнаты без окна» этим объектом не отвечается, и обещать
+#   такое он не должен ни именем метода, ни докстрокой.
+#
+# * НЕТ ПРАВИЛА `most_used`. Оно живёт в `ground._most_used` вместе со своим
+#   порогом `MOST_USED_MIN_RATIO`, и второй экземпляр правила разошёлся бы с
+#   первым на первой же правке — ровно тот дефект, который этот пакет
+#   существует запрещать. Счётчик `instances` в строках виден, решение
+#   принимает автор либо компилятор, но не два разных правила.
+#
+# * НЕТ ЗАПИСИ. Объект неизменяем и отдаёт кортежи копий: скрипт, дописавший
+#   строку в каталог, подписал бы своей подписью документ, которого нет.
+#
+# ЧЕСТНО ПРО СВЕЖЕСТЬ. Каталог — снимок НА МОМЕНТ ЧТЕНИЯ, а не живая модель.
+# Заземление всё равно перезаземляет программу по СВОЕМУ снимку и отказывает,
+# если допущение сломалось, — поэтому устаревший каталог не может построить
+# неверное ЧЕРЕЗ СЕЛЕКТОР. Но он может через ЧИСЛО: скрипт, ветвящийся на
+# `len(model.levels())`, породит другую программу, и заземление её спокойно
+# заземлит. Это названо здесь, потому что второй половины у утверждения
+# «устаревшее чтение безопасно» нет.
+class ModelCatalog:
+    """Каталог открытого документа: уровни, оси и пулы типов. Только чтение."""
+
+    __slots__ = ("_pools", "_digest")
+
+    def __init__(self, pools: Any = None, digest: str = "") -> None:
+        # 🔴 ПУСТОЙ ПУЛ ОСТАЁТСЯ В КАТАЛОГЕ (15.08.2026). До этой правки здесь
+        # стояло `if kept:`, и пул, ПРИШЕДШИЙ пустым, выбрасывался наравне с
+        # пулом, которого не присылали вовсе. Дальше оба давали один и тот же
+        # отказ «пула нет в этом снимке» — то есть ОДИН КОД НА ДВА ИСХОДА,
+        # и различие между ними решает, что автору делать:
+        #
+        #   пул пуст          — фАкт О ДОКУМЕНТЕ: типов такого рода в нём нет,
+        #                       и автор обязан либо создать тип, либо выбрать
+        #                       другой оп. Верный ответ — пустой кортеж;
+        #   пула не прислали  — фАкт О НАС: мы не спросили. Верный ответ —
+        #                       отказ, потому что «нет» тут неправда.
+        #
+        # Замерено на этой же правке: `model.types("wall_types")` со снимком
+        # `{"wall_types": []}` отвечал «пула нет. Пришли: (каталог не подан)»
+        # — оба утверждения ложны, каталог был подан и пул в нём был.
+        clean: dict[str, tuple[dict, ...]] = {}
+        if isinstance(pools, dict):
+            for name, rows in pools.items():
+                if not isinstance(name, str) or not isinstance(rows, list):
+                    continue
+                clean[name] = tuple(
+                    dict(row) for row in rows if isinstance(row, dict))
+        self._pools = clean
+        self._digest = digest
+
+    # ── что вообще пришло ───────────────────────────────────────────────
+    @property
+    def empty(self) -> bool:
+        return not self._pools
+
+    @property
+    def digest(self) -> str:
+        """Подпись каталога — она же едет в квитанцию рядом с подписью скрипта."""
+        return self._digest
+
+    def pools(self) -> tuple[str, ...]:
+        """Имена пулов, которые ПРИШЛИ. Пустой кортеж — каталог не подан."""
+        return tuple(sorted(self._pools))
+
+    # ── содержимое ──────────────────────────────────────────────────────
+    def levels(self) -> tuple[dict, ...]:
+        """Уровни документа: `id`, `name`, и `elevation_mm`, если он пришёл."""
+        return self._rows("levels")
+
+    def grids(self) -> tuple[dict, ...]:
+        """Оси документа — то, по чему строят типовой этаж правилом."""
+        return self._rows("grids")
+
+    def types(self, pool: str) -> tuple[dict, ...]:
+        """Строки одного пула типов; неизвестное имя — ОТКАЗ со списком пришедших.
+
+        Молчаливый пустой кортеж на опечатку означал бы «в документе таких
+        типов нет», а это другое утверждение, и оно неверно.
+        """
+        if not isinstance(pool, str):
+            raise KeyError(
+                f"каталог: имя пула обязано быть строкой, пришло {type(pool).__name__}")
+        return self._rows(pool)
+
+    def _rows(self, pool: str) -> tuple[dict, ...]:
+        """Строки пула. ТРИ исхода, и каждый назван отдельно.
+
+        Раньше исходов было два на три случая: отсутствие каталога отвечало
+        отказом, а отсутствие ПУЛА в поданном каталоге — тихим пустым
+        кортежем, неотличимым от «в документе такого нет». Для `levels()`
+        это особенно дорого: документа Ревита без уровней не бывает, и
+        пустой ответ там означает НАШ пробел чтения, а не факт о здании.
+        """
+        if not self._pools:
+            raise RuntimeError(
+                "каталог документа не подан этому запуску: спрашивать нечего. "
+                "Так бывает у офлайн-прогонов и у ходов без живой модели — "
+                "имена типов и уровней в таком запуске надо называть явно")
+        if pool not in self._pools:
+            raise KeyError(
+                f"каталог: пула {pool!r} в этом снимке нет — его НЕ ПРИСЛАЛИ, "
+                f"и это факт о нашем чтении, а не о документе. Пришли: "
+                f"{', '.join(self.pools())}")
+        return tuple(dict(row) for row in self._pools[pool])
+
+    def __repr__(self) -> str:                       # детерминированно
+        return (f"<каталог документа: {len(self._pools)} пулов, "
+                f"{sum(len(v) for v in self._pools.values())} строк>")
+
+
+class BuildingView:
+    """СУЩЕСТВУЮЩЕЕ ЗДАНИЕ В РУКАХ СКРИПТА — `ls`, `grep` и `read` по модели.
+
+    Каталог (`model`) отвечает «чем я могу строить»; этот объект — «что тут
+    уже стоит». До него на второй вопрос не отвечал никто: опы-запросы уезжают
+    в Ревит и возвращаются в КВИТАНЦИЮ, а не в руки скрипту, поэтому цикл
+    «нашёл → посмотрел → поправил» распадался на три хода.
+
+    Отображение на работу с репозиторием — оно же порядок вызовов:
+
+        building.census()                 # ls   — что в здании и сколько
+        building.levels()                 # ls   — уровни ЗДАНИЯ, не типов
+        building.find(cat="Стены", lvl="3")   # grep — с границей и числом всего
+        building.get("7240696")           # read file:line — со всеми параметрами
+        building.observations()           # прогнать правила по ПОСТРОЕННОМУ
+
+    ТРИ ИСХОДА У КАЖДОГО ВОПРОСА, и ни один не молчит — см. шапку
+    `kukai.ir.building_index`. Пустой ответ при полном индексе есть факт О
+    ЗДАНИИ; при переписи — ОТКАЗ, потому что мы не смотрели; без индекса —
+    отказ третьего рода.
+    """
+
+    __slots__ = ("_tier", "_census", "_rows", "_params", "_by_id",
+                 "_refused", "_observations", "_digest")
+
+    def __init__(self, payload: Any = None, digest: str = "") -> None:
+        data = payload if isinstance(payload, dict) else {}
+        self._tier = data.get("tier") or ""
+        self._census = data.get("census") if isinstance(
+            data.get("census"), dict) else {}
+        rows = data.get("elements")
+        self._rows = tuple(dict(r) for r in rows
+                           if isinstance(r, dict)) if isinstance(rows, list) else ()
+        params = data.get("params")
+        self._params = params if isinstance(params, dict) else {}
+        self._refused = data.get("refused") or ""
+        obs = data.get("observations")
+        self._observations = tuple(obs) if isinstance(obs, list) else ()
+        self._digest = digest
+        self._by_id = {row.get("id"): row for row in self._rows}
+
+    # ── что вообще пришло ───────────────────────────────────────────────
+    @property
+    def empty(self) -> bool:
+        """Индекс не подан вовсе. НЕ то же, что «в здании ничего нет»."""
+        return not self._tier
+
+    @property
+    def tier(self) -> str:
+        """`full` — приехали элементы; `census` — только перепись; `` — не подан."""
+        return self._tier
+
+    @property
+    def digest(self) -> str:
+        """Подпись индекса — четвёртый подписант рядом с каталогом и средой."""
+        return self._digest
+
+    def _require_index(self, what: str) -> None:
+        """ЕДИНСТВЕННОЕ место, где решается отказ «индекса нет вовсе».
+
+        🔴 ПРИЧИНА ОБЯЗАНА ДОЕХАТЬ. До 16.08.2026 отказ был вшит литералом в
+        шесть разных мест, и `refused` из полезной нагрузки не читал НИ ОДИН из
+        них: подавший индекс с честной причиной («разбора этого документа в
+        корпусе нет, просмотрено 80») получал вместо неё общее «не подан».
+        Три исхода схлопывались в один ровно там, где различие и нужно —
+        «мы не смотрели» против «смотреть было не в чем».
+        """
+        if self._tier:
+            return
+        if self._refused:
+            raise RuntimeError(f"{what}: {self._refused}")
+        raise RuntimeError(
+            f"{what}: индекс здания не подан этому запуску. Так бывает у "
+            f"офлайн-прогонов и у ходов без прочитанной модели — это факт "
+            f"о НАШЕМ чтении, а не о здании")
+
+    def _require_elements(self, what: str) -> None:
+        """Единственное место, где решается право отвечать поэлементно."""
+        self._require_index(what)
+        if self._tier != _building_index.TIER_FULL:
+            raise RuntimeError(
+                f"{what}: {self._refused or 'поэлементный слой индекса не приехал'}")
+
+    # ── ls ──────────────────────────────────────────────────────────────
+    def census(self) -> dict:
+        """Сколько чего в здании и на каких уровнях. Есть ВСЕГДА, если индекс подан.
+
+        Перепись весит килобайты и приезжает даже тогда, когда поэлементный
+        слой не поместился, — именно чтобы «здание слишком большое» не читалось
+        как «про здание ничего не известно».
+        """
+        self._require_index("перепись")
+        return json.loads(json.dumps(self._census))     # копия, не наша ссылка
+
+    def top(self, n: int = 10) -> tuple[tuple[str, int], ...]:
+        """Крупнейшие категории здания — ПАРАМИ, по убыванию.
+
+        Порядок решается ЗДЕСЬ, а не в индексе, и это не вкус: кадр stdin
+        сериализуется с `sort_keys=True` (без этого подпись индекса не
+        воспроизводима), поэтому всякий порядок, объявленный на той стороне,
+        МОЛЧА переписывается по алфавиту. Первая редакция на этом и поймалась —
+        «топ категорий» отдавал `OST_CableTray: 1` на здании с 695 стенами.
+        Пары, а не словарь: словарь снова потерял бы порядок при первой же
+        сериализации.
+        """
+        self._require_index("топ категорий")
+        by_cat = self._census.get("by_category")
+        if not isinstance(by_cat, dict):
+            return ()
+        ordered = sorted(by_cat.items(), key=lambda kv: (-kv[1], kv[0]))
+        return tuple(ordered[:max(0, int(n))])
+
+    def levels(self) -> tuple[str, ...]:
+        """Уровни, на которых ЕСТЬ элементы. Это факт о здании, не о типах."""
+        self._require_index("уровни здания")
+        by_level = self._census.get("by_level")
+        return tuple(sorted(by_level)) if isinstance(by_level, dict) else ()
+
+    def total(self) -> int:
+        """Сколько элементов в здании ВСЕГО — известно и при одной переписи."""
+        self._require_index("счёт элементов")
+        value = self._census.get("total")
+        return int(value) if isinstance(value, int) else 0
+
+    # ── grep ────────────────────────────────────────────────────────────
+    def find(self, *, limit: int | None = None, **criteria) -> tuple[dict, ...]:
+        """Элементы по признакам: `cat`, `lvl`, `type` — подстрокой, остальное точно.
+
+        Усечение ОБЪЯВЛЕНО: если найдено больше `limit`, лишнее не исчезает
+        молча — `found()` отдаёт полное число, а список назван усечённым в
+        `__repr__` результата запроса. Полный счёт всегда доступен через
+        `found(**criteria)`.
+        """
+        self._require_elements("поиск по зданию")
+        cap = (_building_index.DEFAULT_FIND_LIMIT if limit is None
+               else int(limit))
+        out = []
+        for row in _building_index.iter_matching(self._rows, criteria):
+            out.append(dict(row))
+            if len(out) >= cap:
+                break
+        return tuple(out)
+
+    def found(self, **criteria) -> int:
+        """Сколько ВСЕГО подходит под признаки — без усечения.
+
+        Пара к `find`: список ограничен потолком ответа, счёт не ограничен
+        ничем. Без этой пары усечённый список читался бы как полный результат.
+        """
+        self._require_elements("счёт по зданию")
+        return sum(1 for _ in _building_index.iter_matching(self._rows, criteria))
+
+    # ── read file:line ──────────────────────────────────────────────────
+    def get(self, element_id: Any) -> dict:
+        """Один элемент со ВСЕМИ параметрами. Неизвестный адрес — ОТКАЗ.
+
+        Молчаливый `None` на неизвестный id означал бы «такого элемента нет»,
+        а это утверждение мы имеем право делать только при полном индексе, и
+        даже тогда его надо СКАЗАТЬ, а не вернуть пустотой.
+        """
+        self._require_elements("чтение элемента")
+        key = str(element_id)
+        row = self._by_id.get(key)
+        if row is None:
+            raise KeyError(
+                f"элемента {key!r} в этом здании нет: индекс полный, "
+                f"{self.total()} элементов, и такого адреса среди них не "
+                f"встретилось")
+        out = dict(row)
+        detail = self._params.get(key)
+        out["params"] = dict(detail) if isinstance(detail, dict) else {}
+        return out
+
+    # ── прогнать правила по ПОСТРОЕННОМУ ────────────────────────────────
+    def observations(self) -> tuple[dict, ...]:
+        """Наблюдения о ПОСТРОЕННОМ здании — теми же правилами, что о замысле.
+
+        Считает их РОДИТЕЛЬ (`assembly_view.observe_l0`) и кладёт в индекс:
+        у ребёнка пять секунд процессорного времени, и судья здания в них не
+        обязан помещаться. Скрипт читает готовое и ветвится.
+
+        Пустой кортеж при полном индексе — факт о здании: правила не нашли
+        нарушений из тех, что умеют видеть. Это НЕ «здание в порядке»: шесть
+        правил из двадцати сняты безусловно, и список снятого едет вердиктом,
+        а не отсюда.
+        """
+        self._require_index("наблюдения о здании")
+        return tuple(dict(o) if isinstance(o, dict) else o
+                     for o in self._observations)
+
+    def __repr__(self) -> str:                       # детерминированно
+        if not self._tier:
+            return "<здание: индекс не подан>"
+        if self._tier != _building_index.TIER_FULL:
+            return (f"<здание: только перепись, {self.total()} элементов "
+                    f"(поэлементный слой не поместился)>")
+        return (f"<здание: {len(self._rows)} элементов, "
+                f"{len(self._census.get('by_level') or ())} уровней>")
+
+
+def _model_pools(model: Any) -> dict[str, list[dict]]:
+    """Снапшот заземления -> только пулы строк `{id, name, …}`, ничего больше.
+
+    Служебные ключи снапшота (`__document_fingerprint`, `__revit_version`,
+    `*__truncated`, `*__total`) сюда не попадают НАМЕРЕННО: это факты о
+    ЧТЕНИИ, а не о документе, и скрипт, ветвящийся на них, ветвился бы на
+    нашей внутренней кухне. Каталог обязан быть про здание.
+    """
+    out: dict[str, list[dict]] = {}
+    if not isinstance(model, dict):
+        return out
+    for name, rows in model.items():
+        if not isinstance(name, str) or name.startswith("__"):
+            continue
+        if not isinstance(rows, list):
+            continue
+        # 🔴 `if kept:` СНЯТ 15.08.2026 — вторая половина той же правки, что в
+        # `ModelCatalog.__init__`. Здесь фильтр стоял на входе и молча ронял
+        # пул, ПРИШЕДШИЙ пустым, ещё до каталога; починка одного конца без
+        # другого дала бы «прибор на часть диапазона»: каталог различал бы
+        # три исхода, а до него доезжало бы два.
+        #
+        # Пустой список означает «снимок этот пул ЧИТАЛ и нашёл ноль строк» —
+        # это факт о ДОКУМЕНТЕ и он обязан доехать. Отсутствие ключа означает
+        # «не читали», и отвечает за него отказ в `_rows`.
+        out[name] = [dict(row) for row in rows
+                     if isinstance(row, dict) and row.get("id") is not None]
+    return out
+
+
+def model_catalog_digest(pools: Any) -> str:
+    """Подпись каталога — ТОТ ЖЕ приём, что у подписи среды.
+
+    Без неё один и тот же `author_digest` удостоверял бы РАЗНЫЕ
+    `program_digest` после правки документа, и читатель не имел бы ни одного
+    поля, чтобы отличить правку СКРИПТА от дрейфа МОДЕЛИ. Ровно этот довод уже
+    записан в шапке модуля про `environment`; здесь третий подписант того же
+    рода.
+    """
+    if not isinstance(pools, dict) or not pools:
+        return ""
+    blob = json.dumps(pools, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"), default=str)
+    return _digest(blob.encode("utf-8", "surrogatepass"))
+
+
+def building_catalog_digest(payload: Any) -> str:
+    """Подпись индекса здания — ТОТ ЖЕ приём, что у подписи каталога.
+
+    Довод дословно тот же и записан у `model_catalog_digest`: без подписи один
+    и тот же `author_digest` удостоверял бы РАЗНЫЕ программы после правки
+    здания, и у читателя не осталось бы поля, чтобы отличить правку СКРИПТА от
+    дрейфа МОДЕЛИ.
+    """
+    if not isinstance(payload, dict) or not payload:
+        return ""
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"), default=str)
+    return _digest(blob.encode("utf-8", "surrogatepass"))
+
+
 def execute_author_script(source: str,
                           *,
-                          policy: SandboxPolicy = DEFAULT_POLICY) -> SandboxResult:
+                          policy: SandboxPolicy = DEFAULT_POLICY,
+                          model: Any = None,
+                          building: Any = None) -> SandboxResult:
     """Исполнить исходник модели и вернуть операции IR либо типизированный отказ.
 
     Единственная публичная точка. Ничего не бросает наружу: любой сбой —
     включая наш собственный — приходит как `SandboxResult(ok=False, refusal=…)`.
+
+    `model` — КАТАЛОГ открытого документа (снапшот заземления как ДАННЫЕ:
+    уровни, оси, пулы типов). Необязателен: без него имя `model` в скрипте
+    по-прежнему есть и на любой вопрос отвечает названной причиной «каталог не
+    подан» — отсутствие имени читалось бы как «такой способности нет», а это
+    другое утверждение. Едет тем же кадром stdin, что и исходник: заводить
+    второй канал ради данных, которые и так идут ребёнку, значило бы завести
+    второй способ ошибиться. Подпись каталога возвращается в
+    `SandboxResult.model_digest` — см. довод у самого поля.
     """
     started = time.perf_counter()
     digest = _digest(source.encode("utf-8", "surrogatepass"))
+    pools = _model_pools(model)
+    model_digest = model_catalog_digest(pools)
+    model_blob = (json.dumps(pools, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), default=str)
+                  .encode("utf-8", "surrogatepass") if pools else b"")
+    building_payload = building if isinstance(building, dict) else {}
+    building_digest = building_catalog_digest(building_payload)
+    building_blob = (json.dumps(building_payload, sort_keys=True,
+                                ensure_ascii=False, separators=(",", ":"),
+                                default=str)
+                     .encode("utf-8", "surrogatepass")
+                     if building_payload else b"")
 
     if not source.strip():
         return SandboxResult(
@@ -665,12 +1144,17 @@ def execute_author_script(source: str,
                 source_bytes=len(raw), limit=policy.max_source_bytes),
         )
 
-    first = _run_once(raw, policy)
+    first = _run_once(raw, policy, model_blob, building_blob)
     first.author_digest = digest
+    first.model_digest = model_digest
+    first.building_digest = building_digest
     first.duration_s = time.perf_counter() - started
 
     if first.ok and policy.replay_check:
-        second = _run_once(raw, policy)
+        # Повтор идёт с ТЕМ ЖЕ каталогом: сверяется детерминизм СКРИПТА, а
+        # подать второй раз другой документ значило бы мерить дрейф модели и
+        # называть его недетерминизмом автора.
+        second = _run_once(raw, policy, model_blob, building_blob)
         if not second.ok:
             second.author_digest = digest
             second.duration_s = time.perf_counter() - started
@@ -700,7 +1184,9 @@ def execute_author_script(source: str,
     return first
 
 
-def _run_once(raw_source: bytes, policy: SandboxPolicy) -> SandboxResult:
+def _run_once(raw_source: bytes, policy: SandboxPolicy,
+              model_blob: bytes = b"",
+              building_blob: bytes = b"") -> SandboxResult:
     """Один запуск ребёнка. Возвращает результат ЛЮБОЙ ценой, без исключений."""
     import resource  # локально: родителю он нужен только для замера
 
@@ -768,7 +1254,16 @@ def _run_once(raw_source: bytes, policy: SandboxPolicy) -> SandboxResult:
         reader.start()
 
         try:
-            _, err = proc.communicate(input=raw_source, timeout=policy.wall_seconds)
+            # КАДР STDIN: длина каталога десятичной строкой, перевод строки,
+            # сам каталог, затем исходник ДОСЛОВНО. Заголовок ставим ВСЕГДА —
+            # «нулевой каталог» и «каталога не было» обязаны читаться одним
+            # разборщиком, иначе у ребёнка появится ветка, которую никто не
+            # прогоняет. Подпись исходника снята ДО кадрирования и кадром не
+            # меняется.
+            frame = (str(len(model_blob)).encode("ascii") + b"\n"
+                     + str(len(building_blob)).encode("ascii") + b"\n"
+                     + model_blob + building_blob + raw_source)
+            _, err = proc.communicate(input=frame, timeout=policy.wall_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
             _kill_group(proc)
@@ -926,6 +1421,10 @@ def _result_from_payload(payload: dict, policy: SandboxPolicy) -> SandboxResult:
     if payload.get("ok"):
         ops = payload.get("ops") or []
         envelope = dict(payload.get("envelope") or {})
+        # Конверт достраиваем ДО дайджеста — иначе подпись описывала бы не ту
+        # программу, что поедет дальше. См. довод у `_ir_version`: путь
+        # переменной `ops` объявлен законным, и он обязан доезжать.
+        envelope.setdefault("ir_version", _ir_version())
         return SandboxResult(
             ok=True, ops=list(ops), envelope=envelope, stdout=stdout,
             isolation=isolation, environment=environment, peak_rss_kb=peak,
@@ -1168,6 +1667,47 @@ def _child_main() -> None:  # pragma: no cover — исполняется в д�
         os.dup2(devnull, 0)
     except OSError:
         pass
+    # КАДР: длина каталога, перевод строки, каталог, исходник. Ставит его
+    # родитель ВСЕГДА (см. `_run_once`), поэтому ветки «кадра нет» здесь не
+    # существует: она была бы веткой, которую никто не прогоняет.
+    model_pools: dict = {}
+    building_payload: dict = {}
+    head, sep, rest = raw.partition(b"\n")
+    if not sep or not head.isdigit():
+        refuse(SANDBOX_CRASH,
+               "кадр stdin песочницы повреждён: заголовок длины каталога не "
+               "прочитан. Это дефект НАШЕЙ стороны, а не скрипта",
+               kind="FrameError", blame="sandbox")
+        return
+    head2, sep2, rest = rest.partition(b"\n")
+    if not sep2 or not head2.isdigit():
+        refuse(SANDBOX_CRASH,
+               "кадр stdin песочницы повреждён: заголовок длины индекса здания "
+               "не прочитан. Это дефект НАШЕЙ стороны, а не скрипта",
+               kind="FrameError", blame="sandbox")
+        return
+    model_bytes, rest = rest[:int(head)], rest[int(head):]
+    building_bytes, raw = rest[:int(head2)], rest[int(head2):]
+    if building_bytes:
+        try:
+            loaded_b = json.loads(building_bytes.decode("utf-8", "surrogatepass"))
+            if isinstance(loaded_b, dict):
+                building_payload = loaded_b
+        except Exception:
+            # Индекс — УДОБСТВО, а не условие исполнения: испорченный индекс не
+            # имеет права отменить ход. Скрипт увидит «индекс не подан» и
+            # скажет об этом словами, если попробует его спросить.
+            building_payload = {}
+    if model_bytes:
+        try:
+            loaded = json.loads(model_bytes.decode("utf-8", "surrogatepass"))
+            if isinstance(loaded, dict):
+                model_pools = loaded
+        except Exception:
+            # Каталог — УДОБСТВО, а не условие исполнения: испорченный каталог
+            # не имеет права отменить ход. Скрипт увидит «каталог не подан» и
+            # скажет об этом словами, если попробует его спросить.
+            model_pools = {}
     try:
         source = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -1176,6 +1716,9 @@ def _child_main() -> None:  # pragma: no cover — исполняется в д�
                kind="UnicodeDecodeError")
         return
     state["source_lines"] = source.splitlines()
+    state["isolation"]["model_pools"] = len(model_pools)
+    state["isolation"]["building_elements"] = len(
+        building_payload.get("elements") or ())
 
     # ── 2. прогрев: ВСЁ, что понадобится, импортируется ДО chroot ────────────
     for entry in reversed(cfg.get("extra_sys_path") or []):
@@ -1499,6 +2042,29 @@ def _child_main() -> None:  # pragma: no cover — исполняется в д�
                 continue
             ns[n] = value
         ns["kir"] = dsl
+    # КАТАЛОГ КЛАДЁТСЯ ВСЕГДА, даже пустой. Имя, которое то есть, то нет,
+    # заставляет автора угадывать, существует ли способность; пустой каталог
+    # на любой вопрос отвечает названной причиной. Это ОБЪЕКТ, не модуль:
+    # инжекция модулей запрещена выше по тому же правилу, что и `os`.
+    # КАТАЛОГ И ИНДЕКС КЛАДУТСЯ ВСЕГДА, даже пустыми: имя, которое то есть, то
+    # нет, заставляет автора угадывать, существует ли способность, а пустой
+    # объект на любой вопрос отвечает названной причиной. Впрыск идёт СПИСКОМ и
+    # сверяется с `HOST_NAMES` — иначе третье имя завелось бы молча и снова
+    # уехало мимо сторожа доки (см. довод у самой константы).
+    hosts = {
+        "model": ModelCatalog(model_pools, model_catalog_digest(model_pools)),
+        "building": BuildingView(building_payload,
+                                 building_catalog_digest(building_payload)),
+    }
+    if set(hosts) != set(HOST_NAMES):
+        refuse(SANDBOX_UNAVAILABLE,
+               "песочница кладёт имена %s, а объявлены %s — это дефект НАШЕЙ "
+               "стороны: имя, не названное в HOST_NAMES, не проверяет ни один "
+               "сторож документации"
+               % (sorted(hosts), sorted(HOST_NAMES)),
+               kind="HostNamesDrift", blame="sandbox")
+        return
+    ns.update(hosts)
 
     stdout = _CappedWriter(int(cfg.get("max_stdout_chars") or MAX_STDOUT_CHARS))
     real_stdout, real_stderr = sys.stdout, sys.stderr

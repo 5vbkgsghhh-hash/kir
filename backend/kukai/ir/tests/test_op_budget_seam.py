@@ -7,7 +7,7 @@ Autodesk (Snowdon Towers Sample Plumbing) разобран и собран за�
 
 Причина — НЕ скорость и НЕ язык, а стык. У системы ДВА бюджета операций:
 
-* ``MAX_OPS_PER_PROGRAM = 20``  — АВТОРСКИЙ бюджет: столько операций может
+* ``MAX_OPS_PER_PROGRAM = 100`` — АВТОРСКИЙ бюджет: столько операций может
   быть в программе, написанной моделью. Он намеренно мал и намеренно невидим
   для LLM (см. ``tool_doc``): модель, которой разрешили писать программы по
   триста операций, — другой продукт с другими рисками.
@@ -428,10 +428,24 @@ class BudgetSeamContract(_DoorHarness):
         self.assertIs(materialize.MAX_BULK_OPS, compiler.MAX_BULK_OPS)
 
     def test_chat_ceiling_is_the_authored_budget_and_is_the_smaller_one(self) -> None:
+        """Литерал здесь СТОИТ НАМЕРЕННО и обязан краснеть при каждом
+        движении бюджета: сверка с самой константой прошла бы при любом её
+        значении, то есть не сторожила бы ничего.
+
+        ПОДНЯТ 20 -> 100 РЕШЕНИЕМ ВЛАДЕЛЬЦА 15.08.2026. Пин сработал ровно
+        так, как задуман: правка одной константы покраснела здесь и потребовала
+        назвать решение вслух, а не проехала молча. Довод ПРОТИВ подъёма (210
+        из 586 живых отказов 30.07 — этот бюджет, работавший сигналом «выбрана
+        не та форма») не отозван и записан в `compiler.py`; владелец принял его
+        и решил иначе.
+
+        Что осталось несущим и проверяется ниже: авторский бюджет по-прежнему
+        МЕНЬШЕ внутреннего (100 < 300), то есть чат не стал внутренней дверью.
+        """
         chat = self._door_ceiling(serving.handle_revit_ir)
         internal = self._door_ceiling(serving.handle_revit_ir_bulk)
         self.assertEqual(chat, compiler.MAX_OPS_PER_PROGRAM)
-        self.assertEqual(chat, 20, "авторский бюджет двигать нельзя")
+        self.assertEqual(chat, 100, "авторский бюджет двигать только решением")
         self.assertLess(chat, internal)
 
     def test_budget_refusal_names_which_budget_ran_out(self) -> None:

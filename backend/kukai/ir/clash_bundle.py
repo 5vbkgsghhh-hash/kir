@@ -119,6 +119,7 @@ import logging
 import math
 import os
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclasses_field
 from typing import Any, Iterable, Mapping, Sequence
@@ -154,6 +155,60 @@ BUNDLE_CLASH_SCHEMA = "kir-bundle-clash/1"
 #: Область поиска пакета, взятая осознанно. См. шапку: область MVP на
 #: ЗАЯВЛЕНИИ пуста по построению, потому что стороны `struct` у программы нет.
 SCOPE = "all_physical_diagnostic"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# ДОКУМЕНТ ХОДА — ЧЕМ ОТКРЫВАЕТСЯ ДВЕРЬ К СТОЯЩЕМУ ЗДАНИЮ
+#
+# Чтобы сравнить пачку с уже стоящим, надо знать, В КАКОМ документе мы пишем.
+# Личность документа известна ровно в одном месте — `serving`, где ground
+# отдал `__document_fingerprint`; сюда она едет ContextVar'ом, тем же приёмом,
+# каким этот код возит устройство хода (`serving._turn_device_id`) и
+# программы обзора (`design.review._programs`).
+#
+# ПОЧЕМУ НЕ ПАРАМЕТРОМ ЧЕРЕЗ ВЕРДИКТ. Путь до сюда — `serving` → `live.verdict`
+# → `_clash_block`; протаскивание параметра тронуло бы два чужих модуля ради
+# величины, которая принадлежит ХОДУ, а не пачке. ContextVar здесь — не
+# сокрытие: он объявлен, назван и обнуляется тем же ходом, что и ставится.
+#
+# ПОЧЕМУ НЕ ИЗ СНАПШОТА. Снапшот сюда доезжает УЖЕ ОБРЕЗАННЫМ
+# (`prune_ground_snapshot` оставляет только пулы с отметкой или сечением) —
+# отпечатка документа в нём нет. Дописать его туда значило бы поменять
+# `base_digest` сцены вьюера, который считается ПО ВСЕМУ снимку: чужой кэш
+# инвалидировался бы молча ради нашей нужды.
+_TURN_DOCUMENT: "ContextVar[str]" = ContextVar(
+    "kir_clash_turn_document", default="")
+
+
+def remember_turn_document(title: str) -> None:
+    """Назвать документ, в котором идёт ход. Пусто — забыть."""
+    _TURN_DOCUMENT.set(str(title or ""))
+
+
+def _live_project_uid(snapshot: Any) -> str:
+    """`project_uid` открытого документа из снимка заземления; пусто — нет.
+
+    Пусто здесь означает РОВНО «мы не знаем», и потребитель обязан читать это
+    как факт о НАШЕМ чтении, а не о здании: снимок мог быть снят до волны
+    отпечатков, обрезан `prune_ground_snapshot` или не приехать вовсе.
+    Отсутствие никогда не превращается в «личность не совпала» — иначе
+    отказ прибора стал бы обвинением документа.
+    """
+    if not isinstance(snapshot, Mapping):
+        return ""
+    fingerprint = snapshot.get("__document_fingerprint")
+    if not isinstance(fingerprint, Mapping):
+        return ""
+    value = fingerprint.get("project_uid")
+    return value if isinstance(value, str) else ""
+
+
+def turn_document_title() -> str:
+    """Заголовок документа хода; пустая строка — личность неизвестна."""
+    try:
+        return _TURN_DOCUMENT.get()
+    except LookupError:      # pragma: no cover — default сделан явным
+        return ""
 
 
 def clash_enabled() -> bool:
@@ -608,6 +663,14 @@ OP_NO_BODY: dict[str, str] = {
     "create_stairs_landing": "тело есть, но оболочку строить нечем — "
                              "OST_StairsLandings нет в закрытой "
                              "таблице clash.hulls.KIND_TABLE",
+    # ВТОРОЙ МАРШ — та же причина слово в слово, и это НЕ копия ради
+    # симметрии: `OST_StairsRuns` в `KIND_TABLE` отсутствует ровно так же,
+    # как `OST_StairsLandings`. Тело у марша есть (это настоящий солид), но
+    # оболочки поиск для него не строит, и обещать её категорией значило бы
+    # ждать от пачки тела, которого не будет.
+    "create_stairs_run": "тело есть, но оболочку строить нечем — "
+                         "OST_StairsRuns нет в закрытой "
+                         "таблице clash.hulls.KIND_TABLE",
     "create_type": "создаёт ТИП, а не элемент",
     "load_family": "загружает семейство, а не элемент",
     "place_family": "тело зависит от семейства; габарит символа программа "
@@ -675,6 +738,8 @@ _BLIND_OPS: dict[str, str] = {
                         "не умеет: у FaceWall нет LocationCurve",
     "create_stairs_landing": "строит площадку лестницы, оболочки "
                              "которой поиск не умеет",
+    "create_stairs_run": "строит марш лестницы, оболочки которой поиск "
+                         "не умеет",
 }
 
 #: Имя `BuiltInParameter`, под которым ЭМИТТЕР пишет объявленный диаметр.
@@ -1723,7 +1788,7 @@ ANSWER_INPUTS: tuple[tuple[str, Any], ...] = (
 
 
 def _cache_key(pack: Sequence[Any], snapshot: Any,
-               new_from: int | None) -> str:
+               new_from: int | None, existing_run: Any = None) -> str:
     """Ключ кэша — ЧИТАЕМАЯ строка, а не один непрозрачный отпечаток.
 
     ПОЧЕМУ НЕ SHA ЦЕЛИКОМ. Свёрнутые в хеш потолки стали бы невидимы, и
@@ -1740,7 +1805,13 @@ def _cache_key(pack: Sequence[Any], snapshot: Any,
     """
     parts = [f"bundle={_bundle_sha(pack)}",
              f"sections={_sections_sha(snapshot)}",
-             f"new_from={'none' if new_from is None else int(new_from)}"]
+             f"new_from={'none' if new_from is None else int(new_from)}",
+             # ИСТОЧНИК СТОЯЩЕГО — ВХОД, МЕНЯЮЩИЙ ОТВЕТ, значит он в ключе.
+             # Одна и та же пачка против ДРУГОГО здания — другой ответ, и
+             # отдать первый было бы тем же враньём, что и молчание. Ключ
+             # держит ИМЯ источника, а не его содержимое: разбор на диске
+             # неизменен по построению (новое чтение — новый каталог).
+             f"existing={'none' if existing_run is None else str(existing_run)}"]
     parts += [f"{name}={reader()}" for name, reader in ANSWER_INPUTS]
     return "|".join(parts)
 
@@ -1759,7 +1830,8 @@ def _cache_put(key: str, block: dict[str, Any]) -> None:
 
 
 def bundle_clash_report(pack: Sequence[Any], *, snapshot: Any = None,
-                        new_from: int | None = None
+                        new_from: int | None = None,
+                        existing_run: Any = None
                         ) -> dict[str, Any] | None:
     """Пачка программ -> блок квитанции о коллизиях. НИКОГДА не бросает.
 
@@ -1775,7 +1847,8 @@ def bundle_clash_report(pack: Sequence[Any], *, snapshot: Any = None,
     if not clash_enabled():
         return None
     try:
-        return _report(pack, snapshot=snapshot, new_from=new_from)
+        return _report(pack, snapshot=snapshot, new_from=new_from,
+                       existing_run=existing_run)
     except Exception as exc:  # noqa: BLE001 — квитанция не может стоить хода
         logger.debug("bundle clash check failed", exc_info=True)
         return {
@@ -1955,7 +2028,8 @@ def _blind_by_class(geometry: "BundleGeometry") -> dict[str, int]:
 
 
 def _report(pack: Sequence[Any], *, snapshot: Any = None,
-            new_from: int | None = None) -> dict[str, Any]:
+            new_from: int | None = None,
+            existing_run: Any = None) -> dict[str, Any]:
     from kukai.clash import detect as _detect
     from kukai.clash import review as _review
     from kukai.ir import clash_judgement as _judgement
@@ -1967,7 +2041,7 @@ def _report(pack: Sequence[Any], *, snapshot: Any = None,
     # ПРЕВРАТИТЬ ОТВЕТ В ОТКАЗ, — см. `ANSWER_INPUTS` и `_cache_key`.
     # Прежде он собирался здесь тремя ветками, и потолки в него не входили
     # вовсе: поднявший потолок получал из кэша тот же отказ.
-    key = _cache_key(pack, snapshot, new_from)
+    key = _cache_key(pack, snapshot, new_from, existing_run)
     cached = _cache_get(key)
     if cached is not None:
         return cached
@@ -2015,6 +2089,55 @@ def _report(pack: Sequence[Any], *, snapshot: Any = None,
     }
     snap = _snapshot.build_from_elements(
         elements, origin=origin, profiles=geometry.profiles)
+
+    # ═════ УЖЕ СТОЯЩЕЕ В ДОКУМЕНТЕ — ВТОРАЯ СТОРОНА ПАРЫ ═════
+    # До этой волны пачка сравнивалась САМА С СОБОЙ, и её собственная
+    # квитанция это называла: «столкновение с чужой стеной не „не найдено“,
+    # а НЕВИДИМО». Область берётся ПОСЛЕ сборки тел пачки, потому что она и
+    # есть габарит этих тел; порядок обратный был бы догадкой о том, где
+    # пачка окажется.
+    #
+    # Заставы по телам/офферам/парам стоят НИЖЕ намеренно: стоящее входит в
+    # них наравне с пачкой, иначе область, набравшая полздания, обошла бы
+    # потолок, который для того и заведён.
+    from kukai.clash import existing as _existing
+
+    region = _existing.Region.around(snap.records)
+    # ИСТОЧНИК РАЗРЕШАЕТСЯ ЗДЕСЬ, А НЕ ТРЕБУЕТСЯ ОТ ВЫЗЫВАЮЩЕГО. Параметр,
+    # который никто не передаёт, — это способность без двери; ровно так
+    # `sdk.py` пролежал пять недель недостижимым. Явный `existing_run`
+    # остаётся (админская дверь, тесты) и ПЕРЕВЕШИВАЕТ разрешение.
+    resolved_freshness = None
+    if existing_run is None:
+        # ЛИЧНОСТЬ ЖИВОГО ДОКУМЕНТА БЕРЁТСЯ ЗДЕСЬ ЖЕ, ИЗ СНИМКА ЗАЗЕМЛЕНИЯ.
+        # Тем же доводом, что абзацем выше: параметр, который никто не
+        # передаёт, — способность без двери. Снимок УЖЕ несёт
+        # `__document_fingerprint` (`open_model.py:870,1908`), и его
+        # `project_uid` — то самое поле Revit, которое разбор пишет в паспорт.
+        # Отсюда `serving` не надо ни о чём просить: он уже дал всё нужное.
+        existing_run, why, resolved_freshness = _existing.resolve_run(
+            turn_document_title(),
+            project_uid=_live_project_uid(snapshot))
+        if existing_run is None:
+            standing = _existing.Existing.absent(why)
+        else:
+            standing = _existing.load(existing_run, region,
+                                      doc_name=turn_document_title(),
+                                      freshness=resolved_freshness)
+    else:
+        standing = _existing.load(existing_run, region,
+                                  doc_name=str(origin.get("doc_name") or ""))
+    pair_filter = _detect.any_physical_pair_filter
+    if standing.present and standing.elements:
+        origin = dict(origin)
+        origin["existing_source"] = standing.source
+        snap = _snapshot.build_from_elements(
+            list(elements) + list(standing.elements),
+            origin=origin, profiles=geometry.profiles)
+        pair_filter = _detect.bundle_vs_document_pair_filter
+    bundle_bodies = sum(1 for r in snap.records
+                        if not _existing.is_existing(r.source_id))
+    standing_bodies = len(snap.records) - bundle_bodies
     # ВТОРАЯ ЗАСТАВА — ПО ТЕЛАМ, И ТЕПЕРЬ ОНА ИХ ДЕЙСТВИТЕЛЬНО СЧИТАЕТ. Стоит
     # ПОСЛЕ снапшота намеренно: раньше тел ещё нет, а считать их по элементам —
     # то самое подписывание чужой оси, которым эта застава и болела (замер и
@@ -2047,12 +2170,12 @@ def _report(pack: Sequence[Any], *, snapshot: Any = None,
     # здесь числом, а не спрятана: она и есть цена того, чтобы решение
     # «считать или отказать» принималось ДО узкой фазы.
     cands = _detect.candidate_pairs(
-        snap.records, grid, pair_filter=_detect.any_physical_pair_filter)
+        snap.records, grid, pair_filter=pair_filter)
     if len(cands) > _max_pairs():
         return _over_cap(
             key, snap, "узкая фаза", len(cands), _max_pairs(),
             len(cands) * _MS_PER_PAIR / 1e3)
-    report = _detect.detect(snap, pair_filter=_detect.any_physical_pair_filter)
+    report = _detect.detect(snap, pair_filter=pair_filter)
     view = _review.build_review(report, top=_TOP, max_elements=0)
 
     # ═════ СЛОЙ СУЖДЕНИЯ ═════
@@ -2101,6 +2224,22 @@ def _report(pack: Sequence[Any], *, snapshot: Any = None,
         "status": "ok",
         "scope_id": report["search"]["scope_id"],
         "assertion": "self_reported",
+        # ПРОТИВ ЧЕГО СРАВНИВАЛИ — БЕЗ ЭТОГО ПОЛЯ НОЛЬ НАХОДОК НИЧЕГО НЕ
+        # ЗНАЧИТ. `present: false` с причиной и `present: true` с нулём тел в
+        # области — РАЗНЫЕ факты: первое «не смотрели», второе «смотрели, в
+        # области пусто». Слить их в пустой список значило бы вернуть тот
+        # самый зелёный без акта различения, ради которого волна и делалась.
+        "compared_against": standing.to_dict(),
+        # ЧИСЛО ПАР — ФОРМУЛОЙ ПО ДВУМ ИЗВЕСТНЫМ ЧИСЛЕННОСТЯМ, а не
+        # сокращением по классам: сокращение законно только для фильтров,
+        # решающих по `(label, mvp_side)`, а этот решает по ИСТОЧНИКУ, и
+        # `detect` честно отдаёт по нему `eligible_pairs=None` с названной
+        # причиной. `None`, прочитанный как ноль, уже однажды дал «ноль рядом
+        # с 58 280 находками», поэтому здесь стоит точное число.
+        "pairs_compared": _existing.pairs_compared(
+            bundle_bodies, standing_bodies),
+        "bodies_bundle": bundle_bodies,
+        "bodies_existing": standing_bodies,
         "bodies": report["search"]["hulls"],
         "elements_considered": totals["eligible"],
         # ЗНАМЕНАТЕЛЬ ЦЕЛИКОМ, а не только сторона MVP: дверь без оболочки —
@@ -2410,11 +2549,47 @@ def _render(block: Mapping[str, Any], report: Mapping[str, Any]
     # ПРЕДЕЛ ДЕЛЬТЫ НАЗЫВАЕТСЯ ВСЕГДА, а не только когда её спросили:
     # «внесено 0» без этой строки читается как «и ни с чем в документе не
     # столкнулись», а этого проверка не знает и знать не может.
-    lines.append(
-        "НЕ ВИДИТ ВООБЩЕ: только объявленное сессией. Стоящее в документе в "
-        "поиск не входит никогда (ground даёт уровни и ТИПЫ, ни одного "
-        "экземпляра) — столкновение с чужой стеной не «не найдено», а "
-        "НЕВИДИМО.")
+    # ПРЕДЕЛ ОБЛАСТИ НАЗЫВАЕТСЯ ВСЕГДА И РАЗНЫМИ СЛОВАМИ. До волны стоящего
+    # здесь стояла одна фраза на все случаи; теперь их три, потому что фактов
+    # три: «не смотрели», «смотрели, в области пусто», «смотрели, вот против
+    # чего». Одна фраза на три факта — то же слияние исходов, которое этот
+    # модуль запрещает у переписи.
+    against = block.get("compared_against") or {}
+    if not against.get("present"):
+        lines.append(
+            "НЕ ВИДИТ СТОЯЩЕЕ: сравнивали только объявленное сессией "
+            f"({against.get('reason') or 'источник не задан'}) — столкновение "
+            "с чужой стеной не «не найдено», а НЕВИДИМО.")
+    else:
+        region = against.get("region") or {}
+        lines.append(
+            f"СРАВНИВАЛИ СО СТОЯЩИМ: разбор `{against.get('source')}`, "
+            f"{against.get('bodies', 0)} тел в области из "
+            f"{against.get('scanned', 0)} прочитанных, пар "
+            f"{block.get('pairs_compared', 0)}. Область — габарит новых тел, "
+            f"запас {region.get('margin_mm', 0)} мм: перекрытие и касание "
+            "требуют пересечения габаритов, поэтому вне её находка невозможна. "
+            "Отношение «рядом» против стоящего НЕ публикуется — иначе в "
+            "находки уехало бы всё здание.")
+        if against.get("without_bbox"):
+            lines.append(
+                f"У {against['without_bbox']} записей разбора габарита нет "
+                "вовсе — они вне сравнения, и это не «не бьются».")
+        # СВЕЖЕСТЬ ПЕЧАТАЕТСЯ ВСЕГДА, КОГДА ИСТОЧНИК РАЗРЕШЁН НАМИ. Находка,
+        # снятая с разбора недельной давности, — это сравнение с ПРОШЛЫМ
+        # зданием, и молчать об этом нельзя: тот же класс, что «устаревший
+        # каталог даёт KIR-G101, а не тихую постройку».
+        fresh = against.get("freshness") or {}
+        if fresh and not fresh.get("proven"):
+            age = fresh.get("age_days")
+            lines.append(
+                "🔴 ИСТОЧНИК СТОЯЩЕГО НЕ ДОКАЗАН: "
+                + (f"разбору {age} сут; " if age is not None else "")
+                + f"совпало только {fresh.get('matched_by')} — "
+                + str(fresh.get("why") or "")
+                + ". Находки ниже сняты с ПРОШЛОГО состояния документа: "
+                  "элемент, снесённый или подвинутый после разбора, здесь "
+                  "по-прежнему стоит.")
     lines.append(
         f"область `{block['scope_id']}` (ВСЕ физические пары), судит "
         f"`{block.get('judgement_schema', '')}`. СВИДЕТЕЛЬСТВО, не отказ.")

@@ -36,7 +36,8 @@ os.environ.setdefault("KIR_REJECTIONS_PATH",
 from kukai.ir import compiler             # noqa: E402
 from kukai.ir import course as C          # noqa: E402
 from kukai.ir import dsl, sandbox, spec   # noqa: E402
-from kukai.ir.compiler import MAX_OPS_PER_PROGRAM, plan_program  # noqa: E402
+from kukai.ir.compiler import (  # noqa: E402
+    MAX_BULK_OPS, MAX_OPS_PER_PROGRAM, plan_program)
 from kukai.ir.diag import KirRefusal      # noqa: E402
 from kukai.ir.emit_utils import ELEMENT_ID_MAX  # noqa: E402
 
@@ -458,9 +459,21 @@ class PhaseCountsHoldTheInvariants(_InProcess):
                 n_phases = rng.randint(1, 6)
                 seen_counts.add(n_phases)
                 handles: list = []
+                # ПОТОЛОК ЗДЕСЬ — СКРИПТОВЫЙ, А НЕ ПРОГРАММНЫЙ, и до
+                # 15.08.2026 разница не проявлялась: при авторском бюджете 20
+                # шесть фаз давали максимум 120 опов, то есть генератор не мог
+                # дотянуться до потолка накопителя `dsl` (`MAX_BULK_OPS`=300).
+                # После подъёма бюджета до 100 шесть фаз дают до 600, и два
+                # прогона из сорока упёрлись в накопитель — отказом ПРОДУКТА,
+                # верным по существу. Чинить надо генератор: он обязан
+                # оставаться внутри той же границы, что и настоящий скрипт.
+                # Свойство, которое файл проверяет (разбиение остаётся
+                # разбиением при любом числе фаз), от величины draw не зависит.
+                per_phase = max(1, min(MAX_OPS_PER_PROGRAM,
+                                       (MAX_BULK_OPS - 1) // n_phases))
                 for index in range(n_phases):
                     with C.phase(f"фаза {index}"):
-                        for k in range(rng.randint(1, MAX_OPS_PER_PROGRAM)):
+                        for k in range(rng.randint(1, per_phase)):
                             if handles and rng.random() < 0.4:
                                 self.wall(rng.choice(handles), k)
                             else:

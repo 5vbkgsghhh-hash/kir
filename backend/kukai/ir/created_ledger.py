@@ -59,18 +59,47 @@ logger = logging.getLogger(__name__)
 LEDGER_DIR_ENV = "KIR_CREATED_LEDGER_DIR"
 SCHEMA_VERSION = "kir-created-ledger/1"
 
-#: Ключи строки результата, несущие ИМЕННО созданное.  Список ЗАКРЫТ и
-#: НЕПОЛОН ПО ПРИЗНАНИЮ: новый эмиттер, начавший возвращать номер под другим
-#: именем, сюда не попадёт сам, и обнаружится это тогда, когда сработает.
-#: Поэтому `test_created_ledger` держит сверку с `witness_feed`, который
-#: решает «создано ли» по тем же ключам: разойдись они — два места станут
-#: отвечать на один вопрос по-разному.
-CREATED_KEYS: tuple[str, ...] = ("id", "ids", "created_ids")
+def created_keys() -> tuple[str, ...]:
+    """Ключи строки результата, несущие ИМЕННО созданное. ПОЛНЫЙ ПО ПОСТРОЕНИЮ.
 
-#: `deleted_id` НЕ здесь и это не упущение: удалённого элемента в модели уже
-#: нет, следить не за чем.  Реестр отвечает на вопрос «что я оставил», а не
-#: «что я трогал».
-_NOT_CREATED_KEYS: tuple[str, ...] = ("deleted_id",)
+    🔴 БЫЛ РУКОПИСНЫМ КОРТЕЖЕМ И ТЕРЯЛ ЧЕТЫРЕ ОПЕРАЦИИ (замер 15.08.2026).
+    Стояло `("id", "ids", "created_ids")`, объявленное «закрытым и неполным по
+    признанию». Замер по реестру показал две вещи разом:
+
+    * `ids` и `created_ids` не объявлены НИ ОДНИМ опом — две мёртвые строки,
+      угаданные по виду имени, а не спрошенные у авторитета;
+    * `segment_ids` — поле идентичности ЧЕТЫРЁХ созидающих опов
+      (`create_pipe_system`, `create_room_separator`, `route_duct_system`,
+      `route_pipe_system`), и его в кортеже не было. **Их созданные элементы
+      не оставляли в реестре следа вовсе** — ровно та потеря, ради запрета
+      которой этот модуль написан. В живом корпусе (1913 строк на 15.08) таких
+      ходов **28**.
+
+    Теперь ключи ВЫВОДЯТСЯ у реестра (`address.created_identity_fields`):
+    поля `ResultSpec.identity_field` всех опов с `EffectKind.CREATE`. Новый
+    созидающий оп попадает сюда сам; забыть его нельзя, потому что списка,
+    который можно забыть, больше нет. Род списка сменился с «закрытый, но не
+    полный» на **полный по построению**, и это разные вещи: там пустая строка
+    значила «не знаем», здесь — «такого поля у реестра нет».
+    """
+
+    from kukai.ir.address import created_identity_fields
+
+    return created_identity_fields()
+
+
+def not_created_keys() -> dict[str, str]:
+    """Поля идентичности, НЕ несущие созданного, — каждое с причиной.
+
+    `deleted_id` исключён не по упущению: удалённого элемента в модели уже
+    нет, следить не за чем. `moved_ids` — по той же причине с другой стороны:
+    элемент существовал до хода. Реестр отвечает на «что я оставил», а не «что
+    я трогал». Раньше названо было только первое, второе выпадало молча.
+    """
+
+    from kukai.ir.address import identity_field_reasons
+
+    return identity_field_reasons()
 
 
 def ledger_path() -> pathlib.Path | None:
@@ -104,11 +133,12 @@ def extract_created(payload: Any) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     if not isinstance(payload, Mapping):
         return out
+    keys = created_keys()
     for oid, row in payload.items():
         if not isinstance(row, Mapping):
             continue
         ids: list[str] = []
-        for key in CREATED_KEYS:
+        for key in keys:
             v = row.get(key)
             if isinstance(v, (str, int)) and not isinstance(v, bool):
                 ids.append(str(v))
@@ -199,5 +229,6 @@ def record_created(
     return row
 
 
-__all__ = ["CREATED_KEYS", "LEDGER_DIR_ENV", "SCHEMA_VERSION",
-           "extract_created", "ledger_path", "record_created"]
+__all__ = ["LEDGER_DIR_ENV", "SCHEMA_VERSION", "created_keys",
+           "extract_created", "ledger_path", "not_created_keys",
+           "record_created"]

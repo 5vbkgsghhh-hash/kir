@@ -410,6 +410,15 @@ def _shown_of(pool: list[dict], pool_name: str) -> str:
     total = len(pool)
     if total <= _CANDIDATES_SHOWN:
         return ""
+    # 🔴 ДВЕРЬ НАЗЫВАЕТСЯ, ТОЛЬКО ЕСЛИ ОНА ЕСТЬ (взято при сведении 15.08.2026
+    # из ветки каталога, где это стояло отдельной функцией `_catalogue_hint`).
+    # Второй такой функции здесь нет и не будет: две, обязанные совпадать, —
+    # именной дефект этого дерева. Спрашивается РЕЕСТР, а не список руками:
+    # пул, до которого `query_types` не дотягивается, назвать в отказе значило
+    # бы послать автора к двери, которой нет.
+    askable = set(spec.OPS["query_types"].params[0].choices)
+    if pool_name not in askable:
+        return f" ПОКАЗАНЫ {_CANDIDATES_SHOWN} ИЗ {total} — остальные не видны"
     return (f" ПОКАЗАНЫ {_CANDIDATES_SHOWN} ИЗ {total} — остальные не видны; "
             f"весь список: query_types(pool=\"{pool_name}\")")
 
@@ -564,7 +573,8 @@ def _resolve_one(sel: Any, pool_name: str, pool: list[dict], op_index: int,
             diags.append(Diagnostic(
                 code=GROUND_NOT_FOUND, op_index=op_index, op_id=op_id,
                 field_name=param, got=want, candidates=_nearest(want, pool),
-                message_ru=f"{pool_name}: «{want}» не найден" + trunc_note))
+                message_ru=(f"{pool_name}: «{want}» не найден" + trunc_note
+                            + _shown_of(pool, pool_name))))
         else:
             # KIR-G102 disambiguation path (2026-07-17): several pool entries
             # share `want` verbatim (e.g. several duct/cable-tray types named

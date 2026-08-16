@@ -2549,6 +2549,32 @@ def _refinement_specs() -> dict[str, OpRefinementSpec]:
             ),
         ),
         OpRefinementSpec(
+            # ВОЛНА ЛЕСТНИЦ, ВТОРОЙ МАРШ (15.08.2026). Третий оп со СВОИМ
+            # шаблоном целой программы; текст разбирается КУСКАМИ той же
+            # дорогой, что марш и площадка (`vacuity_partial`), потому что по
+            # скобкам он намеренно не сбалансирован — рамку даёт
+            # `wrap_user_code`.
+            op="create_stairs_run",
+            materializer=("CreateStraightRun",),
+            obligations=(
+                ob("run exists (materialized or typed refusal)",
+                   KIND_MATERIALIZE, _REFUSE, block=BLOCK_CREATE),
+                ob("GetStairs() == the requested stairs (topology)",
+                   KIND_TOPOLOGY, (".GetStairs()",), key="owner_stairs"),
+                ob("the run appears in Stairs.GetStairsRuns (topology)",
+                   KIND_TOPOLOGY, ("GetStairsRuns",), key="in_run_set"),
+                # Свидетель читает РЕЗУЛЬТАТ: путь ПОСТРОЕННОГО марша против
+                # авторской оси, по обоим направлениям обхода.
+                ob("GetStairsPath reproduces the authored axis endpoints in "
+                   "plan within the derived tolerance (geometry)",
+                   KIND_GEOMETRY, ("GetStairsPath",), key="path"),
+                ob("fresh post-scope BaseElevation equals the stairs base "
+                   "plus the normalized integer riser multiple within the "
+                   "derived geometry tolerance (geometry)",
+                   KIND_GEOMETRY, ("BaseElevation",), key="elevation"),
+            ),
+        ),
+        OpRefinementSpec(
             # feat/native-groups: NewGroup builds the definition (guarded by
             # __Refuse on null); .Groups witnesses the placed instance count;
             # .Name witnesses the requested GroupType name.  Witnesses are
@@ -3047,6 +3073,26 @@ _NON_WITNESSABLE_CLAUSES: dict[str, tuple[tuple[str, str], ...]] = {
     # ВОЛНА ЛЕСТНИЦ (10.08.2026). ТРИ освобождения, и каждое названо ровно
     # затем, чтобы не-свидетельствуемое обещание не растворилось в соседней
     # клаузуле по случайному общему слову.
+    # ВТОРОЙ МАРШ (15.08.2026). ДВА освобождения, обе — не-свидетельствуемые
+    # обещания, названные поимённо, чтобы не растворились в соседней клаузуле
+    # по случайному общему слову.
+    "create_stairs_run": (
+        ("sole op",
+         "PLAN constraint (KIR-L002); emit_program raises before emission"),
+        # НАЗВАННОЕ ОТСУТСТВИЕ ОСИ — тот же довод, что у площадки: Z пути
+        # марша назначает Revit от базы лестницы. Подписать ось, которую не
+        # задавали, — ровно дефект, ради запрета которого заведён
+        # test_witness_axis_honesty.
+        ("z is not compared",
+         "Revit derives the run path Z from the stairs base itself, so that Z "
+         "is Revit's number and not the op's; witnessing it would sign an "
+         "axis nobody authored"),
+        # ПРЕДУСЛОВИЕ, А НЕ ПОСТУСЛОВИЕ: кратность подступенку проверяется ДО
+        # эффекта и отказывает, поэтому обязательства свидетеля у неё нет.
+        ("base_elevation_mm must already be an integer multiple",
+         "checked BEFORE any effect and refused with the adjacent multiples "
+         "named; a precondition has no post-effect witness to discharge"),
+    ),
     "create_stairs_landing": (
         ("sole op",
          "PLAN constraint (KIR-L002); emit_program raises before emission"),

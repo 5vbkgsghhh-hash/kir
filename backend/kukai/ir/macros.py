@@ -86,9 +86,13 @@ MACRO_OPS = ("stack", "grid_array", "series")
 #:
 #: The rule for membership is mechanical, not taste: the op must take `level`
 #: (so the per-storey rewrite means something) and must not be a whole-network
-#: op whose nodes carry their own elevations. Hosted ops (door/window) stay out
-#: because their host is addressed by `ref` to a sibling op, and the expansion
-#: renames ids per storey — a hosted op would point at storey 1 forever.
+#: op whose nodes carry their own elevations.
+#:
+#: 🔴 ПРО ХОСТЯЩИЕСЯ ОПЫ ЗДЕСЬ РАНЬШЕ СТОЯЛ ЗАПРЕТ, И ОН СНЯТ 15.08.2026.
+#: Прежний довод — «hosted op would point at storey 1 forever» — описывал не
+#: свойство двери, а ПРОБЕЛ ЭКСПАНСИИ: она переименовывала id и не переписывала
+#: `by:ref`. Пробел закрыт (`_rename_member_refs` ниже), и дверь с окном едут
+#: вторым правилом членства — `_STACKABLE_HOSTED`.
 _STACKABLE = (
     "create_wall", "create_pipe", "create_column", "create_beam",
     "create_floor", "create_floor_by_contour", "create_room",
@@ -101,6 +105,112 @@ _STACKABLE = (
     # ломаную поэтажно нужно другим переносом, которого никто не мерил.
     "create_conduit", "create_pipe_placeholder", "create_duct_placeholder",
 )
+
+#: ВТОРОЕ ПРАВИЛО ЧЛЕНСТВА: ХОСТЯЩИЕСЯ ОПЫ. Род списка — **ЗАКРЫТЫЙ, НО НЕ
+#: ПОЛНЫЙ**: сюда внесены только те опы, для которых экспансия ЗАМЕРЕНА, и
+#: отсутствие имени значит «не мерили», а не «не поедет».
+#:
+#: ЗАЧЕМ ВТОРОЕ ПРАВИЛО, А НЕ РАСШИРЕНИЕ ПЕРВОГО. Первое требует, чтобы оп
+#: принимал `level` — у двери и окна такого поля НЕТ ВОВСЕ (`ops_authoring`),
+#: и это не упущение реестра: **у хостящегося элемента уровень есть свойство
+#: ХОЗЯИНА.** Дверь стоит на том этаже, на котором стоит её стена. Значит
+#: поэтажная перепись, которая для стены означает «перепиши `level`», для
+#: двери означает «перепиши ССЫЛКУ НА ХОЗЯИНА», и требовать от неё `level`
+#: значило бы завести у двери второй, независимый источник этажа — ровно тот
+#: род дефекта, против которого написан весь пакет.
+#:
+#: ЧТО ОБЯЗАН УДОВЛЕТВОРЯТЬ ЖИЛЕЦ (проверяется тестом, а не глазом):
+#:   1. эффект CREATE — правящие опы (`set_param`, `delete`, `change_type`,
+#:      `set_curtain_panel`) адресуют ЧУЖОЙ элемент и своего этажа не имеют;
+#:   2. обязательный селектор-хозяин, принимающий `ref`;
+#:   3. НЕТ собственного `level`;
+#:   4. и решающее: после экспансии хозяин РАЗРЕШАЕТСЯ в члена ТОГО ЖЕ этажа —
+#:      это замер, а не свойство реестра, и его держит `test_stacked_storey`.
+#:
+#: ПОЧЕМУ ЗДЕСЬ ТОЛЬКО ДВА ИМЕНИ. Механически условиям 1-3 удовлетворяют ещё
+#: `create_opening`, `create_curtain_grid_line`, `create_slab_edge`,
+#: `create_wall_sweep`, `create_area_reinforcement`, `create_wall_foundation`,
+#: `create_face_wall`, `create_site_subregion`. Ни один не внесён, и у каждого
+#: причина СВОЯ, а не общая:
+#:   * `create_wall_foundation` — фундамент принадлежит ОСНОВАНИЮ, а не
+#:     каждому этажу; поэтажное тиражирование построило бы N фундаментов;
+#:   * `create_face_wall` — хозяин это ГРАНЬ ФОРМЫ, а не член этажа; ссылка
+#:     ушла бы наружу набора и упёрлась в отказ условия 4;
+#:   * `create_site_subregion` — хозяин рельеф, у участка этажей нет;
+#:   * `create_opening`, `create_curtain_grid_line`, `create_slab_edge`,
+#:     `create_wall_sweep`, `create_area_reinforcement` — механически проходят
+#:     и НЕ ЗАМЕРЕНЫ: ни одного живого прогона поэтажной экспансии у них нет,
+#:     а вносить в список по симметрии значит объявить проверенным то, что не
+#:     проверялось. Вносить по одному, каждый со своим замером.
+_STACKABLE_HOSTED: dict[str, str] = {
+    "create_door": (
+        "хозяин — стена этажа (`host`, target_w, принимает ref); уровень берёт "
+        "у хозяина; живьём 38 построек, 0 обвинений"),
+    "create_window": (
+        "то же устройство, что у двери, и тот же хозяин-стена; живьём "
+        "33 постройки, 0 обвинений"),
+}
+
+
+def _takes_level(op_name: str) -> bool:
+    """Принимает ли оп собственный `level` — СПРОШЕНО У РЕЕСТРА.
+
+    Не список: второй перечень имён, обязанный совпадать с реестром, разошёлся
+    бы с ним на первом же новом опе. Реестр — авторитет, здесь только вопрос.
+    """
+    from kukai.ir import spec
+    op_spec = spec.OPS.get(op_name)
+    return bool(op_spec) and any(p.name == "level" for p in op_spec.params)
+
+
+def _rename_member_refs(node: Any, renames: dict) -> Any:
+    """Переписать `{"by":"ref","value":X}` -> `renames[X]` для членов набора.
+
+    🔴 ЭТО ПОЛОВИНА, КОТОРОЙ ЭКСПАНСИИ НЕ ХВАТАЛО. Экспандер переименовывает
+    id членов на каждом шаге (`{mid}_L{k}_{base}`), а ссылки между членами
+    оставлял нетронутыми — то есть дверь второго этажа продолжала указывать на
+    стену, которой после переименования уже нет, либо на стену первого шага.
+    Из-за этого хостящиеся опы были ЗАПРЕЩЕНЫ, и запрет читался как факт о
+    двери, хотя был фактом об экспансии.
+
+    Ссылка НА ЧУЖОЕ ИМЯ остаётся нетронутой намеренно: член этажа вправе
+    сослаться на уровень или элемент вне набора, и подменять такую ссылку
+    значило бы решать за автора. Опасный случай — хостящийся оп, чей хозяин
+    ВНЕ набора, — ловится отдельным отказом в экспандере, а не молчаливой
+    подстановкой.
+
+    НАЗВАННЫЙ ДОЛГ: ту же перепись делает приватное замыкание
+    `authoring._rename_refs` внутри эмиттера групп. Две копии одного правила —
+    именной дефект этого дерева; свести их в одно место нельзя из этой волны
+    (эмиттер принадлежит другой), и потому долг записан здесь, а не умолчан.
+    """
+    if isinstance(node, dict):
+        out = {}
+        for key, val in node.items():
+            if (key == "value" and node.get("by") == "ref"
+                    and str(val) in renames):
+                out[key] = renames[str(val)]
+            else:
+                out[key] = _rename_member_refs(val, renames)
+        return out
+    if isinstance(node, list):
+        return [_rename_member_refs(x, renames) for x in node]
+    return node
+
+
+def _host_ref_outside(op: dict, renames: dict) -> str | None:
+    """Имя хозяина, если хостящийся оп ссылается ЗА ПРЕДЕЛЫ набора.
+
+    Возвращает `None`, когда всё в порядке: хозяин либо член набора (ссылка
+    переписана), либо адресован не ссылкой (element_id/имя — настоящий элемент
+    документа, и он один для всех шагов законно).
+    """
+    host = op.get("host") or op.get("wall")
+    if isinstance(host, dict) and host.get("by") == "ref":
+        value = str(host.get("value"))
+        if value not in renames:
+            return value
+    return None
 
 #: Ops whose points carry an explicit Z: the macro keeps them storey-local and
 #: makes them absolute on expansion. Ops that locate by `level` + 2D need no
@@ -318,9 +428,10 @@ def _expand_stack(m: dict) -> list[dict]:
     for f in floor:
         if not isinstance(f, dict):
             raise _err("stack.floor: op должен быть объектом", mid)
-        if f.get("op") not in _STACKABLE:
+        if f.get("op") not in _STACKABLE and f.get("op") not in _STACKABLE_HOSTED:
             raise _err(f"stack.floor: '{f.get('op')}' не тиражируется по этажам "
-                       f"(допустимы {list(_STACKABLE)})", mid, got=f.get("op"))
+                       f"(допустимы {list(_STACKABLE)}; хостящиеся — "
+                       f"{sorted(_STACKABLE_HOSTED)})", mid, got=f.get("op"))
         if "level" in f:
             # `_err(msg, op_id=None, **kw)`: `mid` уже занимает `op_id`
             # позиционно, и второй `op_id=None` рвал вызов TypeError'ом.
@@ -341,11 +452,24 @@ def _expand_stack(m: dict) -> list[dict]:
                     "elev_mm": e0 + (k - 1) * h, "name": f"{prefix} {k}"})
     for k in range(1, n + 1):
         frac = (k - 1) / (n - 1) if n > 1 else 0.0
+        # КАРТА ПЕРЕИМЕНОВАНИЙ ЭТОГО ЭТАЖА, СОБРАННАЯ ДО ТЕЛА ЦИКЛА: ссылка
+        # члена на соседа обязана попасть на соседа ТОГО ЖЕ этажа, в том числе
+        # когда сосед объявлен НИЖЕ по списку. Строить карту по ходу значило бы
+        # переписать ссылки только назад, а вперёд — молча оставить на первом
+        # этаже, то есть ровно тот дефект, ради которого карта и заводится.
+        renames = {(f.get("id") or f["op"]): f"{mid}_L{k}_{f.get('id') or f['op']}"
+                   for f in floor}
         for f in floor:
             c = copy.deepcopy(f)
             base = c.get("id") or c["op"]
             c["id"] = f"{mid}_L{k}_{base}"
-            c["level"] = {"by": "ref", "value": f"{mid}_L{k}"}
+            # УРОВЕНЬ ПИШЕТСЯ ТОЛЬКО ТОМУ, КТО ЕГО ПРИНИМАЕТ. У хостящегося
+            # опа своего `level` нет вовсе, и вписать его значило бы завести
+            # второй источник этажа рядом с хозяином — при расхождении молча
+            # победил бы один из двух. Этаж двери есть этаж её стены, и ничего
+            # больше.
+            if _takes_level(c["op"]):
+                c["level"] = {"by": "ref", "value": f"{mid}_L{k}"}
             _apply_transform(c, tr, frac, mid)
             # per-storey Z shift for ops whose points carry an explicit Z:
             # points stay storey-local in the macro, absolute after expansion
@@ -362,6 +486,24 @@ def _expand_stack(m: dict) -> list[dict]:
                     # то, чего от адреса и ждут.
                     c[key] = dict(c[key])
                     c[key]["z_mm"] = float(c[key]["z_mm"]) + e0 + (k - 1) * h
+            # ХОЗЯИН ВНЕ НАБОРА — ОТКАЗ, А НЕ ТИХАЯ ССЫЛКА НА ПЕРВЫЙ ЭТАЖ.
+            # Проверяется ДО переписи: после неё «внутри» и «снаружи» уже не
+            # различить, а различие здесь решает всё.
+            stray = _host_ref_outside(c, renames)
+            if stray is not None:
+                raise _err(
+                    f"stack.floor: '{c['op']}' ссылается на хозяина "
+                    f"'{stray}', которого нет среди членов этажа. Хостящийся "
+                    f"оп тиражируется поэтажно ТОЛЬКО вместе со своим "
+                    f"хозяином: иначе на каждом этаже он повис бы на одном и "
+                    f"том же элементе первого. СЛЕДУЮЩИЙ ХОД: внеси хозяина в "
+                    f"floor — либо адресуй его element_id, если это настоящий "
+                    f"элемент документа, один для всех этажей",
+                    mid, field_name="host", got=stray)
+            # ПЕРЕПИСЬ ССЫЛОК — ПОСЛЕДНЕЙ, когда id уже назначены и карта
+            # этажа полна. Ссылка на `level` при этом не задета: имя уровня
+            # (`{mid}_L{k}`) в карте членов не значится.
+            c = _rename_member_refs(c, renames)
             out.append(c)
     return out
 
@@ -412,10 +554,14 @@ def _expand_grid_array(m: dict) -> list[dict]:
 #: НЕ переписывает `level` — значит требование «оп принимает level» здесь не
 #: нужно, и create_grid, которому в stack отказано как не-поэтажному объекту,
 #: сюда входит законно (переменный шаг осей — ровно то, зачем макрос нужен).
-#: Остаётся одно ограничение, общее со stack: оп не должен адресовать СОСЕДНИЙ
-#: оп по `ref` как хост, потому что экспансия переименовывает id на каждом шаге,
-#: и hosted-оп (door/window) навсегда указал бы на шаг 0.
-_SERIES_ABLE = _STACKABLE + ("create_grid",)
+#: 🔴 ОГРАНИЧЕНИЕ ПРО ХОСТЯЩИЕСЯ ОПЫ СНЯТО 15.08.2026, И ПО ЗАМЕРУ, А НЕ ПО
+#: СИММЕТРИИ СО stack. Прежний текст говорил: «hosted-оп навсегда указал бы на
+#: шаг 0» — и это было верно ровно до того, как экспансия научилась переписывать
+#: ссылки (`_rename_member_refs`). Замер после починки, ряд из трёх пролётов
+#: «стена + дверь»: `bay_0_d -> bay_0_w`, `bay_1_d -> bay_1_w`,
+#: `bay_2_d -> bay_2_w`, **несовпадений шага 0**. Допущены ровно те же два
+#: имени, что и в stack, и ровно потому, что замер их накрыл.
+_SERIES_ABLE = _STACKABLE + ("create_grid",) + tuple(_STACKABLE_HOSTED)
 
 #: Грамматика ссылки на параметр трека. ЗАКРЫТАЯ, четыре формы, без композиции:
 #:     $имя   -$имя   $имя@next   -$имя@next
@@ -663,10 +809,30 @@ def _expand_series(m: dict) -> list[dict]:
         at_k = {name: _track_at(nodes, k) for name, nodes in parsed.items()}
         at_next = {name: _track_at(parsed[name], k + 1)
                    for name, needs_next in used.items() if needs_next}
+        # ТОТ ЖЕ КЛАСС, ЧТО У stack, И ЛЕЧИТСЯ ТЕМ ЖЕ. `series` тоже
+        # переименовывает id членов на каждом шаге (`{mid}_{k}_{base}`) и тоже
+        # не переписывал ссылки между ними. Живого дефекта здесь сегодня нет —
+        # среди `_SERIES_ABLE` некому ссылаться на соседа, — но пробел тот же,
+        # и оставить его закрытым в одном экспандере из двух значило бы
+        # починить СЛУЧАЙ вместо КЛАССА: первый же хостящийся жилец приехал бы
+        # сюда с той же ошибкой, уже объявленной исправленной.
+        renames = {it.get("id", it["op"]): f"{mid}_{k}_{it.get('id', it['op'])}"
+                   for it in items}
         for it, body in zip(items, bodies):
             base = it.get("id", it["op"])
             c = {"op": it["op"], "id": f"{mid}_{k}_{base}"}
             c.update(_substitute(body, at_k, at_next))
+            stray = _host_ref_outside(c, renames)
+            if stray is not None:
+                raise _err(
+                    f"series.items: '{c['op']}' ссылается на хозяина "
+                    f"'{stray}', которого нет среди членов шага. Хостящийся оп "
+                    f"тиражируется ТОЛЬКО вместе со своим хозяином: иначе на "
+                    f"каждом шаге он повис бы на элементе нулевого. "
+                    f"СЛЕДУЮЩИЙ ХОД: внеси хозяина в items — либо адресуй его "
+                    f"element_id, если это настоящий элемент документа",
+                    mid, field_name="host", got=stray)
+            c = _rename_member_refs(c, renames)
             out.append(c)
     return out
 

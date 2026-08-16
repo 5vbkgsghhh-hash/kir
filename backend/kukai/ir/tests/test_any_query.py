@@ -63,8 +63,31 @@ OUT_OF_COVERAGE_KINDS = [
     # оператора/контекст запроса, а не подставить наугад.
     "Опоры",
     # nonsense / adversarial (must stay RAW in telemetry — they ARE the signal):
-    "unicorn", "стена", "Wall ", "WALL", "wall​", "OST_ImportInstances",
+    "unicorn", "стена", "wall​", "OST_ImportInstances",
 ]
+
+#: 🔴 ПЕРЕЕХАЛИ ИЗ СОСТЯЗАТЕЛЬНЫХ 15.08.2026, И ЭТО НЕ ОСЛАБЛЕНИЕ ИНВАРИАНТА.
+#:
+#: `"Wall "` и `"WALL"` стояли выше как доказательство «компилятор не
+#: угадывает». Слиянием приехала ЛЕСТНИЦА РАЗРЕШЕНИЯ ИМЕНИ ВИДА
+#: (`compiler._check_kind`, `_canon_kind`, `_kind_canon_index`), и она приняла
+#: осознанное решение: одно совпадение в ЗАКРЫТОМ множестве — это то же имя,
+#: набранное иначе, а не выбор из двух. На столкновении она ОТКАЗЫВАЕТ (индекс
+#: держит список, а не первое имя), и отказ называет соседа.
+#:
+#: Поэтому эти два больше не «вне охвата»: они В охвате, просто написаны
+#: иначе. Инвариант анти-скоупа не тронут — состязательные, которые обязаны
+#: отказывать, остались наверху, и среди них `"wall​"` с нулевой шириной:
+#: `\s` его не снимает, лестница его не сводит, отказ на месте.
+#:
+#: 🔴 НАЗВАННЫЙ ДОЛГ, КОТОРЫЙ ЭТОТ ТЕСТ НЕ ЗАКРЫВАЕТ. Лестница срабатывает
+#: МОЛЧА: `_check_kind` возвращает исправленное имя и ничего не кладёт в
+#: квитанцию. По закону этого дерева «выбор, которого вызывающий не видит, —
+#: это `.FirstOrDefault()` с хорошей репутацией» (тот же довод, по которому
+#: `ground` обязан печатать `grounding_report`). Здесь пишется, что исправление
+#: ПРОИСХОДИТ; что оно ВИДНО автору — не проверяется, потому что канала пока
+#: нет. Закрывается вместе с каналом, а не отдельным тестом.
+RESOLVED_BY_THE_NAME_LADDER = ["Wall ", "WALL"]
 
 
 class AnyQueryInvariant(unittest.TestCase):
@@ -111,6 +134,34 @@ class AnyQueryInvariant(unittest.TestCase):
                 self.assertIn("KIR-G001", codes, f"{kind!r}: want typed unsupported-kind")
                 self.assertIsNotNone(out.handoff, f"{kind!r}: refusal must carry a route")
                 self.assertEqual(out.handoff["route"], "recipe-path")
+
+    def test_a_spelling_variant_resolves_and_does_not_hand_off(self):
+        """Написание того же вида РАЗРЕШАЕТСЯ, а не уезжает в рецепт.
+
+        Контроль с обеих сторон, иначе утверждение вырождено: вариант написания
+        обязан СОБРАТЬСЯ, а состязательный мусор из `OUT_OF_COVERAGE_KINDS` —
+        нет. Оба конца в одном тесте, чтобы «зелено, потому что принимаем всё»
+        не выглядело как «зелено, потому что различаем»."""
+        for kind in RESOLVED_BY_THE_NAME_LADDER:
+            with self.subTest(kind=kind):
+                out = compile_program({
+                    "ir_version": "1.0",
+                    "intent": f"count {kind} in model",
+                    "ops": [{"op": "query_count", "kind": kind}],
+                }, query_id=f"ladder-{kind!r}")
+                self.assertTrue(
+                    out.ok,
+                    f"{kind!r}: одно совпадение в закрытом множестве — то же "
+                    f"имя; диагностики: {[d.code for d in out.diagnostics]}")
+                self.assertNotIn("KIR-G001", [d.code for d in out.diagnostics])
+
+        # ОБРАТНЫЙ КОНЕЦ: лестница не всеядна. Ноль совпадений — отказ.
+        out = compile_program({
+            "ir_version": "1.0",
+            "ops": [{"op": "query_count", "kind": "unicorn"}],
+        }, query_id="ladder-negative")
+        self.assertFalse(out.ok, "лестница приняла бессмыслицу — она всеядна")
+        self.assertIn("KIR-G001", [d.code for d in out.diagnostics])
 
     def test_newly_covered_kinds_answer_instead_of_handing_off(self):
         """Вышедший из анти-скоупа вид обязан ОТВЕЧАТЬ, а не молчать.
