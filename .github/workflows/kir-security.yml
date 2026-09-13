@@ -1,0 +1,77 @@
+name: CI — KIR secret boundary
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      # 🔴 THE PATHS WERE PRE-SPLIT: of 18 patterns in each block, 14 matched
+      # NOT ONE tracked file (measured 04.09.2026). The job never ran on
+      # package edits at all, and the scanner, had it run, was looking at 4
+      # files out of 1141. They reflect `kir_secret_boundary.KIR_PREFIXES` and
+      # `KIR_FILES`; the match is guarded by
+      # `test_secret_boundary_owns_and_triggers_for_the_same_source_set`.
+      # The two `backend/…` paths below are NOT the layout but a ban: these
+      # files must NEVER be tracked (`FORBIDDEN_TRACKED_PATHS`).
+      - 'backend/.env'
+      - 'backend/.antigravity-proxy-key'
+      - 'kir/**'
+      - 'tools/**'
+      - 'connector/**'
+      - 'examples/**'
+      - 'MANIFEST.in'
+      - 'pyproject.toml'
+      - 'build_support/**'
+      - '.github/scripts/kir_ci_suites.py'
+      - '.github/scripts/Kir.CI.References.csproj'
+      - '.github/scripts/kir_evidence_manifest.py'
+      - '.github/scripts/kir_secret_boundary.py'
+      - '.github/workflows/kir-evidence.yml'
+      - '.github/workflows/kir-security.yml'
+  push:
+    branches: [main, prod-live]
+    paths:
+      # 🔴 THE PATHS WERE PRE-SPLIT: of 18 patterns in each block, 14 matched
+      # NOT ONE tracked file (measured 04.09.2026). The job never ran on
+      # package edits at all, and the scanner, had it run, was looking at 4
+      # files out of 1141. They reflect `kir_secret_boundary.KIR_PREFIXES` and
+      # `KIR_FILES`; the match is guarded by
+      # `test_secret_boundary_owns_and_triggers_for_the_same_source_set`.
+      # The two `backend/…` paths below are NOT the layout but a ban: these
+      # files must NEVER be tracked (`FORBIDDEN_TRACKED_PATHS`).
+      - 'backend/.env'
+      - 'backend/.antigravity-proxy-key'
+      - 'kir/**'
+      - 'tools/**'
+      - 'connector/**'
+      - 'examples/**'
+      - 'MANIFEST.in'
+      - 'pyproject.toml'
+      - 'build_support/**'
+      - '.github/scripts/kir_ci_suites.py'
+      - '.github/scripts/Kir.CI.References.csproj'
+      - '.github/scripts/kir_evidence_manifest.py'
+      - '.github/scripts/kir_secret_boundary.py'
+      - '.github/workflows/kir-evidence.yml'
+      - '.github/workflows/kir-security.yml'
+
+concurrency:
+  group: ci-kir-security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  secret-boundary:
+    name: KIR tracked secret boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Reject KIR/backend runtime credentials
+        run: python .github/scripts/kir_secret_boundary.py

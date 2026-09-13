@@ -1,0 +1,464 @@
+{
+ "audit": {
+  "clean": 72,
+  "instrument": ".work/marathon-fable-20260907/writers/parity_diff_audit.py",
+  "method": "per-emission line diff of the two full dumps (counterfactual vs current): the multiset of non-scaffold lines removed from post must equal the multiset added to operation, and the multiset of NUMERIC LITERALS over the whole emission must be identical",
+  "numbers_shifted_total": 0,
+  "of": 72,
+  "verdict": "72/72 — перенос предиката post→operation с воротами отказа, чисел сдвинуто 0"
+ },
+ "counterfactual": {
+  "helper": "kir/tests/emit_parity_fixtures/e1_counterfactual.py",
+  "method": "typed field flip `WitnessCheck.stage` operation→final on exactly one witness of each of the two emitters; the registry is restored on exit",
+  "restored_manifest_keys": 2361
+ },
+ "current_review_source_sha256": {
+  ".work/marathon-fable-20260907/writers/parity_diff_audit.py": "0fdf28e4a841590d8dd8e43f4c405750c26306ebe50c58d44233521a0035c088",
+  "kir/tests/emit_parity_fixtures/e1_counterfactual.py": "be73ab54fe5325af5d2dbbfbf49b3725002ee4ccc69976860580247e2688cbcc",
+  "kir/tests/emit_parity_fixtures/generate_fixtures.py": "bf8cd876f69f0b1329cbcda3d1990d4d2d382b96bfdf15d79e30285091277572",
+  "kir/tests/test_emit_model_byte_parity.py": "1a161a67df11be266184e1ab9aaf4333d9a8551e98ebdda99b6e75381d202f17"
+ },
+ "delta_shape": "identical predicate fragment moved from the `// post <oid>` block into an `// operation <oid>` block behind `int __operationPostStart_<oid> = __post.Count;` and the existing refusal gate; no declaration, create block, readback, refusal marker, tolerance or numeric literal changed anywhere in any emission",
+ "emission_source_snapshot_scope": "named diagnostic read set at migration; not a complete dependency closure",
+ "emission_source_snapshot_sha256": {
+  "kir/authoring.py": "fbf035644011cba40a318460dd9a682a2b2d7ceb542a1f9697483d9849915ac7",
+  "kir/emit_model.py": "a9ff772b733d2a896a41a07f6d95193eb3cc2d1c2dd95a9c6a584bb564c674cf",
+  "kir/tests/emit_parity_fixtures/generate_fixtures.py": "bf8cd876f69f0b1329cbcda3d1990d4d2d382b96bfdf15d79e30285091277572",
+  "kir/translation_cert.py": "76167ad9daea592666c769e8d23d1d89df33b49365cc428e2d835ef6b9b50947"
+ },
+ "goldens": {
+  "changed": [
+   "auth_move_and_change_type",
+   "modify_setparam_delete"
+  ],
+  "changed_count": 2,
+  "compared_count": 75,
+  "note": "modify_setparam_delete и auth_move_and_change_type мигрированы через KIR_UPDATE_GOLDEN=1; оба диффа прочитаны целиком, остальные 73 файла байт в байт равны эпохе D-1",
+  "unchanged": {
+   "analysis_loads": "4676a8a5c4bc3705e7d0219aaaf2d46b7b9110729a62d2164d9fddb0cd62adc0",
+   "analysis_path_of_travel": "f69205dd44c296ce1831f9d6c0c2374e8d0daa917703fbd4eff4a7a268d29ede",
+   "annotation_explicit_types": "87c1cc0d7fc5999c1f8ac2b1650976f6a52c37430500febc8f9c8fb7cd0540a5",
+   "annotation_full_set": "68ef2e8a82d48f1f8adada0fc1439dd5bfb411be9d4cfee94e5df595a9458b70",
+   "arch_ceiling": "cd652260c2d47ed0904a26435add1566e47d518f32e2f33f2f3a8035fdf51007",
+   "arch_ceiling_contour": "ab522ccfdfe058f9f1383b85fdf0d5a90c6748aeb62aeb64a4d3712685b4c287",
+   "arch_railing_hosted": "7e677d0532e20beac9c347344799e862d77ab12d4b5235c0990c59494c85e50c",
+   "arch_railing_path": "7d009c915d68ee7e76b55dbef5808021761ad701a3cbe15fa7790c55d32dfb46",
+   "auth_annotation": "ba32438b143e76582f1a0c1048fa036000e308e853a4bb65516106e8f02fd341",
+   "auth_contour_l": "35277563e6125a9f24d9c1d7e8270ff54ab88e544bf93b0b8edd80898962ac18",
+   "auth_curtain_cell_named_type": "9bdbc82ded8abca3adf499a0a8d8bd3ac388e65a963a43bb5de0c082e762bd7a",
+   "auth_curtain_grid_lines": "855d375319d904c4699769912cdfaf39bc5a837a7466ad8ecfe3bb3ec5a79ec6",
+   "auth_directshape_tower": "420b247e6f76aaf2888466b1dd7bff9b59c6de766025dc38fc384c129a0cd69c",
+   "auth_face_wall_existing_mass": "8831f7f99d493ce209646dcbddbc003862193412d52e224292a083cbbcf6f5d7",
+   "auth_move_and_change_type": "54b5269cd4100bfbb615c0a15b34288575c5d8610d44d9cc5a6cfff3336e7620",
+   "auth_pipe_system_chain": "dcb24da497ba9f341a1fa422e0bfd8b27337d813ab33f9dcc6ede3aa7921ff26",
+   "auth_solid_boolean_difference": "b15ab87c2370a1280f67258d9735834f8e627b5b773510735522ce61e988d861",
+   "auth_solid_boolean_prism_voids": "870a5d175c8f81e3add5a6e5462f9bd56723955e96d30c9acef1625f456c77d7",
+   "authoring_stairs_landing": "282654ac3bb0d73419b2e38f9636aa82294de1c59eca923d9c233b0141e59820",
+   "authoring_stairs_run": "7ebdbda64098072a2ffd159d0118b6970eb5659468c528851fc0c9f985385bd6",
+   "authoring_stairs_spiral": "cbf46f0ecde0a809f3285861907006753360462fa95f80dfa5e58bce0a2c8b1d",
+   "authoring_stairs_straight": "77cec261491c637195fbd6e8383a0541d5883c1686f4fd5db4712a77fb62521e",
+   "authoring_wall_arc": "7fa7369be970172a81f708a9d769a6f4b387e8fcdd739f3475e0460cecf63140",
+   "authoring_wall_pipe_grid": "e0a461f0c06885b4a78ce6deaf46fcd394005f6a3473341a89d928992d9efcb6",
+   "datums_extrusion_roof": "7ea9feb2b2a3b89699e184a22f83e17ef443ea067914826a89cb2cabf59a0e2c",
+   "datums_multi_segment_grid": "687e7cefbc1224d5ffb1be04546eabb6b57a13542b78433db2d016d0be7f4399",
+   "datums_multistory_stairs": "769077efba659d0ea7627babe9fc45fb7d79f8155df84d9039a0bbb5dc09f075",
+   "detail_filled_region_doc_default": "b6a45d26ff153664d79675ca8d682c2d3341f3d9c4d24d6458e7e1bc7f2d7317",
+   "detail_filled_region_named_type": "7e1124f0a8aab8e89335495c733995fadbcb6621825c46ab9924e54865a259a2",
+   "duct_min": "2ef86f1028511221e7181754f09394e064158bfd507122e0b25a34b8f23b7393",
+   "families_create_type_full": "42aac69beee81dedecf108ca3dc4fe9acc65d18d94afc588fc47374087de2af8",
+   "families_load_family_whole": "3b575192852ac9fdc88c4351dccdb257dc4171e38d0928e6511dfd8069ffd12a",
+   "full_house_v1": "3d0789ac13c253f3b9208276b928e9e63efcecafe71410b3f600505d4bdefb7b",
+   "hosted_door_flips": "7fcc2f592dd83f67b754fe626ad4b6dc9047568a122ab9bffd82a5af1acdf889",
+   "list_walls_level1": "48562b17a6e8c93023a6facf28002e31fde59f3455254ee6f45598bde95576b7",
+   "mep_conduit_and_placeholders": "eef34a06584f9704f62d8557391b1da6b2f5296eb471620c97fccd4374080d89",
+   "mep_flex_runs": "6cb2f1e3be96d03600332dc8a2852a0816c4fdee24744666b38e7aea3cfbd41b",
+   "mixed_program": "fbadee8e578ce25dea7accd05de49d399b5ace1d3379729c7dfa06b33a92e596",
+   "modify_setparam_delete": "6202e2cb1c666ea89e12c4f76271d0db694ce88b6979489653fa29ea4d6d540f",
+   "native_group": "1aa0d32256ff6dd519405c5e35dfc358377c1e3e6f365e7d87390657d0e23b7c",
+   "opening_contour_perpendicular": "4f470078d74907287d42706534cc69ef761b159f6a2c9659d6efae61a905bd91",
+   "opening_contour_vertical": "df6a704f33bd49dabb8300c163018c7783909a73603c80dc1f356797819d1a71",
+   "opening_host_face_perpendicular": "87cdae979c8f7cd6dd67a75b4efe439b61ae1c0d13d9a0cb9322ac3fee39f08b",
+   "opening_host_face_vertical": "3ff478f9521cfd1a75962da1136e4de9d86406f5307c6e1dd02e526c0c0470ef",
+   "opening_wall_rect": "15bc6b36a03303f9ca105ec799512f284382198ca0cd45c5f76307d2fe9be093",
+   "pdf_underlay_count": "0f4a4424d39e8ca192d95cf5ce565e4bb473f8bd4fa6669623305d7e498f4ff9",
+   "place_family_placement_kinds": "2ca20aa6cd47b44ad277ba24c096e580b97616648920e7657c914af43cbee17f",
+   "place_family_point_and_curve": "2af0ad7e032694e39fd665a454dc03014cf891e0e4646f35331e85a3102364e1",
+   "roof_gable_slopes": "368c1d545a26783cdf136a631263ac5683d6ea4942bf57ee547dd6725b55e198",
+   "roof_min": "2049c3c317581a9fe49d4c0b91135f2c05aeb39b17d236741935ff48d008fe24",
+   "room_separator": "f3dffb2d6d801557e266ab9c45ab099ab9ee3ac94128905495e2641ebafba904",
+   "room_separator_then_room": "5a55d5bddefa2cdc538bf6d0f6807852311ba544f9055007be1481134950e1df",
+   "route_duct_system_tee": "449c301fdffb9be8785fda146688f3dc1e0204bb91a4f81692f63184034d31c0",
+   "route_pipe_system_riser_branch": "117d16f22effd3091556fdd135398d7ea9ba14448464ffd21316956410d70003",
+   "site_building_pad": "a5bc042e6131d1dd66d84f321513b69e13debe54765b93370b2ab3ba0540016c",
+   "site_subregion_hosted": "1be96b5b7182e52a8541b57d5dcfc87f836160070cd0dd7c2aa50ef363116662",
+   "site_topography_surface": "95c3aef7970ea4938a625e9a6c8839f0c75b1ad2014b34eca4d8d82a7dec13a6",
+   "site_topography_toposolid": "edf54d9e89790c4ce9606881c4ded0a9c2138ac5c6a4cc2bdce4ea5d227700e2",
+   "solid_extrusion_and_revolve": "83d479bbf1ddcc5a62a4686b0b2b4f8a1a025b85121dba890850127635909c4e",
+   "space_mep": "d180bd3e710f3064c17bc73b9a37966f8c889a24209b996db01d196cf3886ed4",
+   "stack_two_storeys": "762430d3ce2ea352d6d5cf2424607f1302d011a280b73116d4972bb95d6678c5",
+   "struct_area_reinforcement_slabs": "28b6597736b57c2fd1c1ca1c2c66a176ccf8d0a8018c7e752af9de84c16c9726",
+   "struct_beam": "d84b8c5b67e4f1c19376bc3b16540ac6d10f248e507a4ba82377b766b508e47d",
+   "struct_column_top_constrained": "3ec24276b1a4ec7e92c2e4abd3876b743444c7a4006e1fd927fefd1642a9d4fc",
+   "struct_foundation_isolated": "b1448b17fe59f74863dce9af059ac991ccde79b1f5f54c2567fcf253639a2b9a",
+   "struct_foundation_slab": "d10ee5e15c0a9fbc785b3807b617282c3e06df684888fd42ded6ba83a87f07d4",
+   "struct_foundation_slab_two_holes": "c56b20a8154c42043af86db576cbc8e496c04e1e5aa806dad4ee52f791778b97",
+   "struct_framing_bay": "570168d997e2497782f28367cefb88054114a27e6b1c3dde269a67e3f7714471",
+   "struct_wall_foundation": "17eef14cd1af35f536274efa7ec0e2f05ce41152e3a098a93c410cc69bb0a933",
+   "sweep_slab_edge_bottom_ref": "5a0fb5baeb00395276cb5d5047bfffd18ed5609d5b59d2742ac6338a78436711",
+   "sweep_slab_edge_top": "d7005db22cb1e5d566c8ef412f9bb1627dd539f02a9e0bcf1b775d1d0d5bfc0f",
+   "sweep_wall_horizontal": "ed671e2751e3986d125f1659de35c6844de868caf0dc2d460f2541608f760aa1",
+   "sweep_wall_vertical_ref": "a556116ca48259d982b788c11e8595e7e13d7ae7d5924c1f81b2ce7bcba63204",
+   "wall_base_offset": "09b4fcfecfc9b04e7bba6880f7bfc2b528da9f05925fbf9bd39cfc602bf2b31f",
+   "wall_top_attached": "9a8b4f98ebba22199ac0e737e538390b889241e40f3bdc2fc61327305c408240"
+  }
+ },
+ "limits": [
+  "живой Revit не проверялся: стадия исполнения — утверждение об эмиссии и планировщике, не о поведении API",
+  "свидетели create-опов на стадии не разбирались; create_wall → move_elements той же стены остаётся живым отказом",
+  "byte-parity доказывает, что делта ровно та, что названа; верность выбора стадии доказывают приборы replacement_tests"
+ ],
+ "manifest": {
+  "added_keys": [],
+  "after_file_sha256": "bd89857c4478e01d296ddf60cd84ebaf88571092fb62b6fc63c40b88ec507ac0",
+  "before_file_sha256": "1cd878fce4f217416e61ade79230b344cb3ab8169a24ab1429645d0282ff9f76",
+  "changed_count": 72,
+  "changes": {
+   "gate:mod_setparam_delete|2021|atomic": {
+    "after": "bf14cf651efb2ab022d91b16f04dd08e97f22b48ea4a8f707bea0639e2304023",
+    "before": "1572b6a87c5074b1f3b09b34c2b47aecdead769e914643663dd0eca383960317"
+   },
+   "gate:mod_setparam_delete|2021|per_op": {
+    "after": "41076ef2955e0ad9edf7e247ee8b08ade6382f13625d46aba5783e57a051bb36",
+    "before": "8a7fcdbdb2079e2afd0fbe319a79d9f33bc02547e945d6ac436778802013a498"
+   },
+   "gate:mod_setparam_delete|2022|atomic": {
+    "after": "bf14cf651efb2ab022d91b16f04dd08e97f22b48ea4a8f707bea0639e2304023",
+    "before": "1572b6a87c5074b1f3b09b34c2b47aecdead769e914643663dd0eca383960317"
+   },
+   "gate:mod_setparam_delete|2022|per_op": {
+    "after": "41076ef2955e0ad9edf7e247ee8b08ade6382f13625d46aba5783e57a051bb36",
+    "before": "8a7fcdbdb2079e2afd0fbe319a79d9f33bc02547e945d6ac436778802013a498"
+   },
+   "gate:mod_setparam_delete|2023|atomic": {
+    "after": "bf14cf651efb2ab022d91b16f04dd08e97f22b48ea4a8f707bea0639e2304023",
+    "before": "1572b6a87c5074b1f3b09b34c2b47aecdead769e914643663dd0eca383960317"
+   },
+   "gate:mod_setparam_delete|2023|per_op": {
+    "after": "41076ef2955e0ad9edf7e247ee8b08ade6382f13625d46aba5783e57a051bb36",
+    "before": "8a7fcdbdb2079e2afd0fbe319a79d9f33bc02547e945d6ac436778802013a498"
+   },
+   "gate:mod_setparam_delete|2024|atomic": {
+    "after": "83e7e4827da272c134ee928d6f737aebe53e043a27c1476f1a9c513173ac4d74",
+    "before": "9e172a680e28a3e5cf57655d916ff1599da64cf736dd97093bb04d404479596b"
+   },
+   "gate:mod_setparam_delete|2024|per_op": {
+    "after": "1e99b9d9b8576d92df0aa11b7f60ce5fd21a5cfe8dd76a5e9fb8b21d6d1d0a57",
+    "before": "665940878649dac594b156b67b1d20de96338fe73d55f129329a19c1d46c0725"
+   },
+   "gate:mod_setparam_delete|2025|atomic": {
+    "after": "83e7e4827da272c134ee928d6f737aebe53e043a27c1476f1a9c513173ac4d74",
+    "before": "9e172a680e28a3e5cf57655d916ff1599da64cf736dd97093bb04d404479596b"
+   },
+   "gate:mod_setparam_delete|2025|per_op": {
+    "after": "1e99b9d9b8576d92df0aa11b7f60ce5fd21a5cfe8dd76a5e9fb8b21d6d1d0a57",
+    "before": "665940878649dac594b156b67b1d20de96338fe73d55f129329a19c1d46c0725"
+   },
+   "gate:mod_setparam_delete|2026|atomic": {
+    "after": "83e7e4827da272c134ee928d6f737aebe53e043a27c1476f1a9c513173ac4d74",
+    "before": "9e172a680e28a3e5cf57655d916ff1599da64cf736dd97093bb04d404479596b"
+   },
+   "gate:mod_setparam_delete|2026|per_op": {
+    "after": "1e99b9d9b8576d92df0aa11b7f60ce5fd21a5cfe8dd76a5e9fb8b21d6d1d0a57",
+    "before": "665940878649dac594b156b67b1d20de96338fe73d55f129329a19c1d46c0725"
+   },
+   "golden:auth_move_and_change_type|2021|atomic": {
+    "after": "35b2974a19822b77814773f8224d23ee633ed6a8ef0d84b44562c750de916659",
+    "before": "32787e7eae9f4b51376f58ae1dcfac9440a8ef06ed904876a3da995088c8a2e9"
+   },
+   "golden:auth_move_and_change_type|2021|per_op": {
+    "after": "7969af5b8e6b73d741234711a84f8491ddf1ceb9ec91c97b9d2bfd740a706c85",
+    "before": "74a799e2f452312a6e17595824e96c77a03d808c57ce26f9ed2aa5ffa2dcc22c"
+   },
+   "golden:auth_move_and_change_type|2022|atomic": {
+    "after": "35b2974a19822b77814773f8224d23ee633ed6a8ef0d84b44562c750de916659",
+    "before": "32787e7eae9f4b51376f58ae1dcfac9440a8ef06ed904876a3da995088c8a2e9"
+   },
+   "golden:auth_move_and_change_type|2022|per_op": {
+    "after": "7969af5b8e6b73d741234711a84f8491ddf1ceb9ec91c97b9d2bfd740a706c85",
+    "before": "74a799e2f452312a6e17595824e96c77a03d808c57ce26f9ed2aa5ffa2dcc22c"
+   },
+   "golden:auth_move_and_change_type|2023|atomic": {
+    "after": "35b2974a19822b77814773f8224d23ee633ed6a8ef0d84b44562c750de916659",
+    "before": "32787e7eae9f4b51376f58ae1dcfac9440a8ef06ed904876a3da995088c8a2e9"
+   },
+   "golden:auth_move_and_change_type|2023|per_op": {
+    "after": "7969af5b8e6b73d741234711a84f8491ddf1ceb9ec91c97b9d2bfd740a706c85",
+    "before": "74a799e2f452312a6e17595824e96c77a03d808c57ce26f9ed2aa5ffa2dcc22c"
+   },
+   "golden:auth_move_and_change_type|2024|atomic": {
+    "after": "54b5269cd4100bfbb615c0a15b34288575c5d8610d44d9cc5a6cfff3336e7620",
+    "before": "31e9dfd8e999dc8c94d249f57db6110a264ff87927a6361b4c5bda0dfd2eb7f8"
+   },
+   "golden:auth_move_and_change_type|2024|per_op": {
+    "after": "cc716d38c78b4e1ec2b646cb10423b19eb276f11cd31a9097185e45e4a22ca53",
+    "before": "e98a482ac25769cae5e342686c314ac759419fc554b0b79cfd3bbe23ae5b35ba"
+   },
+   "golden:auth_move_and_change_type|2025|atomic": {
+    "after": "54b5269cd4100bfbb615c0a15b34288575c5d8610d44d9cc5a6cfff3336e7620",
+    "before": "31e9dfd8e999dc8c94d249f57db6110a264ff87927a6361b4c5bda0dfd2eb7f8"
+   },
+   "golden:auth_move_and_change_type|2025|per_op": {
+    "after": "cc716d38c78b4e1ec2b646cb10423b19eb276f11cd31a9097185e45e4a22ca53",
+    "before": "e98a482ac25769cae5e342686c314ac759419fc554b0b79cfd3bbe23ae5b35ba"
+   },
+   "golden:auth_move_and_change_type|2026|atomic": {
+    "after": "54b5269cd4100bfbb615c0a15b34288575c5d8610d44d9cc5a6cfff3336e7620",
+    "before": "31e9dfd8e999dc8c94d249f57db6110a264ff87927a6361b4c5bda0dfd2eb7f8"
+   },
+   "golden:auth_move_and_change_type|2026|per_op": {
+    "after": "cc716d38c78b4e1ec2b646cb10423b19eb276f11cd31a9097185e45e4a22ca53",
+    "before": "e98a482ac25769cae5e342686c314ac759419fc554b0b79cfd3bbe23ae5b35ba"
+   },
+   "golden:modify_setparam_delete|2021|atomic": {
+    "after": "6202e2cb1c666ea89e12c4f76271d0db694ce88b6979489653fa29ea4d6d540f",
+    "before": "f15ccc61ee4390e896ad8971b7b069871d89b5efd9175f3957ae8282c2a8b095"
+   },
+   "golden:modify_setparam_delete|2021|per_op": {
+    "after": "f327ad6bcafc6c3028978ec62e40e6a6fb31c6bc78932b16772dd81f38240aab",
+    "before": "a90679548ed85d494efc310d594e69b11b9f569f89c7a10b4df4ae965adc48ff"
+   },
+   "golden:modify_setparam_delete|2022|atomic": {
+    "after": "6202e2cb1c666ea89e12c4f76271d0db694ce88b6979489653fa29ea4d6d540f",
+    "before": "f15ccc61ee4390e896ad8971b7b069871d89b5efd9175f3957ae8282c2a8b095"
+   },
+   "golden:modify_setparam_delete|2022|per_op": {
+    "after": "f327ad6bcafc6c3028978ec62e40e6a6fb31c6bc78932b16772dd81f38240aab",
+    "before": "a90679548ed85d494efc310d594e69b11b9f569f89c7a10b4df4ae965adc48ff"
+   },
+   "golden:modify_setparam_delete|2023|atomic": {
+    "after": "6202e2cb1c666ea89e12c4f76271d0db694ce88b6979489653fa29ea4d6d540f",
+    "before": "f15ccc61ee4390e896ad8971b7b069871d89b5efd9175f3957ae8282c2a8b095"
+   },
+   "golden:modify_setparam_delete|2023|per_op": {
+    "after": "f327ad6bcafc6c3028978ec62e40e6a6fb31c6bc78932b16772dd81f38240aab",
+    "before": "a90679548ed85d494efc310d594e69b11b9f569f89c7a10b4df4ae965adc48ff"
+   },
+   "golden:modify_setparam_delete|2024|atomic": {
+    "after": "6202e2cb1c666ea89e12c4f76271d0db694ce88b6979489653fa29ea4d6d540f",
+    "before": "f15ccc61ee4390e896ad8971b7b069871d89b5efd9175f3957ae8282c2a8b095"
+   },
+   "golden:modify_setparam_delete|2024|per_op": {
+    "after": "f327ad6bcafc6c3028978ec62e40e6a6fb31c6bc78932b16772dd81f38240aab",
+    "before": "a90679548ed85d494efc310d594e69b11b9f569f89c7a10b4df4ae965adc48ff"
+   },
+   "golden:modify_setparam_delete|2025|atomic": {
+    "after": "6202e2cb1c666ea89e12c4f76271d0db694ce88b6979489653fa29ea4d6d540f",
+    "before": "f15ccc61ee4390e896ad8971b7b069871d89b5efd9175f3957ae8282c2a8b095"
+   },
+   "golden:modify_setparam_delete|2025|per_op": {
+    "after": "f327ad6bcafc6c3028978ec62e40e6a6fb31c6bc78932b16772dd81f38240aab",
+    "before": "a90679548ed85d494efc310d594e69b11b9f569f89c7a10b4df4ae965adc48ff"
+   },
+   "golden:modify_setparam_delete|2026|atomic": {
+    "after": "6202e2cb1c666ea89e12c4f76271d0db694ce88b6979489653fa29ea4d6d540f",
+    "before": "f15ccc61ee4390e896ad8971b7b069871d89b5efd9175f3957ae8282c2a8b095"
+   },
+   "golden:modify_setparam_delete|2026|per_op": {
+    "after": "f327ad6bcafc6c3028978ec62e40e6a6fb31c6bc78932b16772dd81f38240aab",
+    "before": "a90679548ed85d494efc310d594e69b11b9f569f89c7a10b4df4ae965adc48ff"
+   },
+   "scope:modify|2021|atomic": {
+    "after": "83dfd9d7ac8047531769135bf4f90126c263dee93eeb4f94a6f283ab58ce791d",
+    "before": "c0bbfbbf9a02811e0b5dd9c4490e401c4fc334935ef77b65782c89499dffe50c"
+   },
+   "scope:modify|2021|per_op": {
+    "after": "5018c0fbfd7e5d4310bbdd7c015ce0fd99f83d180b9aa3f39bde6ff0e00cf19a",
+    "before": "83b36a34febd8b31128438afbacb4caeff35de81b48dab97fa24b12001781c3c"
+   },
+   "scope:modify|2022|atomic": {
+    "after": "83dfd9d7ac8047531769135bf4f90126c263dee93eeb4f94a6f283ab58ce791d",
+    "before": "c0bbfbbf9a02811e0b5dd9c4490e401c4fc334935ef77b65782c89499dffe50c"
+   },
+   "scope:modify|2022|per_op": {
+    "after": "5018c0fbfd7e5d4310bbdd7c015ce0fd99f83d180b9aa3f39bde6ff0e00cf19a",
+    "before": "83b36a34febd8b31128438afbacb4caeff35de81b48dab97fa24b12001781c3c"
+   },
+   "scope:modify|2023|atomic": {
+    "after": "83dfd9d7ac8047531769135bf4f90126c263dee93eeb4f94a6f283ab58ce791d",
+    "before": "c0bbfbbf9a02811e0b5dd9c4490e401c4fc334935ef77b65782c89499dffe50c"
+   },
+   "scope:modify|2023|per_op": {
+    "after": "5018c0fbfd7e5d4310bbdd7c015ce0fd99f83d180b9aa3f39bde6ff0e00cf19a",
+    "before": "83b36a34febd8b31128438afbacb4caeff35de81b48dab97fa24b12001781c3c"
+   },
+   "scope:modify|2024|atomic": {
+    "after": "83dfd9d7ac8047531769135bf4f90126c263dee93eeb4f94a6f283ab58ce791d",
+    "before": "c0bbfbbf9a02811e0b5dd9c4490e401c4fc334935ef77b65782c89499dffe50c"
+   },
+   "scope:modify|2024|per_op": {
+    "after": "5018c0fbfd7e5d4310bbdd7c015ce0fd99f83d180b9aa3f39bde6ff0e00cf19a",
+    "before": "83b36a34febd8b31128438afbacb4caeff35de81b48dab97fa24b12001781c3c"
+   },
+   "scope:modify|2025|atomic": {
+    "after": "83dfd9d7ac8047531769135bf4f90126c263dee93eeb4f94a6f283ab58ce791d",
+    "before": "c0bbfbbf9a02811e0b5dd9c4490e401c4fc334935ef77b65782c89499dffe50c"
+   },
+   "scope:modify|2025|per_op": {
+    "after": "5018c0fbfd7e5d4310bbdd7c015ce0fd99f83d180b9aa3f39bde6ff0e00cf19a",
+    "before": "83b36a34febd8b31128438afbacb4caeff35de81b48dab97fa24b12001781c3c"
+   },
+   "scope:modify|2026|atomic": {
+    "after": "83dfd9d7ac8047531769135bf4f90126c263dee93eeb4f94a6f283ab58ce791d",
+    "before": "c0bbfbbf9a02811e0b5dd9c4490e401c4fc334935ef77b65782c89499dffe50c"
+   },
+   "scope:modify|2026|per_op": {
+    "after": "5018c0fbfd7e5d4310bbdd7c015ce0fd99f83d180b9aa3f39bde6ff0e00cf19a",
+    "before": "83b36a34febd8b31128438afbacb4caeff35de81b48dab97fa24b12001781c3c"
+   },
+   "scope:move_and_change_type|2021|atomic": {
+    "after": "708da70b775d523b96e72efc785941e715c204bf47f82bf27092b9f654574bc6",
+    "before": "031c5bac7a1a06f92c8a424f3145632388caf2172efb7c2f976451e8a13d3578"
+   },
+   "scope:move_and_change_type|2021|per_op": {
+    "after": "e459053a57cded6e96d002a9272ca6cc061ef8293def85cdf818b51de1a7ab1a",
+    "before": "3a183eabb3fb825a99a16d55cc6cbb0e0c91ef82778aeb20d0241b4c5ba5b131"
+   },
+   "scope:move_and_change_type|2022|atomic": {
+    "after": "708da70b775d523b96e72efc785941e715c204bf47f82bf27092b9f654574bc6",
+    "before": "031c5bac7a1a06f92c8a424f3145632388caf2172efb7c2f976451e8a13d3578"
+   },
+   "scope:move_and_change_type|2022|per_op": {
+    "after": "e459053a57cded6e96d002a9272ca6cc061ef8293def85cdf818b51de1a7ab1a",
+    "before": "3a183eabb3fb825a99a16d55cc6cbb0e0c91ef82778aeb20d0241b4c5ba5b131"
+   },
+   "scope:move_and_change_type|2023|atomic": {
+    "after": "708da70b775d523b96e72efc785941e715c204bf47f82bf27092b9f654574bc6",
+    "before": "031c5bac7a1a06f92c8a424f3145632388caf2172efb7c2f976451e8a13d3578"
+   },
+   "scope:move_and_change_type|2023|per_op": {
+    "after": "e459053a57cded6e96d002a9272ca6cc061ef8293def85cdf818b51de1a7ab1a",
+    "before": "3a183eabb3fb825a99a16d55cc6cbb0e0c91ef82778aeb20d0241b4c5ba5b131"
+   },
+   "scope:move_and_change_type|2024|atomic": {
+    "after": "c5cfe771e04a8bc2a5d8f142439fa401f009dd300e69e94470abdc56db35116e",
+    "before": "1ecd595bb1122b7b70a64cf09ecd71623c12ad373bfad39350ab49809e3f58bf"
+   },
+   "scope:move_and_change_type|2024|per_op": {
+    "after": "3afe7582e9e7775d9512b9ddbea227d51e23a8e5b50d5b7584e7d0002a2bc628",
+    "before": "06bd603cc2e5c8b633a3810bfb7b038586beb5e606e05350903fd12e8c7cf2db"
+   },
+   "scope:move_and_change_type|2025|atomic": {
+    "after": "c5cfe771e04a8bc2a5d8f142439fa401f009dd300e69e94470abdc56db35116e",
+    "before": "1ecd595bb1122b7b70a64cf09ecd71623c12ad373bfad39350ab49809e3f58bf"
+   },
+   "scope:move_and_change_type|2025|per_op": {
+    "after": "3afe7582e9e7775d9512b9ddbea227d51e23a8e5b50d5b7584e7d0002a2bc628",
+    "before": "06bd603cc2e5c8b633a3810bfb7b038586beb5e606e05350903fd12e8c7cf2db"
+   },
+   "scope:move_and_change_type|2026|atomic": {
+    "after": "c5cfe771e04a8bc2a5d8f142439fa401f009dd300e69e94470abdc56db35116e",
+    "before": "1ecd595bb1122b7b70a64cf09ecd71623c12ad373bfad39350ab49809e3f58bf"
+   },
+   "scope:move_and_change_type|2026|per_op": {
+    "after": "3afe7582e9e7775d9512b9ddbea227d51e23a8e5b50d5b7584e7d0002a2bc628",
+    "before": "06bd603cc2e5c8b633a3810bfb7b038586beb5e606e05350903fd12e8c7cf2db"
+   },
+   "scope:set_param_numeric|2021|atomic": {
+    "after": "8d5c865c30634e43ac0bfaffa85ed18bc20cf9a7a36ed6bc95da899795e135cd",
+    "before": "c43ef5a82f80059a1d81828f0f81b273951a389481d53684e3b9550651b4ece3"
+   },
+   "scope:set_param_numeric|2021|per_op": {
+    "after": "59f7983e87da3ed50939211c13dd72408f8e0374a92a3e45208aaf45e8bec4d2",
+    "before": "e81f51a2f3572d4a444c805fc8a74c836c2daebc140ccec32b50776072fdbe3c"
+   },
+   "scope:set_param_numeric|2022|atomic": {
+    "after": "8d5c865c30634e43ac0bfaffa85ed18bc20cf9a7a36ed6bc95da899795e135cd",
+    "before": "c43ef5a82f80059a1d81828f0f81b273951a389481d53684e3b9550651b4ece3"
+   },
+   "scope:set_param_numeric|2022|per_op": {
+    "after": "59f7983e87da3ed50939211c13dd72408f8e0374a92a3e45208aaf45e8bec4d2",
+    "before": "e81f51a2f3572d4a444c805fc8a74c836c2daebc140ccec32b50776072fdbe3c"
+   },
+   "scope:set_param_numeric|2023|atomic": {
+    "after": "8d5c865c30634e43ac0bfaffa85ed18bc20cf9a7a36ed6bc95da899795e135cd",
+    "before": "c43ef5a82f80059a1d81828f0f81b273951a389481d53684e3b9550651b4ece3"
+   },
+   "scope:set_param_numeric|2023|per_op": {
+    "after": "59f7983e87da3ed50939211c13dd72408f8e0374a92a3e45208aaf45e8bec4d2",
+    "before": "e81f51a2f3572d4a444c805fc8a74c836c2daebc140ccec32b50776072fdbe3c"
+   },
+   "scope:set_param_numeric|2024|atomic": {
+    "after": "8d5c865c30634e43ac0bfaffa85ed18bc20cf9a7a36ed6bc95da899795e135cd",
+    "before": "c43ef5a82f80059a1d81828f0f81b273951a389481d53684e3b9550651b4ece3"
+   },
+   "scope:set_param_numeric|2024|per_op": {
+    "after": "59f7983e87da3ed50939211c13dd72408f8e0374a92a3e45208aaf45e8bec4d2",
+    "before": "e81f51a2f3572d4a444c805fc8a74c836c2daebc140ccec32b50776072fdbe3c"
+   },
+   "scope:set_param_numeric|2025|atomic": {
+    "after": "8d5c865c30634e43ac0bfaffa85ed18bc20cf9a7a36ed6bc95da899795e135cd",
+    "before": "c43ef5a82f80059a1d81828f0f81b273951a389481d53684e3b9550651b4ece3"
+   },
+   "scope:set_param_numeric|2025|per_op": {
+    "after": "59f7983e87da3ed50939211c13dd72408f8e0374a92a3e45208aaf45e8bec4d2",
+    "before": "e81f51a2f3572d4a444c805fc8a74c836c2daebc140ccec32b50776072fdbe3c"
+   },
+   "scope:set_param_numeric|2026|atomic": {
+    "after": "8d5c865c30634e43ac0bfaffa85ed18bc20cf9a7a36ed6bc95da899795e135cd",
+    "before": "c43ef5a82f80059a1d81828f0f81b273951a389481d53684e3b9550651b4ece3"
+   },
+   "scope:set_param_numeric|2026|per_op": {
+    "after": "59f7983e87da3ed50939211c13dd72408f8e0374a92a3e45208aaf45e8bec4d2",
+    "before": "e81f51a2f3572d4a444c805fc8a74c836c2daebc140ccec32b50776072fdbe3c"
+   }
+  },
+  "fixtures": [
+   "gate:mod_setparam_delete",
+   "golden:auth_move_and_change_type",
+   "golden:modify_setparam_delete",
+   "scope:modify",
+   "scope:move_and_change_type",
+   "scope:set_param_numeric"
+  ],
+  "key_count": 2361,
+  "keyset_sha256": "255807ab72dc7f76a3a6d15b46f4a0727753d15612eb298f8446e86067185c55",
+  "missing_keys": [],
+  "mode_counts": {
+   "atomic": 36,
+   "per_op": 36
+  },
+  "obligation_keys_moved": [
+   "move_elements.location",
+   "set_param.value_held"
+  ],
+  "predicates_removed": 0,
+  "prefix_counts": {
+   "gate": 12,
+   "golden": 24,
+   "scope": 36
+  },
+  "refusal_changes": [],
+  "refusal_count": 21,
+  "tolerances_changed": 0,
+  "unchanged_count": 2289
+ },
+ "parent": {
+  "historical_review_source_sha256": {
+   "kir/tests/emit_parity_fixtures/d1_counterfactual.py": "831c12def2a09fabbe7a8e09fb4ac394113df77864be1271c96f5f025121c13d",
+   "kir/tests/emit_parity_fixtures/generate_fixtures.py": "30424463f964da0c536f7d7ddc67cadc7d04fd303c369c88fa778f5ee8cc86e4",
+   "kir/tests/test_emit_model_byte_parity.py": "0ad6c91398de782aff14668683255eb9e7e7c5fceed210cb1a92b7f6ed471881"
+  },
+  "record_digest": "12440410af5c4dc9dfcc430555ace46bba603734c2d73c272fd0e19f15ea180a",
+  "record_file_sha256": "d0810aaed695b4cfb50d475970843e588d97d77ee6524bf773004bc382fa58e4",
+  "record_path": "kir/tests/emit_parity_fixtures/d1_migration_2026_09_06.json",
+  "source_pin_scope": "the D-1 record keeps asserting what it always asserted; E-1 hands it its own historical manifest"
+ },
+ "reason": "E-1 (F1/C01, 2026-09-07): два уже существовавших свидетеля стояли на стадии FINAL и потому судили состояние ПОСЛЕ ВСЕЙ программы — set_param.value_held и move_elements.location. Второй ЗАКОННЫЙ писатель того же адреса×свойства делал свидетеля первого ложным: два set_param одного параметра давали postconditions_violated и RollBack на верно построенной программе, два move одной цели расходились на 5 мм при допуске 1.0. Оба переведены на stage=\"operation\" — дословно контракт change_type.type_assignment из docs/OPERATION_WITNESS_STAGE_RU.md. Предикат, допуск, сообщение и ключ обязательства НЕ ТРОНУТЫ.",
+ "record_digest": "e10d89f2233506816237d25b9b61b344c008128fa4c60b8dcbcb8d4bcd9f4fe1",
+ "replacement_tests": [
+  "kir/tests/test_the_last_legal_writer_defines_the_final_state.py",
+  "kir/tests/test_operation_witness_stage.py",
+  "kir/tests/test_type_assignment_stage.py"
+ ],
+ "schema": "kir-emission-e1-migration/1"
+}

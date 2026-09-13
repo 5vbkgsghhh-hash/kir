@@ -1,0 +1,11 @@
+include pyproject.toml
+include LICENSE
+include build_support/wheel.py
+include docs/CHANGELOG.md
+# The authoring reference the README leans on: ten compilable examples and
+# the refusal table. `pip download --no-binary` must carry it; the wheel does
+# not, because it ships no documents at all.
+include docs/KIR_CHEATSHEET.md
+include examples/kir.project.json
+include examples/repository_demo.kir.json
+recursive-include examples *.py

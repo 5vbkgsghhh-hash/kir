@@ -1,0 +1,39 @@
+# EditorConfig for the KIR tree — https://editorconfig.org
+#
+# This file is DEVELOPER TOOLING, not evidence: it tells an editor how to save
+# a file, and nothing here gates a commit or a run.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+
+[*.py]
+indent_style = space
+indent_size = 4
+
+[*.cs]
+indent_style = space
+indent_size = 4
+
+[*.{js,mjs,json,yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+
+# 🔴 THE FROZEN BYTES ARE EXEMPT, AND THE EXEMPTION IS MEASURED (2026-09-11).
+# `kir/tests/golden/**` is compared BYTE FOR BYTE by
+# `kir/tests/test_emit_model_byte_parity.py`, and all 75 of its files end
+# WITHOUT a trailing newline (counted over the tracked tree). A rule saying
+# `insert_final_newline = true` would make any editorconfig-aware editor add
+# one on save — a silent one-byte edit that reddens the parity test for a
+# reason that has nothing to do with the emitter. Same for the single
+# newline-less file under `emit_parity_fixtures/`.
+[kir/tests/golden/**]
+insert_final_newline = false
+
+[kir/tests/emit_parity_fixtures/**]
+insert_final_newline = false

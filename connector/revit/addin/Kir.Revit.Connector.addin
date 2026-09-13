@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>KIR Revit Connector</Name>
+    <Assembly>Kir.Revit.Connector.dll</Assembly>
+    <AddInId>4FBAA279-5B36-4553-A9DB-74A6EF28BB11</AddInId>
+    <FullClassName>Kir.Revit.Connector.App</FullClassName>
+    <VendorId>KIR</VendorId>
+    <VendorDescription>KIR local Revit connector</VendorDescription>
+  </AddIn>
+</RevitAddIns>

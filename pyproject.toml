@@ -1,0 +1,143 @@
+[project]
+name = "kir-building"
+version = "0.8.4"
+description = "KIR — typed, verifiable IR for buildings. A building is a program."
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+authors = [{ name = "Dima" }]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Compilers",
+    "Typing :: Typed",
+]
+keywords = ["revit", "bim", "compiler", "ir", "buildings", "cad", "llm"]
+
+dependencies = [
+    "shapely>=2.0,<3.0",
+    "networkx>=3.0,<4.0",
+    "pydantic>=2.7.0,<3.0",
+    "httpx>=0.27.0,<1.0",
+]
+
+[project.optional-dependencies]
+bridge = ["fastapi>=0.115.0,<1.0"]
+dev = ["pytest>=8.0,<9.0", "jsonschema>=4.0,<5.0", "ruff==0.16.1"]
+geometry = ["cadquery-ocp-novtk==7.9.3.1.1", "cadquery-ocp-proxy==7.9.3.1.1"]
+
+mcp = ["mcp>=2.1,<3.0"]
+
+[project.scripts]
+kir = "kir.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/5vbkgsghhh-hash/kir"
+Source = "https://github.com/5vbkgsghhh-hash/kir"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.cmdclass]
+build_py = "build_support.wheel.PrunedBuildPy"
+
+[tool.kir.wheel]
+keep = [
+    "kir/decompile/tests/__init__.py",
+    "kir/decompile/tests/conftest.py",
+    "kir/decompile/tests/fixtures_decompile.py",
+    "kir/decompile/tests/test_delta_carries_the_obligation.py",
+    "kir/decompile/tests/test_merkle.py",
+    "kir/decompile/tests/test_reverse_chain_to_csharp.py",
+    "kir/decompile/tests/test_reverse_contract.py",
+    "kir/tests/__init__.py",
+    "kir/tests/acceptance_fakes.py",
+    "kir/tests/conftest.py",
+    "kir/tests/emit_parity_fixtures/capture_all_creates_counterfactual.py",
+    "kir/tests/emit_parity_fixtures/__init__.py",
+    "kir/tests/emit_parity_fixtures/c1_counterfactual.py",
+    "kir/tests/emit_parity_fixtures/capture_counterfactual.py",
+    "kir/tests/emit_parity_fixtures/d1_counterfactual.py",
+    "kir/tests/emit_parity_fixtures/delete_cascade_counterfactual.py",
+    "kir/tests/emit_parity_fixtures/e1_counterfactual.py",
+    "kir/tests/emit_parity_fixtures/e2_counterfactual.py",
+    "kir/tests/emit_parity_fixtures/e2_parity_diff_audit.py",
+    "kir/tests/emit_parity_fixtures/e3_counterfactual.py",
+    "kir/tests/emit_parity_fixtures/generate_fixtures.py",
+    "kir/tests/emit_parity_fixtures/native_readback_counterfactual.py",
+    "kir/tests/envtools.py",
+    "kir/tests/fixtures.py",
+    "kir/tests/gate_fixture.py",
+    "kir/tests/test_a_chain_of_edits_ends_in_the_right_state.py",
+    "kir/tests/test_a_created_element_is_judged_by_its_final_place.py",
+    "kir/tests/test_a_reading_typo_does_not_erase_the_program.py",
+    "kir/tests/test_a_refused_op_leaves_no_trace.py",
+    "kir/tests/test_a_stable_address_is_not_permission.py",
+    "kir/tests/test_an_overflowing_contract_keeps_its_tail.py",
+    "kir/tests/test_annotation.py",
+    "kir/tests/test_author_geometry_constructors.py",
+    "kir/tests/test_authoring.py",
+    "kir/tests/test_consumer_type_conformance.py",
+    "kir/tests/test_consumer_type_runtime.py",
+    "kir/tests/test_created_element_identity.py",
+    "kir/tests/test_emission_guard_contract.py",
+    "kir/tests/test_emit_model_byte_parity.py",
+    "kir/tests/test_emitter_scope_contract.py",
+    "kir/tests/test_expressiveness_census.py",
+    "kir/tests/test_families.py",
+    "kir/tests/test_gold_path_axes.py",
+    "kir/tests/test_golden.py",
+    "kir/tests/test_golden_files_have_one_owner.py",
+    "kir/tests/test_lineage_archive_compatibility.py",
+    "kir/tests/test_op_budget_seam.py",
+    "kir/tests/test_operation_witness_stage.py",
+    "kir/tests/test_pbt.py",
+    "kir/tests/test_planning_preserves_program_lineage.py",
+    "kir/tests/test_rehearsal_over_the_corpus.py",
+    "kir/tests/test_section_identity_capture.py",
+    "kir/tests/test_shape_census.py",
+    "kir/tests/test_the_last_legal_writer_defines_the_final_state.py",
+    "kir/tests/test_tolerance_provenance.py",
+    "kir/tests/test_tool_doc.py",
+    "kir/tests/test_type_assignment_stage.py",
+    "kir/tests/test_type_creation_conformance.py",
+    "kir/tests/test_type_creation_ownership.py",
+    "kir/tests/test_typed_section_conformance.py",
+    "kir/tests/test_witness_vacuity.py",
+]
+
+[tool.setuptools.packages.find]
+include = ["kir*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.cs", "*.json", "*.jsonl", "*.md", "*.mjs", "*.txt", "*.yaml", "*.yml"]
+
+[tool.setuptools.exclude-package-data]
+kir = ["CLAUDE.md", "WIRING.md"]
+"kir.clash" = ["BUILDING_GRAPH_NOTE.md", "ORACLE_LIMITS.md"]
+"kir.specs" = ["SPEC_V1.md", "KIR_DECOMPILE_SPEC.md", "PROD_OP_DISTRIBUTION.md"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+# Recipe scripts run in an injected namespace. CI checks them separately with
+# the two actual supplied names, not a blanket undefined-name suppression.
+extend-exclude = ["examples/recipes"]
+
+[tool.ruff.lint]
+select = ["F82", "E9", "F63", "F7"]
+
+[tool.ruff.lint.per-file-ignores]
+# Initial narrow-lint exception: this frozen evidence module has three postponed
+# Any annotations. No executable failure was established, so it is not rewritten.
+"kir/coverage_feed.py" = ["F821"]

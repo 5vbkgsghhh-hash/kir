@@ -1,0 +1,57 @@
+build/
+kir.egg-info/
+*.egg-info/
+__pycache__/
+*.pyc
+connector/revit/src/*/bin/
+connector/revit/src/*/obj/
+/.work/
+/connector/revit/dist/
+
+# Keep internal working material local. Product README and release notes are public.
+/docs/internal/
+/docs/audits/
+/docs/plans/
+**/AGENTS.md
+**/CLAUDE.md
+/KIR_PLAN.md
+/kir/WIRING.md
+/docs/AGENT_WORKFLOW_PLAN_RU.md
+/docs/DELIVERY_PLAN_RU.md
+/docs/LIVE_2023_READINESS_RU.md
+/docs/RELEASE_READINESS_RU.md
+/docs/WORKSPACE_ARTIFACTS_RU.md
+
+# Internal planning and audit documents stay in local working copies.
+/docs/CONNECTOR_RUNTIME_GAPS_RU.md
+/docs/FINAL_RESULT_RU.md
+/docs/JOURNAL_DOCUMENT_KEY_RU.md
+/docs/NATIVE_UPDATE_RU.md
+/docs/OPERATION_WITNESS_STAGE_RU.md
+/docs/PREVIEW_CARD_RU.md
+/docs/PROMISES_RU.md
+/docs/RELEASE_CHECK_RU.md
+/docs/SCALE_RU.md
+/docs/STAGED_CREATE_RU.md
+/docs/laws/CONSTRUCTION_EXECUTION_SPEC.md
+/docs/laws/KIR_MASTER_DESIGN.md
+/kir/CLAUDE.md
+/kir/clash/BUILDING_GRAPH_NOTE.md
+/kir/clash/ORACLE_LIMITS.md
+/kir/specs/KIR_DECOMPILE_SPEC.md
+/kir/specs/PROD_OP_DISTRIBUTION.md
+/kir/specs/SPEC_V1.md
+/docs/laws/TRANSLATION_VALIDATION_SPEC.md
+/docs/laws/MERKLE_SPEC.md
+/docs/laws/TYPED_HONESTY_SPEC.md
+
+# Tracked private files still require an explicit outgoing-tree review.
+/plans/
+# Registry of what is proven: internal tree paths, run addresses and a
+# truncated owner device id. Read by sessions, never published.
+/docs/PROVEN_RU.md
+# Architecture review of 13.09.2026: internal tree paths, prod file addresses,
+# .work report references and the owner's decision queue. Never published.
+/docs/ARCHITECTURE_REVIEW_2026-09-13_RU.md
+connector/revit/tests/**/bin/
+connector/revit/tests/**/obj/

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="../ContextLifecycle.Tests/RevitStubs.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/Messages.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/ConnectorTarget.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/JsonFraming.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/StrictJson.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/ConnectorService.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Context/*.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/*.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Compat/RevitCompat.cs" />
+  </ItemGroup>
+</Project>

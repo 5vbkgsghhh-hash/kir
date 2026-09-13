@@ -1,0 +1,319 @@
+{
+ "audit": {
+  "blocks_touched": [
+   "post MP"
+  ],
+  "clean": 24,
+  "command": "python -m kir.tests.emit_parity_fixtures.e2_parity_diff_audit --old <dump HEAD> --new <dump дерева> --keys <24 ключа> --delta 1000 0 500",
+  "instrument": "kir/tests/emit_parity_fixtures/e2_parity_diff_audit.py",
+  "instrument_note": "прибор E-2 взят ДОСЛОВНО, а не скопирован: предмет делты у E-2 и E-3 буквально один (сдвиг чисел ожидания концов на delta_mm программы), и второй прибор про то же самое разошёлся бы с первым на первой правке. Живёт В ДЕРЕВЕ рядом с записью — `.work/` в коммит не входит (поймано красным 07.09.2026).",
+  "lines_moved_total": 0,
+  "method": "per-emission line diff of the two full tree dumps (pre-patch dump снят с чистой копии HEAD `git archive`, post-patch — с рабочего дерева): every differing line must be a pure replacement whose skeleton is identical once the endpoint expectation literals are blanked, and every such literal must equal old + delta_mm on its own axis; orientation lines (MM(__a.X)/MM(__b.X)) count too",
+  "numbers_shifted_total": 288,
+  "of": 24,
+  "verdict": "24/24 — ожидание концов сдвинуто ровно на delta_mm программы (12 чисел на эмиссию: 6 вердикта + 6 ориентации, конец ТРЁХМЕРНЫЙ), строк не двигалось, блок один: post MP. НЕ РАЗОБРАН: 0",
+  "why_twelve_not_eight": "у E-2 было 8 чисел на эмиссию, у E-3 — 12, и разница не косметическая: конец стены плоский (X,Y), конец трубы объёмный (X,Y,Z). Взять число E-2 сюда значило бы подписать вердикт про другой предмет."
+ },
+ "counterfactual": {
+  "e3_ops": [
+   "create_pipe",
+   "create_duct",
+   "create_cable_tray",
+   "create_conduit",
+   "create_pipe_placeholder",
+   "create_duct_placeholder",
+   "create_beam",
+   "create_truss"
+  ],
+  "helper": "kir/tests/emit_parity_fixtures/e3_counterfactual.py",
+  "method": "typed field strip, ТОТ ЖЕ, что у E-2 (strip_e2_shift импортирован, не переписан): spec.SYNTHETIC_FINAL_SHIFT снимается с опа, который видит эмиттер, и endpoint_witness падает на своё умолчание shift=(0,0,0). Отличие от E-2 — НАБОР ОПОВ: восемь, БЕЗ create_wall, иначе «восстановленный» манифест уехал бы на два звена назад и приписал бы E-3 чужую делту. Никакого regex по C#; реестр эмиттеров восстанавливается на выходе, пустой счёт снятий — падение."
+ },
+ "current_review_source_sha256": {
+  "kir/tests/emit_parity_fixtures/e2_parity_diff_audit.py": "41244990cac4c0cdf232070cedb4f7d2d2c7518ecee3f4f8076dabdb13fd15ce",
+  "kir/tests/emit_parity_fixtures/e3_counterfactual.py": "a06da03e300aba093c767e76a946de9608d5f7f1f897aec86d441e1f653d07a0",
+  "kir/tests/emit_parity_fixtures/generate_fixtures.py": "9758750d310dc53f431750a8783f04296078bb675ace8f2fc78bccc566d54a11",
+  "kir/tests/test_emit_model_byte_parity.py": "5eac5e2835badebe7deb15840cc07821270adcc41a0ebfc600417e860af41163"
+ },
+ "delta_shape": "the same final `// post <oid>` endpoint witness, in the same block, at the same stage, with the same predicate/tolerance/message/key — only the expected coordinate LITERALS moved, each by exactly the program's own delta_mm; no line was added or removed anywhere in any emission, and at a zero shift the synthetic field is not attached at all so the bytes are identical",
+ "emission_source_snapshot_scope": "named diagnostic read set at migration; not a complete dependency closure",
+ "emission_source_snapshot_sha256": {
+  "kir/authoring.py": "4b111bd37ca0301c2e9ed970538aa42bd00ca793d0cc74729f2bb8f88cbe2400",
+  "kir/emit_core.py": "75696f20ff61af83f699c83e844929e6e3fcc171a4d520209338fd4895ef2a96",
+  "kir/geom.py": "ea3da0f1bd38bdc324be2c8cee0c1e281e3981b25e894a99c5c306d7dc3b27ea",
+  "kir/mep_emit.py": "cca9c90d7a0db7b6844c38d3d068679338283dfbbbc1d1dd671b10eec034cb00",
+  "kir/registry_base.py": "e0f861210bd5852e6c30d913ba28f91354c164c3f1e7371e93946a1dce83300f",
+  "kir/struct_emit.py": "14627d63e7d9943454845fbe3050485bf7d19e0196bf60a314861c4ffc23f3b4",
+  "kir/tests/emit_parity_fixtures/generate_fixtures.py": "802cd17154fce638bddcca95441a6ce5961bdbf8180e34f0663d46909f74768f"
+ },
+ "goldens": {
+  "before_sha256": {
+   "auth_move_and_change_type": "03124e2f4a27ae58080fbc0210a6cebc0774c7a5e55c4c24c8e82d364d9696dc"
+  },
+  "changed": [
+   "auth_move_and_change_type"
+  ],
+  "changed_count": 1,
+  "compared_count": 75,
+  "note": "auth_move_and_change_type мигрирован тем же механизмом, что у E-2; дифф прочитан ЦЕЛИКОМ — 12 строк (4 замены + 4 заголовка ханков), 12 чисел, ни одного предиката, ни одной добавленной или снятой строки, блок один — post MP. Остальные 74 файла байт в байт равны эпохе E-2.",
+  "unchanged": {
+   "analysis_loads": "4676a8a5c4bc3705e7d0219aaaf2d46b7b9110729a62d2164d9fddb0cd62adc0",
+   "analysis_path_of_travel": "f69205dd44c296ce1831f9d6c0c2374e8d0daa917703fbd4eff4a7a268d29ede",
+   "annotation_explicit_types": "87c1cc0d7fc5999c1f8ac2b1650976f6a52c37430500febc8f9c8fb7cd0540a5",
+   "annotation_full_set": "68ef2e8a82d48f1f8adada0fc1439dd5bfb411be9d4cfee94e5df595a9458b70",
+   "arch_ceiling": "cd652260c2d47ed0904a26435add1566e47d518f32e2f33f2f3a8035fdf51007",
+   "arch_ceiling_contour": "ab522ccfdfe058f9f1383b85fdf0d5a90c6748aeb62aeb64a4d3712685b4c287",
+   "arch_railing_hosted": "7e677d0532e20beac9c347344799e862d77ab12d4b5235c0990c59494c85e50c",
+   "arch_railing_path": "7d009c915d68ee7e76b55dbef5808021761ad701a3cbe15fa7790c55d32dfb46",
+   "auth_annotation": "ba32438b143e76582f1a0c1048fa036000e308e853a4bb65516106e8f02fd341",
+   "auth_contour_l": "35277563e6125a9f24d9c1d7e8270ff54ab88e544bf93b0b8edd80898962ac18",
+   "auth_curtain_cell_named_type": "9bdbc82ded8abca3adf499a0a8d8bd3ac388e65a963a43bb5de0c082e762bd7a",
+   "auth_curtain_grid_lines": "855d375319d904c4699769912cdfaf39bc5a837a7466ad8ecfe3bb3ec5a79ec6",
+   "auth_directshape_tower": "420b247e6f76aaf2888466b1dd7bff9b59c6de766025dc38fc384c129a0cd69c",
+   "auth_face_wall_existing_mass": "8831f7f99d493ce209646dcbddbc003862193412d52e224292a083cbbcf6f5d7",
+   "auth_move_and_change_type": "743894213702a8d9e9557ecb8decdd4b61e301c5b7058fef23bb909d511a11dd",
+   "auth_pipe_system_chain": "dcb24da497ba9f341a1fa422e0bfd8b27337d813ab33f9dcc6ede3aa7921ff26",
+   "auth_solid_boolean_difference": "b15ab87c2370a1280f67258d9735834f8e627b5b773510735522ce61e988d861",
+   "auth_solid_boolean_prism_voids": "870a5d175c8f81e3add5a6e5462f9bd56723955e96d30c9acef1625f456c77d7",
+   "authoring_stairs_landing": "282654ac3bb0d73419b2e38f9636aa82294de1c59eca923d9c233b0141e59820",
+   "authoring_stairs_run": "7ebdbda64098072a2ffd159d0118b6970eb5659468c528851fc0c9f985385bd6",
+   "authoring_stairs_spiral": "cbf46f0ecde0a809f3285861907006753360462fa95f80dfa5e58bce0a2c8b1d",
+   "authoring_stairs_straight": "77cec261491c637195fbd6e8383a0541d5883c1686f4fd5db4712a77fb62521e",
+   "authoring_wall_arc": "7fa7369be970172a81f708a9d769a6f4b387e8fcdd739f3475e0460cecf63140",
+   "authoring_wall_pipe_grid": "e0a461f0c06885b4a78ce6deaf46fcd394005f6a3473341a89d928992d9efcb6",
+   "datums_extrusion_roof": "7ea9feb2b2a3b89699e184a22f83e17ef443ea067914826a89cb2cabf59a0e2c",
+   "datums_multi_segment_grid": "687e7cefbc1224d5ffb1be04546eabb6b57a13542b78433db2d016d0be7f4399",
+   "datums_multistory_stairs": "769077efba659d0ea7627babe9fc45fb7d79f8155df84d9039a0bbb5dc09f075",
+   "detail_filled_region_doc_default": "b6a45d26ff153664d79675ca8d682c2d3341f3d9c4d24d6458e7e1bc7f2d7317",
+   "detail_filled_region_named_type": "7e1124f0a8aab8e89335495c733995fadbcb6621825c46ab9924e54865a259a2",
+   "duct_min": "2ef86f1028511221e7181754f09394e064158bfd507122e0b25a34b8f23b7393",
+   "families_create_type_full": "42aac69beee81dedecf108ca3dc4fe9acc65d18d94afc588fc47374087de2af8",
+   "families_load_family_whole": "3b575192852ac9fdc88c4351dccdb257dc4171e38d0928e6511dfd8069ffd12a",
+   "full_house_v1": "3d0789ac13c253f3b9208276b928e9e63efcecafe71410b3f600505d4bdefb7b",
+   "hosted_door_flips": "7fcc2f592dd83f67b754fe626ad4b6dc9047568a122ab9bffd82a5af1acdf889",
+   "list_walls_level1": "48562b17a6e8c93023a6facf28002e31fde59f3455254ee6f45598bde95576b7",
+   "mep_conduit_and_placeholders": "eef34a06584f9704f62d8557391b1da6b2f5296eb471620c97fccd4374080d89",
+   "mep_flex_runs": "6cb2f1e3be96d03600332dc8a2852a0816c4fdee24744666b38e7aea3cfbd41b",
+   "mixed_program": "fbadee8e578ce25dea7accd05de49d399b5ace1d3379729c7dfa06b33a92e596",
+   "modify_setparam_delete": "6202e2cb1c666ea89e12c4f76271d0db694ce88b6979489653fa29ea4d6d540f",
+   "native_group": "1aa0d32256ff6dd519405c5e35dfc358377c1e3e6f365e7d87390657d0e23b7c",
+   "opening_contour_perpendicular": "4f470078d74907287d42706534cc69ef761b159f6a2c9659d6efae61a905bd91",
+   "opening_contour_vertical": "df6a704f33bd49dabb8300c163018c7783909a73603c80dc1f356797819d1a71",
+   "opening_host_face_perpendicular": "87cdae979c8f7cd6dd67a75b4efe439b61ae1c0d13d9a0cb9322ac3fee39f08b",
+   "opening_host_face_vertical": "3ff478f9521cfd1a75962da1136e4de9d86406f5307c6e1dd02e526c0c0470ef",
+   "opening_wall_rect": "15bc6b36a03303f9ca105ec799512f284382198ca0cd45c5f76307d2fe9be093",
+   "pdf_underlay_count": "0f4a4424d39e8ca192d95cf5ce565e4bb473f8bd4fa6669623305d7e498f4ff9",
+   "place_family_placement_kinds": "2ca20aa6cd47b44ad277ba24c096e580b97616648920e7657c914af43cbee17f",
+   "place_family_point_and_curve": "2af0ad7e032694e39fd665a454dc03014cf891e0e4646f35331e85a3102364e1",
+   "roof_gable_slopes": "368c1d545a26783cdf136a631263ac5683d6ea4942bf57ee547dd6725b55e198",
+   "roof_min": "2049c3c317581a9fe49d4c0b91135f2c05aeb39b17d236741935ff48d008fe24",
+   "room_separator": "f3dffb2d6d801557e266ab9c45ab099ab9ee3ac94128905495e2641ebafba904",
+   "room_separator_then_room": "5a55d5bddefa2cdc538bf6d0f6807852311ba544f9055007be1481134950e1df",
+   "route_duct_system_tee": "449c301fdffb9be8785fda146688f3dc1e0204bb91a4f81692f63184034d31c0",
+   "route_pipe_system_riser_branch": "117d16f22effd3091556fdd135398d7ea9ba14448464ffd21316956410d70003",
+   "site_building_pad": "a5bc042e6131d1dd66d84f321513b69e13debe54765b93370b2ab3ba0540016c",
+   "site_subregion_hosted": "1be96b5b7182e52a8541b57d5dcfc87f836160070cd0dd7c2aa50ef363116662",
+   "site_topography_surface": "95c3aef7970ea4938a625e9a6c8839f0c75b1ad2014b34eca4d8d82a7dec13a6",
+   "site_topography_toposolid": "edf54d9e89790c4ce9606881c4ded0a9c2138ac5c6a4cc2bdce4ea5d227700e2",
+   "solid_extrusion_and_revolve": "83d479bbf1ddcc5a62a4686b0b2b4f8a1a025b85121dba890850127635909c4e",
+   "space_mep": "d180bd3e710f3064c17bc73b9a37966f8c889a24209b996db01d196cf3886ed4",
+   "stack_two_storeys": "762430d3ce2ea352d6d5cf2424607f1302d011a280b73116d4972bb95d6678c5",
+   "struct_area_reinforcement_slabs": "28b6597736b57c2fd1c1ca1c2c66a176ccf8d0a8018c7e752af9de84c16c9726",
+   "struct_beam": "d84b8c5b67e4f1c19376bc3b16540ac6d10f248e507a4ba82377b766b508e47d",
+   "struct_column_top_constrained": "3ec24276b1a4ec7e92c2e4abd3876b743444c7a4006e1fd927fefd1642a9d4fc",
+   "struct_foundation_isolated": "b1448b17fe59f74863dce9af059ac991ccde79b1f5f54c2567fcf253639a2b9a",
+   "struct_foundation_slab": "d10ee5e15c0a9fbc785b3807b617282c3e06df684888fd42ded6ba83a87f07d4",
+   "struct_foundation_slab_two_holes": "c56b20a8154c42043af86db576cbc8e496c04e1e5aa806dad4ee52f791778b97",
+   "struct_framing_bay": "570168d997e2497782f28367cefb88054114a27e6b1c3dde269a67e3f7714471",
+   "struct_wall_foundation": "17eef14cd1af35f536274efa7ec0e2f05ce41152e3a098a93c410cc69bb0a933",
+   "sweep_slab_edge_bottom_ref": "5a0fb5baeb00395276cb5d5047bfffd18ed5609d5b59d2742ac6338a78436711",
+   "sweep_slab_edge_top": "d7005db22cb1e5d566c8ef412f9bb1627dd539f02a9e0bcf1b775d1d0d5bfc0f",
+   "sweep_wall_horizontal": "ed671e2751e3986d125f1659de35c6844de868caf0dc2d460f2541608f760aa1",
+   "sweep_wall_vertical_ref": "a556116ca48259d982b788c11e8595e7e13d7ae7d5924c1f81b2ce7bcba63204",
+   "wall_base_offset": "09b4fcfecfc9b04e7bba6880f7bfc2b528da9f05925fbf9bd39cfc602bf2b31f",
+   "wall_top_attached": "9a8b4f98ebba22199ac0e737e538390b889241e40f3bdc2fc61327305c408240"
+  }
+ },
+ "limits": [
+  "живой Revit не проверялся: это утверждение об эмиссии, не о поведении API",
+  "байтами покрыт ОДИН оп из восьми (create_pipe): остальные семь корпус не строит в цепочке «создал → сдвинул», и паритет про них молчит — их держит test_a_created_element_is_judged_by_its_final_place.py",
+  "create_truss берёт сдвиг ТОЛЬКО в плане: его свидетель концов двумерный (отметка базы читается у плоскости в рантайме, обязательство base_elevation), и вертикальный перенос фермы этим свидетелем не проверяется ни до, ни после",
+  "цели move_elements по element_id этой правкой НЕ затронуты и остаются пределом реестра F1: сдвиг считается только по `by: ref` — см. geom.same_program_shift",
+  "set_param, переписывающий параметр создания, и delete созданного элемента остаются живыми ложными отказами (пин xfail(strict) в test_a_created_element_is_judged_by_its_final_place.py) — их лечит условная стадия, и это отдельный ход",
+  "byte-parity доказывает, что делта ровно та, что названа; верность самого правила доказывают приборы replacement_tests"
+ ],
+ "manifest": {
+  "added_keys": [],
+  "after_file_sha256": "690439ae61664052cd51f69476b4580e855f3d1ae5e198b84a69cacc1cd59245",
+  "before_file_sha256": "10e5d2dd777abfa4f3fa828a2cdbf102d37721cc2a5f5a13cc4db2ef4664bd07",
+  "changed_count": 24,
+  "changes": {
+   "golden:auth_move_and_change_type|2021|atomic": {
+    "after": "e81d8019b8cce7f924e74464b467b0d96971ef39c26b73864eaf71a7f269f01a",
+    "before": "866a1564e99a43fc2806f5b8af272d20e600c02dd66bb6f5c214905508cd871a"
+   },
+   "golden:auth_move_and_change_type|2021|per_op": {
+    "after": "6e4c31a06edd0542b7fd8eaa985b22806080b2a1af34e16c38950357dfb011db",
+    "before": "ca3710048f3e224e79dacc7353a2ae755e9cda70f38a44241e39b6e2e298bf27"
+   },
+   "golden:auth_move_and_change_type|2022|atomic": {
+    "after": "e81d8019b8cce7f924e74464b467b0d96971ef39c26b73864eaf71a7f269f01a",
+    "before": "866a1564e99a43fc2806f5b8af272d20e600c02dd66bb6f5c214905508cd871a"
+   },
+   "golden:auth_move_and_change_type|2022|per_op": {
+    "after": "6e4c31a06edd0542b7fd8eaa985b22806080b2a1af34e16c38950357dfb011db",
+    "before": "ca3710048f3e224e79dacc7353a2ae755e9cda70f38a44241e39b6e2e298bf27"
+   },
+   "golden:auth_move_and_change_type|2023|atomic": {
+    "after": "e81d8019b8cce7f924e74464b467b0d96971ef39c26b73864eaf71a7f269f01a",
+    "before": "866a1564e99a43fc2806f5b8af272d20e600c02dd66bb6f5c214905508cd871a"
+   },
+   "golden:auth_move_and_change_type|2023|per_op": {
+    "after": "6e4c31a06edd0542b7fd8eaa985b22806080b2a1af34e16c38950357dfb011db",
+    "before": "ca3710048f3e224e79dacc7353a2ae755e9cda70f38a44241e39b6e2e298bf27"
+   },
+   "golden:auth_move_and_change_type|2024|atomic": {
+    "after": "743894213702a8d9e9557ecb8decdd4b61e301c5b7058fef23bb909d511a11dd",
+    "before": "03124e2f4a27ae58080fbc0210a6cebc0774c7a5e55c4c24c8e82d364d9696dc"
+   },
+   "golden:auth_move_and_change_type|2024|per_op": {
+    "after": "bb83306fc18301733bd58b4e2423acc0e1005cc0d96cbb59af9da1ee52aef9e0",
+    "before": "92c6b1afb89cd665d9f6d5ee9ea4f053a8eefa530f857bb6308ce057845852e3"
+   },
+   "golden:auth_move_and_change_type|2025|atomic": {
+    "after": "743894213702a8d9e9557ecb8decdd4b61e301c5b7058fef23bb909d511a11dd",
+    "before": "03124e2f4a27ae58080fbc0210a6cebc0774c7a5e55c4c24c8e82d364d9696dc"
+   },
+   "golden:auth_move_and_change_type|2025|per_op": {
+    "after": "bb83306fc18301733bd58b4e2423acc0e1005cc0d96cbb59af9da1ee52aef9e0",
+    "before": "92c6b1afb89cd665d9f6d5ee9ea4f053a8eefa530f857bb6308ce057845852e3"
+   },
+   "golden:auth_move_and_change_type|2026|atomic": {
+    "after": "743894213702a8d9e9557ecb8decdd4b61e301c5b7058fef23bb909d511a11dd",
+    "before": "03124e2f4a27ae58080fbc0210a6cebc0774c7a5e55c4c24c8e82d364d9696dc"
+   },
+   "golden:auth_move_and_change_type|2026|per_op": {
+    "after": "bb83306fc18301733bd58b4e2423acc0e1005cc0d96cbb59af9da1ee52aef9e0",
+    "before": "92c6b1afb89cd665d9f6d5ee9ea4f053a8eefa530f857bb6308ce057845852e3"
+   },
+   "scope:move_and_change_type|2021|atomic": {
+    "after": "b2fc8113dd70b245eec857738bf8c2749318db7edbf329c28a7b6378893ed7b6",
+    "before": "12f164ef54b49244e27f60bf76a2629fe138a1b9af960893258b9aedf9b77619"
+   },
+   "scope:move_and_change_type|2021|per_op": {
+    "after": "2de13e71e2c62e3927344f7c21d2e21623b772c7454a5f8ede4c4ecc5219491f",
+    "before": "217dfb57f7e055d7bc28e6af99199184a0a8ac418639d2a542d757d46c0c7c9a"
+   },
+   "scope:move_and_change_type|2022|atomic": {
+    "after": "b2fc8113dd70b245eec857738bf8c2749318db7edbf329c28a7b6378893ed7b6",
+    "before": "12f164ef54b49244e27f60bf76a2629fe138a1b9af960893258b9aedf9b77619"
+   },
+   "scope:move_and_change_type|2022|per_op": {
+    "after": "2de13e71e2c62e3927344f7c21d2e21623b772c7454a5f8ede4c4ecc5219491f",
+    "before": "217dfb57f7e055d7bc28e6af99199184a0a8ac418639d2a542d757d46c0c7c9a"
+   },
+   "scope:move_and_change_type|2023|atomic": {
+    "after": "b2fc8113dd70b245eec857738bf8c2749318db7edbf329c28a7b6378893ed7b6",
+    "before": "12f164ef54b49244e27f60bf76a2629fe138a1b9af960893258b9aedf9b77619"
+   },
+   "scope:move_and_change_type|2023|per_op": {
+    "after": "2de13e71e2c62e3927344f7c21d2e21623b772c7454a5f8ede4c4ecc5219491f",
+    "before": "217dfb57f7e055d7bc28e6af99199184a0a8ac418639d2a542d757d46c0c7c9a"
+   },
+   "scope:move_and_change_type|2024|atomic": {
+    "after": "a324118b6463d5968ac9f77805b303a38297834e03fb94700098197474e90866",
+    "before": "b998a01184300fedfc034ab9ff9bd0d5209b5d71b904674f496abccfa9883fdf"
+   },
+   "scope:move_and_change_type|2024|per_op": {
+    "after": "548cf8b0e5438a1d3243b2814fedff5398a5340a8b6fe30a88b2dd2e1b1b5d54",
+    "before": "8f8d8c600a66e6039d3d0117cfc3ccff5cf9c0a1abee209c6b45b46a95bad173"
+   },
+   "scope:move_and_change_type|2025|atomic": {
+    "after": "a324118b6463d5968ac9f77805b303a38297834e03fb94700098197474e90866",
+    "before": "b998a01184300fedfc034ab9ff9bd0d5209b5d71b904674f496abccfa9883fdf"
+   },
+   "scope:move_and_change_type|2025|per_op": {
+    "after": "548cf8b0e5438a1d3243b2814fedff5398a5340a8b6fe30a88b2dd2e1b1b5d54",
+    "before": "8f8d8c600a66e6039d3d0117cfc3ccff5cf9c0a1abee209c6b45b46a95bad173"
+   },
+   "scope:move_and_change_type|2026|atomic": {
+    "after": "a324118b6463d5968ac9f77805b303a38297834e03fb94700098197474e90866",
+    "before": "b998a01184300fedfc034ab9ff9bd0d5209b5d71b904674f496abccfa9883fdf"
+   },
+   "scope:move_and_change_type|2026|per_op": {
+    "after": "548cf8b0e5438a1d3243b2814fedff5398a5340a8b6fe30a88b2dd2e1b1b5d54",
+    "before": "8f8d8c600a66e6039d3d0117cfc3ccff5cf9c0a1abee209c6b45b46a95bad173"
+   }
+  },
+  "corpus_reach_note": "научено восемь эмиттеров, байтами покрыт ОДИН: в замороженном корпусе цепочку «создал → сдвинул по ссылке» несут только MW=create_wall (E-2) и MP=create_pipe (здесь). Про остальные семь паритет не говорит НИЧЕГО — их держит заменяющий пин test_a_created_element_is_judged_by_its_final_place.py, где все девять проверяются ПО ЭМИССИИ (зонд «создал → сдвинул»), а не по пересказу.",
+  "fixtures": [
+   "golden:auth_move_and_change_type",
+   "scope:move_and_change_type"
+  ],
+  "key_count": 2361,
+  "keyset_sha256": "255807ab72dc7f76a3a6d15b46f4a0727753d15612eb298f8446e86067185c55",
+  "missing_keys": [],
+  "mode_counts": {
+   "atomic": 12,
+   "per_op": 12
+  },
+  "obligation_keys_moved": [],
+  "obligation_keys_retargeted": [
+   "create_pipe.endpoints"
+  ],
+  "ops_visible_in_corpus": [
+   "create_pipe"
+  ],
+  "predicates_removed": 0,
+  "prefix_counts": {
+   "golden": 12,
+   "scope": 12
+  },
+  "refusal_changes": [],
+  "refusal_count": 21,
+  "stages_moved": 0,
+  "taught_ops": 8,
+  "tolerances_changed": 0,
+  "unchanged_count": 2337
+ },
+ "parent": {
+  "historical_review_source_sha256": {
+   "kir/tests/emit_parity_fixtures/e2_counterfactual.py": "48979c4f2901fbac2d805aa02fcb1afbc780306faf1d0c7d673134eea3bc7bfd",
+   "kir/tests/emit_parity_fixtures/e2_parity_diff_audit.py": "7fe17a8c00a4bc9daa03b37fede8ca858d80e8d95f09b679dc265511bdb146f1",
+   "kir/tests/emit_parity_fixtures/generate_fixtures.py": "6c354127849b711d71b73a7a3d18d1af134d62735d52f82fb8abd80589bda03b",
+   "kir/tests/test_emit_model_byte_parity.py": "af5beeea3aa0182ff056415432726eebb1666b82ba7eac87759323e759adad04"
+  },
+  "record_digest": "0392d63eaa515d1e8381ab40d3048c63c7ec285fc45375b23bd10b8e5957c7be",
+  "record_file_sha256": "c7ffcfb05fe919584e624ec1e16b78bdf133a6fbac414410e9c3290dd01d7adb",
+  "record_path": "kir/tests/emit_parity_fixtures/e2_migration_2026_09_07.json",
+  "source_pin_scope": "запись E-2 продолжает утверждать источники СВОЕЙ эпохи; они хранятся здесь и не сравниваются с сегодняшним диском"
+ },
+ "reason": "E-3 (F1/C01, 07.09.2026, третья часть «последнего законного писателя»): E-2 научил считать итог последнего законного писателя ОДИН эмиттер (create_wall) и назвал своим пределом остальные семь мест endpoint_witness. Зонд «создал → сдвинул по ref» на девяти создающих опах дал 8 из 8 живых ложных отказов: create_pipe, create_duct, create_cable_tray, create_conduit, create_pipe_placeholder, create_duct_placeholder, create_beam и create_truss ждали АВТОРСКИЕ концы после законного move_elements той же программы — тот же гарантированный postconditions_violated и RollBack на верно построенном здании. Закон не заведён заново (geom.program_shift_after, зеркало same_program_shift), и читатель поля стал ОДИН на всех девятерых — emit_core.final_shift: девять раз написанное `op.get(...) or (0,0,0)` было бы девятью местами, где умолчание разъедется. Предикат, допуск, сообщение, ключ обязательства И СТАДИЯ не тронуты — сдвинулись только ЧИСЛА ожидания.",
+ "record_digest": "519261856c9a7c6800182c0450b3c41029d6c7025c7f0d684e1c1bce2736a801",
+ "replacement_tests": [
+  "kir/tests/test_a_created_element_is_judged_by_its_final_place.py",
+  "kir/tests/test_the_last_legal_writer_defines_the_final_state.py",
+  "kir/tests/test_a_chain_of_edits_ends_in_the_right_state.py"
+ ],
+ "review_sources_resigned": [
+  {
+   "code_identity_evidence": "astcheck: for every pinned .py the AST with docstrings and comments stripped is byte-equal to the file at commit 8457284604d934c32fde704db33261ff74fdb752 (the tree whose pins stood before this re-sign); py_compile -W error clean",
+   "files_re_pinned": [
+    "kir/tests/emit_parity_fixtures/e2_parity_diff_audit.py",
+    "kir/tests/emit_parity_fixtures/e3_counterfactual.py",
+    "kir/tests/emit_parity_fixtures/generate_fixtures.py",
+    "kir/tests/test_emit_model_byte_parity.py"
+   ],
+   "on": "2026-09-09",
+   "previous_current_review_source_sha256": {
+    "kir/tests/emit_parity_fixtures/e2_parity_diff_audit.py": "7fe17a8c00a4bc9daa03b37fede8ca858d80e8d95f09b679dc265511bdb146f1",
+    "kir/tests/emit_parity_fixtures/e3_counterfactual.py": "753641032a78678c03058b5b114411942d023b1d3d378734d87416a05268e530",
+    "kir/tests/emit_parity_fixtures/generate_fixtures.py": "802cd17154fce638bddcca95441a6ce5961bdbf8180e34f0663d46909f74768f",
+    "kir/tests/test_emit_model_byte_parity.py": "e2597279d454061e2686636c1d23a63a8eb4b872785d770a388cb89b69637510"
+   },
+   "previous_record_digest": "fca0c27f5e29418c1c4431e3667df91caf234f98c59b1469d941da56f82e2f32",
+   "verdict_reestablished_by": "kir/tests/test_emit_model_byte_parity.py::E3MigrationContract on the re-signed record: the E-3 delta, keyset 2361, 24 changes and the line audit are re-checked against the current corpus, not copied",
+   "why": "comments and docstrings of the pinned review sources were translated into English (documentation i18n, owner's word 08.09.2026); no code changed"
+  }
+ ],
+ "schema": "kir-emission-e3-migration/1"
+}

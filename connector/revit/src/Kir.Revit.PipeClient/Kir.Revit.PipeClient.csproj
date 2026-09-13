@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Kir.Revit.PipeClient</AssemblyName>
+    <RootNamespace>Kir.Revit.PipeClient</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Kir.Revit.Protocol/Kir.Revit.Protocol.csproj" />
+  </ItemGroup>
+</Project>

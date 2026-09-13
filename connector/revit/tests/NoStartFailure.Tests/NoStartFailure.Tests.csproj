@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework><OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable><ImplicitUsings>disable</ImplicitUsings>
+    <DefineConstants>REVIT_MODERN</DefineConstants>
+    <UseAppHost>false</UseAppHost><UseSharedCompilation>false</UseSharedCompilation>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/Kir.Revit.Connector/Context/DocumentRevisionTracker.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Context/ContextSnapshotCollector.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Context/ContextQueryScheduler.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/ExecutionEngine.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/ExecutionWorkItem.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/OperationJournal.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/ExternalEventScheduler.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/SessionAdmission.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/JournalOwner.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/CompilerHostClient.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/ConnectorService.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Compat/RevitCompat.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/Messages.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/ConnectorTarget.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/JsonFraming.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/StrictJson.cs" />
+    <Compile Include="../ContextLifecycle.Tests/RevitStubs.cs" />
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+</Project>

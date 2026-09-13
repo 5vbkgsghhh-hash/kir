@@ -1,0 +1,6 @@
+{
+  "source_commit": "0369326f7dbac1d1ec844d165344ace60ea77961",
+  "first_preservation_test_commit": "b3d60e11abbecba828051c110017f9f40e228f46",
+  "plan_digest": "a9afed580e1ee9ffd3609b75651694b6a13c510b373be40960304de8369db715",
+  "canonical_unsigned_plan_utf8": "{\"allow_destructive\":false,\"bulk\":false,\"family\":\"write\",\"intent\":\"\",\"ir_version\":\"1.0\",\"ops\":[{\"contract_digest\":\"45519a9bba32e57013724bd8dd535b4fab8526b3f5ad59786c15d7a2b143a25e\",\"effect\":\"create\",\"family\":\"authoring\",\"nested_contracts\":[],\"payload\":{\"host_kind\":\"floor\",\"id\":\"T1\",\"layers\":[{\"function\":\"Substrate\",\"width_mm\":80.0}],\"new_name\":\"KIR parity type\",\"op\":\"create_wall_type\",\"source_type\":{\"by\":\"element_id\",\"value\":4001}},\"provenance\":{\"fields\":{\"host_kind\":\"explicit\",\"id\":\"explicit\",\"layers\":\"explicit\",\"new_name\":\"explicit\",\"op\":\"explicit\",\"source_type\":\"explicit\"},\"source_id\":\"T1\",\"source_index\":0,\"source_op\":\"create_wall_type\"},\"result\":{\"identity_cardinality\":\"one\",\"identity_field\":\"id\",\"reference_kind\":\"wall_type\"}}],\"program_id\":null,\"schema\":\"kir-planned-program/3\",\"source_op_count\":1}"
+}

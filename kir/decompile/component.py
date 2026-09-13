@@ -1,0 +1,810 @@
+"""Component library and instancing over the Merkle DAG (wave 5).
+
+A Merkle-deduped subtree (wave 1) becomes a reusable **component definition**
+(drawn once, its leaves localized to the component origin) plus a set of
+**instances** (each just an ``offset_mm`` taken from an occurrence).  This is
+the forward "draw once, place N times" analytical form: expanding the instances
+reproduces exactly the original *template-canonical* leaves.  Turning that
+analysis into an executable operation requires the separate FidelityCanon proof
+described below.
+
+Because the key is the merkle-hash (a shape's equivalence class up to
+translation — wave 1's invariance), the same shape anywhere is one component;
+its occurrences are the instances.  A component is shared only among
+TRANSLATION copies — rotated / mirrored copies hash differently and stay
+distinct components (never falsely merged; honest by construction).
+
+Discipline (forks in COMPONENT_LIBRARY_SPEC.md):
+
+* **Localization is subtract-node_origin** — the same canonicalization the
+  merkle-hash already uses, so a component's ``def_hash`` equals its
+  occurrence hash (no new notion of shape).
+* **Template round-trip is exact.**  ``instantiate(defn, offset)`` translates
+  the localized leaves by ``+offset``; for an occurrence O it reproduces O's
+  template-canonical leaves (property C1), and ``expand_library`` reproduces
+  the whole tree's template multiset (property C-RT).  This deliberately broad
+  identity is what discovers repeated floors whose concrete level bindings
+  differ.
+* **Execution fidelity is a separate proof.**  A ``PlaceGroupOp`` carries
+  ``fidelity_proven`` only when every instantiated occurrence also matches the
+  source under ``FidelityCanon`` (concrete levels and graph bindings survive).
+  Native Revit-group emission consumes only such ops.  A visually identical
+  floor bound to another Level therefore remains discoverable as a component,
+  but cannot be executed as one shared Revit definition until an explicit
+  per-instance binding model proves that mapping.
+* **Instance ids are regenerated deterministically** so N copies never share an
+  id; a residual collision is a typed ``ComponentSchemaError`` (fail-closed,
+  like fold's ``assert_preservation``).
+* **Inert, additive, opt-in.**  Nothing is touched; ``component_enabled()`` is
+  default OFF.  Frozen L0 untouched.
+"""
+from __future__ import annotations
+
+import os
+from kir import env  # noqa: E402  (a submodule with no dependencies — introduces no cycle)
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping, Sequence
+
+from kir.decompile.fold import (
+    FidelityCanon,
+    TreeNode,
+    canon_op,
+    iter_l1_leaves,
+)
+from kir.decompile.fold import (  # canonicalization authority — reused
+    _COORDINATE_FIELDS,
+    _round_mm,
+)
+from kir.decompile.l1_schema import L1Node, stable_l1_id
+from kir.decompile.merkle import (
+    MerkleError,
+    Occurrence,
+    dedup_report,
+    node_origin,
+)
+
+Vec3 = tuple[float, float, float]
+_ZERO = (0.0, 0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Typed failures (fail-closed)
+# ---------------------------------------------------------------------------
+
+
+class ComponentError(ValueError):
+    """Base for every typed component-layer failure."""
+
+
+class ComponentRoundTripError(ComponentError):
+    """Expanding a component does not reproduce its source leaves."""
+
+
+class ComponentSchemaError(ComponentError):
+    """A malformed component / instance, or a residual id collision."""
+
+
+# ---------------------------------------------------------------------------
+# Flag (inertness contract)
+# ---------------------------------------------------------------------------
+
+
+def component_enabled() -> bool:
+    """Opt-in gate for future pipeline wiring; default OFF."""
+
+    return env.get("KIR_COMPONENT", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Coordinate translation (field-aware, deterministic, mm-grid exact)
+# ---------------------------------------------------------------------------
+
+
+def _translate_coord_value(value: Any, delta: Vec3, field_name: str | None) -> Any:
+    """Translate coordinate vectors by ``+delta``; leave everything else."""
+
+    if field_name in _COORDINATE_FIELDS and isinstance(value, list):
+        if (len(value) in (2, 3)
+                and all(isinstance(item, (int, float))
+                        and not isinstance(item, bool) for item in value)):
+            return [
+                _round_mm(float(component) + delta[index])
+                for index, component in enumerate(value)
+            ]
+        return [
+            _translate_coord_value(item, delta, field_name) for item in value
+        ]
+    if isinstance(value, dict):
+        # elevation is a z-relative scalar; translate it by delta.z.
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in ("elevation_mm", "elev_mm") and isinstance(
+                    item, (int, float)) and not isinstance(item, bool):
+                result[key] = _round_mm(float(item) + delta[2])
+            else:
+                result[key] = _translate_coord_value(item, delta, key)
+        return result
+    if isinstance(value, list):
+        return [_translate_coord_value(item, delta, field_name) for item in value]
+    return value
+
+
+def _translate_leaf(leaf: L1Node, delta: Vec3) -> dict[str, Any]:
+    """Return a deep copy of ``leaf`` with coordinates translated by ``delta``."""
+
+    out: dict[str, Any] = {}
+    for key, value in leaf.items():
+        if key == "anchor_mm":
+            out[key] = (
+                None if value is None
+                else [_round_mm(float(value[i]) + delta[i]) for i in range(3)])
+        elif key in ("bbox_min_mm", "bbox_max_mm"):
+            out[key] = (
+                None if value is None
+                else [_round_mm(float(value[i]) + delta[i]) for i in range(3)])
+        elif key == "params":
+            out[key] = _translate_coord_value(value, delta, None)
+        else:
+            out[key] = value
+    return out  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Component definition / instance / place-group op
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentDefinition:
+    """A reusable shape: leaves localized to the component origin, drawn once."""
+
+    def_hash: str
+    kind: str
+    origin_mm: Vec3
+    leaves: tuple[L1Node, ...]
+    leaf_count: int
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentInstance:
+    """One placement of a component.
+
+    ``offset_mm`` is the ABSOLUTE placement point of the localized definition —
+    i.e. the occurrence's own canonical origin.  Because ``extract_component``
+    localizes the leaves by subtracting the DEFINITION origin, the leaves live
+    at ``absolute - def_origin``; the shape at this occurrence therefore has its
+    absolute leaves at ``localized + occ_origin`` (the ``def_origin`` cancels),
+    so the reconstruction offset is exactly ``occ_origin`` — NOT
+    ``occ_origin - def_origin``.  (That relative-delta form was the LOT31 C-RT
+    bug: it silently coincided with the correct value only when ``def_origin``
+    was ``(0,0,0)``, which is all the synthetic tests happened to produce.)
+
+    ``origin_mm`` is the same absolute origin, kept for reporting; ``rel_mm``
+    is the translation relative to the definition origin, for audit/emission.
+    """
+
+    def_hash: str
+    instance_index: int
+    offset_mm: Vec3
+    origin_mm: Vec3
+    rel_mm: Vec3
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentFidelityProof:
+    """Concrete per-occurrence identity evidence for execution eligibility.
+
+    The two hash sequences are computed independently: one from the translated
+    component definition, one from the exact source occurrence.  Equality under
+    the pinned ``FidelityCanon`` version is the proof.  Keeping both sides makes
+    a refusal auditable instead of reducing it to a forgeable boolean.
+    """
+
+    canon_version: str
+    instantiated_hashes: tuple[str, ...]
+    source_hashes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.canon_version != FidelityCanon.VERSION:
+            raise ComponentSchemaError(
+                "component fidelity proof uses an unknown canon version")
+        if len(self.instantiated_hashes) != len(self.source_hashes):
+            raise ComponentSchemaError(
+                "component fidelity proof cardinalities differ")
+        for value in (*self.instantiated_hashes, *self.source_hashes):
+            if (not isinstance(value, str) or len(value) != 40
+                    or any(ch not in "0123456789abcdef" for ch in value)):
+                raise ComponentSchemaError(
+                    "component fidelity proof hash must be lowercase sha1")
+
+    @property
+    def verified(self) -> bool:
+        return (
+            bool(self.instantiated_hashes)
+            and self.instantiated_hashes == self.source_hashes
+        )
+
+    @property
+    def mismatch_indices(self) -> tuple[int, ...]:
+        return tuple(
+            index for index, (instantiated, source) in enumerate(
+                zip(self.instantiated_hashes, self.source_hashes))
+            if instantiated != source
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PlaceGroupOp:
+    """Forward op: place a component ``occurrence_count`` times."""
+
+    def_hash: str
+    definition: ComponentDefinition
+    instances: tuple[ComponentInstance, ...]
+    # TemplateCanon is intentionally broad enough to discover typical floors.
+    # Revit execution needs the stronger proof: concrete external bindings
+    # (Level/type ids) and graph targets must also reconstruct exactly.
+    fidelity_proof: ComponentFidelityProof | None = None
+
+    @property
+    def occurrence_count(self) -> int:
+        return len(self.instances)
+
+    @property
+    def savings_leaves(self) -> int:
+        return self.definition.leaf_count * (self.occurrence_count - 1)
+
+    @property
+    def fidelity_proven(self) -> bool:
+        proof = self.fidelity_proof
+        return (
+            proof is not None
+            and len(proof.source_hashes) == self.occurrence_count
+            and proof.verified
+        )
+
+    @property
+    def fidelity_mismatch_indices(self) -> tuple[int, ...]:
+        proof = self.fidelity_proof
+        if proof is None or len(proof.source_hashes) != self.occurrence_count:
+            return tuple(range(self.occurrence_count))
+        return proof.mismatch_indices
+
+
+def _neg(origin: Vec3) -> Vec3:
+    return (-origin[0], -origin[1], -origin[2])
+
+
+def extract_component(occurrence: Occurrence) -> ComponentDefinition:
+    """Build a component definition from one occurrence (leaves localized)."""
+
+    if not isinstance(occurrence, Occurrence):
+        raise ComponentSchemaError("extract_component needs an Occurrence")
+    origin = node_origin(occurrence.tree_node)
+    localized = [
+        _translate_leaf(leaf, _neg(origin))
+        for leaf in iter_l1_leaves(occurrence.tree_node)
+    ]
+    localized.sort(key=lambda leaf: (
+        canon_op(leaf, _ZERO), leaf["source_element_id"]))
+    return ComponentDefinition(
+        def_hash=occurrence.hash,
+        kind=str(occurrence.tree_node["kind"]),
+        origin_mm=origin,
+        leaves=tuple(localized),
+        leaf_count=len(localized),
+        label=str(occurrence.tree_node["label"]),
+    )
+
+
+def _instance_source_id(def_hash: str, instance_index: int, source_id: str) -> str:
+    return f"{def_hash[:12]}:{instance_index}:{source_id}"
+
+
+def instantiate(
+    defn: ComponentDefinition,
+    offset_mm: Vec3,
+    *,
+    instance_index: int,
+    regenerate_ids: bool = True,
+) -> tuple[L1Node, ...]:
+    """Return the component's leaves translated by ``offset_mm``.
+
+    With ``regenerate_ids`` (the default for a placed instance) each leaf gets a
+    deterministic, per-instance-unique source id / _id so N instances never
+    share an id.  With ``regenerate_ids=False`` the localized leaves keep their
+    ids — used by the round-trip proof to compare pure geometry.
+    """
+
+    if not isinstance(defn, ComponentDefinition):
+        raise ComponentSchemaError("instantiate needs a ComponentDefinition")
+    placed: list[L1Node] = []
+    for leaf in defn.leaves:
+        translated = _translate_leaf(leaf, offset_mm)
+        if regenerate_ids:
+            new_source = _instance_source_id(
+                defn.def_hash, instance_index, leaf["source_element_id"])
+            translated["source_element_id"] = new_source
+            translated["_id"] = stable_l1_id(leaf["kind"], new_source)
+        placed.append(translated)  # type: ignore[arg-type]
+    return tuple(placed)
+
+
+# ---------------------------------------------------------------------------
+# Library assembly
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentLibrary:
+    definitions: Mapping[str, ComponentDefinition]
+    place_ops: tuple[PlaceGroupOp, ...]
+    singletons_leaves: tuple[L1Node, ...]
+
+    def get(self, def_hash: str) -> ComponentDefinition | None:
+        return self.definitions.get(def_hash)
+
+    def has(self, def_hash: str) -> bool:
+        return def_hash in self.definitions
+
+    @property
+    def total_defined_leaves(self) -> int:
+        return sum(d.leaf_count for d in self.definitions.values())
+
+    @property
+    def total_instanced_leaves(self) -> int:
+        return sum(
+            op.definition.leaf_count * op.occurrence_count
+            for op in self.place_ops)
+
+    @property
+    def fidelity_summary(self) -> dict[str, int]:
+        """Discovered vs EXECUTABLE, in one place the caller can read.
+
+        Discovery and authorization are separate stages here by design, and
+        the gap between them is not a rounding error.  Measured 2026-08-11
+        over the stored corpus (one run per `doc_name`, 10 runs, 368 313
+        folded leaves): 595 components and 2 482 instances cover 49 641
+        leaves (13.48%) and save 35 292 (9.58%), but only **316 of 595
+        (53.11%)** carry a fidelity proof, and the executable saving is
+        27 714 of 35 292 = 78.53% of the analytical one.  The split is
+        bimodal, so no single intuition is safe: Snowdon Plumbing 220/221 and
+        the facade 11/11, against the tower 32/145 and `демо` 22/70; and 4 of
+        the 10 runs yield no components at all.
+
+        Before `prove_execution_fidelity` runs, `proven` is 0 by construction
+        -- an unproven op must never read as executable.  This follows the law
+        `ground.py` states for a named default: a choice the caller cannot see
+        is `.FirstOrDefault()` with a better reputation.
+        """
+
+        proven = [op for op in self.place_ops if op.fidelity_proven]
+        return {
+            "components": len(self.place_ops),
+            "proven": len(proven),
+            "instances": sum(
+                op.occurrence_count for op in self.place_ops),
+            "covered_leaves": self.total_instanced_leaves,
+            "saved_leaves": sum(
+                op.savings_leaves for op in self.place_ops),
+            "proven_saved_leaves": sum(op.savings_leaves for op in proven),
+            "singleton_leaves": len(self.singletons_leaves),
+        }
+
+
+def _place_op_reconstructs(
+    place_op: "PlaceGroupOp", ordered_occs: Sequence[Occurrence],
+) -> bool:
+    """Whether every instance reproduces its occurrence's template multiset.
+
+    This is the broad discovery/partition gate, not permission to emit a native
+    Revit Group.  Concrete levels and graph targets are checked separately by
+    :func:`_place_op_fidelity_proof`.
+    """
+
+    if len(place_op.instances) != len(ordered_occs):
+        return False
+    for instance, occ in zip(place_op.instances, ordered_occs):
+        placed = instantiate(
+            place_op.definition, instance.offset_mm,
+            instance_index=instance.instance_index, regenerate_ids=False)
+        if _abs_multiset(placed) != _abs_multiset(iter_l1_leaves(occ.tree_node)):
+            return False
+    return True
+
+
+def _place_op_fidelity_proof(
+    place_op: "PlaceGroupOp", ordered_occs: Sequence[Occurrence],
+) -> ComponentFidelityProof | None:
+    """Build concrete evidence for (or against) native-group eligibility.
+
+    ``TemplateCanon`` intentionally erases storey labels/ids to discover a
+    typical floor.  ``FidelityCanon`` retains concrete selectors and resolves
+    graph references by structural identity.  A native Revit Group is eligible
+    only when this stronger comparison succeeds for *every* occurrence.
+
+    Any malformed graph or cardinality mismatch is a mismatch, never an
+    exception that could accidentally turn the optimization on.
+    """
+
+    if len(place_op.instances) != len(ordered_occs):
+        return None
+    instantiated_hashes: list[str] = []
+    source_hashes: list[str] = []
+    for instance, occ in zip(place_op.instances, ordered_occs):
+        placed = instantiate(
+            place_op.definition, instance.offset_mm,
+            instance_index=instance.instance_index, regenerate_ids=False)
+        source = tuple(iter_l1_leaves(occ.tree_node))
+        try:
+            instantiated_hashes.append(
+                FidelityCanon.multiset_hash(placed, _ZERO))
+            source_hashes.append(
+                FidelityCanon.multiset_hash(source, _ZERO))
+        except (TypeError, ValueError):
+            return None
+    return ComponentFidelityProof(
+        canon_version=FidelityCanon.VERSION,
+        instantiated_hashes=tuple(instantiated_hashes),
+        source_hashes=tuple(source_hashes),
+    )
+
+
+def _place_op_fidelity_mismatches(
+    place_op: "PlaceGroupOp", ordered_occs: Sequence[Occurrence],
+) -> tuple[int, ...]:
+    """Compatibility helper returning the proof's mismatch indices."""
+
+    proof = _place_op_fidelity_proof(place_op, ordered_occs)
+    if proof is None:
+        return tuple(range(max(len(place_op.instances), len(ordered_occs))))
+    return proof.mismatch_indices
+
+
+def build_library(
+    index: Any,
+    *,
+    min_occurrences: int = 2,
+    min_leaves: int = 2,
+) -> ComponentLibrary:
+    """Turn a building's maximal repeated subtrees into components + instances.
+
+    Chooses DISJOINT maximal repeats: each occurrence path is claimed by at
+    most one component, and a repeat nested inside another is skipped.  Leaves
+    outside every component become singletons, so every original leaf is
+    accounted exactly once (property C7).
+
+    NON-DOMINATION IS NOT DONE HERE, and saying it was is what this paragraph
+    corrects (2026-08-11).  ``dedup_report`` defaults to
+    ``include_dominated=False`` and drops those entries at the source, so every
+    entry reaching this function already carries ``dominated=False`` and the
+    local filter below can never fire -- measured 0 of 460 repeats over 7 real
+    buildings, with 0 dominated entries ever delivered.  The argument is now
+    passed EXPLICITLY so the dependency is stated at the call site instead of
+    inherited from someone else's default, and a dominated entry arriving here
+    is a typed refusal rather than a silent skip: it would mean the upstream
+    contract changed, and skipping it quietly would change WHICH repeats become
+    components with nobody told.
+
+    A second measured limit, so an unexercised branch is not mistaken for a
+    guarantee: the fail-closed reconstruction gate
+    (``_place_op_reconstructs``) has never rejected anything on real data
+    either -- 0 of those same 460 -- because merkle's translation-invariant
+    hash already guarantees what the gate re-derives.  It is kept as an
+    independent cross-check that would catch a hash collision or a
+    canonicalization drift between the two modules, and it must be quoted as
+    exactly that and nothing more.
+    """
+
+    if not (hasattr(index, "occurrences") and hasattr(index, "by_path")
+            and hasattr(index, "root")):
+        raise ComponentSchemaError("build_library needs a MerkleIndex")
+
+    repeats = dedup_report(
+        [index], min_occurrences=min_occurrences, min_leaves=min_leaves,
+        include_dominated=False)
+
+    claimed_paths: list[tuple[int, ...]] = []
+
+    def _covered(path: tuple[int, ...]) -> bool:
+        return any(
+            len(base) < len(path) and path[:len(base)] == base
+            for base in claimed_paths)
+
+    # THE CLAIM WAS STAKED ON THE WRONG KEY (2026-08-13).
+    #
+    # `claimed_paths` claims PATHS in the tree, while the collision happens in
+    # the ABSOLUTE OP: two instances honestly take DIFFERENT nodes and yield
+    # ONE AND THE SAME absolute element. A path-based claim cannot see this by
+    # construction — this is our named form, stated literally: the set of a
+    # claim's inputs must be EXACTLY the set of what changes the answer, and
+    # here it covered too little.
+    #
+    # MEASURED on `k2_ar_rd_v7` before the fix: an unrolling of 115,979
+    # against 115,880 source leaves — 99 extra, 0 shortfall. All 99 in one
+    # category (`OST_RoomSeparationLines`), each produced by EXACTLY two
+    # instances, four component pairs. On `v6` — the same building, read
+    # without that category — the excess is 0. Reproduces on 3 of 7
+    # buildings.
+    #
+    # WHAT THE RULE FORBIDS, AND WHAT IT DOES NOT. It does not forbid
+    # splitting a key, but EXCEEDING the source's multiplicity: it is
+    # measured that of 421 keys produced by two or more instances, 322 are
+    # LEGITIMATE (the source carries just as many, up to multiplicities of
+    # 438 and 1,507), and exactly 99 are excess — for all 99 the source
+    # carries the element ONCE.
+    #
+    # THE INVARIANT THIS ESTABLISHES: a library unrolling must be a
+    # PARTITION of the source's leaves, not a covering. This is C-RT, stated
+    # as a rule of CONSTRUCTION rather than a hoped-for property: a property
+    # checked afterward breaks at scale (the C-RT test runs on grids of 1-4
+    # storeys and holds; it turns false at 115,880 leaves).
+    #
+    # ZERO AFTER THE FIX IS TWO-SIDED, and the second side costs more than
+    # the first. EXCESS 0 — "we did not overclaim", exactly what was being
+    # fixed. SHORTFALL 0 — "while fixing the excess, we did not discard what
+    # is legitimate", and without it the rule "reject on collision" is
+    # indistinguishable from the rule "never split at all": both give an
+    # excess of 0, but the second would have erased 322 legitimate splits
+    # with source multiplicities up to 438 and 1,507. Both ends are measured
+    # on all 7 buildings and both stand in guards — `test_component_overclaim_fixture.py`
+    # holds excess and shortfall in ONE assertion and separately requires
+    # that after the fix the split between instances CONTINUES (5 keys on
+    # the fixture).
+    #
+    # THE COST IS NAMED AS A NUMBER, not left implicit: the INSTANCE is
+    # rejected, but if fewer than `min_occurrences` remain after the
+    # rejection, the whole component is dropped — on the fixture 2
+    # components / 6 placements become 1 / 4, and the leaves fall to
+    # singletons by the same mechanism as for rejected components.
+    source_abs = _abs_multiset(iter_l1_leaves(index.root.tree_node))
+    claimed_abs: Counter[str] = Counter()
+
+    def _fits(occ: Occurrence) -> bool:
+        """Whether this occurrence would exceed the source's multiplicity on any op."""
+        want = _abs_multiset(iter_l1_leaves(occ.tree_node))
+        return _multiset_fits(want, claimed_abs, source_abs)
+
+    definitions: dict[str, ComponentDefinition] = {}
+    place_ops: list[PlaceGroupOp] = []
+
+    for entry in repeats:
+        if entry.dominated:
+            raise ComponentSchemaError(
+                "dedup_report delivered a dominated repeat "
+                f"({entry.hash[:12]}) although include_dominated=False was "
+                "requested: the upstream contract changed, and silently "
+                "skipping it would change which repeats become components")
+        occs = index.occurrences_of(entry.hash)
+        paths = [occ.path for occ in occs]
+        if any(_covered(path) for path in paths):
+            continue
+        # Deterministic instance order by absolute origin then path.
+        ordered = sorted(occs, key=lambda o: (o.origin_mm, o.path))
+        # THE INSTANCE IS REJECTED, NOT THE COMPONENT AND NOT THE TEMPLATE,
+        # and this is a choice with a named cost: rejecting the COMPONENT
+        # would mean losing all of its placements over a single clash;
+        # trimming the TEMPLATE would break placements where the element is
+        # NOT shared with anyone. A rejected instance costs one placement,
+        # and its leaves fall to singletons by the SAME mechanism that
+        # already works for rejected components (paths are not claimed).
+        #
+        # Traversal order is deterministic (`repeats` and `ordered` are
+        # sorted), so the choice of WHICH of two instances yields is also
+        # deterministic. This is an assigned rule, not a property of the
+        # data: the building gives no hint — it is measured that our
+        # components match the author's groups in 88 of 40,803 cases
+        # (0.22%).
+        kept = [occ for occ in ordered if _fits(occ)]
+        if len(kept) < min_occurrences:
+            continue
+        ordered = kept
+        definition = extract_component(ordered[0])
+        instances = tuple(
+            ComponentInstance(
+                def_hash=definition.def_hash,
+                instance_index=idx,
+                # ABSOLUTE placement of the localized definition (see the
+                # ComponentInstance docstring for why occ_origin, not the delta).
+                offset_mm=occ.origin_mm,
+                origin_mm=occ.origin_mm,
+                rel_mm=(
+                    _round_mm(occ.origin_mm[0] - definition.origin_mm[0]),
+                    _round_mm(occ.origin_mm[1] - definition.origin_mm[1]),
+                    _round_mm(occ.origin_mm[2] - definition.origin_mm[2]),
+                ),
+            )
+            for idx, occ in enumerate(ordered)
+        )
+        place_op = PlaceGroupOp(
+            def_hash=definition.def_hash,
+            definition=definition,
+            instances=instances,
+        )
+        # FAIL-CLOSED (LOT31 directive): a component enters the library ONLY if
+        # EVERY instance provably reconstructs its occurrence's exact leaves.
+        # If any instance diverges (a shape the localize/translate model cannot
+        # reproduce), the whole component is REJECTED and its leaves fall back
+        # to singletons — geometry is never silently lost or distorted.
+        if not _place_op_reconstructs(place_op, ordered):
+            continue
+        definitions[definition.def_hash] = definition
+        place_ops.append(place_op)
+        claimed_paths.extend(occ.path for occ in ordered)
+        for occ in ordered:
+            claimed_abs.update(_abs_multiset(iter_l1_leaves(occ.tree_node)))
+
+    # Singletons: every leaf not inside a claimed component occurrence.
+    claimed_leaf_ids: set[str] = set()
+    for path in claimed_paths:
+        occ = index.by_path.get(path)
+        if occ is None:
+            continue
+        for leaf in iter_l1_leaves(occ.tree_node):
+            claimed_leaf_ids.add(leaf["_id"])
+    singletons = [
+        leaf for leaf in iter_l1_leaves(index.root.tree_node)
+        if leaf["_id"] not in claimed_leaf_ids
+    ]
+    singletons.sort(key=lambda leaf: (
+        canon_op(leaf, _ZERO), leaf["source_element_id"]))
+
+    place_ops.sort(key=lambda op: (-op.savings_leaves, op.def_hash))
+    return ComponentLibrary(
+        definitions=dict(definitions),
+        place_ops=tuple(place_ops),
+        singletons_leaves=tuple(singletons),
+    )
+
+
+def prove_execution_fidelity(
+    library: ComponentLibrary,
+    index: Any,
+) -> ComponentLibrary:
+    """Return the same analytical library with execution proofs attached.
+
+    Discovery and authorization are deliberately separate stages.  Merkle /
+    TemplateCanon is the cheap, broad analysis pass; ``FidelityCanon`` is paid
+    only before a caller considers a model-writing optimization.  This keeps
+    ordinary naming, cost and dedup workloads fast while making native-group
+    eligibility explicit and fail-closed.
+    """
+
+    if not isinstance(library, ComponentLibrary):
+        raise ComponentSchemaError(
+            "prove_execution_fidelity needs a ComponentLibrary")
+    if not (hasattr(index, "occurrences_of") and hasattr(index, "root_hash")):
+        raise ComponentSchemaError(
+            "prove_execution_fidelity needs a MerkleIndex")
+
+    proven: list[PlaceGroupOp] = []
+    for place_op in library.place_ops:
+        ordered = sorted(
+            index.occurrences_of(place_op.def_hash),
+            key=lambda occurrence: (occurrence.origin_mm, occurrence.path),
+        )
+        proof = _place_op_fidelity_proof(place_op, ordered)
+        proven.append(PlaceGroupOp(
+            def_hash=place_op.def_hash,
+            definition=place_op.definition,
+            instances=place_op.instances,
+            fidelity_proof=proof,
+        ))
+    return ComponentLibrary(
+        definitions=library.definitions,
+        place_ops=tuple(proven),
+        singletons_leaves=library.singletons_leaves,
+    )
+
+
+def place_group_ops(index: Any) -> tuple[PlaceGroupOp, ...]:
+    """Analytical place-group ops; no execution proof is implied."""
+
+    return build_library(index).place_ops
+
+
+# ---------------------------------------------------------------------------
+# Expansion + round-trip proof
+# ---------------------------------------------------------------------------
+
+
+def expand_library(lib: ComponentLibrary) -> list[L1Node]:
+    """Expand every instance + singletons back into a flat leaf list.
+
+    Property C-RT: the canonical absolute-op multiset of this equals that of
+    the original tree's leaves — the library reproduces the building exactly.
+    Ids are NOT regenerated here so the geometry round-trip is comparable to the
+    source; a placed emission would use ``instantiate(..., regenerate_ids=True)``.
+    """
+
+    if not isinstance(lib, ComponentLibrary):
+        raise ComponentSchemaError("expand_library needs a ComponentLibrary")
+    out: list[L1Node] = []
+    for op in lib.place_ops:
+        for instance in op.instances:
+            out.extend(instantiate(
+                op.definition, instance.offset_mm,
+                instance_index=instance.instance_index,
+                regenerate_ids=False))
+    out.extend(lib.singletons_leaves)
+    return out
+
+
+def _abs_multiset(leaves: Iterable[L1Node]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for leaf in leaves:
+        key = canon_op(leaf, _ZERO)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _multiset_fits(
+    want: dict[str, int],
+    claimed: Counter[str],
+    source: dict[str, int],
+) -> bool:
+    """Whether one more occurrence still fits the source's multiplicity on EVERY key.
+
+    LIVES AT MODULE LEVEL FOR THE SAKE OF A CONTROL, and this is not
+    cosmetic. The C-RT rule holds because this predicate rejects an
+    occurrence; proving that the experiment COULD have ended otherwise is
+    only possible by disabling IT and getting an excess on the same input.
+    While the predicate was a closure inside `build_library`, the only way
+    to show the pre-fix behaviour was to rewrite the loop in the test — that
+    is, to check a COPY of the algorithm instead of the algorithm itself.
+
+    `test_component_overclaim_fixture.py::TheGuardCanBeDisabled` disables
+    exactly this function and requires exactly the excess (10) that the
+    unfixed code gives on the same fixture.
+    """
+    return all(claimed[k] + n <= source.get(k, 0) for k, n in want.items())
+
+
+def assert_round_trip(lib: ComponentLibrary, tree: TreeNode) -> None:
+    """Raise unless expanding the library reproduces the tree's leaf multiset."""
+
+    expanded = _abs_multiset(expand_library(lib))
+    original = _abs_multiset(iter_l1_leaves(tree))
+    if expanded != original:
+        raise ComponentRoundTripError(
+            "component library does not reproduce the source leaf multiset")
+
+
+def assert_unique_instance_ids(op: PlaceGroupOp) -> None:
+    """Raise if two instances of a place-group would share a leaf id."""
+
+    seen: set[str] = set()
+    for instance in op.instances:
+        for leaf in instantiate(
+                op.definition, instance.offset_mm,
+                instance_index=instance.instance_index, regenerate_ids=True):
+            if leaf["source_element_id"] in seen:
+                raise ComponentSchemaError(
+                    "instances share a source_element_id after regeneration")
+            seen.add(leaf["source_element_id"])
+
+
+__all__ = [
+    "ComponentDefinition",
+    "ComponentError",
+    "ComponentFidelityProof",
+    "ComponentInstance",
+    "ComponentLibrary",
+    "ComponentRoundTripError",
+    "ComponentSchemaError",
+    "PlaceGroupOp",
+    "_place_op_fidelity_proof",
+    "_place_op_fidelity_mismatches",
+    "assert_round_trip",
+    "assert_unique_instance_ids",
+    "build_library",
+    "component_enabled",
+    "expand_library",
+    "extract_component",
+    "instantiate",
+    "place_group_ops",
+    "prove_execution_fidelity",
+]

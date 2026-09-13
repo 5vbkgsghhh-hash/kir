@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <StartupObject>PipeClientTests</StartupObject>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="../../src/Kir.Revit.PipeClient/Program.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/*.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/ConnectorService.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Context/*.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/*.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Transport/*.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Compat/RevitCompat.cs" />
+    <Compile Include="../ContextLifecycle.Tests/RevitStubs.cs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <StartupObject>LifecycleTests</StartupObject>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/Messages.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/ConnectorTarget.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/JsonFraming.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/StrictJson.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/CompilerHostClient.cs" />
+    <Compile Include="../../src/Kir.Revit.CompilerHost/Program.cs" />
+    <Compile Include="../../src/Kir.Revit.CompilerHost/Compiler.cs" />
+    <Compile Include="../../src/Kir.Revit.CompilerHost/CodePolicy.cs" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.12.0" />
+  </ItemGroup>
+</Project>

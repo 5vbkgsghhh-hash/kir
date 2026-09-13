@@ -1,0 +1,2587 @@
+"""KIR ground stage — selector resolution against a model snapshot (SPEC §5, R4).
+
+The create_element GROUND discipline, generalized: *no ungrounded C# is ever
+emitted*. Every Sel<K> resolves to a pinned ElementId here, in ONE pass over a
+snapshot (census-style dict; at serving time built from one batched bridge
+round-trip — this module never talks to the bridge itself, which keeps it
+fully testable with fixtures).
+
+Resolution rules (silent-fallback ban, SPEC §2):
+  by=element_id  -> pinned as-is (existence re-checked by the emitted
+                    null-guard: model may drift between ground and execute).
+  by=name        -> exact match after trim; if none, ONE case-insensitive
+                    match is accepted; zero -> NOT_FOUND with the 5 nearest
+                    names as candidates; several -> AMBIGUOUS with candidates.
+  by=default     -> only where the op declares a deterministic rule:
+                      * wall.type: doc default wall type, resolved IN-EMIT via
+                        GetDefaultElementTypeId (echoed in the witness readback);
+                      * pipe.system_type / pipe.pipe_type: the SOLE snapshot
+                        entry; more than one -> AMBIGUOUS (never "first").
+                    Every default resolution is echoed in the grounding record.
+
+Snapshot shape: {"levels": [{"id": int, "name": str}, ...],
+                 "wall_types": [...], "pipe_types": [...],
+                 "piping_system_types": [...]}
+"""
+from __future__ import annotations
+
+import difflib
+import math
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from kir.midend import GroundedProgram, GroundingContext, GroundingResolution, PlannedProgram
+
+from kir import relate, spec
+from kir.diag import (Diagnostic, KirRefusal, GROUND_BAD_SELECTOR,
+                           EMIT_CONTOUR_SPLINE)
+from kir.emit_utils import ELEMENT_ID_MAX
+# The decision of «which placement type is mandatory» belongs to the REGISTRY,
+# not to this file: here it is only APPLIED (see `_pool_for_placement`).
+from kir.registry_base import PLACEMENT_TYPES_REQUIRED
+
+GROUND_NOT_FOUND = "KIR-G101"
+GROUND_AMBIGUOUS = "KIR-G102"
+GROUND_NO_SNAPSHOT = "KIR-G103"
+GROUND_EMPTY_POOL = "KIR-G104"
+
+#: Word for the gender of the reference, for the human-readable refusal.
+#: Reference gender -> (word, participle). The participle is separate,
+#: because «фаза не найден» is not a typo, but a message written for
+#: English grammar in a Russian product.
+_REF_WORD = {"materials": ("материал", "найден"),
+             "phases": ("фаза", "найдена"),
+             "worksets": ("рабочий набор", "найден")}
+GROUND_BAD_SNAPSHOT = "KIR-G106"
+
+# Sentinel a grounded op carries when the default is resolved in-emit
+# (wall type via GetDefaultElementTypeId) rather than from the snapshot.
+IN_EMIT_DEFAULT = "__doc_default__"
+_MISSING = object()
+
+#: NAMED DEFAULT — pools where the "default type" is drawn from the DOCUMENT
+#: ITSELF, by the declared rule "most commonly used".
+#:
+#: Measurement 02.08.2026 (kir-bench, T1, Snowdon): the C# arm took
+#: `.FirstOrDefault()` and built door 1 of 62 SILENTLY — the user got a type
+#: they never chose, and never found out. Our arm refused with KIR-G102 and
+#: left ZERO trace. The fork between these two outcomes is false: a button
+#: must have a default look, and it must be NAMED, not accidental.
+#:
+#: Why the rule leans on the document rather than on Revit: `ElementTypeGroup`
+#: contains NEITHER `DoorType` NOR `WindowType` — checked name by name against
+#: RevitAPI.xml 2021 and 2026 (94 members; WallType/FloorType/RoofType/
+#: CeilingType/TextNoteType are present, doors and windows are in neither
+#: version). That is why `create_wall.type` has a document default
+#: (`IN_EMIT_DEFAULT`), while asking Revit "what is your default door" is
+#: IMPOSSIBLE BY CONSTRUCTION. The only explainable rule is what a human
+#: would do: "place the same one that is already there."
+#:
+#: THE MEMBERSHIP BOUNDARY IS STRUCTURAL, NOT A MATTER OF TASTE: the pool
+#: must be NARROWED BY CATEGORY in the snapshot collector itself. "That's how
+#: it's done in this project" is meaningful only WITHIN a kind of thing: a
+#: door has an established door type, a column an established section. A
+#: pool without narrowing compares the incomparable.
+#:
+#: `family_symbols` STOOD HERE AND WAS REMOVED 03.08.2026 — my own mistake,
+#: caught by an offline rehearsal over 63 saved parses BEFORE a live Revit
+#: (`scratchpad/rehearse_named_default.py`). It is the only one collected via
+#: `OfClass(FamilySymbol)` WITHOUT `OfCategory` (see
+#: `open_model.GROUND_SNAPSHOT_CS`), and the rule chose from within it:
+#:
+#:   R_0_200Lx50W_-50   10 190 instances, gap 1.73x   ← CURTAIN WALL MULLION TYPE
+#:   Standard            8 070 instances, gap 4.51x
+#:   170x60x5              151 instances, gap 2.29x
+#:   305x305x97UC            2 instances, no second one   ← steel profile
+#:
+#: A mullion is generated by the host grid and `place_family` is never called
+#: to place it at all. That is, `place_family` without a `symbol` would
+#: silently receive an object that this operation does not create — WORSE
+#: than the previous honest refusal, not better.
+#:
+#: A THRESHOLD DID NOT SAVE THIS CASE, and that is the main conclusion: gaps
+#: of 2.29x / 3.65x / 4.51x are confident ones. The trouble is not the
+#: strength of the signal but the incomparability of the candidates, and the
+#: cure is the pool boundary, not a number.
+#:
+#: The list is CLOSED and held by TWO locks (`test_named_default.py`): the
+#: roster of names, and a check of the membership rule itself against the
+#: collector. Extending it is a deliberate, measured decision, not a side
+#: effect: a pool that lands here without reason turns a refusal into a
+#: silent substitution — exactly the defect this rule was written to
+#: prevent.
+MOST_USED_POOLS = frozenset({
+    "door_symbols", "window_symbols",
+    "column_symbols_structural", "column_symbols_architectural",
+    "foundation_symbols", "beam_types",
+})
+
+#: The key in a pool row carrying the number of PLACED instances of this type.
+INSTANCE_COUNT_KEY = "instances"
+
+#: How many times the leader must outnumber the runner-up before it can be
+#: NAMED the project's established practice.
+#:
+#: The threshold came from a measurement over 5 real buildings (03.08.2026,
+#: 64 parses on disk, deduplicated by building). Without it the rule would be
+#: signing off on claims the data cannot support:
+#:
+#:   building        kind     1st   2nd   gap   share
+#:   snowdon_plumb   doors     25    21   1.2x   17%   ← "practice" from 4 doors
+#:   snowdon_plumb   windows   38    32   1.2x   33%
+#:   k2_ar_rd        doors    500   272   1.8x   24%
+#:   demo-v3         doors   2698  1219   2.2x   45%
+#:   sob62_r23       windows   22     7   3.1x   71%
+#:   k2_ar_rd        windows   48     1  48.0x   98%
+#:
+#: 25 versus 21 is not a project standard, it is a coin toss, and calling it
+#: the "most commonly used" means selling the user a confidence that does
+#: not exist.
+#:
+#: HONEST ABOUT WHERE THE NUMBER COMES FROM. The observations split into two
+#: groups with a wide gap between them: {1.0, 1.0, 1.2, 1.2} and
+#: {1.8, 2.2, 3.1, 48, ∞}. The boundary is drawn AT THE LARGEST GAP between
+#: observations (1.2 → 1.8), not at a nice round number: "double" would
+#: sound more convincing, but it would cut off 500 versus 272 in a real
+#: residential building where ДГ 21-8 П is an obvious project standard. The
+#: result cannot be sacrificed for a round number: the user needs a house,
+#: not a refusal.
+#:
+#: This is still an `assigned` boundary in bounds_audit terms, not a
+#: `measured` one: nine data points do not derive a threshold, they only
+#: show where the data breaks. That is why the gap ALWAYS travels in the
+#: receipt — the user sees the strength of the signal for themself and need
+#: not take our number on faith. Revisit at the first building whose gap
+#: lands in the 1.2–1.8 zone.
+MOST_USED_MIN_RATIO = 1.5
+
+
+def _validate_snapshot_pool(snapshot: dict, pool_name: str,
+                            diags: list[Diagnostic]) -> list[dict]:
+    """Return structurally safe rows for one externally supplied pool.
+
+    The census is a bridge result, not trusted compiler state.  A malformed
+    row must become a typed grounding refusal rather than an AttributeError,
+    ValueError, or an out-of-range ElementId literal during emission.
+    Category-specific extra fields (grid endpoints) are deliberately kept;
+    their consumers validate those fields when needed.
+    """
+    raw = snapshot.get(pool_name)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        diags.append(Diagnostic(
+            code=GROUND_BAD_SNAPSHOT, field_name=pool_name,
+            expected="список строк {id, name}", got=type(raw).__name__,
+            message_ru=f"снапшот: пул {pool_name} должен быть списком"))
+        return []
+    rows: list[dict] = []
+    seen_ids: set[int] = set()
+    for index, row in enumerate(raw):
+        field = f"{pool_name}[{index}]"
+        if not isinstance(row, dict):
+            diags.append(Diagnostic(
+                code=GROUND_BAD_SNAPSHOT, field_name=field,
+                expected="{id, name}", got=type(row).__name__,
+                message_ru=f"снапшот: {field} должен быть объектом"))
+            continue
+        element_id, name = row.get("id"), row.get("name")
+        if (isinstance(element_id, bool) or not isinstance(element_id, int)
+                or not (1 <= element_id <= ELEMENT_ID_MAX)):
+            diags.append(Diagnostic(
+                code=GROUND_BAD_SNAPSHOT, field_name=f"{field}.id",
+                expected=f"целое 1..{ELEMENT_ID_MAX}", got=element_id,
+                message_ru=f"снапшот: {field}.id — положительный 64-битный ElementId"))
+            continue
+        if not isinstance(name, str):
+            diags.append(Diagnostic(
+                code=GROUND_BAD_SNAPSHOT, field_name=f"{field}.name",
+                expected="строка", got=type(name).__name__,
+                message_ru=f"снапшот: {field}.name должен быть строкой"))
+            continue
+        if pool_name == "family_symbols":
+            family_fields = ("category", "family_name", "type_name")
+            # Legacy name/element-id selectors remain valid against old
+            # snapshots. Once any v1.1 identity field is present, however,
+            # the triple is inseparable and must be fully well-formed.
+            bad_family_field = next((
+                key for key in family_fields
+                if any(candidate in row for candidate in family_fields)
+                and (not isinstance(row.get(key), str)
+                     or not row[key].strip())
+            ), None)
+            if bad_family_field is not None:
+                diags.append(Diagnostic(
+                    code=GROUND_BAD_SNAPSHOT,
+                    field_name=f"{field}.{bad_family_field}",
+                    expected="непустая строка",
+                    got=row.get(bad_family_field),
+                    message_ru=(f"снапшот: {field}.{bad_family_field} "
+                                "обязателен для family selector")))
+                continue
+        params = row.get("params")
+        if params is not None and (
+                not isinstance(params, dict)
+                or not all(isinstance(key, str) for key in params)):
+            diags.append(Diagnostic(
+                code=GROUND_BAD_SNAPSHOT, field_name=f"{field}.params",
+                expected="объект {имя параметра: значение}",
+                got=type(params).__name__,
+                message_ru=(f"снапшот: {field}.params должен быть объектом "
+                            "со строковыми именами параметров")))
+            continue
+        if element_id in seen_ids:
+            diags.append(Diagnostic(
+                code=GROUND_BAD_SNAPSHOT, field_name=f"{field}.id", got=element_id,
+                message_ru=f"снапшот: ElementId {element_id} повторяется в пуле {pool_name}"))
+            continue
+        seen_ids.add(element_id)
+        rows.append(row)
+    return rows
+
+
+def _nearest(name: str, pool: list[dict]) -> list[dict]:
+    """Closest candidates by name — as POOL ROWS, not bare names.
+
+    🔴 FIXED 24.08.2026, FOUND LIVE. Name-strings were being returned here,
+    and the `KIR-G101` refusal lost TWO facts, both needed for the next turn:
+
+      * `id` — the very `element_id` an author would use to reassemble the
+        selector deterministically. The neighboring `KIR-G102` path has been
+        handing it over since 17.07, and the «не найден» refusal remained
+        the only one where the name is offered up to be searched for by eye;
+      * `placement_type` — the trait by which a candidate can be unusable BY
+        CONSTRUCTION. It was introduced in `8b3e5f64` (24.08) precisely for
+        this refusal — and before this fix it NEVER REACHED it at all.
+
+    A live measurement that same evening («Проект1», Revit 2026):
+    `create_adaptive_component` with a nonexistent name returned five
+    candidates as BARE STRINGS («Выноска элемента», «Коническое врезание»,
+    …) — not one id, not one reason for unusability. The author was shown
+    five names, probably none of them adaptive, with no way to find that
+    out.
+
+    Ordering stays RELEVANCE-BASED (`difflib`), not pool-based: given only a
+    name, closeness by name is the best that can be offered.
+    """
+    by_name: dict[str, dict] = {}
+    for item in pool:
+        by_name.setdefault(str(item.get("name", "")), item)
+    # `n` is NOT its own number. A five used to stand here, having survived
+    # the threshold's rise to twelve (ceb4ea24), and it was exactly this that
+    # made the `_shown_of` caption false.
+    близкие = difflib.get_close_matches(name, list(by_name),
+                                        n=_CANDIDATES_SHOWN, cutoff=0.0)
+    return _candidate_rows([by_name[n] for n in близкие])
+
+
+def _disambiguator(sel: dict, op_index: int, op_id: str, param: str,
+                   diags: list[Diagnostic]) -> Optional[dict]:
+    """Return a normalized disambiguator, or None.
+
+    ``None`` means either "not requested" or "malformed and diagnosed".  The
+    latter is safe because the caller sees the appended typed diagnostic and
+    the ground stage refuses the complete program.
+    """
+    raw = sel.get("disambiguate_by")
+    if raw is None:
+        return None
+    if sel.get("by") not in ("name", "default"):
+        diags.append(Diagnostic(
+            code=GROUND_BAD_SELECTOR, op_index=op_index, op_id=op_id,
+            field_name=f"{param}.disambiguate_by", got=raw,
+            message_ru="disambiguate_by допустим только для name/default"))
+        return None
+    if not isinstance(raw, dict) or set(raw) not in ({"param", "value"},
+                                                     {"param", "value",
+                                                      "tol_mm"}):
+        diags.append(Diagnostic(
+            code=GROUND_BAD_SELECTOR, op_index=op_index, op_id=op_id,
+            field_name=f"{param}.disambiguate_by",
+            expected={"param": "непустое имя", "value": "скаляр"}, got=raw,
+            message_ru="disambiguate_by — объект {param, value}"))
+        return None
+    pname, value = raw.get("param"), raw.get("value")
+    tol = raw.get("tol_mm")
+    if tol is not None and not (
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            and isinstance(tol, (int, float)) and not isinstance(tol, bool)
+            and math.isfinite(float(tol)) and float(tol) > 0.0):
+        # A TOLERANCE IS LEGAL ONLY ON A NUMBER, AND ONLY POSITIVE: on a
+        # string it would mean "similar name" (guessing), on zero it would
+        # mean "exact", which is already expressed by the field's absence.
+        # The second form law stands in `authoring_validation._sel_shape_ok`;
+        # it is the same one here, because grounding must survive input that
+        # never passed through parsing.
+        diags.append(Diagnostic(
+            code=GROUND_BAD_SELECTOR, op_index=op_index, op_id=op_id,
+            field_name=f"{param}.disambiguate_by.tol_mm",
+            expected="положительное конечное число при ЧИСЛОВОМ value", got=tol,
+            message_ru=("tol_mm — допуск сравнения, он законен только у "
+                        "числового значения и только положительный")))
+        return None
+    scalar = (value is None or isinstance(value, (str, bool, int, float)))
+    if (not isinstance(pname, str) or not pname.strip() or not scalar
+            or (isinstance(value, float) and not math.isfinite(value))):
+        diags.append(Diagnostic(
+            code=GROUND_BAD_SELECTOR, op_index=op_index, op_id=op_id,
+            field_name=f"{param}.disambiguate_by",
+            expected={"param": "непустое имя", "value": "JSON-скаляр"}, got=raw,
+            message_ru="disambiguate_by требует имя параметра и конечное скалярное значение"))
+        return None
+    out = {"param": pname.strip(), "value": value}
+    if tol is not None:
+        # THE TOLERANCE TRAVELS FURTHER WHOLE, IT IS NOT LOST ON
+        # NORMALIZATION. The first edit returned only {param, value}, and
+        # that cost two different untruths at once: narrowing compared
+        # EXACTLY (the tolerance never reached it), while
+        # `midend._valid_grounded_selector` checked the declared dict
+        # against the grounded one and found no equality — grounding fell
+        # into KIR-P000. One dict, one meaning, one path.
+        out["tol_mm"] = float(tol)
+    return out
+
+
+def _parameter_equals(actual: Any, expected: Any) -> bool:
+    """Exact, non-coercive equality for externally supplied parameter data."""
+    if isinstance(actual, dict):
+        # The bridge may preserve both a typed/raw value and Revit's display
+        # string for unit-bearing parameters.  Either representation must
+        # still match exactly; no locale parsing or unit guessing happens here.
+        return any(_parameter_equals(actual[key], expected)
+                   for key in ("value", "raw", "display") if key in actual)
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return type(actual) is type(expected) and actual == expected
+    if (isinstance(actual, (int, float))
+            and isinstance(expected, (int, float))):
+        return (not isinstance(actual, bool) and not isinstance(expected, bool)
+                and math.isfinite(float(actual))
+                and math.isfinite(float(expected))
+                and actual == expected)
+    return type(actual) is type(expected) and actual == expected
+
+
+def _disqualified_rows(before: list[dict], disambiguate_by: dict) -> list[dict]:
+    """Candidates filtered out by narrowing — WITH the ACTUAL value of the parameter.
+
+    🔴 WHY (25.08.2026). The "zero after disambiguate_by" refusal handed the
+    author the list from BEFORE narrowing — that is, the id of exactly the
+    row that the author's own predicate had just disqualified. The author
+    went to the named address and got THE SAME refusal: a full loop with no
+    progress.
+
+    The row now carries the ACTUAL value of the parameter that was asked
+    about, and the list turns from a trap into an answer: «просил
+    Diameter=100, у этой 200».
+    """
+    pname = disambiguate_by["param"]
+    rows = []
+    for row in _candidate_rows(before):
+        исходная = next((r for r in before
+                         if int(r.get("id", -1)) == row.get("id")), None)
+        params = (исходная or {}).get("params")
+        было = (params or {}).get(pname, None) if isinstance(params, dict) else None
+        row[pname] = было if было is not None else "нет такого параметра"
+        rows.append(row)
+    return rows
+
+
+def _narrow_by_parameter(pool: list[dict], disambiguate_by: Optional[dict]) -> list[dict]:
+    # An explicit predicate is a constraint, not merely a tie-breaker.  It
+    # must therefore be checked even when the name/default stage happened to
+    # leave one row; otherwise a caller asking for Diameter=100 could silently
+    # receive the sole Diameter=200 type.
+    if disambiguate_by is None:
+        return pool
+    pname, expected = disambiguate_by["param"], disambiguate_by["value"]
+    # 🔴 THE TOLERANCE IS ABOUT THE NUMBER'S REPRESENTATION, NOT ABOUT SIZE,
+    # and the first edit of this comment lied (02.09.2026). It named the
+    # dirt as coming FROM THE SHAPE SIDE — "the thickness comes out as
+    # 379.99999999999994" — and that turned out to be a fabrication: the
+    # measurement gives EXACTLY 380.0 both on the axis-aligned strip and on
+    # one rotated by 1°, 17°, 30°, 45°, because `rhino.faces` rounds the
+    # thickness to 1e-6 mm.
+    #
+    # The real source of the discrepancy is the CATALOG SIDE: Revit stores
+    # lengths in feet, and 250 mm comes back through the bridge as
+    # 250.00000000000003. WE DID NOT MEASURE THIS HERE — there is no live
+    # document in this tree — and that is why the tolerance's magnitude must
+    # be at the order of REPRESENTATION, not of size: a whole-millimeter
+    # tolerance would silently accept a type that is off by a millimeter.
+    #
+    # A tolerance is legal ONLY on a number (checked by the selector's
+    # form): on a string it would mean "similar name", i.e. guessing.
+    tol = disambiguate_by.get("tol_mm")
+    narrowed = []
+    for row in pool:
+        params = row.get("params")
+        actual = params.get(pname, _MISSING) if isinstance(params, dict) else _MISSING
+        if actual is _MISSING:
+            continue
+        if tol is None:
+            if _parameter_equals(actual, expected):
+                narrowed.append(row)
+        elif _parameter_within(actual, expected, float(tol)):
+            narrowed.append(row)
+    return narrowed
+
+
+def _parameter_within(actual: Any, expected: Any, tol: float) -> bool:
+    """Numeric equality WITHIN a tolerance. Neither strings nor booleans.
+
+    Exactly the same value carriers as `_parameter_equals` (the bridge
+    stores both the typed and the displayed value): a second law for
+    reading a pool row would part ways with the first on the very first
+    parameter that has units.
+    """
+    if isinstance(actual, dict):
+        return any(_parameter_within(actual[key], expected, tol)
+                   for key in ("value", "raw", "display") if key in actual)
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return False
+    if not (isinstance(actual, (int, float))
+            and isinstance(expected, (int, float))):
+        return False
+    if not (math.isfinite(float(actual)) and math.isfinite(float(expected))):
+        return False
+    return abs(float(actual) - float(expected)) <= tol
+
+
+def _instance_count(row: dict) -> Optional[int]:
+    """The number of placed instances, or None if the row does not carry one.
+
+    `bool` is excluded deliberately: in Python `True == 1`, and a counter
+    that arrives as a boolean means a broken collector, not "one instance"."""
+    value = row.get(INSTANCE_COUNT_KEY)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _most_used(pool: list[dict], pool_name: str,
+               disambiguate_by: Optional[dict]) -> Optional[dict]:
+    """Named default: the most commonly used type in THIS document.
+
+    Returns None (the rule does not apply — the caller continues on the
+    previous path, up to a refusal) in each case where the choice would
+    stop being explainable:
+
+    * the pool is not declared in `MOST_USED_POOLS`;
+    * at least one pool row has no counter — at best, over incomplete data,
+      this would be a claim we cannot prove (an older bridge that does not
+      send counters must keep the previous behavior byte for byte);
+    * not a single placed instance — the rule has nothing to lean on;
+    * a TIE at the maximum — equality means there is no established
+      practice in the project, and the choice really is arbitrary. Rigor is
+      cheap here, and we do not give it up: a refusal with candidates is
+      more honest than a coin flip;
+    * a WEAK GAP from the runner-up (< ``MOST_USED_MIN_RATIO``) — "most
+      commonly used" at 25 against 21 sells a confidence that does not
+      exist.
+    """
+    if pool_name not in MOST_USED_POOLS or not pool:
+        return None
+    counts = [_instance_count(row) for row in pool]
+    if any(count is None for count in counts):
+        return None
+    top = max(counts)
+    if top <= 0:
+        return None
+    winners = [row for row, count in zip(pool, counts) if count == top]
+    if len(winners) != 1:
+        return None
+    # The gap is measured from the BEST OF THE REST, not from the pool's
+    # second row: row order is the collector's business, and relying on it
+    # would mean bringing back `.FirstOrDefault()` through the back door.
+    runner_up = max((count for count in counts if count != top), default=0)
+    if runner_up and top < runner_up * MOST_USED_MIN_RATIO:
+        return None
+    row = winners[0]
+    return {
+        "id": int(row["id"]),
+        "name": str(row.get("name")),
+        "via": ("most_used+disambiguate_by"
+                if disambiguate_by is not None else "most_used"),
+        # The rule must not only be applied, but also DISPLAYED: without
+        # these numbers the choice is indistinguishable from
+        # `.FirstOrDefault()` in a costume. `runner_up` always travels along
+        # — the threshold is an assigned one, and the user must see the
+        # strength of the signal rather than take our pair of numbers on
+        # faith.
+        "rule_detail": {"instances": top, "candidates": len(pool),
+                        "runner_up": runner_up},
+        **({"disambiguate_by": disambiguate_by}
+           if disambiguate_by is not None else {}),
+    }
+
+
+#: How many candidates travel in the refusal. The number is DERIVED FROM A
+#: MEASUREMENT, not picked as a round one — see below.
+#:
+#: 🔴 IT USED TO BE FIVE, AND FIVE COST A MODEL A TURN (measured 26.08.2026).
+#: A live run by a real model: on seeing "SHOWN 5 OF 9", it did NOT go call
+#: `query_types` — it chose from the five. Its own trace records this
+#: verbatim: «I only saw 5 of 9». The refusal was honest (it named the
+#: remainder and the door), but the fix cost A WHOLE TURN, and a turn is
+#: worth more than three lines of text.
+#:
+#: THE MEASUREMENT THAT SET THE NUMBER: 83 saved open-model profiles,
+#: 1344 non-empty pool observations (`open_model.profile.json`, field
+#: `total_count`). Share of pools that fit ENTIRELY INTO THE REFUSAL:
+#:
+#:      threshold  5   48.3 %        threshold 16   67.6 %   (+0.7 pp over 12)
+#:      threshold 12   66.9 %        threshold 24   72.9 %
+#:
+#: The curve breaks exactly at twelve: from 5 to 12 that is +18.6 pp, from 12
+#: to 16 it is +0.7. Twelve is not a round number, it is the break point.
+#:
+#: AND MOST IMPORTANT — WHAT EXACTLY BECOMES FULLY VISIBLE. At twelve, what
+#: becomes fully visible is EXACTLY the pools on which the model chooses a
+#: type and on which live refusals concentrate:
+#:
+#:      piping_system_types  max  12  · 100 %   ← 494 `create_pipe` refusals,
+#:                                                every single one «несколько
+#:                                                варианта, default
+#:                                                невозможен»
+#:      duct_types           max  11  · 100 %
+#:      cable_tray_types     max   7  · 100 %
+#:      ceiling_types        max  10  · 100 %
+#:      railing_types        max  44  ·  93 %
+#:      window_symbols       max 162  ·  85 %
+#:
+#: Pools that will never fit (`family_symbols` median 320, `levels` 40,
+#: `wall_types` 48) KEEP the note about the remainder and the door — honesty
+#: is not weakened, only the size up to which it need not be invoked has
+#: changed.
+#:
+#: THE COST IS NAMED: seven extra names in a refusal — on the order of a
+#: hundred and seventy characters — and they are paid ONLY where there are
+#: genuinely more than five candidates. The previous edit's argument
+#: ("a list the eye cannot read does not help you choose") remains true, and
+#: that is why the threshold was not raised to 24: twelve lines the eye can
+#: read, forty it no longer can.
+_CANDIDATES_SHOWN = 12
+
+
+def _candidate_rows(pool: list[dict]) -> list[dict]:
+    rows = []
+    for item in pool[:_CANDIDATES_SHOWN]:
+        row = {"id": int(item["id"]), "name": str(item.get("name"))}
+        # `placement_type` — the trait by which a candidate can be unusable
+        # BY CONSTRUCTION, not by taste: an adaptive op needs Adaptive, a
+        # beam needs CurveDriven*, `place_family` places only point-based
+        # ones. Live on 24.08 a refusal carried 323 candidates and not one
+        # reason (see the CandidateNamesWhyItIsUnusable test). If the key is
+        # not in the row, we do not make one up: "did not read it" and "read
+        # it, and here is what it says" must be distinguished.
+        for key in ("category", "family_name", "type_name", "placement_type"):
+            if isinstance(item.get(key), str):
+                row[key] = item[key]
+        rows.append(row)
+    return rows
+
+
+#: The value with which C# writes "the property failed to read". THIS IS AN
+#: INSTRUMENT REFUSAL, not a fact about the family: `Family.FamilyPlacementType`
+#: throws for some system families. Treating it as unusable would turn our
+#: own blindness into a claim about the model — precisely the kind of
+#: defect this tree gives a name to.
+_PLACEMENT_UNREADABLE = "unreadable"
+
+
+def _placement_known(row: dict) -> bool:
+    """The trait is READABLE — that is, it can be used to judge."""
+    got = row.get("placement_type")
+    return isinstance(got, str) and got != _PLACEMENT_UNREADABLE
+
+
+def _pool_for_placement(op_name: str, param: str, pool: list[dict],
+                        op_index: int, op_id: str,
+                        diags: list) -> Optional[list[dict]]:
+    """The pool NARROWED to usable ones by placement type, or None with a refusal.
+
+    🔴 WHY (24.08.2026, live measurement). `placement_type` has been reaching
+    Python since 24.08, but there was nowhere to filter by it: the pool
+    handed back 320 candidates, NOT ONE of which was usable, and the refusal
+    read «выбери один из 320». The correct answer is different: «адаптивных
+    в модели нет, выбирать не из чего» — and these are different NEXT TURNS:
+    in the second case the author goes to load a family, not page through a
+    list.
+
+    Three outcomes, and they DIFFER:
+      · no requirement            -> the pool as is (most ops);
+      · usable ones exist         -> only those;
+      · the pool is NOT EMPTY, usable count is ZERO -> a refusal NAMING both
+                                    what was required and what was found. An
+                                    empty pool never reaches here: "there is
+                                    nothing in the model" is a different
+                                    fact, and it is stated by the general
+                                    rule.
+
+    A row WITHOUT `placement_type` — and a row with `"unreadable"` — is
+    treated as USABLE: "did not read it" is not "unusable", and dropping it
+    would turn an instrument's refusal into a claim about the model. C#
+    writes `"unreadable"` PRECISELY to distinguish "read it, and here is
+    what it says" from "could not"; this is exactly where that distinction
+    is spent.
+
+    🔴 WHAT THIS FILTER DOES NOT SEE, AND THIS IS NAMED, NOT FORGOTTEN. The
+    pool's `{"by": "element_id"}` selector DOES NOT READ at all — the id is
+    accepted as authority — so an id unusable by placement will not reach
+    here. This leaves no hole: that path is caught by REVIT itself and
+    answered with a typed refusal carrying the same next turn (measured
+    live 24.08: «типоразмер не адаптивный: у этого семейства нет точек
+    размещения. Следующий ход — загрузить адаптивное семейство
+    (load_family) либо взять place_family»). The only difference is in
+    COST: here the refusal arrives BEFORE the transaction, there — after it
+    is sent. Fixing this would mean reading the pool on a path that the
+    pool deliberately does not read.
+    """
+    нужно = PLACEMENT_TYPES_REQUIRED.get((op_name, param))
+    if not нужно or not pool:
+        return pool
+    годные = [row for row in pool
+              if not _placement_known(row) or row["placement_type"] in нужно]
+    if годные:
+        return годные
+    встретилось = sorted({row["placement_type"] for row in pool
+                          if _placement_known(row)})
+    diags.append(Diagnostic(
+        code=GROUND_EMPTY_POOL, op_index=op_index, op_id=op_id,
+        field_name=param, expected=sorted(нужно),
+        candidates=_candidate_rows(pool),
+        message_ru=(
+            f"{op_name}.{param}: в модели {len(pool)} подходящих по категории, "
+            f"но НИ ОДНОГО с типом размещения {', '.join(sorted(нужно))} — "
+            f"встретились: {', '.join(встретилось) or 'признак не прочитан'}. "
+            f"СЛЕДУЮЩИЙ ХОД: загрузи нужное семейство (load_family) — "
+            f"перебирать пул бесполезно, годных в нём нет ПО ПОСТРОЕНИЮ")))
+    return None
+
+
+def _shown_of(pool: list[dict], pool_name: str,
+              показаны: list[dict]) -> str:
+    """«Показаны 5 из 185, весь список — query_types(...)» or EMPTY.
+
+    WHY THIS EXISTS (measured 12.08.2026). A refusal carries five candidates
+    and offers «уточни через element_id из candidates». The pool, though, is
+    often far bigger than five: across 69 saved corpus profiles **43.6% of
+    all pool observations are more than five**, and `family_symbols` and
+    `levels` exceed five in 69 profiles out of 69 (maxima 741 and 122;
+    `wall_types` — 185 in 59 profiles out of 69). Before this line, a model
+    could not tell "five of five" from "five of seven hundred forty-one" and
+    would choose a type from a truncated set, taking it for the whole.
+
+    THE SLICE FOLLOWS ARRIVAL ORDER (the pool is sorted by ElementId, i.e. by
+    creation order in the document) — a magnitude unrelated to the question.
+    Where a NAME EXISTS, the right idiom already stands right next to this in
+    the same file — `_nearest()` cuts by RELEVANCE (`difflib`). Here there is
+    no name by construction (the `by=default` branch), so there is nowhere to
+    draw relevance from, and there is one honest move: NAME THE REMAINDER AND
+    GIVE A WAY TO READ IT. The number says how much you do not see; the next
+    turn says what to do about it.
+
+    A pool that fits in whole pays not a single character: the note appears
+    only when there is something that does not fit.
+    """
+    # 🔴 THE NUMBER IS TAKEN FROM THE SAME LIST THAT WENT TO THE AUTHOR
+    # (26.08.2026).
+    #
+    # A CONSTANT, `_CANDIDATES_SHOWN`, used to stand here, meaning the
+    # message ASSERTED how many rows were shown instead of COUNTING them.
+    # Exactly our named defect: a quantity is declared in one place, read in
+    # another, and nothing forced them to match.
+    #
+    # AND THEY DIVERGED. The "name not found" branch (`KIR-G101`) hands
+    # candidates back via `_nearest`, which cut by RELEVANCE with its own
+    # `n=5` — its own carrier of the same number. The author got FIVE rows
+    # under the caption «ПОКАЗАНЫ 12 ИЗ 48». The caption lied to exactly the
+    # party that acts on it for the next turn.
+    #
+    # This is the THIRD carrier in one day: 1e8ebe24 (26.08, morning) merged
+    # two truncators that wrote «модель видела 8» where it had seen 11. Since
+    # a shared constant did not hold them together even by evening, what
+    # holds them from here on is CONSTRUCTION: `shown` is the very object
+    # that went into `candidates=`, and there is nothing left for them to
+    # diverge over. A fellow smith on the marathon asked the question
+    # («did the 5→12 raise apply to ALL pools?») — the answer turned out to
+    # be "no".
+    total = len(pool)
+    shown = len(показаны)
+    if total <= shown:
+        return ""
+    # 🔴 THE DOOR IS NAMED ONLY IF IT EXISTS (carried over at merge time
+    # 15.08.2026 from the catalog branch, where it stood as a separate
+    # function, `_catalogue_hint`). There is no second such function here and
+    # there will not be one: two things obligated to agree are this tree's
+    # named defect. The REGISTRY is consulted, not a hand-written list: to
+    # name, in a refusal, a pool that `query_types` cannot reach would mean
+    # sending the author to a door that does not exist.
+    askable = set(spec.OPS["query_types"].params[0].choices)
+    if pool_name not in askable:
+        return f" ПОКАЗАНЫ {shown} ИЗ {total} — остальные не видны"
+    return (f" ПОКАЗАНЫ {shown} ИЗ {total} — остальные не видны; "
+            f"весь список: query_types(pool=\"{pool_name}\")")
+
+
+def _producer_call_of(name: str, kind_value: str) -> str:
+    """EXACTLY how to call this op so that it yields THIS kind.
+
+    The op's name alone is not enough when a parameter decides the kind:
+    `create_wall_type` without `host_kind` gives a WALL type, and a model
+    that read «поставь create_wall_type» would get KIR-L004 on the next
+    turn. A refusal that costs an extra round is the same defect as a
+    refusal with an unworkable move, only more expensive: it looks like it
+    worked.
+    """
+    op = spec.OPS[name]
+    if op.result_by_param is None:
+        return f"`{name}`"
+    pname, table = op.result_by_param
+    values = sorted(value for value, rspec in table.items()
+                    if rspec.reference_kind is not None
+                    and rspec.reference_kind.value == kind_value)
+    if not values:
+        return f"`{name}`"
+    return f"`{name}` с {pname}={' либо '.join(repr(v) for v in values)}"
+
+
+def _producers_of(kind_value: str) -> list[str]:
+    """Ops that PRODUCE a reference of this kind. We ask the registry, not a list.
+
+    The kind of the result is sometimes decided by a PARAMETER
+    (`create_wall_type.host_kind`), so `result_kinds` is queried — all the
+    kinds an op is able to produce. Reading just `result` here would mean
+    telling an empty `floor_types` pool that there is "nothing to produce
+    it" when a producing op does exist: a refusal that names an unworkable
+    move costs more than a refusal that names none."""
+    return sorted(
+        name for name, op in spec.OPS.items()
+        if any(r.reference_kind is not None
+               and r.reference_kind.value == kind_value
+               for r in op.result_kinds))
+
+
+def _empty_pool_next_move(op_name: str, param: str) -> str:
+    """The next move for an EMPTY pool — and only a WORKABLE one.
+
+    WHY THIS IS NOT ONE PHRASE FOR EVERYONE. A refusal naming an unworkable
+    move is worse than a refusal naming none: it looks like help and costs a
+    round that could never have succeeded. Measured 13.08 on a real building:
+    of 22 empty pools the move is workable for **two**
+    (`create_column.symbol`, `create_foundation.symbol` — both accept
+    `family_symbol`, which the language knows how to produce), and NOT
+    workable for twenty: their parameters do not accept a reference at all,
+    and the language produces only four kinds (`element`, `family_symbol`,
+    `level`, `wall`).
+
+    The distinction is drawn not by my list but by the REGISTRY: whether the
+    parameter's `ref_kinds` intersects with the kinds that have a producer.
+    Add a producer tomorrow, and the phrase will change on its own.
+    """
+    op = spec.OPS.get(op_name)
+    pspec = next((p for p in op.params if p.name == param), None) if op else None
+    for kind in (pspec.ref_kinds if pspec else ()):
+        producers = _producers_of(kind.value)
+        if producers:
+            how = " или ".join(_producer_call_of(name, kind.value)
+                               for name in producers)
+            return (f"Создай его В ЭТОЙ ЖЕ программе: поставь {how} выше, затем "
+                    f"{param}: {{\"by\": \"ref\", \"value\": \"<id того опа>\"}}. "
+                    f"Снимок переснимать не нужно — ссылка разрешается внутри "
+                    f"программы")
+    return ("Ни одна операция KIR не создаёт этот род, поэтому в программе "
+            "сделать нечего: тип обязан появиться в документе иначе (шаблон "
+            "проекта или загрузка семейства пользователем), и только после "
+            "этого — НОВОЕ чтение модели")
+
+
+def _refuse_sole_visible(pool_name: str, pool: list[dict], why: str,
+                         op_index: int, op_id: str, param: str,
+                         diags: list) -> None:
+    """ONE form of the refusal «a truncated pool does not prove uniqueness» (F7).
+
+    A truncated pool cannot prove sole-entry-ness (audit F7): the sole VISIBLE
+    row may have invisible siblings beyond the cap.
+
+    🔴 WHY A SHARED FORM, NOT THREE SIMILAR ONES (04.09.2026, audit finding
+    FC-16). The argument above was written exactly once — in the
+    ``by == "default"`` branch — and worked there and only there. The
+    neighboring branches asked the SAME question ("exactly one visible
+    match") and NEVER asked about ``truncated``. A second carrier of this
+    law was not needed; ONE was needed, and here it is.
+    ``relate._find_grid`` references this same one — it says "following the
+    ``ground._resolve_one`` TEMPLATE", and a template must be singular and
+    real.
+    """
+    показаны = _candidate_rows(pool)
+    diags.append(Diagnostic(
+        code=GROUND_AMBIGUOUS, op_index=op_index, op_id=op_id,
+        field_name=param, candidates=показаны,
+        message_ru=(f"{pool_name}: снапшот-пул обрезан коллектором — "
+                    f"{why}, укажите element_id"
+                    + _shown_of(pool, pool_name, показаны))))
+    return None
+
+
+def _resolve_one(sel: Any, pool_name: str, pool: list[dict], op_index: int,
+                 op_id: str, param: str, op_name: str,
+                 diags: list, truncated: bool = False) -> Optional[dict]:
+    """Returns {"id": int, "name": str, "via": ...} or None (diag appended).
+
+    ``truncated`` (audit F7): the snapshot pool was capped by the collector and
+    the model holds MORE rows than were sent.  A not-found says so, and NO
+    sole-visible-row resolution is granted — neither ``default``, nor an exact
+    ``name``, nor a ``family_type`` triple: "the sole visible entry" proves
+    nothing about an invisible remainder.
+
+    🔴 THE SECOND AND THIRD HALVES OF THIS LAW WERE COMPLETED 04.09.2026
+    (audit FC-16), AND BEFORE THAT THE DOCSTRING SAID THE OPPOSITE. It used
+    to read: «A by=name/exact match inside the slice is still accepted
+    (id-ordered slice; the residual same-name-twin risk is documented)». The
+    measurement refutes both halves of that sentence:
+
+        pool [{11,"Тип A"}, {12,"Другое"}], truncated=True
+            by=name   "Тип A"      -> id 11, diags 0   (the word `truncated`
+                                      appeared 0 times in the success branch)
+            by=family_type F/T     -> id 21, diags 0
+        CONTROL truncated=False   -> the same ids, and this IS LEGAL
+
+    "Risk documented" is not a mechanism: `id`-ordering of the slice only
+    says WHERE the cut was made, and nothing about what lies beyond the cut.
+    A namesake with the same name beyond the ceiling turns the verdict from
+    AMBIGUOUS (a refusal the author fixes with a single `element_id`) into a
+    SILENTLY CHOSEN WRONG TYPE — a silently-incorrect outcome, forbidden by
+    the cardinal invariant.
+
+    THE DIFFERENCE FROM ``default`` IS NAMED, NOT PASSED OVER IN SILENCE,
+    AND IT IS ONE: a name has a LEGAL case — the pool is NOT truncated, and
+    then "one exact match" is itself proof of uniqueness. That case
+    remains: the refusal is hung EXACTLY on ``truncated``, not on the name
+    as such. Truncated — there is nothing to prove with, and the author's
+    next move is precise: ``{"by": "element_id", "value": <id>}``, which
+    does not touch the slice at all.
+    """
+    if not isinstance(sel, dict) or sel.get("by") not in (
+            "name", "element_id", "default", "family_type"):
+        diags.append(Diagnostic(
+            code=GROUND_BAD_SELECTOR, op_index=op_index, op_id=op_id, field_name=param,
+            expected={"by": "name|element_id|default|family_type"}, got=sel,
+            message_ru=f"{param} — селектор {{by, value}}"))
+        return None
+    by = sel["by"]
+    if by == "family_type":
+        expected_fields = {"by", "category", "family_name", "type_name"}
+        if set(sel) != expected_fields or any(
+                not isinstance(sel.get(key), str) or not sel[key].strip()
+                for key in ("category", "family_name", "type_name")):
+            diags.append(Diagnostic(
+                code=GROUND_BAD_SELECTOR, op_index=op_index, op_id=op_id,
+                field_name=param,
+                expected={
+                    "by": "family_type", "category": "OST_...",
+                    "family_name": "...", "type_name": "...",
+                },
+                got=sel,
+                message_ru=(f"{param}: family_type требует category+family_name+"
+                            "type_name")))
+            return None
+        want = {
+            key: sel[key].strip()
+            for key in ("category", "family_name", "type_name")
+        }
+        exact = [
+            row for row in pool
+            if all(row.get(key) == value for key, value in want.items())
+        ]
+        if len(exact) == 1:
+            if truncated:
+                # THE SAME reason as for the name below: the
+                # category/family/type triple is NOT unique by construction
+                # (the same type-symbol can be entered twice), so "exactly
+                # one visible match" proves uniqueness only on the FULL
+                # pool. And this pool does get cut live —
+                # `acceptance.symbol_rows_from_snapshot` abstains exactly on
+                # `family_symbols__truncated`.
+                return _refuse_sole_visible(
+                    pool_name, pool,
+                    f"единственное ВИДИМОЕ совпадение тройки {want} не "
+                    f"доказывает, что за срезом нет второго такого символа",
+                    op_index, op_id, param, diags)
+            return {
+                "id": int(exact[0]["id"]),
+                "name": str(exact[0]["name"]),
+                "via": "family_type",
+                **want,
+            }
+        diags.append(Diagnostic(
+            code=(GROUND_NOT_FOUND if not exact else GROUND_AMBIGUOUS),
+            op_index=op_index,
+            op_id=op_id,
+            field_name=param,
+            got=want,
+            candidates=_candidate_rows(exact if exact else pool),
+            message_ru=(
+                f"{pool_name}: family selector не найден"
+                if not exact else
+                f"{pool_name}: family selector неоднозначен — "
+                f"{len(exact)} совпадений"),
+        ))
+        return None
+    disambiguate_by = _disambiguator(sel, op_index, op_id, param, diags)
+    if "disambiguate_by" in sel and disambiguate_by is None:
+        return None
+    if by == "element_id":
+        val = sel.get("value")
+        if (isinstance(val, bool) or not isinstance(val, int)
+                or not (1 <= val <= ELEMENT_ID_MAX)):
+            diags.append(Diagnostic(
+                code=GROUND_BAD_SELECTOR, op_index=op_index, op_id=op_id,
+                field_name=f"{param}.value",
+                expected=f"целое 1..{ELEMENT_ID_MAX}", got=val,
+                message_ru="element_id — положительное 64-битное целое"))
+            return None
+        return {"id": val, "name": None, "via": "element_id"}
+    if by == "name":
+        val = sel.get("value")
+        if not isinstance(val, str) or not val.strip():
+            diags.append(Diagnostic(
+                code=GROUND_BAD_SELECTOR, op_index=op_index, op_id=op_id,
+                field_name=f"{param}.value", expected="непустая строка", got=val,
+                message_ru="имя — непустая строка"))
+            return None
+        want = val.strip()
+        exact = [p for p in pool if str(p.get("name", "")).strip() == want]
+        if not exact:
+            ci = [p for p in pool
+                  if str(p.get("name", "")).strip().lower() == want.lower()]
+            # One case-insensitive match may resolve, several are AMBIGUOUS.
+            # Keeping ``exact=[]`` for the latter used to misreport a real
+            # ambiguity as NOT_FOUND (F31).
+            exact = ci
+        initial_matches = exact
+        exact = _narrow_by_parameter(exact, disambiguate_by)
+        if len(exact) == 1:
+            if truncated:
+                # 🔴 THE ONLY VISIBLE NAMESAKE IS NOT THE ONLY ONE (FC-16).
+                # `disambiguate_by` does not fix this: it narrows VISIBLE
+                # rows, while the issue is about invisible ones. The
+                # argument and the refusal's form are shared, see
+                # `_refuse_sole_visible`.
+                return _refuse_sole_visible(
+                    pool_name, initial_matches or pool,
+                    f"единственное ВИДИМОЕ совпадение имени «{want}» не "
+                    f"доказывает, что за срезом нет тезки",
+                    op_index, op_id, param, diags)
+            return {"id": int(exact[0]["id"]), "name": str(exact[0]["name"]),
+                    "via": ("name+disambiguate_by"
+                            if disambiguate_by is not None else "name"),
+                    **({"disambiguate_by": disambiguate_by}
+                       if disambiguate_by is not None else {})}
+        if not initial_matches:
+            trunc_note = ("; снапшот-пул обрезан коллектором — тип может "
+                          "существовать за пределами среза, используйте "
+                          "element_id" if truncated else "")
+            показаны = _nearest(want, pool)
+            diags.append(Diagnostic(
+                code=GROUND_NOT_FOUND, op_index=op_index, op_id=op_id,
+                field_name=param, got=want, candidates=показаны,
+                message_ru=(f"{pool_name}: «{want}» не найден" + trunc_note
+                            + _shown_of(pool, pool_name, показаны))))
+        elif disambiguate_by is not None and not exact:
+            # 🔴 ZERO AFTER NARROWING IS NOT-FOUND (25.08.2026, an audit
+            # finding, reproduced by a run). `AMBIGUOUS` used to stand here
+            # with the text «неоднозначен — после disambiguate_by осталось 0
+            # совпадений»: a sentence that refutes itself. Zero matches is
+            # never ambiguous.
+            #
+            # And the candidates were taken FROM BEFORE narrowing — that is,
+            # the refusal handed the author the id of exactly the row that
+            # the author's own predicate had disqualified. The author went
+            # to the named address and got THE SAME refusal: a full loop
+            # with no progress.
+            показаны = _disqualified_rows(initial_matches, disambiguate_by)
+            diags.append(Diagnostic(
+                code=GROUND_NOT_FOUND, op_index=op_index, op_id=op_id,
+                field_name=param,
+                got={"name": want, "disambiguate_by": disambiguate_by},
+                candidates=показаны,
+                message_ru=(
+                    f"{pool_name}: «{want}» есть "
+                    f"({len(initial_matches)} шт.), но НИ ОДНА строка не "
+                    f"прошла disambiguate_by "
+                    f"{disambiguate_by['param']}={disambiguate_by['value']!r}. "
+                    f"У кандидатов ниже показано ФАКТИЧЕСКОЕ значение этого "
+                    f"параметра. СЛЕДУЮЩИЙ ХОД: возьми существующее значение "
+                    f"либо адресуй "
+                    f"{{\"by\": \"element_id\", \"value\": <id>}}"
+                    + _shown_of(initial_matches, pool_name, показаны))))
+        else:
+            # KIR-G102 disambiguation path (2026-07-17): several pool entries
+            # share `want` verbatim (e.g. several duct/cable-tray types named
+            # "По умолчанию" — routine in real projects, see fix report).
+            # Surface each candidate's element_id alongside its name so the
+            # caller's NEXT program can re-select deterministically via
+            # {"by": "element_id", "value": <id>} instead of retrying the
+            # same ambiguous name. The ids were already sitting in `pool`
+            # (same dicts _resolve_one reads `id`/`name` off of two branches
+            # above) — only the AMBIGUOUS diagnostic used to throw them away.
+            показаны = _candidate_rows(
+                exact if exact or disambiguate_by is None else initial_matches)
+            diags.append(Diagnostic(
+                code=GROUND_AMBIGUOUS, op_index=op_index, op_id=op_id,
+                field_name=param,
+                got=({"name": want, "disambiguate_by": disambiguate_by}
+                     if disambiguate_by is not None else want),
+                candidates=показаны,
+                message_ru=(
+                    f"{pool_name}: «{want}» неоднозначен — после "
+                    f"disambiguate_by осталось {len(exact)} совпадений"
+                    if disambiguate_by is not None else
+                    f"{pool_name}: «{want}» неоднозначен — "
+                    f"{len(exact)} совпадений; уточни через "
+                    f"{{\"by\": \"element_id\", \"value\": <id из candidates>}}"
+                    + _shown_of(exact, pool_name, показаны))))
+        return None
+    # by == "default"
+    # AN EXPLICIT `{"by":"default"}` READS THE SAME HOUSE AS AN OMISSION.
+    # Before 24.08, ONE op out of eight stood here, and the consequence was
+    # worse than a mere discrepancy: for seven ops an EXPLICIT "take the
+    # default" and an OMITTED parameter produced OPPOSITE outcomes — an
+    # omission went through to the document, while the explicit request fell
+    # into the "sole entry in the pool" rule and refused with KIR-G102 on a
+    # real project. An author who said out loud what the system does
+    # silently got refused FOR IT.
+    if (op_name in OPS_WITH_DOC_DEFAULT_TYPE and param == "type"
+            and disambiguate_by is None):
+        return {"id": None, "name": None, "via": "doc_default",
+                "in_emit": IN_EMIT_DEFAULT}
+    initial_pool = pool
+    if truncated and initial_pool:
+        # The argument and the form are shared with the `name`/`family_type`
+        # branches above; it was written here first, and since 04.09 it
+        # lives in `_refuse_sole_visible`.
+        return _refuse_sole_visible(
+            pool_name, initial_pool, "default/sole-entry невозможен",
+            op_index, op_id, param, diags)
+    pool = _narrow_by_parameter(pool, disambiguate_by)
+    if len(pool) == 1:
+        return {"id": int(pool[0]["id"]), "name": str(pool[0].get("name")),
+                "via": ("sole_entry+disambiguate_by"
+                        if disambiguate_by is not None else "sole_entry"),
+                **({"disambiguate_by": disambiguate_by}
+                   if disambiguate_by is not None else {})}
+    # THE NAMED DEFAULT sits strictly between "sole entry in the pool" and
+    # the refusal. The order is not accidental: sole_entry is stronger (a
+    # single candidate needs no selection rule), and the refusal must stay
+    # exactly where the rule fell silent.
+    named = _most_used(pool, pool_name, disambiguate_by)
+    if named is not None:
+        return named
+    # 🔴 THE SAME LAW AS THE `by=name` BRANCH (25.08.2026): zero after
+    # narrowing is NOT-FOUND, not ambiguity, and the candidates have no
+    # right to be the very rows that narrowing just disqualified.
+    if disambiguate_by is not None and not pool and initial_pool:
+        показаны = _disqualified_rows(initial_pool, disambiguate_by)
+        diags.append(Diagnostic(
+            code=GROUND_NOT_FOUND, op_index=op_index, op_id=op_id,
+            field_name=param, got={"disambiguate_by": disambiguate_by},
+            candidates=показаны,
+            message_ru=(
+                f"{pool_name}: в пуле {len(initial_pool)} строк, но НИ ОДНА "
+                f"не прошла disambiguate_by "
+                f"{disambiguate_by['param']}={disambiguate_by['value']!r}. "
+                f"У кандидатов ниже показано ФАКТИЧЕСКОЕ значение этого "
+                f"параметра. СЛЕДУЮЩИЙ ХОД: возьми существующее значение "
+                f"либо адресуй {{\"by\": \"element_id\", \"value\": <id>}}"
+                + _shown_of(initial_pool, pool_name, показаны))))
+        return None
+    code = GROUND_EMPTY_POOL if not initial_pool else GROUND_AMBIGUOUS
+    # Same id-surfacing fix as the by=name AMBIGUOUS branch above, for the
+    # by=default path (omitted param, several pool entries -> AMBIGUOUS never
+    # "first"): EMPTY_POOL has no candidates by construction (pool is empty),
+    # AMBIGUOUS gets {id, name} pairs so the caller can re-issue with an
+    # explicit element_id selector instead of retrying default.
+    показаны = _candidate_rows(
+        pool if pool or disambiguate_by is None else initial_pool)
+    diags.append(Diagnostic(
+        code=code, op_index=op_index, op_id=op_id, field_name=param,
+        got=({"disambiguate_by": disambiguate_by}
+             if disambiguate_by is not None else None),
+        candidates=показаны,
+        message_ru=(
+            f"{pool_name}: пусто в модели. {_empty_pool_next_move(op_name, param)}"
+            if not initial_pool else
+            f"{pool_name}: после disambiguate_by осталось {len(pool)} вариантов"
+            + _shown_of(pool, pool_name, показаны)
+            if disambiguate_by is not None else
+            # THERE WAS NO NUMBER HERE AT ALL — the branch said "several
+            # options" and offered to choose from candidates, naming
+            # neither how many there were nor that not all were shown. This
+            # is the worst of the three cases in this file: truncation with
+            # neither a magnitude nor a name for the remainder.
+            f"{pool_name}: {len(pool)} вариантов — default невозможен, "
+            f"уточните через "
+            f"{{\"by\": \"element_id\", \"value\": <id из candidates>}}"
+            + _shown_of(pool, pool_name, показаны))))
+    return None
+
+
+#: Rules where the choice was made by the COMPILER, not the program's author.
+#: Everything else (`name`, `element_id`, `family_type`, `ref`) is an echo of
+#: what was said, and there is nothing to report there. The "+disambiguate_by"
+#: pair remains the compiler's choice: narrowing constrains the pool, but the
+#: rule still makes the final step.
+_COMPILER_CHOICE_RULES = frozenset({
+    "most_used", "most_used+disambiguate_by",
+    "sole_entry", "sole_entry+disambiguate_by",
+    "doc_default",
+})
+
+#: Who answers the question "which type" when the compiler has handed it off
+#: to the document. This is NOT "we don't know", it is "Revit knows, and it
+#: only knows at the moment of construction": `doc.GetDefaultElementTypeId(
+#: ElementTypeGroup.*)` is asked of the open document inside the transaction
+#: (see `IN_EMIT_DEFAULT` and, for example, `authoring._emit_wall`).
+DEFERRED_TO_REVIT = "revit"
+
+#: The key under which emission places the built element's TYPE NAME into
+#: the execution receipt. One key for all ops with a document default —
+#: measured 10.08.2026 across emission of all eight such ops; the lock is
+#: held by `test_choice_showcase.
+#: test_every_document_default_op_reads_its_type_name_back`, because a
+#: pointer to a nonexistent field is worse than no pointer at all.
+RUNTIME_TYPE_NAME_KEY = "type_name"
+
+
+#: The only parameter whose deferred name emission reads back. Today
+#: `IN_EMIT_DEFAULT` is set ONLY on `type` (both sites in `ground()`), and
+#: the pointer is correct precisely because of that. If a document default
+#: is ever introduced on another parameter, the row will honestly remain
+#: without an address, rather than sending the reader to the `type_name`
+#: field, which does not pertain to it.
+_DEFERRED_PARAM_WITH_READBACK = "type"
+
+
+def _deferred_chosen(op_id: Any, param: Any) -> dict:
+    """The row for a choice that the compiler DEFERRED to the document.
+
+    WHY THIS IS NOT "FILL IN THE EMPTY FIELD". A live run on 10.08.2026 (the
+    operator's model, Revit 2023, a wall with no `type`) went green straight
+    through and returned `chosen: {"id": null, "name": null}`, while the
+    wall that got built received a perfectly concrete «111_Кирпич 380». At
+    the grounding stage the name DOES NOT EXIST — and this is not an
+    oversight on our part but how the rule is built: the document itself
+    chooses the type, and only inside emission. Making up a name would be
+    the worst of the answers (a fabricated type name is worse than an empty
+    one); dropping the row would be the second worst (staying silent about
+    a choice that was made is exactly the original defect).
+
+    So the row changes not the content but the MEANING: an empty "id/name"
+    pair reads as "no choice was made", while `resolved_at` + `read_from`
+    say exactly what is true — a choice was made, the document made it, and
+    the name will appear in the execution receipt at this very address.
+    After execution the name does arrive there
+    (`attach_runtime_choices`), so the pointer is short-lived and is needed
+    exactly where execution has not happened (yet, or ever): dry
+    compilation, a refusal before any effect, parsing a program without
+    Revit.
+    """
+    chosen = {"id": None, "name": None, "resolved_at": DEFERRED_TO_REVIT}
+    if param == _DEFERRED_PARAM_WITH_READBACK:
+        chosen["read_from"] = f"result.{op_id}.{RUNTIME_TYPE_NAME_KEY}"
+    return chosen
+
+
+def attach_runtime_choices(report: list[dict], payload: Any) -> list[dict]:
+    """Write into the receipt the names that only Revit knew.
+
+    Of the two honest answers to a deferred choice — "say where to read it"
+    and "read it and say" — BOTH were taken, and the order is not
+    accidental. The pointer is mandatory: it is correct always, including
+    when there was no execution. But stopping there is not allowed, and the
+    reason is not convenience: the answer is ALREADY SITTING IN THE SAME
+    JSON, since the emitter that applied the type is the very same one that
+    read it back with `GetTypeId()` of the built element. Leaving the
+    connection to the reader would mean handing the model work we can do
+    once and exactly — and leaving it in the state "the rule is named, the
+    result unknown", which is exactly where the mechanism started.
+
+    This is a MEASUREMENT, not a plausible fill-in: the name is taken from
+    the built element and from nowhere else. No row in the receipt, no
+    field, an empty row — the choice stays unresolved, and the pointer
+    stays in place. Provenance is named (`source: readback`), because the
+    name from the snapshot and the name from the built element are
+    different facts, and gluing them together silently is not allowed.
+
+    Returns a NEW list: `CompileOutput` outlives a turn and lands in the
+    compilation cache, and a receipt is not a draft.
+    """
+    if not report:
+        return report
+    filled: list[dict] = []
+    for row in report:
+        chosen = row.get("chosen") if isinstance(row, dict) else None
+        if (not isinstance(chosen, dict)
+                or chosen.get("resolved_at") != DEFERRED_TO_REVIT
+                or chosen.get("name") is not None
+                # Without an address there is nowhere to read from: a row
+                # without `read_from` is an honest "we don't know where
+                # this is", and guessing the field here would mean bringing
+                # back a guess disguised as a measurement.
+                or not chosen.get("read_from")):
+            filled.append(row)
+            continue
+        readback = (payload.get(row.get("op_id"))
+                    if isinstance(payload, dict) else None)
+        name = (readback.get(RUNTIME_TYPE_NAME_KEY)
+                if isinstance(readback, dict) else None)
+        if not isinstance(name, str) or not name.strip():
+            filled.append(row)
+            continue
+        filled.append({**row, "chosen": {**chosen, "name": name.strip(),
+                                         "source": "readback"}})
+    return filled
+
+
+def compiler_choices(grounded_ops: list[dict]) -> list[dict]:
+    """The receipt: what the compiler chose where the author stayed silent.
+
+    A separate function, not a byproduct of grounding, for the same reason
+    the report itself exists: a choice with no one to show it to is
+    `.FirstOrDefault()` with a better reputation. Order is kept as-written,
+    so that the receipt reads top to bottom like the program itself.
+    """
+    report: list[dict] = []
+    # 🔴 GROUP MEMBERS ARE OPS TOO (25.08.2026, an audit finding, reproduced
+    # by a run on the same one choice).
+    #
+    #   OUTSIDE a group: «выбрано по умолчанию — symbol: «ДГ 21-8 П» (самый
+    #               употребимый в модели: 500 экз. из 3 кандидатов, следующий 272)»
+    #   INSIDE A GROUP:   0 choices, the text is EMPTY.
+    #
+    # The very same choice is made, there is simply no one to show it to —
+    # that is, exactly `.FirstOrDefault()` with a better reputation, the
+    # thing this whole module is written against. Measured 22.08: 82.6% of
+    # a real building's operations live INSIDE groups, so blindness here is
+    # blindness to the building.
+    #
+    # We unroll FLAT and PRESERVING ORDER: members come right after their
+    # group, so the receipt reads top to bottom like the program itself.
+    развёрнутые: list[dict] = []
+    for _op in grounded_ops:
+        развёрнутые.append(_op)
+        if isinstance(_op, dict):
+            развёрнутые.extend(
+                m for m in (_op.get("members") or ()) if isinstance(m, dict))
+    for op in развёрнутые:
+        if not isinstance(op, dict):
+            continue
+        # RELATE: the address is NOT a default (the author said «А/3» out
+        # loud), but it IS the compiler's INFERENCE from what was said, and
+        # it must be shown for the same reason. Separate `at_grid`/
+        # `at_element` rules, rather than mixing into
+        # `_COMPILER_CHOICE_RULES`: conflating "I chose for you" with "I
+        # inferred from your words" would mean lying about the provenance
+        # of both.
+        for row in op.get("__address__") or ():
+            report.append({
+                "op_id": op.get("id"), "op": op.get("op"),
+                "param": row.get("param"),
+                "rule": "at_element" if row.get("element") else "at_grid",
+                "chosen": {"point_mm": row.get("point_mm")},
+                "rule_detail": {"lines": row.get("lines"),
+                                "angle_deg": row.get("angle_deg"),
+                                "element": row.get("element")},
+            })
+        for param, sel in op.items():
+            if not isinstance(sel, dict):
+                continue
+            res = sel.get("__grounded__")
+            if not isinstance(res, dict):
+                continue
+            via = res.get("via")
+            if via not in _COMPILER_CHOICE_RULES:
+                continue
+            # The row's form is decided by the EMISSION MARKER, not by the
+            # rule's name: `in_emit` is the very thing that makes the
+            # emitter ask the document, and binding to it keeps the
+            # showroom from drifting apart from emission if the rule is
+            # ever renamed or a second one just like it is introduced.
+            chosen = (_deferred_chosen(op.get("id"), param)
+                      if res.get("in_emit") == IN_EMIT_DEFAULT
+                      else {"id": res.get("id"), "name": res.get("name")})
+            row = {
+                "op_id": op.get("id"),
+                "op": op.get("op"),
+                "param": param,
+                "rule": via,
+                "chosen": chosen,
+            }
+            if isinstance(res.get("rule_detail"), dict):
+                row["rule_detail"] = res["rule_detail"]
+            report.append(row)
+    return report
+
+
+#: What the rule is called in plain language when it is shown to the user.
+#: The user does not read `via`, and "most_used" in the response is machine
+#: code passed off as an explanation.
+_RULE_NAMES_RU = {
+    "most_used": "самый употребимый в модели",
+    "most_used+disambiguate_by": "самый употребимый после сужения",
+    "sole_entry": "единственный в модели",
+    "sole_entry+disambiguate_by": "единственный после сужения",
+    "doc_default": "тип по умолчанию документа",
+}
+
+
+def describe_choices_ru(report: list[dict]) -> str:
+    """One human-readable line: what the compiler chose and by which rule.
+
+    An empty string if there was nothing to choose from — a note saying
+    "nothing happened" is noise, and noise teaches people not to read notes.
+    """
+    parts: list[str] = []
+    addresses: list[str] = []
+    for row in report:
+        if row.get("rule") in ("at_grid", "at_element"):
+            # The address receipt is printed ALWAYS: it answers the
+            # question "what did the compiler infer from «А/3»", not "what
+            # did it fill the silence with". Without it, the choice of axis
+            # is indistinguishable from guessing.
+            detail = row.get("rule_detail") or {}
+            addresses.extend(relate.describe_receipt_ru([{
+                "op_id": row.get("op_id"), "param": row.get("param"),
+                "point_mm": (row.get("chosen") or {}).get("point_mm"),
+                "lines": detail.get("lines") or (),
+                "element": detail.get("element"),
+            }]))
+            continue
+        rule = _RULE_NAMES_RU.get(row.get("rule", ""), row.get("rule", ""))
+        chosen = row.get("chosen") or {}
+        name = chosen.get("name")
+        detail = row.get("rule_detail") or {}
+        if chosen.get("resolved_at") == DEFERRED_TO_REVIT:
+            # A DEFERRED CHOICE IS PRINTED ALWAYS, AND THIS IS THE FIX OF
+            # 10.08.2026. The row used to fall out right here, alongside
+            # `sole_entry`, under the same "no candidates" condition — and a
+            # live run returned an empty note for a wall that got built as
+            # «111_Кирпич 380». The condition was correct for `sole_entry`
+            # (one candidate, nothing to choose from) and wrong for a
+            # document default: a real project has dozens of wall types, a
+            # choice among them WAS MADE — just not by us, and that is
+            # exactly why it must be said out loud.
+            parts.append(
+                f"{row.get('param')}: «{name}» ({rule}, прочитано в "
+                f"построенном элементе)"
+                if name else
+                f"{row.get('param')}: выбирает документ ({rule}); имя типа "
+                f"известно только после постройки"
+                + (f" — {chosen['read_from']}" if chosen.get("read_from")
+                   else ""))
+            continue
+        # "The only one in the model" needs no defense: there was no choice
+        # there. What must be shown is the case where there are many
+        # candidates — that is exactly the case indistinguishable from an
+        # unexplained `.FirstOrDefault()`.
+        if not detail.get("candidates"):
+            continue
+        runner_up = detail.get("runner_up")
+        # The gap is shown whenever there is something to compare against:
+        # our threshold is an assigned one, and the user must measure the
+        # strength of the signal for themself.
+        gap = (f", следующий {runner_up}" if runner_up else "")
+        parts.append(
+            f"{row.get('param')}: «{name}» "
+            f"({rule}: {detail.get('instances')} экз. "
+            f"из {detail.get('candidates')} кандидатов{gap})")
+    lines: list[str] = []
+    if addresses:
+        lines.append("адрес — " + "; ".join(addresses))
+    if parts:
+        lines.append("выбрано по умолчанию — " + "; ".join(parts))
+    return "\n".join(lines)
+
+
+def _ground_members(members: list, snapshot: Any, gid: str,
+                    diags: list[Diagnostic], *, group_index: int) -> list:
+    """Plan, then ground every group member through the ordinary pipeline.
+
+    A legacy pre-grounded marker is decoded by the member planner into an
+    explicit selector and validated; it is never accepted as executable shape
+    merely because a component bridge supplied it.  The repeat validation here
+    is an intentional defence at the legacy ``ground(list[dict])`` boundary:
+    production ``ground_program`` already owns a typed parent, while direct
+    callers must not regain the historical member bypass.
+
+    🔴 REWRITING THE MEMBER ADDRESS LIVED HERE AS A SECOND CARRIER (removed
+    27.08.2026).
+
+    Below there used to be its own loop, repeating
+    `compiler._group_member_diagnostic` by hand — and the two carriers had
+    ALREADY DIVERGED: the compiler substituted `member_index` for an
+    unnamed member, while `'?'` stood here. They would have diverged
+    further at the very next edit to the address's form, which is exactly
+    this tree's named defect.
+
+    The measurement that exposed this: the member's address reached the
+    refusal text at two stages out of three (`KIR-P003` parsing,
+    `KIR-T001` typing) and did not reach it at the third (`KIR-G101`
+    grounding) — precisely because the third one bypassed the authority.
+    Grounding now CALLS it, rather than repeating it.
+
+    `'?'` is kept as the value of `member_index`: it is pinned by
+    `test_member_path_gets_no_foreign_advice`
+    (`members[?].levels[0].id`), and changing it here would mean paying
+    someone else's price for our own cleanup.
+    """
+    from kir.compiler import _group_member_diagnostic, _plan_group_members
+
+    try:
+        member_plans = _plan_group_members(
+            members, group_id=gid, group_index=group_index)
+    except KirRefusal as refusal:
+        diags.extend(refusal.diagnostics)
+        return members
+    raw = [item.to_dict() for item in member_plans]
+    try:
+        return ground(raw, snapshot)
+    except KirRefusal as refusal:
+        diags.extend(
+            _group_member_diagnostic(
+                d, group_id=gid, group_index=group_index,
+                member_id=d.op_id, member_index="?")
+            for d in refusal.diagnostics)
+        return members
+
+
+#: OPS WHOSE DEFAULT TYPE IS CARRIED BY THE DOCUMENT, NOT THE POOL.
+#:
+#: 🔴 INTRODUCED 24.08.2026, AND INTRODUCED FROM A LIVE REPRODUCTION. This
+#: list lived in THREE carriers, and they held THREE DIFFERENT sets:
+#:
+#:     `_resolve_one`  (explicit `{"by":"default"}`)   KNEW 1: create_wall
+#:     `_needs_pool`   (is a snapshot needed at all)    KNEW 4
+#:     the resolve loop (whether to read the parameter's pool)  KNEW 8
+#:
+#: Every addition — 09.08 (`create_wall_foundation`, `create_extrusion_roof`,
+#: `create_filled_region`), 10.08 (`create_area_reinforcement`) — landed in
+#: ONE carrier. Meanwhile the header of `_omitted_param_is_irrelevant`
+#: claimed about the document type: "Both already stand identically in both
+#: carriers." The claim was FALSE, 4 against 8, and nothing could turn red
+#: over it.
+#:
+#: THE COST WAS MEASURED, NOT ASSUMED (run of 24.08):
+#:
+#:     op                        snapshot {}     snapshot None
+#:     create_wall                     ok              ok
+#:     create_wall_foundation          ok        KIR-G103   <- discrepancy
+#:     create_extrusion_roof           ok        KIR-G103   <- discrepancy
+#:     create_filled_region            ok        KIR-G103   <- discrepancy
+#:
+#: That is, a program that compiles with an EMPTY snapshot (not a single
+#: pool is read) REFUSES to compile WITHOUT a snapshot — demanding an
+#: artifact that, by construction, is never read at all. This is, verbatim,
+#: the invariant declared by the header of the guard file
+#: `test_snapshot_demand_mirrors_resolution.py`.
+#:
+#: WHY EACH ONE HAS THIS TYPE — the arguments were bought by measurement
+#: across six versions and are kept here in full, because the list is
+#: closed and grows only this way:
+#:   create_wall · create_floor · create_roof · create_floor_by_contour
+#:       the base four, `ElementTypeGroup.<X>Type` from the very start;
+#:   create_wall_foundation (09.08)
+#:       `ElementTypeGroup.WallFoundationType` compiles on all six —
+#:       unlike a door, a window, and a railing, where asking the document
+#:       is IMPOSSIBLE BY CONSTRUCTION;
+#:   create_extrusion_roof (09.08)
+#:       `ElementTypeGroup.RoofType` is present on all six (measurement
+#:       :52412); without this row, an omitted `type` would fall to the
+#:       general rule and refuse with KIR-G104 on a model with no pool,
+#:       where a CONTOUR roof is being built;
+#:   create_filled_region (09.08)
+#:       `ElementTypeGroup.FilledRegionType` on all six. The general "sole
+#:       entry in the pool" rule is WORST OF ALL here: a real project has
+#:       dozens of fill types — an omitted `type` would refuse with
+#:       KIR-G102 ALWAYS, while on an empty project it would silently take
+#:       the sole one;
+#:   create_area_reinforcement (10.08)
+#:       `ElementTypeGroup.AreaReinforcementType` on all six; the same
+#:       arithmetic as for fills.
+#:
+#: THE SUBSTITUTION IS NOT SILENT FOR ANY OF THEM: the `semantic` witness
+#: checks the built element's `GetTypeId()` against the exact id that
+#: landed here.
+OPS_WITH_DOC_DEFAULT_TYPE: frozenset = frozenset({
+    "create_wall",
+    "create_floor",
+    "create_roof",
+    "create_floor_by_contour",
+    "create_wall_foundation",
+    "create_extrusion_roof",
+    "create_filled_region",
+    "create_area_reinforcement",
+})
+
+
+def _omitted_param_is_irrelevant(ospec, op: dict, param: str) -> bool:
+    """The omitted parameter that THIS BRANCH of the op does not use at all.
+
+    🔴 WHY THIS FUNCTION EXISTS, INSTEAD OF TWO LISTS. The rule is needed by
+    TWO carriers, and they diverged. `_needs_pool` decides "will a snapshot
+    be needed at all" (and refuses `KIR-G103` before any work), while the
+    main resolve loop decides "should this parameter's pool be read". Both
+    enumerated omissions by hand, and by 21.08.2026 the mirror held THREE
+    out of FIVE: `create_topography` and `place_family` were added to the
+    loop and not added to `_needs_pool`.
+
+    The cost, taken by measurement: `create_topography` with
+    `variety="surface"` compiles GREEN on an empty snapshot (not a single
+    pool is read) and refuses `KIR-G103` without a snapshot — that is, it
+    demands an artifact that, by construction, is never read.
+
+    The NAKAZ's point 4, verbatim: a table obligated to agree with another
+    must BE it, seen from a different angle. Here that is one predicate for
+    two call sites; a new omission is introduced ONCE and reaches both by
+    construction.
+
+    🔴 WHAT IS DELIBERATELY NOT HERE. Two omissions are shared by all ops
+    and live with their own carriers: `top_level` (an omitted top binding
+    means "do not bind", and this holds for ANY op) and the document
+    default type (`create_wall.type` and kin — there the parameter is not
+    omitted, it is resolved by a DIFFERENT source, not the pool). Both
+    already stand identically in both carriers; dragging them in here would
+    mean conflating "this branch does not use it" with "resolved a
+    different way".
+    """
+    name = ospec.name
+    # wave/struct (17.07): the first op with VARIANT groundable parameters.
+    # `symbol` (the FamilySymbol of an isolated footing) is irrelevant under
+    # variety="slab", `type` (the FloorType of a slab) — under
+    # variety="isolated". The general rule would resolve BOTH against their
+    # pools on every op and would refuse over an empty/ambiguous pool
+    # belonging to the OTHER branch (caught live).
+    if name == "create_foundation":
+        return ((param == "symbol" and op.get("variety") != "isolated")
+                or (param == "type" and op.get("variety") != "slab"))
+    # wave/site: the same reason in its sharpest form. A TOPOGRAPHY SURFACE
+    # has no level in the API at all — `TopographySurface.Create` does not
+    # accept one, the elevation lives in each point's Z. It has no type
+    # either. This branch covers BOTH of the op's optional selectors.
+    if name == "create_topography":
+        return op.get("variety") != "toposolid"
+    # wave/reinforcement (10.08): AN OMITTED HOOK MEANS "NO HOOKS", and this
+    # is the API's OWN meaning: «If this parameter is InvalidElementId, it
+    # means to create a rebar with no hooks» (RevitAPI.xml).
+    if name == "create_area_reinforcement":
+        return param == "hook_type"
+    # wave/arch: a base level is needed ONLY by a free-standing railing; a
+    # railing on a stair takes its level from the host, and the
+    # `Railing.Create(doc, hostId, typeId, position)` overload does not
+    # accept a level.
+    if name == "create_railing":
+        return param == "level" and op.get("variety") != "path"
+    # The curve-based variant of `place_family` HAS NO level, and this is a
+    # measurement: all 79 casings in the electrical model have LevelId = -1,
+    # and the `NewFamilyInstance` overload keyed on a host face reference
+    # does not accept a level at all.
+    if name == "place_family":
+        return param == "level" and "p0_mm" in op
+    return False
+
+
+def ground(normed_ops: list[dict], snapshot: Any) -> list[dict]:
+    """Grounded copy of ops: every grounded param becomes
+    {"__grounded__": {"id": ..., "name": ..., "via": ...}}. Raises KirRefusal
+    with ALL resolution failures at once (one round of typed feedback beats
+    a drip of single errors — SPEC 12.7 economy)."""
+    if not any(spec.OPS[op["op"]].family in spec.WRITE_FAMILIES for op in normed_ops):
+        return normed_ops
+    # snapshot is needed only when something must resolve FROM it: by-name /
+    # by-default selectors or omitted-with-pool-default params. Pure
+    # element_id/ref programs ground without one.
+    def _needs_pool(op, ospec):
+        """The FIELD NAME that requires a snapshot, or `None`.
+
+        🔴 IT USED TO BE `bool`, IT BECAME A NAME, AND THIS IS A REFUSAL
+        FIX, NOT DECORATION (02.09.2026). `any(_needs_pool(...))` was
+        throwing away the ONE thing the author needs in order to fix
+        things — exactly where. The KIR-G103 refusal used to leave with
+        `op_index=None, op_id=None, field_name=None`, even though
+        `Diagnostic`'s fields exist precisely for this.
+
+        THE COST WAS MEASURED, not assumed: the `tools/mcp_schema_bench.py`
+        rig, six model runs on one task. FOUR out of six spent MOST of
+        their call budget on bisecting the program ("level" → "level +
+        wall" → "+ door") to find out what the refusal could have said in
+        one line: the snapshot is required by `symbol` on the door and the
+        window. One run spent the entire budget on this and never built the
+        house.
+
+        This is a violation of the house's own law: a refusal that does not
+        name the next move forces guessing, and guessing costs a run.
+
+        Truthfulness is preserved byte for byte: every former `True` is now
+        a non-empty string, every former `False` is `None`. The predicate is
+        the same, the question is the same, the answer is richer.
+        """
+        for param, _pool, required in ospec.grounded:
+            sel = op.get(param)
+            if sel is None:
+                # An irrelevant omitted parameter does not read the pool —
+                # so it must not demand a snapshot either. The predicate is
+                # SHARED with the main resolve loop below: before 21.08 its
+                # own list stood here, and it lagged behind by two ops (see
+                # the header of `_omitted_param_is_irrelevant`). Pinned by
+                # `tests/test_snapshot_demand_mirrors_resolution.py`.
+                if _omitted_param_is_irrelevant(ospec, op, param):
+                    continue
+                if param == "top_level":
+                    # audit F6 (generalized, P1 2026-07-21): omitted top_level
+                    # = no top attach for ANY op (wall unconnected height,
+                    # column as-placed height).  A top constraint is opt-in by
+                    # construction — default-resolving one from the pool is
+                    # never meaningful.  No pool read.
+                    continue
+                if not required and not (
+                        op["op"] in OPS_WITH_DOC_DEFAULT_TYPE
+                        and param == "type"):
+                    return param           # default rule reads the pool
+                continue
+            if isinstance(sel, dict) and sel.get("by") in (
+                    "name", "default", "family_type"):
+                return param
+        # An address from grids reads the `grids` pool.
+        #
+        # Before 04.08 there was ONE op here and a STRING search:
+        # `op["op"] == "create_floor_by_contour" and "at_grid" in repr(...)`.
+        # Now the address can live in any point-like parameter, and whether
+        # to ask about the pool must be decided from the REAL values of real
+        # parameters, not from `repr`: an "at_grid" substring in a type's
+        # name can no longer either trigger reading the pool or (worse)
+        # slip by unnoticed where an address is actually present.
+        #
+        # 09.08.2026 — THE REMAINDER OF THE SAME FIX, FINISHED OFF BY THE
+        # BODIES WAVE. The row above moved to kinds, while THIS ONE was left
+        # with the parameter NAME `contour` hard-coded — and it worked
+        # precisely because both regions of that time happened to be called
+        # that. A body's profile is called `profile`, and with the name
+        # hard-coded, an address from grids inside it would not have
+        # demanded a snapshot: the `grids` pool would have arrived empty,
+        # and the refusal would have said "grids not found" instead of "no
+        # snapshot" — a fix aimed at the wrong place. The rule is addressed
+        # by KIND, like its neighbor.
+        for p in ospec.params:
+            if p.kind == "region" and "at_grid" in repr(op.get(p.name)):
+                return p.name
+        # 🔴 A PARAMETER NAME, NOT PROSE (review 02.09.2026). `return
+        # "<адрес от осей>"` used to stand here, and this landed straight
+        # into `Diagnostic.field_name` — the machine field for "which slot",
+        # which is exactly what this fix was for. A consumer looking for
+        # such a slot on the op (a fixer, highlighting, the `handoff`
+        # collector) would find nothing: the string matches no parameter.
+        # Prose belongs in `message_ru`.
+        for param in relate.addressable_params(str(op.get("op", ""))):
+            if relate.is_address(op.get(param)):
+                return param
+        return None
+
+    # 🔴 A FULL TRAVERSAL — ONLY ON THE REFUSAL PATH (review 02.09.2026).
+    # The previous `any(...)` broke off at the very first op that needed
+    # one; in collecting the LIST of locations, I removed the break on ALL
+    # paths, including the one where a snapshot is supplied and the list is
+    # not needed by a single line. The cost is not theoretical:
+    # `kir_compile` calls `compile_program` six times (once per version),
+    # and the predicate calls `repr()` on region parameters — on a program
+    # with thousands of contour operations that is six full traversals
+    # where there used to be one step.
+    # The order of the conditions is therefore reversed: first "is there a
+    # snapshot", and only then "who requires it".
+    demands: list[tuple[int, str, str]] = []
+    if not isinstance(snapshot, dict):
+        for index, op in enumerate(normed_ops):
+            field = _needs_pool(op, spec.OPS[op["op"]])
+            if field is not None:
+                demands.append((index, str(op.get("id") or ""), field))
+    if demands:
+        sites = ", ".join(
+            f"{normed_ops[i]['op']}"
+            + (f"#{oid}" if oid else "")
+            + f".{fld}"
+            for i, oid, fld in demands[:8])
+        more = "" if len(demands) <= 8 else f" и ещё {len(demands) - 8}"
+        index0, oid0, field0 = demands[0]
+        raise KirRefusal([Diagnostic(
+            code=GROUND_NO_SNAPSHOT,
+            message_ru=(
+                "программа требует снапшот модели (census) для ground-стадии "
+                "(резолв по имени/default). Снимка требуют: "
+                f"{sites}{more}. Без снимка эти слоты адресуются только "
+                "формой {\"by\": \"element_id\", \"value\": <id>}"),
+            op_index=index0,
+            op_id=oid0 or None,
+            field_name=field0)])
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    diags: list[Diagnostic] = []
+    pool_cache: dict[str, list[dict]] = {}
+
+    def snapshot_pool(pool_name: str) -> list[dict]:
+        if pool_name not in pool_cache:
+            pool_cache[pool_name] = _validate_snapshot_pool(
+                snapshot, pool_name, diags)
+        return pool_cache[pool_name]
+
+    def pool_truncated(pool_name: str) -> bool:
+        return snapshot.get(pool_name + "__truncated") is True
+
+    out = []
+    address_receipt: list[dict] = []
+    #: Grounded ops STANDING ABOVE the current one, by id — the only source
+    #: of numbers for an address from an element. Filled at the end of the
+    #: iteration, so a forward reference is unfindable BY CONSTRUCTION,
+    #: rather than by a check that could be forgotten (the same trick as
+    #: `created` in `plan_program`).
+    by_id_so_far: dict[str, dict] = {}
+    for i, op in enumerate(normed_ops):
+        ospec = spec.OPS[op["op"]]
+        g = dict(op)
+        # RELATE: an address from grids -> a literal point, HERE and before
+        # everything else. The intersection of two lines is a pure function
+        # of the snapshot: a refusal before the transaction is cheaper than
+        # a refusal inside it, and, just as with CONTOUR, only numbers go
+        # on to the emitter.
+        op_receipt: list[dict] = []
+        for param, dims in relate.addressable_params(ospec.name).items():
+            value = op.get(param)
+            if not relate.is_address(value):
+                continue
+            if relate.is_element_address(value):
+                # AN ADDRESS FROM AN ELEMENT reads not the snapshot but THE
+                # PROGRAM ITSELF — the already-grounded ops standing ABOVE
+                # (`by_id_so_far`). This is also where the answer to "what
+                # if the element is created by this same program" lives:
+                # this is the ONE case expressed here, exactly the mirror
+                # image of how `at_grid` refuses on a grid from the same
+                # program. The `levels` pool is needed only for the
+                # elevation.
+                point = relate.resolve_element_address(
+                    value, by_id_so_far, snapshot_pool("levels"),
+                    op["id"], param, diags, dims=dims, receipt=op_receipt)
+            else:
+                point = relate.resolve_address(
+                    value, snapshot_pool("grids"), op["id"], param, diags,
+                    dims=dims, truncated=pool_truncated("grids"),
+                    receipt=op_receipt)
+            if point is not None:
+                g[param] = point
+        if op_receipt:
+            # THE RECEIPT. The author wrote «А/3» — they must see WHAT the
+            # compiler inferred from it (the id and name of each grid, the
+            # offset, the side, the resulting point). A choice with no one
+            # to show it to is indistinguishable from `.FirstOrDefault()` in
+            # a costume — the same law as for the NAMED DEFAULT.
+            g["__address__"] = op_receipt
+            address_receipt.extend(op_receipt)
+        diameter_spec = next((p for p in ospec.params if p.name == "diameter_mm"), None)
+        diameter_bounds = ((diameter_spec.min_val, diameter_spec.max_val)
+                           if diameter_spec is not None else None)
+        # CONTOUR: the region is lowered into canonical edges HERE, because
+        # its points can be grid addresses, and grids live in the snapshot.
+        #
+        # The rule is addressed by the parameter's KIND, not the op's name
+        # (09.08.2026). Before that day, `if ospec.name ==
+        # "create_floor_by_contour"` stood here, and a second op with a
+        # sketch (create_ceiling) would have silently received `contour`
+        # with not a single law applied to it: anchors unresolved, arcs
+        # unlowered, and the emitter — a KeyError instead of a shape. The
+        # `region` kind in the registry is exactly one and means exactly
+        # this, so the binding must be to it.
+        region_specs = [p for p in ospec.params if p.kind == "region"]
+        for region_spec in region_specs:
+            raw_region = op.get(region_spec.name)
+            if raw_region is None:
+                # An optional sketch (for create_ceiling it is an
+                # alternative to `outline`). A mandatory one that is missing
+                # has already been named earlier: authoring_validation
+                # refuses by kind, while mutual obligation is held by the
+                # plan (KIR-P007).
+                continue
+            from kir import contour as contour_mod
+            grids = (snapshot_pool("grids")
+                     if "at_grid" in repr(raw_region) else [])
+            region = contour_mod.validate_region(
+                raw_region, grids, op["id"], region_spec.name, diags)
+            if region is not None:
+                # 🔴 THE SPLINE GUARD. The language can say a curve, emission
+                # can build it — but the witness for most ops is a
+                # bounding-box one, and a spline's bounding box is
+                # UNDERSTATED (Revit chooses the shape between the points,
+                # we know only our own sample of it). Letting it through
+                # would mean building the curve and signing off on a
+                # bounding box that no one checked. The refusal is HERE, at
+                # grounding, not in emission: before any effect, with a
+                # named cause and a named next move.
+                if (contour_mod.region_has_spline(region)
+                        and ospec.name not in contour_mod.SPLINE_WITNESSED_OPS):
+                    diags.append(Diagnostic(
+                        code=EMIT_CONTOUR_SPLINE, op_id=op["id"],
+                        field_name=region_spec.name,
+                        message_ru=(
+                            f"{ospec.name}: контур несёт сплайн, а свидетель "
+                            f"этого опа доказывает только прямые и дуги — "
+                            f"кривая была бы построена и НЕ проверена. "
+                            f"Следующий ход: выразить край дугами (arcs) либо "
+                            f"дождаться свидетеля сплайна у этого опа")))
+                else:
+                    # 🔴 EACH REGION TRAVELS UNDER ITS OWN NAME — AND ONLY
+                    # FOR AN OP WITH TWO OR MORE REGIONS.
+                    #
+                    # Status as of 20.08.2026, evening: closed. Below is
+                    # the history, and it is deliberately in the PAST
+                    # tense — this block already misled a neighboring wave,
+                    # which read the middle layer ("the defect remains")
+                    # and reported live a defect that had been fixed an
+                    # hour earlier. A history comment with a retracted
+                    # claim in the PRESENT tense reads as the current
+                    # state: the reader takes the first thing found at the
+                    # top.
+                    #
+                    # What was. The loop goes over EVERY parameter of the
+                    # `region` kind, but was putting them into a shared
+                    # `__region__`: an op with two profiles (a blend —
+                    # bottom and top) got the TOP one twice and silently
+                    # built a degenerate body. The first fix — a named key
+                    # right here — dropped 23 contour programs into
+                    # KIR-P000 across all six versions (276 gate failures
+                    # against green target tests): grounding may only add
+                    # DECLARED derived fields, and `midend
+                    # ._assert_payload_refinement` rejects anything else.
+                    #
+                    # What was done. The derived-fields contract
+                    # (`midend._recomputed_derived_artifact`) declared
+                    # named keys legal EXACTLY where the shared one was
+                    # losing data. For an op with ONE region everything
+                    # stays byte for byte: the shared key, no named one,
+                    # emission does not move by a single character.
+                    if len(region_specs) > 1:
+                        g[f"__region_{region_spec.name}__"] = region
+                    else:
+                        g["__region__"] = region
+        if ospec.name == "create_group" and isinstance(op.get("members"), list):
+            g["members"] = _ground_members(
+                op["members"], snapshot, op["id"], diags, group_index=i)
+        if ospec.name == "create_pipe_system":
+            from kir import connect as connect_mod
+            graph = connect_mod.graph_validate(
+                op, op["id"], diags, op.get("diameter_mm"), diameter_bounds)
+            if graph is not None:
+                g["__graph__"] = graph
+        if ospec.name in ("route_pipe_system", "route_duct_system"):
+            # wave/mep: same connect.graph_validate reuse as create_pipe_system,
+            # plus the checked (not generative) slope_min_pct extraction —
+            # see ops_connect.py's module docstring and route_mep.py.
+            from kir import connect as connect_mod
+            from kir import route_mep as route_mep_mod
+            slope_reqs = route_mep_mod.extract_slope_requirements(op, op["id"], diags)
+            if slope_reqs is not None:
+                stripped = route_mep_mod.strip_slope_keys(op)
+                graph = connect_mod.graph_validate(
+                    stripped, op["id"], diags, op.get("diameter_mm"), diameter_bounds)
+                if graph is not None:
+                    g["__graph__"] = graph
+                    g["__slope_reqs__"] = slope_reqs
+        # THE REFERENCE VALUE OF `set_param` IS CHECKED AGAINST THE POOL
+        # HERE, NOT AT RUNTIME. It is not a selector and therefore does not
+        # go through `ospec.grounded` below, but it needs exactly the same
+        # check — and EARLIER than emission.
+        #
+        # The precedent (`create_type.material`) resolves the name via the
+        # collector INSIDE the transaction: the refusal is honest and
+        # typed, but it arrives where a round-trip costs the most. The
+        # pool moves the same check to AUTHORING TIME — a wrong material
+        # name is refused offline, before any Revit. The live check STAYS
+        # in place: the pool is a snapshot, the document could have
+        # changed between the snapshot and execution, and dropping the
+        # live witness for the offline one would be trading proof for
+        # convenience.
+        val = op.get("value")
+        if (op.get("op") == "set_param" and isinstance(val, dict)
+                and val.get("type") in ("ref", "int_ref")):
+            pool_name = val.get("pool") or "materials"
+            if pool_name == "worksets":
+                # WORKSETS ARE READ NOT AS AN ELEMENT POOL, AND THIS IS NOT
+                # A BYPASS OF THE CHECK, IT IS ACKNOWLEDGING IT.
+                # `snapshot_pool` requires `1 <= id <= ELEMENT_ID_MAX`,
+                # because "pool" in this compiler means AN ELEMENT POOL. A
+                # workset's id is `WorksetId.IntegerValue`, an integer
+                # starting at ZERO, and `Workset` does not inherit from
+                # `Element`. The check was right, and what was wrong was
+                # my own attempt to declare a workset a pool: the same
+                # lesson as one floor below — "the work is the same in
+                # shape, the mechanism is different".
+                raw = snapshot.get("worksets")
+                pool = []
+                if raw is None:
+                    pass
+                elif not isinstance(raw, list):
+                    diags.append(Diagnostic(
+                        code=GROUND_BAD_SNAPSHOT, op_index=i, op_id=op["id"],
+                        field_name="worksets", expected="список {id, name}",
+                        got=type(raw).__name__,
+                        message_ru="снапшот: worksets должен быть списком"))
+                else:
+                    for n, row in enumerate(raw):
+                        wid = row.get("id") if isinstance(row, dict) else None
+                        nm = row.get("name") if isinstance(row, dict) else None
+                        if (isinstance(wid, bool) or not isinstance(wid, int)
+                                or wid < 0 or not isinstance(nm, str)):
+                            diags.append(Diagnostic(
+                                code=GROUND_BAD_SNAPSHOT, op_index=i,
+                                op_id=op["id"], field_name=f"worksets[{n}]",
+                                expected="{id: целое >= 0, name: строка}",
+                                got=row,
+                                message_ru=(f"снапшот: worksets[{n}].id — "
+                                            f"неотрицательное целое "
+                                            f"(WorksetId.IntegerValue)")))
+                        else:
+                            pool.append(row)
+            else:
+                pool = snapshot_pool(pool_name)
+            wanted = val.get("v")
+            if pool_name == "worksets" and not snapshot.get(
+                    "worksets__workshared", False):
+                # NOT "there are no worksets", BUT "THE DOCUMENT IS NOT
+                # WORKSHARED". One empty pool for two different outcomes is
+                # form 11; here they are distinguished by a separate fact
+                # that the producer captures alongside the pool.
+                diags.append(Diagnostic(
+                    code=GROUND_EMPTY_POOL, op_index=i, op_id=op["id"],
+                    field_name="value", expected=pool_name,
+                    message_ru=("документ не разделён на рабочие наборы — "
+                                "набор задать некуда")))
+            elif not pool:
+                diags.append(Diagnostic(
+                    code=GROUND_EMPTY_POOL, op_index=i, op_id=op["id"],
+                    field_name="value", expected=pool_name,
+                    message_ru=f"{pool_name}: пусто в модели"))
+            else:
+                _w = _REF_WORD.get(pool_name, (pool_name, "найден"))
+                hit = [r for r in pool if r.get("name") == wanted]
+                if not hit:
+                    # 🔴 THE FOURTH CARRIER, AND ALSO A REPEAT OF SOMETHING
+                    # ALREADY FIXED (26.08.2026). `sorted(names)[:8]` used
+                    # to stand here: its OWN number (eight) and BARE NAMES.
+                    # Exactly what `_nearest` fixed in itself on 24.08 —
+                    # "the refusal was losing TWO facts, both needed for
+                    # the next turn": `id`, which the author would use to
+                    # reassemble the selector deterministically, and
+                    # `placement_type`, the trait of being unusable BY
+                    # CONSTRUCTION. The neighboring branch's fix never
+                    # touched this one, and the author here still got
+                    # names that were offered up to be searched for by
+                    # eye.
+                    #
+                    # And the order was ALPHABETICAL — a magnitude with no
+                    # bearing on the question. Given that we have a name,
+                    # closeness by name is the best that can be offered:
+                    # the same `_nearest` as in the neighboring branch.
+                    показаны = _nearest(str(wanted), pool)
+                    diags.append(Diagnostic(
+                        code=GROUND_NOT_FOUND, op_index=i, op_id=op["id"],
+                        field_name="value", expected=pool_name, got=wanted,
+                        candidates=показаны,
+                        message_ru=(f"{_w[0]} «{wanted}» не {_w[1]} в модели; "
+                                    f"известно {len(pool)}"
+                                    + _shown_of(pool, pool_name, показаны))))
+                elif len(hit) > 1:
+                    diags.append(Diagnostic(
+                        code=GROUND_AMBIGUOUS, op_index=i, op_id=op["id"],
+                        field_name="value", expected=pool_name, got=wanted,
+                        message_ru=(f"{_w[0]} «{wanted}» неоднозначен: "
+                                    f"совпадений {len(hit)}")))
+                # Found — and we do NOTHING ELSE. Grounding here only
+                # REFUSES; substituting the found id into the program
+                # would mean setting up a second source of truth about the
+                # material alongside the live resolution in emission, and
+                # the two would diverge on the very first document that
+                # changed after the snapshot was taken.
+        # THE POOL IS TAKEN FROM THE CALL, NOT FROM THE OP (24.08.2026).
+        # For `create_wall_type` the kind of the source is decided by
+        # `host_kind`: a floor type is produced only from a floor type.
+        # Reading a static `ospec.grounded` here would mean searching for
+        # a floor type's name among wall types and refusing "not found" —
+        # a refusal naming the wrong cause.
+        for param, pool_name, required in ospec.grounded_for(op):
+            sel = op.get(param)
+            pspec = next((pp for pp in ospec.params if pp.name == param), None)
+            if pspec is not None and pspec.kind == "sel_list":
+                # THE PLURAL OF THE `sel` KIND (wave/datums).  Each
+                # selector in the list is resolved by THE SAME
+                # `_resolve_one` and against THE SAME pool as a single
+                # one: a selection rule written here a second time would
+                # diverge from the single one at the very first
+                # `disambiguate_by`.  The result is a LIST of
+                # `{"__grounded__": ...}`, i.e. the same shape as a single
+                # one, elementwise; only that op's own emitter reads it.
+                #
+                # THERE IS NO `by: ref` BRANCH HERE, AND THIS IS NOT AN
+                # OMISSION.  Today no parameter of the `sel_list` kind
+                # declares `ref_kinds` (see
+                # `create_multistory_stairs.levels`: the reason is
+                # recorded there), so validate rejects such a reference
+                # earlier — and a branch that can never be reached is dead
+                # code, which over time starts to look like a working
+                # feature. The day `ref_kinds` appears on a list, it
+                # begins with teaching the dependency graph in
+                # `compiler.plan_program`, and the branch is written THEN,
+                # together with it.
+                if sel is None:
+                    if required:
+                        diags.append(Diagnostic(
+                            code=GROUND_BAD_SELECTOR, op_index=i,
+                            op_id=op["id"], field_name=param,
+                            message_ru=(f"{param}: обязательный список "
+                                        "селекторов отсутствует")))
+                    continue
+                resolved: list = []
+                for one in sel:
+                    res = _resolve_one(
+                        one, pool_name, snapshot_pool(pool_name),
+                        i, op["id"], param, ospec.name, diags,
+                        truncated=pool_truncated(pool_name))
+                    if res:
+                        resolved.append({"__grounded__": res})
+                if len(resolved) == len(sel):
+                    # THE SAME NAME TWICE — AND DIFFERENT NAMES LEADING TO
+                    # THE SAME id — ARE ONE AND THE SAME DEFECT.  validate
+                    # catches only a textual repeat; a repeat BY RESULT is
+                    # visible only here, and letting it through would mean
+                    # handing ConnectLevels a set of smaller cardinality
+                    # than was asked for — and with the sets being equal,
+                    # the witness will NOT notice this.
+                    ids = [r["__grounded__"].get("id") for r in resolved
+                           if r["__grounded__"].get("id") is not None]
+                    dup = next((x for k, x in enumerate(ids)
+                                if x in ids[:k]), None)
+                    if dup is not None:
+                        diags.append(Diagnostic(
+                            code=GROUND_BAD_SELECTOR, op_index=i,
+                            op_id=op["id"], field_name=param, got=dup,
+                            message_ru=(f"{param}: два селектора разрешились "
+                                        f"в ОДИН элемент (id {dup}) — "
+                                        "множество вышло меньше, чем "
+                                        "названо")))
+                    else:
+                        g[param] = resolved
+                continue
+            if isinstance(sel, dict) and sel.get("by") == "ref":
+                # intra-program DAG reference: resolved by the plan stage, not
+                # against the snapshot (validity checked by the DAG walk).
+                g[param] = {"__grounded__": {"ref": str(sel.get("value")), "via": "ref"}}
+                continue
+            if sel is None:
+                # wave/struct (2026-07-17): create_foundation is the first op
+                # whose grounded params are VARIETY-DISCRIMINATED — "symbol"
+                # (FamilySymbol for the isolated footing) is irrelevant when
+                # variety="slab", and "type" (FloorType for the slab) is
+                # irrelevant when variety="isolated". The generic omitted-
+                # optional rule below has no per-branch concept and would
+                # otherwise speculatively resolve BOTH against their pools on
+                # every create_foundation op regardless of variety — refusing
+                # a perfectly well-formed program because the OTHER branch's
+                # pool happens to be empty/ambiguous (a real bug caught live:
+                # variety=isolated failed on empty floor_types, variety=slab
+                # failed on empty foundation_symbols, neither pool being
+                # relevant to the branch actually used). Skip silently (no
+                # diagnostic, no __grounded__ entry) exactly when the branch
+                # doesn't use the param — struct_emit.py's emit_foundation
+                # dispatch never reads that key on the branch where it's
+                # skipped, so this is
+                # a true no-op for the irrelevant param, not a silent
+                # substitute for a real resolution.
+                if required:
+                    diags.append(Diagnostic(
+                        code=GROUND_BAD_SELECTOR, op_index=i, op_id=op["id"],
+                        field_name=param, message_ru=f"{param} обязателен"))
+                elif _omitted_param_is_irrelevant(ospec, op, param):
+                    # This branch of the op does not use this parameter at
+                    # all — the omission is silent and deliberate: no
+                    # diagnostic, no entry in `__grounded__`. All five
+                    # cases with their reasons and measurements are in the
+                    # predicate's header, and it is the very same one
+                    # queried in `_needs_pool` above: before 21.08 there
+                    # were TWO lists here and there, and they diverged on
+                    # two ops. One carrier, two call sites.
+                    pass
+                elif param == "top_level":
+                    # audit F6 (generalized, P1 2026-07-21): omitted top_level
+                    # MEANS «no top attach» for ANY op — wall keeps its
+                    # unconnected height, column its as-placed height.  It must
+                    # not speculatively resolve a "default level" from the pool
+                    # (a sole-level model would silently attach every top).
+                    # Skip: no diagnostic, no __grounded__ key; the emitter's
+                    # absent-branch is the byte-stable historical emission.
+                    pass
+                elif (ospec.name in OPS_WITH_DOC_DEFAULT_TYPE
+                      and param == "type"):
+                    # THE SAME HOUSE AS `_needs_pool` AND `_resolve_one`.
+                    # An eight-member literal with arguments for each op
+                    # used to stand here — the arguments moved in full to
+                    # `OPS_WITH_DOC_DEFAULT_TYPE`, because what diverged
+                    # was not the argument but the LIST: 1 against 4
+                    # against 8.
+                    g[param] = {"__grounded__": {"id": None, "name": None,
+                                                 "via": "doc_default",
+                                                 "in_emit": IN_EMIT_DEFAULT}}
+                else:
+                    # generic omitted-optional rule: the SOLE snapshot entry,
+                    # several -> AMBIGUOUS (never first), none -> EMPTY_POOL
+                    real_pool = (pool_name.format(category=op.get("category", "structural"))
+                                 if "{category}" in pool_name else pool_name)
+                    годный = _pool_for_placement(
+                        ospec.name, param, snapshot_pool(real_pool),
+                        i, op["id"], diags)
+                    if годный is None:
+                        continue
+                    res = _resolve_one({"by": "default"}, real_pool,
+                                       годный,
+                                       i, op["id"], param, ospec.name, diags,
+                                       truncated=pool_truncated(real_pool))
+                    if res:
+                        g[param] = {"__grounded__": res}
+                continue
+            real_pool = (pool_name.format(category=op.get("category", "structural"))
+                         if "{category}" in pool_name else pool_name)
+            selected_pool = (snapshot_pool(real_pool)
+                             if sel.get("by") in (
+                                 "name", "default", "family_type") else [])
+            if selected_pool:
+                годный = _pool_for_placement(
+                    ospec.name, param, selected_pool, i, op["id"], diags)
+                if годный is None:
+                    continue
+                selected_pool = годный
+            res = _resolve_one(sel, real_pool, selected_pool,
+                               i, op["id"], param, ospec.name, diags,
+                               truncated=pool_truncated(real_pool))
+            if res:
+                g[param] = {"__grounded__": res}
+        by_id_so_far[op["id"]] = g
+        out.append(g)
+    if address_receipt:
+        _recheck_geometry_after_addresses(out, diags)
+    if diags:
+        raise KirRefusal(diags)
+    return out
+
+
+#: Pools for which the receipt must return a NUMBER, not only an identity.
+#: Today there is one — levels. The reason is a measurement, not tidiness:
+#: the vertical is the ONLY axis that the program expresses by a REFERENCE
+#: rather than a value, and all three major failures of the 18.08 live
+#: benchmark were vertical ones with otherwise clean planar geometry. The
+#: model COMPUTES the horizontal and writes it as a number — a number
+#: cannot lie; a reference can, and it lies plausibly.
+_NUMBERED_POOLS = {"levels": "elevation_mm"}
+
+
+def _pool_rows_by_id(snapshot: Any, pool_name: str) -> dict[int, dict]:
+    rows: dict[int, dict] = {}
+    pool = snapshot.get(pool_name) if isinstance(snapshot, dict) else None
+    for row in pool or ():
+        if not isinstance(row, dict):
+            continue
+        try:
+            rows[int(row["id"])] = row
+        except (KeyError, TypeError, ValueError):
+            continue
+    return rows
+
+
+def _numbered_pool_params(op_name: Any) -> list[tuple[str, str, str]]:
+    """(parameter, pool name, numeric field name) for one operation."""
+    ospec = spec.OPS.get(op_name) if isinstance(op_name, str) else None
+    out: list[tuple[str, str, str]] = []
+    for entry in (getattr(ospec, "grounded", ()) or ()):
+        try:
+            param, pool_name = entry[0], entry[1]
+        except (TypeError, IndexError):
+            continue
+        field = _NUMBERED_POOLS.get(pool_name)
+        if field:
+            out.append((param, pool_name, field))
+    return out
+
+
+def resolved_references(grounded_ops: list[dict], snapshot: Any) -> list[dict]:
+    """THE NUMBER THAT A REFERENCE TURNED INTO — for each resolved level.
+
+    WHY, FROM A LIVE BENCHMARK MEASUREMENT ON 18.08.2026. A model wrote,
+    540 times, `{"op": "create_beam", "p0_mm": [0,0,0], "level":
+    {"by":"name","value":"Этаж 5"}}` and got back a receipt from which
+    there was NO WAY to learn that «Этаж 5» is 18000 mm, while its curve
+    sits at zero. All 540 beams ended up in one plane; this survived the
+    witness, an independent acceptance check, THREE audits, and a full
+    rebuild. The value existed in the snapshot (`elevation_mm` has been
+    collected since 09.08, `Level.Elevation`, 6/6 versions) and was
+    discarded at the grounding stage, because `_resolve_one` returns
+    `{id, name, via}`.
+
+    WHY A SEPARATE REPORT, NOT A FIELD IN `compiler_choices`. That one
+    answers the question "what did the compiler choose for an author who
+    stayed silent" and DELIBERATELY does not show ordinary `by=name`
+    resolutions — the author named those themself. Here the question is
+    different: "what did the thing I named turn into". Folding the two
+    questions into one field is exactly the named defect that makes
+    `is_partial_read` measure closed sets while it is read as "is the
+    snapshot complete".
+
+    🔴 `elevation_mm` can be absent: in the collector it sits under a
+    `try/catch`. Then the row carries `None` and `elevation_source: "не
+    отдан коллектором"`, and NOT zero. Zero for a value the instrument did
+    not compute here is a separate named defect of this tree, paid for
+    twice within one hour.
+
+    🔴 THE INDISTINGUISHABLE NEIGHBOR. If a level with a DIFFERENT name
+    sits at the same elevation, it is named in `indistinguishable`. The
+    live evidence is `KIR-A006`: 35 columns went to the template
+    «Уровень 1» instead of «Этаж 1», because both are at zero. The
+    reference resolved to the neighbor and looked entirely legitimate;
+    there was nothing to tell it apart with, because the deciding axis —
+    the elevation — never made it into the receipt.
+    """
+    report: list[dict] = []
+
+    def walk(ops: Any, host_id: Any = None) -> None:
+        for op in ops or ():
+            if not isinstance(op, dict):
+                continue
+            op_name = op.get("op")
+            for param, pool_name, field in _numbered_pool_params(op_name):
+                sel = op.get(param)
+                if not isinstance(sel, dict):
+                    continue
+                res = sel.get("__grounded__")
+                if not isinstance(res, dict):
+                    continue
+                rid = res.get("id")
+                if isinstance(rid, bool) or not isinstance(rid, int):
+                    continue
+                rows = _pool_rows_by_id(snapshot, pool_name)
+                row = rows.get(rid)
+                value = row.get(field) if isinstance(row, dict) else None
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    value, source = None, "не отдан коллектором"
+                else:
+                    value, source = float(value), pool_name
+                twins = []
+                if value is not None:
+                    for other_id, other in sorted(rows.items()):
+                        if other_id == rid:
+                            continue
+                        theirs = other.get(field)
+                        if isinstance(theirs, bool) or not isinstance(
+                                theirs, (int, float)):
+                            continue
+                        # The threshold is the same value by which Revit
+                        # itself distinguishes elevations in the
+                        # interface: 1 mm. Strict float equality would
+                        # declare the neighbor distinguishable purely from
+                        # unit conversion.
+                        if abs(float(theirs) - value) <= 1.0:
+                            twins.append({"id": other_id,
+                                          "name": str(other.get("name"))})
+                # 🔴 THE AUTHOR'S WORDS ARE ALREADY GONE HERE, and lying
+                # about them is not allowed. `ground()` REPLACES the
+                # selector: `{"by":"name","value":"Этаж 5"}` becomes
+                # `{"__grounded__": {...}}`, the original string is not
+                # kept anywhere. That is why this row has no "what was
+                # asked for" field — there is `via` (which rule resolved
+                # it) and a name READ FROM THE POOL. On resolution by
+                # `element_id`, `_resolve_one` returns `name: None`, and
+                # without consulting the pool the receipt would carry an
+                # identity with no name.
+                name = res.get("name")
+                if not name and isinstance(row, dict):
+                    name = row.get("name")
+                row_out = {
+                    "op_id": op.get("id"),
+                    "op": op_name,
+                    "param": param,
+                    "via": res.get("via"),
+                    "id": rid,
+                    "name": str(name) if name is not None else None,
+                    field: value,
+                    "elevation_source": source,
+                }
+                if host_id is not None:
+                    row_out["inside_group"] = host_id
+                if twins:
+                    row_out["indistinguishable"] = twins
+                report.append(row_out)
+            members = op.get("members")
+            if isinstance(members, list):
+                walk(members, host_id=op.get("id"))
+
+    walk(grounded_ops)
+    return report
+
+
+def describe_resolved_refs_ru(report: list[dict]) -> str:
+    """One row for a human: what the references they named turned into.
+
+    Silent when there is nothing to say. It shouts about indistinguishable
+    neighbors, because that is the only part of the report that names a
+    POSSIBLE error rather than a fact: the reference resolved, but it had
+    a twin, and the choice between them was made by the pool's order, not
+    by the author.
+    """
+    if not report:
+        return ""
+    parts: list[str] = []
+    seen: set = set()
+    for row in report:
+        key = (row.get("name"), row.get("elevation_mm"))
+        if key in seen:
+            continue
+        seen.add(key)
+        elev = row.get("elevation_mm")
+        shown = ("отметка не отдана коллектором" if elev is None
+                 else f"{elev:.0f} мм")
+        parts.append(f"«{row.get('name')}» -> {shown}")
+    note = "ссылки превратились в числа: " + "; ".join(parts[:8])
+    twins = [r for r in report if r.get("indistinguishable")]
+    if twins:
+        first = twins[0]
+        names = ", ".join(f"«{t['name']}»" for t in first["indistinguishable"])
+        note += (f". 🔴 НЕОТЛИЧИМЫЙ СОСЕД: на той же отметке стоит {names} — "
+                 f"выбор между ними сделал не ты"
+                 + (f" (и ещё {len(twins) - 1} таких)" if len(twins) > 1 else ""))
+    return note
+
+
+def resolution_report(
+    grounded_ops: list[dict],
+) -> tuple["GroundingResolution", ...]:
+    """Return every explicit selector resolution in deterministic order.
+
+    ``compiler_choices`` is intentionally a concise user-facing report and
+    omits ordinary by-name/by-id resolutions.  Digest evidence cannot make
+    that trade-off: every nested ``__grounded__`` marker must be accounted,
+    including selectors inside lists and grouped member operations.
+    """
+    from kir.midend import GroundingResolution
+
+    report: list[GroundingResolution] = []
+    for op in grounded_ops:
+        op_id = op.get("id") if isinstance(op, dict) else None
+        if not isinstance(op_id, str) or not op_id:
+            raise ValueError("grounded operation needs an id")
+        report.extend(GroundingResolution.collect(op_id=op_id, payload=op))
+    return tuple(report)
+
+
+def ground_program(
+    planned: "PlannedProgram",
+    snapshot: Any,
+    *,
+    context: "GroundingContext | None" = None,
+) -> "GroundedProgram":
+    """Freeze output and bind it to the exact snapshot that produced it.
+
+    Direct compiler callers get a content-addressed, explicitly untrusted
+    ``compiler_argument`` context.  The live serving boundary supplies its
+    own trusted context after the bridge read.  Neither path invents revision
+    evidence when the collector did not provide it.
+    """
+    from kir.midend import (
+        GroundedProgram,
+        GroundingContext,
+        PlannedProgram,
+    )
+
+    if not isinstance(planned, PlannedProgram):
+        raise TypeError("ground_program requires PlannedProgram")
+    if context is None:
+        context = GroundingContext.from_snapshot(
+            snapshot,
+            source="compiler_argument",
+            trusted_source=False,
+        )
+    elif not isinstance(context, GroundingContext):
+        raise TypeError("context must be GroundingContext or None")
+    else:
+        observed = GroundingContext.from_snapshot(
+            snapshot,
+            source="context_recheck",
+            trusted_source=False,
+        )
+        if context.snapshot_digest != observed.snapshot_digest:
+            raise ValueError(
+                "grounding context is bound to another snapshot payload")
+        if context.document_digest != observed.document_digest:
+            raise ValueError(
+                "grounding context is bound to another document identity")
+    grounded_ops = ground(planned.to_ops(), snapshot)
+    return GroundedProgram.from_ops(
+        planned,
+        grounded_ops,
+        resolution_report(grounded_ops),
+        context=context,
+        snapshot=snapshot,
+    )
+
+
+def _recheck_geometry_after_addresses(grounded: list[dict],
+                                      diags: list[Diagnostic]) -> None:
+    """Laws that need NUMBERS — as a second call site, not a copy.
+
+    Two plan-level laws read the coordinates of the endpoints: "length ~0"
+    and "door past the wall's edge". While the endpoints were literals,
+    both were proven before the snapshot. An address from grids yields
+    numbers only here — and the law must REACH here, not fall silent over
+    this part of the range (an instrument that covers part of the range is
+    more dangerous than a missing one).
+
+    Both functions are IMPORTED, not rewritten: `authoring_validation.
+    reject_zero_length` and `compiler.hosted_offset_check` remain the sole
+    owners of their rules.
+
+    THE LAW READS ONLY RESOLVED NUMBERS, and this is a REFUTING
+    MEASUREMENT, not a precaution (found 09.08.2026 on base `2bfbec0a`,
+    before any fix). A `create_wall` program with an address to a
+    NONEXISTENT grid in `p0_mm` and a valid address in `p1_mm` reached
+    this point with a receipt (the second address resolved, so
+    `__address__` exists) and an UNRESOLVED first one — that is, with an
+    address object where the law expects a list. `reject_zero_length` took
+    `p0_mm[0]` and got a `KeyError`, and the whole program answered with
+    «KIR-P000 внутренняя ошибка компилятора» INSTEAD OF the honest
+    KIR-G108 «оси нет в модели», which by that point was already sitting
+    in `diags`. The worst of the possible trades: a typed refusal with a
+    named next move got replaced by a message that sends the author off
+    to fix the compiler.
+    """
+    from kir.authoring_validation import reject_zero_length
+    from kir.compiler import hosted_offset_check
+    from kir.geom import same_program_shift
+
+    def _resolved(op: dict) -> bool:
+        return all(isinstance(op.get(key), list)
+                   for key in ("p0_mm", "p1_mm"))
+
+    addressed = {op["id"] for op in grounded if "__address__" in op}
+    by_id = {op["id"]: op for op in grounded}
+    for index, op in enumerate(grounded):
+        if op["id"] in addressed and _resolved(op):
+            reject_zero_length(op["p0_mm"], op["p1_mm"], op["op"], index,
+                               op["id"], diags)
+        if op["op"] not in ("create_window", "create_door"):
+            continue
+        host = op.get("host") or {}
+        wall = by_id.get(host.get("value"))
+        if (wall is None or wall.get("op") != "create_wall"
+                or wall["id"] not in addressed or not _resolved(wall)):
+            continue
+        hosted_offset_check(
+            op, wall, str(host.get("value")), index, diags,
+            shift=same_program_shift(grounded, index, str(host.get("value"))))
+
+
+def omitted_authorities(ops: list[dict]) -> list[dict]:
+    """WHAT WILL BE DECIDED WITHOUT THE AUTHOR, BECAUSE THEY STAYED SILENT.
+
+    WHY, FROM A LIVE-MODEL MEASUREMENT. `create_column.top_level` is
+    omitted — and the height comes from the TYPE's default, not from the
+    program: **420 columns silently ended up at 2500 mm instead of
+    3600–4500**. Not a single refusal; three audits missed it. The same
+    for a room: `upper_offset_mm` is omitted, the upper limit stays at
+    2438, and `HAB022` screams on the very first real apartment about a
+    magnitude the author had no way to set.
+
+    Knowledge of this SAT IN THE REGISTRY THE WHOLE TIME — `ParamSpec.
+    omission_transfers`, eight fields, each with a reason in words. It was
+    PASSIVE: it described the consequence and went nowhere. The
+    constitution demands the opposite — the model DOES NOT SEE, so the
+    environment must TELL.
+
+    🔴 WHY A SEPARATE REPORT, NOT A ROW IN `grounding_report`. Not by
+    taste, but by measurement on 27.08.2026, via a run:
+
+        create_wall, top_level OMITTED   ->  grounding_report == []
+        create_wall, top_level GIVEN     ->  grounding_report == []
+
+    That report answers "what the compiler CHOSE for an author who stayed
+    silent", and deliberately does not show ordinary `by=name`
+    resolutions. An omission is something it did NOT choose: the power
+    went to the type or to Revit. And second, decisively: of the eight
+    fields, THREE are grounded (`top_level` on a wall, a column, and a
+    family); the other five are `str`/`mm`, grounding never sees them at
+    all and will NEVER produce a row about them.
+
+    This is a third question next to the two already in place, each with
+    its own report:
+
+        grounding_report   what the compiler CHOSE for a silent author
+        resolved_refs      what the thing I named TURNED INTO
+        here               what the TYPE or REVIT will decide, because I
+                            stayed silent
+
+    🔴 THE BOUNDARY IS NAMED, NOT SIDESTEPPED: the row says WHAT took the
+    power, and does not say WHAT VALUE came out. The value is knowable
+    only by reading the built element back, and filling this in with
+    something plausible would be form 44 ("a plausible number is not
+    argued with"). It is delivered by the same mechanism as a deferred
+    choice — `attach_runtime_choices` via `read_from`.
+
+    THE INPUT is ops AFTER the defaults envelope and macro expansion. This
+    matters: by declaring `defaults: {top_level: ...}`, the author said
+    the word ONCE for the whole program, and that is not silence.
+    Post-envelope ops answer the question correctly with not a single
+    extra check.
+    """
+    from kir import spec as _spec
+
+    report: list[dict] = []
+
+    def walk(items: Any, host_id: Any = None) -> None:
+        for op in items or ():
+            if not isinstance(op, dict):
+                continue
+            ospec = _spec.OPS.get(op.get("op"))
+            if ospec is not None:
+                for p in ospec.params:
+                    if not p.omission_transfers or p.name in op:
+                        continue
+                    row = {
+                        "op_id": op.get("id"),
+                        "op": ospec.name,
+                        "param": p.name,
+                        "transfers": p.omission_transfers,
+                    }
+                    if host_id is not None:
+                        row["inside_group"] = host_id
+                    report.append(row)
+            members = op.get("members")
+            if isinstance(members, list):
+                walk(members, host_id=op.get("id"))
+
+    walk(ops)
+    return report
+
+
+def describe_omissions_ru(report: list[dict]) -> str:
+    """One human-readable row: what will be decided without the author, and why.
+
+    Empty when there is nothing to say — by the same law as its
+    neighbors: a note saying "nothing happened" is noise, and noise
+    teaches people not to read notes. A field without
+    `omission_transfers` NEVER produces a row: omitting it turns off the
+    decoration, it does not change the mechanism.
+    """
+    parts = [f"{row.get('op')}.{row.get('param')} — {row.get('transfers')}"
+             for row in report if row.get("transfers")]
+    if not parts:
+        return ""
+    return "не задано, решится без тебя — " + "; ".join(parts)

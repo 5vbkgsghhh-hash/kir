@@ -1,0 +1,401 @@
+name: CI — KIR compiler evidence
+
+# Every pytest-collected KIR test belongs to exactly one required offline lane.
+# Native reference compilation and portable Connector execution are separate:
+# neither claims a desktop Revit installation or live BIM acceptance.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'kir/**'
+      - 'tools/**'
+      - 'connector/**'
+      - 'examples/**'
+      - 'build_support/**'
+      - 'pyproject.toml'
+      - 'MANIFEST.in'
+      - '.github/scripts/kir_evidence_manifest.py'
+      - '.github/scripts/kir_secret_boundary.py'
+      - '.github/scripts/kir_ci_suites.py'
+      - '.github/scripts/Kir.CI.References.csproj'
+      - '.github/workflows/kir-evidence.yml'
+      - '.github/workflows/kir-security.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'kir/**'
+      - 'tools/**'
+      - 'connector/**'
+      - 'examples/**'
+      - 'build_support/**'
+      - 'pyproject.toml'
+      - 'MANIFEST.in'
+      - '.github/scripts/kir_evidence_manifest.py'
+      - '.github/scripts/kir_secret_boundary.py'
+      - '.github/scripts/kir_ci_suites.py'
+      - '.github/scripts/Kir.CI.References.csproj'
+      - '.github/workflows/kir-evidence.yml'
+      - '.github/workflows/kir-security.yml'
+
+concurrency:
+  group: ci-kir-evidence-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  workflow:
+    name: GitHub workflow syntax and contexts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate workflows with a pinned upstream actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --max-time 60 \
+            --output "$archive" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" | sha256sum --check -
+          tar --no-same-owner -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes= .github/workflows/*.yml
+
+  lint:
+    name: limited Python correctness checks, not formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the declared development tools
+        run: python -m pip install -e ".[dev]"
+      - name: Check ordinary Python and separately injected recipe namespaces
+        run: |
+          python -m ruff check --no-cache kir tools examples build_support .github/scripts connector/revit
+          python -m ruff check --no-cache --config 'extend-exclude=[]' --config 'builtins=["param", "project_output_id"]' examples/recipes
+      - name: README numbers are recomputed, not retold
+        # `tools/readme_numbers.py --check` recomputes the README's numeric claims
+        # (registry counts, supported versions, the examples' observations) and
+        # exits 1 on a mismatch. Measured 13.09.2026: 5 checks, ~15 s. It rides in
+        # a required job because a number nobody recomputes is a claim, not a
+        # measurement; the instrument existed since 11.09 and nothing ran it.
+        run: python tools/readme_numbers.py --check
+
+  offline:
+    name: offline ${{ matrix.lane }}
+    runs-on: ubuntu-latest
+    # Full local runs exceed 100 minutes. Materialization includes full emission
+    # at the registry's bulk ceiling (200,000 ops at this revision), not the old
+    # 10,000-op fixture described in historical notes. This isolated lane stays
+    # required, but its runner RAM is not qualified; a timeout is not a RAM fix.
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        lane: [compiler-0, compiler-1, compiler-2, compiler-3, decompile, product, materialize]
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install offline suite dependencies, including optional geometry
+        run: |
+          python -m pip install -e ".[dev,bridge,mcp,geometry]"
+          python -m pip install "pytest-asyncio>=0.24.0"
+      - name: Report extreme-lane capacity without claiming it is sufficient
+        if: matrix.lane == 'materialize'
+        run: |
+          free -h
+          python -c 'from kir.compiler import MAX_OPS_PER_PROGRAM, MAX_BULK_OPS; print("authored budget:", MAX_OPS_PER_PROGRAM, "bulk budget:", MAX_BULK_OPS)'
+      - name: Run this lane of the complete collected suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          /usr/bin/time -v python .github/scripts/kir_ci_suites.py "${{ matrix.lane }}" \
+            --junitxml "$RUNNER_TEMP/kir-offline-${{ matrix.lane }}.xml"
+      - name: Retain lane results, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kir-offline-${{ matrix.lane }}
+          path: ${{ runner.temp }}/kir-offline-${{ matrix.lane }}.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  generated-csharp-6x:
+    name: selected generated C# against real Revit 2021–2026 APIs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: kir-native-refs-${{ runner.os }}-${{ hashFiles('.github/scripts/Kir.CI.References.csproj', 'connector/revit/tests/CompilerConformance.Tests/CompilerConformance.Tests.csproj') }}
+      - name: Install driver dependencies
+        run: python -m pip install -e ".[dev,geometry]"
+      - name: Restore exact reference versions and build the existing Connector compiler
+        run: |
+          dotnet restore .github/scripts/Kir.CI.References.csproj --nologo -p:NuGetAudit=false -p:MSBuildProjectExtensionsPath="$RUNNER_TEMP/kir-ci-refs/"
+          dotnet build connector/revit/tests/CompilerConformance.Tests/CompilerConformance.Tests.csproj -c Release --nologo -p:NuGetAudit=false
+      - name: Refuse missing references before any optional test can skip
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import OCP
+          from kir.instruments import revit_refs
+
+          versions = tuple(str(year) for year in range(2021, 2027))
+          found = revit_refs.require(versions)
+          assert set(found) == set(versions)
+          runner = Path("connector/revit/tests/CompilerConformance.Tests/bin/Release/net8.0/CompilerConformance.Tests.dll").resolve()
+          assert runner.is_file()
+          cache = Path.home() / ".nuget/packages/revit_all_main_versions_api_x64"
+          assert cache.is_dir()
+          values = {
+              "KIR_TYPE_CONFORMANCE_RUNNER": runner,
+              "KIR_TYPE_REVIT_API_CACHE": cache,
+              "KIR_TEST_NET48_REFS": revit_refs.framework_references("2023"),
+              "KIR_TEST_NET8_REFS": revit_refs.framework_references("2026"),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  print(f"{key}={value}", file=output)
+          print(revit_refs.describe(versions))
+          PY
+      - name: Execute actual compiler drivers, including negative controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q -p no:cacheprovider -p no:randomly \
+            kir/tests/test_connector_compiler_conformance.py \
+            kir/tests/test_type_creation_conformance.py \
+            kir/tests/test_consumer_type_conformance.py \
+            kir/tests/test_typed_section_conformance.py \
+            kir/tests/test_an_opening_is_judged_against_the_profile_before_any_effect.py \
+            --junitxml "$RUNNER_TEMP/kir-native-conformance.xml"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          result = ET.parse(Path(os.environ["RUNNER_TEMP"]) / "kir-native-conformance.xml")
+          cases = list(result.iter("testcase"))
+          assert cases, "no actual compiler tests ran"
+          assert not list(result.iter("skipped")), "native reference lane skipped obligations"
+          assert not list(result.iter("failure")) and not list(result.iter("error"))
+          for year in range(2021, 2027):
+              assert any(str(year) in case.attrib["name"] for case in cases), year
+          print(f"{len(cases)} executed tests, all six API versions named; no live Revit claim")
+          PY
+      - name: Retain actual compiler results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kir-native-conformance
+          path: ${{ runner.temp }}/kir-native-conformance.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  connector:
+    name: portable Connector lifecycle, transport and packaging execution
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install Python transport driver dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Name the private root required by cancellation fixtures
+        run: |
+          mkdir -p "$RUNNER_TEMP/kir-connector-tests"
+          echo "KIR_TEST_ARTIFACT_ROOT=$RUNNER_TEMP/kir-connector-tests" >> "$GITHUB_ENV"
+      # These projects are console executables. dotnet test does not run Main.
+      - name: Execute actual linked context and compiler-host lifecycle cases
+        run: |
+          dotnet run --project connector/revit/tests/ContextLifecycle.Tests/ContextLifecycle.Tests.csproj -c Release -p:NuGetAudit=false
+          dotnet run --project connector/revit/tests/CompilerHostLifecycle.Tests/CompilerHostLifecycle.Tests.csproj -c Release -p:NuGetAudit=false
+      - name: Execute real protocol and process drivers
+        run: |
+          python -m pytest -q -p no:cacheprovider -p no:randomly \
+            kir/tests/test_revit_transport.py \
+            kir/tests/test_connector_protocol_replay.py \
+            kir/tests/test_native_no_start_failure.py
+      - name: Execute packaging with explicit synthetic native fixtures
+        run: |
+          pwsh -NoLogo -NoProfile -File connector/revit/tests/Packaging.Tests/Run.ps1 -FixtureRoot "$RUNNER_TEMP/kir-packaging"
+      - name: Execute installer isolation and rollback against the package fixture
+        run: |
+          pwsh -NoLogo -NoProfile -File connector/revit/tests/Packaging.Tests/Install.Tests.ps1 -PackageRoot "$RUNNER_TEMP/kir-packaging/debug/dist/packages" -FixtureRoot "$RUNNER_TEMP/kir-installer"
+      - name: Execute packaging free-space refusal cases
+        run: |
+          pwsh -NoLogo -NoProfile -File connector/revit/tests/Packaging.Tests/Space.Tests.ps1
+
+  release-gate:
+    name: build sdist and wheel, clean install, installed selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install build tooling
+        run: python -m pip install build setuptools wheel
+      - name: Build and exercise the installed package
+        run: python tools/release_gate.py
+
+  windows-wheel:
+    name: Windows fresh-wheel compiler/reverse slice, not POSIX sandbox
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - name: Preserve the LF bytes used by emission/source fixtures
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build the wheel through the sdist
+        shell: pwsh
+        run: |
+          python -m pip install build setuptools wheel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m build --outdir (Join-Path $env:RUNNER_TEMP 'kir-windows-dist')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install into a fresh venv outside the checkout and exercise the supported slice
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP 'kir-windows-dist'
+          $wheels = @(Get-ChildItem -LiteralPath $dist -Filter '*.whl')
+          if ($wheels.Count -ne 1) { throw 'expected exactly one freshly built wheel' }
+          $venv = Join-Path $env:RUNNER_TEMP 'kir-windows-venv'
+          if (Test-Path -LiteralPath $venv) { throw 'fresh Windows venv target already exists' }
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $python = Join-Path $venv 'Scripts/python.exe'
+          & $python -m pip install "$($wheels[0].FullName)[dev]"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-Location $env:RUNNER_TEMP
+          $env:KIR_WINDOWS_VENV = $venv
+          & $python -I -X utf8 -m kir --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -I -X utf8 -m kir demo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # --list proves composition only. Full selftest includes sandbox tests
+          # whose child runner imports POSIX resource; it is not this profile.
+          & $python -I -X utf8 -m kir.selftest --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $probe = @'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          import kir
+
+          root = Path(kir.__file__).resolve().parent
+          checkout = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          assert not root.is_relative_to(checkout), "checkout shadowed the installed wheel"
+          assert Path(sys.prefix).resolve() == Path(os.environ["KIR_WINDOWS_VENV"]).resolve()
+          assert all(not Path(p).resolve().is_relative_to(checkout) for p in sys.path if p)
+          names = [
+              "decompile/tests/test_reverse_chain_to_csharp.py",
+              "decompile/tests/test_reverse_contract.py",
+              "tests/test_emit_model_byte_parity.py",
+              "tests/test_golden.py",
+              "tests/test_shape_census.py",
+              "tests/test_witness_vacuity.py",
+              "tests/test_tool_doc.py",
+              "tests/test_expressiveness_census.py",
+          ]
+          paths = [root / name for name in names]
+          assert all(path.is_file() for path in paths)
+          print(json.dumps({"package": str(root), "version": kir.__version__,
+                            "profile": "windows_installed_compiler_reverse_slice",
+                            "test_files": len(paths), "full_selftest": False}))
+          subprocess.run([sys.executable, "-I", "-X", "utf8", "-m", "pytest", "-q",
+                          "-p", "no:cacheprovider", *map(str, paths)],
+                         cwd=os.environ["RUNNER_TEMP"], check=True)
+          '@
+          & $python -I -X utf8 -c $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Execute portable Connector stubs and child-process cases on Windows
+        shell: pwsh
+        run: |
+          $env:KIR_TEST_ARTIFACT_ROOT = Join-Path $env:RUNNER_TEMP 'kir-windows-connector'
+          New-Item -ItemType Directory -Path $env:KIR_TEST_ARTIFACT_ROOT -Force | Out-Null
+          dotnet run --project connector/revit/tests/ContextLifecycle.Tests/ContextLifecycle.Tests.csproj -c Release -p:NuGetAudit=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet run --project connector/revit/tests/CompilerHostLifecycle.Tests/CompilerHostLifecycle.Tests.csproj -c Release -p:NuGetAudit=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  provenance:
+    name: commit-bound KIR evidence
+    needs: [workflow, lint, offline, generated-csharp-6x, connector, release-gate, windows-wheel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      KIR_OFFLINE_RESULT: ${{ needs.offline.result }}
+      KIR_SIX_VERSION_RESULT: ${{ needs.generated-csharp-6x.result }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Bind successful required jobs to the exact source commit
+        run: |
+          python .github/scripts/kir_evidence_manifest.py \
+            --output kir-evidence-provenance.json
+      - name: Upload commit-bound evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: kir-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: kir-evidence-provenance.json
+          if-no-files-found: error
+          retention-days: 90

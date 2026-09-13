@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework Condition="'$(NativeReferenceCheck)' != 'true'">net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- Windows ACL methods are linked but replaced at the resource seam in
+         portable tests; their actual execution requires a Windows lane. -->
+    <NoWarn Condition="'$(NativeReferenceCheck)' != 'true'">$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(NativeReferenceCheck)' == 'true'">
+    <OutputType>Library</OutputType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(NativeReferenceCheck)' == 'true' And '$(TargetFramework)' == 'net8.0-windows'">
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/Kir.Revit.Connector/Context/DocumentRevisionTracker.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Context/ContextSnapshotCollector.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Context/ContextQueryScheduler.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/ConnectorService.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/App.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/ConnectorSession.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Transport/DiscoveryFile.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Transport/NamedPipeHost.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/ExternalEventScheduler.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/CompilerHostClient.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/ExecutionEngine.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/ExecutionWorkItem.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/OperationJournal.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/JournalOwner.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Execution/SessionAdmission.cs" />
+    <Compile Include="../../src/Kir.Revit.Connector/Compat/RevitCompat.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/Messages.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/ConnectorTarget.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/JsonFraming.cs" />
+    <Compile Include="../../src/Kir.Revit.Protocol/StrictJson.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(NativeReferenceCheck)' != 'true'">
+    <Compile Include="Program.cs" />
+    <Compile Include="RevitStubs.cs" />
+    <Compile Include="ExecutionBindingTests.cs" />
+    <Compile Include="JournalOwnershipTests.cs" />
+    <Compile Include="SessionLifecycleTests.cs" />
+    <Compile Include="CancellationTests.cs" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.12.0" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(NativeReferenceCheck)' == 'true'">
+    <Reference Include="RevitAPI"><HintPath>$(RevitReferenceDirectory)/RevitAPI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="RevitAPIUI"><HintPath>$(RevitReferenceDirectory)/RevitAPIUI.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(NativeReferenceCheck)' == 'true' And '$(TargetFramework)' == 'net48'">
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+</Project>

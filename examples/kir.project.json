@@ -1,0 +1,5 @@
+{
+  "schema": "kir.project/1",
+  "title": "KIR Git Viewer Demo",
+  "entry": "repository_demo.kir.json"
+}

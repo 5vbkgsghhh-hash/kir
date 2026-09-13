@@ -1,0 +1,25 @@
+{
+  "_зачем": "ВЫБРАННЫЙ НАБОР KIR — то, что ворота разреза гоняют ВНУТРИ чистого venv без КУКАЯ. Пути — относительно установленного пакета `kir`.",
+  "_сверка": "Этот выбранный standalone-набор принадлежит пакету KIR. Его доставка сверяется с wheel.keep; совместимость внешних интеграционных ведомостей проверяется отдельно.",
+  "набор": [
+    "decompile/tests/test_delta_carries_the_obligation.py",
+    "decompile/tests/test_reverse_chain_to_csharp.py",
+    "decompile/tests/test_reverse_contract.py",
+    "tests/test_a_reading_typo_does_not_erase_the_program.py",
+    "tests/test_an_overflowing_contract_keeps_its_tail.py",
+    "tests/test_author_geometry_constructors.py",
+    "tests/test_emit_model_byte_parity.py",
+    "tests/test_expressiveness_census.py",
+    "tests/test_gold_path_axes.py",
+    "tests/test_golden.py",
+    "tests/test_lineage_archive_compatibility.py",
+    "tests/test_op_budget_seam.py",
+    "tests/test_planning_preserves_program_lineage.py",
+    "tests/test_rehearsal_over_the_corpus.py",
+    "tests/test_shape_census.py",
+    "tests/test_tool_doc.py",
+    "tests/test_witness_vacuity.py"
+  ],
+  "шов": {},
+  "_почему_шов_назван": "Шов ОПУСТЕЛ 27.08.2026: 30 файлов, чей предмет — продукт, переехали в дерево хоста (backend/tests/seam/), а те, что читают ИСХОДНИК языка или нужны другим тестам KIR, вернулись в область и переведены на порты. test_op_budget_seam остался в KIR и ПРОПУСКАЕТ проверку о продукте с названной причиной, когда дерева хоста нет: пропуск видно, вакуумный зелёный — нет. Пустой шов — не «нечего называть», а «называть больше нечего»; ворота по-прежнему требуют набор ПЛЮС шов == KIR-часть ведомости продукта."
+}

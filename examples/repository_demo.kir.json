@@ -1,0 +1,69 @@
+{
+  "ir_version": "1.0",
+  "intent": "Small reproducible building used by the Git repository viewer",
+  "ops": [
+    {
+      "op": "create_level",
+      "id": "level-1",
+      "elev_mm": 0,
+      "name": "Level 1"
+    },
+    {
+      "op": "create_floor",
+      "id": "floor-1",
+      "outline": [[0, 0], [8000, 0], [8000, 6000], [0, 6000]],
+      "level": {"by": "ref", "value": "level-1"}
+    },
+    {
+      "op": "create_wall",
+      "id": "wall-south",
+      "p0_mm": [0, 0],
+      "p1_mm": [8000, 0],
+      "level": {"by": "ref", "value": "level-1"},
+      "height_mm": 3200
+    },
+    {
+      "op": "create_wall",
+      "id": "wall-east",
+      "p0_mm": [8000, 0],
+      "p1_mm": [8000, 6000],
+      "level": {"by": "ref", "value": "level-1"},
+      "height_mm": 3200
+    },
+    {
+      "op": "create_wall",
+      "id": "wall-north",
+      "p0_mm": [8000, 6000],
+      "p1_mm": [0, 6000],
+      "level": {"by": "ref", "value": "level-1"},
+      "height_mm": 3200
+    },
+    {
+      "op": "create_wall",
+      "id": "wall-west",
+      "p0_mm": [0, 6000],
+      "p1_mm": [0, 0],
+      "level": {"by": "ref", "value": "level-1"},
+      "height_mm": 3200
+    },
+    {
+      "op": "create_directshape",
+      "id": "roof",
+      "category": "generic_model",
+      "name": "Gabled roof",
+      "mesh": {
+        "vertices_mm": [
+          [0, 0, 3200], [8000, 0, 3200],
+          [8000, 6000, 3200], [0, 6000, 3200],
+          [0, 3000, 4800], [8000, 3000, 4800]
+        ],
+        "triangles": [
+          [0, 3, 4], [1, 5, 2],
+          [0, 4, 5], [0, 5, 1],
+          [3, 2, 5], [3, 5, 4],
+          [0, 1, 2], [0, 2, 3]
+        ]
+      }
+    }
+  ]
+}
